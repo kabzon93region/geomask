@@ -10,6 +10,20 @@
 
 ## Установка (на роутере)
 
+Рекомендуется jsDelivr (быстрее GitHub raw, виден прогресс скачивания):
+
+```sh
+curl -fL -m 60 -o /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/geomask@master/geomask.sh' && sh /tmp/geomask.sh
+```
+
+Если curl отсутствует:
+
+```sh
+wget -T 30 -O /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/geomask@master/geomask.sh' && sh /tmp/geomask.sh
+```
+
+Классический one-liner через GitHub raw (может быть **очень медленным** с некоторых сетей — выглядит как зависание пустого экрана, используйте варианты выше):
+
 ```sh
 sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master/geomask.sh')
 ```

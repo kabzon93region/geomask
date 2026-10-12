@@ -13,9 +13,12 @@
 #   sh geomask.sh --vpn-url U --ai-url U    set subscription URLs (kept secret in config only)
 #   sh geomask.sh --help
 #
-# After publish it can be run as:  sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master/geomask.sh')
-#
-# After publish it can be run as:  sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master/geomask.sh')
+# Install (jsDelivr CDN - fast, shows download progress):
+#   curl -fL -m 60 -o /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/geomask@master/geomask.sh' && sh /tmp/geomask.sh
+# wget fallback:
+#   wget -T 30 -O /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/geomask@master/geomask.sh' && sh /tmp/geomask.sh
+# GitHub raw (can be VERY slow from some networks -> looks like a hang; prefer jsDelivr):
+#   sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master/geomask.sh')
 #
 # SAFETY: never reboots the router; never restarts working services (only starts missing ones);
 #         never touches network/pppoe config; backups before every file write; mihomo restart
@@ -25,7 +28,7 @@
 
 set -u
 
-GM_VERSION="1.1.0"
+GM_VERSION="1.1.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -1878,7 +1881,7 @@ menu_loop() {
   done
 }
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---- args ----
 while [ $# -gt 0 ]; do

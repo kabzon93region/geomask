@@ -1,4 +1,4 @@
-## geomask v1.1.2
+﻿## geomask v1.1.2
 
 Патч меню: два визуальных бага v1.1.x.
 
@@ -17,7 +17,7 @@ curl -fL -m 60 -o /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/ge
 Если jsDelivr ещё отдаёт старую версию (кэш @master обновляется несколько минут) — возьмите пин на этот релиз:
 
 ```sh
-curl -fL -m 60 -o /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/geomask@<commit>/geomask.sh' && sh /tmp/geomask.sh
+curl -fL -m 60 -o /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/geomask@cabb8f3/geomask.sh' && sh /tmp/geomask.sh
 ```
 
 (commit см. в теге; либо скачайте `geomask.sh` из ассетов релиза.)

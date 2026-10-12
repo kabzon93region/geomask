@@ -11,7 +11,7 @@
 ## Установка (на роутере)
 
 ```sh
-sh <(wget -qO - 'https://raw.githubusercontent.com/<you>/zm-setup/main/zm-setup.sh')
+sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/zm-setup/master/zm-setup.sh')
 ```
 
 Или локально: скопируйте `zm-setup.sh` на роутер и запустите `sh /root/zm-setup.sh`.

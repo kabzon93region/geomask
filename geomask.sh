@@ -28,7 +28,7 @@
 
 set -u
 
-GM_VERSION="1.1.1"
+GM_VERSION="1.1.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -1719,7 +1719,7 @@ _row()      { printf '%s%-20s%s %s\n' "$C_Y" "$1:" "$NC" "$2"; }
 _api_node() { curl -s -m2 "http://127.0.0.1:9090/proxies/$1" 2>/dev/null | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//;s/"$//'; }
 
 _svc_row() { # _svc_row <label> <initd> <pidof-name>
-  if [ ! -x "$(P /etc/init.d/$2)" ]; then _row "$1" "${C_DIM}не установлен${NC}"; return; fi
+  if [ ! -f "$(P /etc/init.d/$2)" ]; then _row "$1" "${C_DIM}не установлен${NC}"; return; fi
   if pidof "${3:-$2}" >/dev/null 2>&1; then _row "$1" "${C_G}запущен${NC}"; else _row "$1" "${C_R}остановлен${NC}"; fi
 }
 
@@ -1729,7 +1729,7 @@ dashboard() {
   _row "Роутер" "${_model:-OpenWrt}${_rel:+ ${C_DIM}/ OpenWrt $_rel${NC}}"
   _svc_row "Zapret" zapret nfqws
   _svc_row "Mihomo" mihomo
-  _svc_row "MagiTrickle" magitrickled magitrickled
+  _svc_row "MagiTrickle" magitrickle magitrickled
   _svc_row "HevSocks5" hev-socks5-tunnel
   _svc_row "Dnsmasq" dnsmasq
   if [ -x "$(P /etc/init.d/adblock-fast)" ]; then
@@ -1765,7 +1765,7 @@ show_menu() {
   echo
   printf '%s1)%s %sБыстрая диагностика%s %s(только чтение)%s\n'  "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
   printf '%s2)%s %sПодписки VPN + AI%s (mihomo конфиг)\n'        "$C_B" "$NC" "$C_G" "$NC"
-  printf '%s3)%s %sГео-панель LuCI%s (оверлей)%s\n'              "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%s3)%s %sГео-панель LuCI (оверлей)%s\n'                "$C_B" "$NC" "$C_G" "$NC"
   printf '%s4)%s %sПанель Zapret-Manager%s\n'                    "$C_B" "$NC" "$C_G" "$NC"
   printf '%s5)%s %sMagitrickle -> Mihomo%s (синхронизация)\n'     "$C_B" "$NC" "$C_G" "$NC"
   printf '%s6)%s %sЗапустить остановленные сервисы%s\n'           "$C_B" "$NC" "$C_G" "$NC"

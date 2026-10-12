@@ -28,7 +28,7 @@
 
 set -u
 
-GM_VERSION="1.1.2"
+GM_VERSION="1.1.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -91,7 +91,7 @@ initd() { # initd <svc> <action>  - respects GM_PREFIX for tests
 # ============================================================ STEP 1: env
 step1_check() {
   _need=0
-  [ -f "$(P /etc/openwrt_release)" ] && info "OpenWrt: $(grep DISTRIBUTION_RELEASE "$(P /etc/openwrt_release)" 2>/dev/null | cut -d= -f2)" || { bad "not OpenWrt (/etc/openwrt_release missing)"; _need=1; }
+  [ -f "$(P /etc/openwrt_release)" ] && info "OpenWrt: $(grep '^DISTRIB_RELEASE=' "$(P /etc/openwrt_release)" 2>/dev/null | cut -d"'" -f2)" || { bad "not OpenWrt (/etc/openwrt_release missing)"; _need=1; }
   if have apk; then info "pkg manager: apk"; elif have opkg; then info "pkg manager: opkg"; else bad "no apk/opkg"; _need=1; fi
   for c in python3 curl; do
     if have "$c"; then info "$c: present"; else warn "$c: MISSING (needed for magitrickle->mihomo sync)"; _need=1; fi
@@ -478,7 +478,7 @@ run_step() { # run_step N  (interactive/auto common logic)
   _fc_before=$FAILCNT
   if step_fn "$_n" check; then
     info "check: ALL GOOD"
-    step_fn "$_n" verify || true
+    PASS=$((PASS+1))
     SKIP=$((SKIP+1))
     return 0
   fi

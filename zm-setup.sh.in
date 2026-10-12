@@ -1,0 +1,529 @@
+#!/bin/sh
+# zm-setup.sh - install & configure Zapret-Manager panel + geo overlay + 2-subscription mihomo
+# Our fork workflow: panel (official) -> geo overlay (ours) -> mihomo 2 subs -> magitrickle sync -> verify
+#
+# Usage:
+#   sh zm-setup.sh              interactive step-by-step (check -> ask -> apply -> verify)
+#   sh zm-setup.sh --auto       all steps unattended: check, apply if needed, verify; stop on FAIL
+#   sh zm-setup.sh --check      read-only report of every step (no changes, no downloads)
+#   sh zm-setup.sh --step N     single step N interactively
+#   sh zm-setup.sh --yes        never ask (with --auto or --step)
+#   sh zm-setup.sh --restart    allow mihomo/magitrickle restarts where needed (drops VPN ~3s)
+#   sh zm-setup.sh --vpn-url U --ai-url U    set subscription URLs in step 4 (kept secret in config only)
+#   sh zm-setup.sh --help
+#
+# After publish it can be run as:  sh <(wget -qO - 'https://raw.githubusercontent.com/<you>/<repo>/main/zm-setup.sh')
+#
+# SAFETY: never reboots the router; never restarts working services (only starts missing ones);
+#         never touches network/pppoe config; backups before every file write; mihomo restart
+#         only with --restart or explicit interactive yes, and only after `mihomo -t` passes.
+
+set -u
+
+ZM_VERSION="1.0.0"
+ZM_PREFIX="${ZM_PREFIX:-}"          # path prefix for tests (empty on real router)
+ZM_YES=0
+ZM_AUTO=0
+ZM_CHECK_ONLY=0
+ZM_RESTART=0
+ZM_STEP=""
+ZM_VPN_URL=""
+ZM_AI_URL=""
+
+# ---- embedded assets are injected by build.py into the heredocs below ----
+
+PASS=0; FAILCNT=0; SKIP=0
+
+log()  { printf '%s\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+ok()   { printf '  [OK] %s\n' "$*"; PASS=$((PASS+1)); }
+bad()  { printf '  [FAIL] %s\n' "$*"; FAILCNT=$((FAILCNT+1)); }
+warn() { printf '  [WARN] %s\n' "$*"; }
+hdr()  { printf '\n== [%s] %s ==\n' "$1" "$2"; }
+
+ask() { # ask "question" -> 0=yes  (auto/yes modes never block)
+  [ "$ZM_YES" = 1 ] && return 0
+  [ "$ZM_AUTO" = 1 ] && return 0
+  printf '%s [y/N]: ' "$1"
+  read -r _a || return 1
+  case "$_a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+P() { printf '%s%s' "$ZM_PREFIX" "$1"; }
+
+save_stream() { # save_stream <target-path> <mode>  (content on stdin)
+  _t="$(P "$1")"; _m="$2"
+  mkdir -p "$(dirname "$_t")"
+  _tmp="$_t.zmnew"
+  cat > "$_tmp" || { rm -f "$_tmp"; return 1; }
+  if [ -f "$_t" ]; then
+    if cmp -s "$_tmp" "$_t"; then rm -f "$_tmp"; info "unchanged: $1"; return 0; fi
+    cp -p "$_t" "$_t.bak_zmsetup_$(date +%s 2>/dev/null || echo bak)" 2>/dev/null || true
+  fi
+  chmod "$_m" "$_tmp" 2>/dev/null || true
+  mv -f "$_tmp" "$_t" || return 1
+  info "written: $1 (mode $_m)"
+  return 0
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+svc_alive() { pidof "$1" >/dev/null 2>&1; }
+
+initd() { # initd <svc> <action>  - respects ZM_PREFIX for tests
+  "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+}
+
+# ============================================================ STEP 1: env
+step1_check() {
+  _need=0
+  [ -f "$(P /etc/openwrt_release)" ] && info "OpenWrt: $(grep DISTRIBUTION_RELEASE "$(P /etc/openwrt_release)" 2>/dev/null | cut -d= -f2)" || { bad "not OpenWrt (/etc/openwrt_release missing)"; _need=1; }
+  if have apk; then info "pkg manager: apk"; elif have opkg; then info "pkg manager: opkg"; else bad "no apk/opkg"; _need=1; fi
+  for c in python3 curl; do
+    if have "$c"; then info "$c: present"; else warn "$c: MISSING (needed for magitrickle->mihomo sync)"; _need=1; fi
+  done
+  _tmp=$(df -m "$(P /tmp)" 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -n "${_tmp:-}" ] && [ "$_tmp" -ge 20 ] 2>/dev/null; then info "/tmp free: ${_tmp}MB"; else warn "/tmp free low or unknown"; _need=1; fi
+  _root=$(df -m "$(P /)" 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -n "${_root:-}" ] && [ "$_root" -ge 30 ] 2>/dev/null; then info "root free: ${_root}MB"; else warn "root free low or unknown"; _need=1; fi
+  _code=$(curl -m 5 -s -o /dev/null -w '%{http_code}' http://www.gstatic.com/generate_204 2>/dev/null)
+  if [ "$_code" = "204" ]; then info "internet: OK (204 via router path)"; else warn "internet check: HTTP ${_code:-none} (WAN may be down)"; _need=1; fi
+  return $_need
+}
+step1_apply() { warn "env issues cannot be auto-fixed here - fix manually, then re-run"; }
+step1_verify() { step1_check; }
+
+# ============================================================ STEP 2: panel (official Zapret-Manager)
+ZM_OFFICIAL_URL="https://raw.githubusercontent.com/StressOzz/Zapret-Manager/main/ZapretManager_LuCI.sh"
+
+step2_check() {
+  _need=0
+  for f in /opt/zapret-manager-luci/backend.sh /usr/libexec/rpcd/zapret-manager \
+           /usr/share/rpcd/acl.d/luci-app-zapret-manager.json \
+           /www/luci-static/resources/zapret-manager/common.js; do
+    if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
+  done
+  if have ubus; then
+    if ubus list 2>/dev/null | grep -qx 'zapret-manager'; then
+      _m=$(ubus -v list zapret-manager 2>/dev/null | grep -c '"')
+      if [ "$_m" -ge 100 ] 2>/dev/null; then info "ubus zapret-manager: $_m methods"; else bad "ubus methods too few: ${_m:-0}"; _need=1; fi
+    else bad "ubus object zapret-manager not registered"; _need=1; fi
+  else warn "ubus not available in this environment"; _need=1; fi
+  return $_need
+}
+step2_apply() {
+  log "  Panel is installed from the official StressOzz installer."
+  log "  URL: $ZM_OFFICIAL_URL"
+  log "  WARNING: this downloads and runs EXTERNAL code (2MB installer); it may restart rpcd/uhttpd."
+  ask "  Download and run official installer now?" || { warn "skipped - panel not installed"; return 1; }
+  _tmp=/tmp/zm_official_install.sh
+  info "downloading installer..."
+  if ! wget -q -O "$_tmp" "$ZM_OFFICIAL_URL"; then bad "download failed"; return 1; fi
+  _sz=$(wc -c < "$_tmp" 2>/dev/null || echo 0)
+  if [ "$_sz" -lt 100000 ]; then bad "installer too small ($_sz b) - abort"; rm -f "$_tmp"; return 1; fi
+  if ! sh -n "$_tmp" 2>/dev/null; then bad "installer failed sh -n syntax check - abort"; rm -f "$_tmp"; return 1; fi
+  info "installer ok ($_sz b), running (may take a few minutes)..."
+  sh "$_tmp"; _rc=$?
+  rm -f "$_tmp"
+  [ $_rc -eq 0 ] || { bad "installer exited rc=$_rc"; return 1; }
+  info "reloading rpcd..."
+  initd rpcd reload 2>/dev/null || initd rpcd restart 2>/dev/null || true
+  sleep 1
+  return 0
+}
+step2_verify() { step2_check; }
+
+# ============================================================ STEP 3: geo overlay (ours)
+step3_check() {
+  _need=0
+  for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
+           /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
+           /usr/share/luci/menu.d/luci-app-geo-sync.json \
+           /www/luci-static/resources/view/geo-sync/main.js; do
+    if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
+  done
+  if have ubus && ubus list 2>/dev/null | grep -qx 'geo-sync'; then info "ubus geo-sync: registered"; else bad "ubus geo-sync not registered"; _need=1; fi
+  return $_need
+}
+step3_apply() {
+  save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
+@@ASSET:geo-backend.sh@@
+ASSET_EOF
+  save_stream /usr/libexec/rpcd/geo-sync 755 <<'ASSET_EOF'
+@@ASSET:geo-sync@@
+ASSET_EOF
+  save_stream /usr/share/rpcd/acl.d/luci-app-geo-sync.json 644 <<'ASSET_EOF'
+@@ASSET:acl.json@@
+ASSET_EOF
+  save_stream /usr/share/luci/menu.d/luci-app-geo-sync.json 644 <<'ASSET_EOF'
+@@ASSET:menu.json@@
+ASSET_EOF
+  save_stream /www/luci-static/resources/view/geo-sync/main.js 644 <<'ASSET_EOF'
+@@ASSET:geo-main.js@@
+ASSET_EOF
+  info "reloading rpcd + luci menu..."
+  initd rpcd reload 2>/dev/null || true
+  sleep 1
+  return 0
+}
+step3_verify() { step3_check; }
+
+# ============================================================ STEP 4: mihomo 2-subscription config
+MIHOMO_CONF=/etc/mihomo/config.yaml
+
+step4_check() {
+  _need=0
+  if ! have mihomo; then bad "mihomo binary missing"; return 1; fi
+  _c="$(P $MIHOMO_CONF)"
+  if [ ! -s "$_c" ]; then bad "$MIHOMO_CONF missing"; return 1; fi
+  _np=$(grep -c 'type: http' "$_c" 2>/dev/null || echo 0)
+  if [ "$_np" -ge 2 ] 2>/dev/null; then info "proxy-providers: $_np (need >=2)"; else bad "proxy-providers: $_np (need 2: VPN + AI)"; _need=1; fi
+  for g in VPN AI; do
+    if grep -q "name: $g$" "$_c" 2>/dev/null; then info "group $g: present"; else bad "group $g: missing"; _need=1; fi
+  done
+  grep -q 'RULE-SET,ai,AI' "$_c" 2>/dev/null && info "rule ai->AI: present" || { bad "rule ai->AI missing"; _need=1; }
+  grep -q 'RULE-SET,mtrickle,VPN' "$_c" 2>/dev/null && info "rule mtrickle->VPN: present" || { bad "rule mtrickle->VPN missing"; _need=1; }
+  for rf in /etc/mihomo/ruleset/mtrickle.yaml /etc/mihomo/ruleset/ai.yaml /etc/mihomo/ruleset/ytdirect.yaml; do
+    if [ -s "$(P "$rf")" ]; then info "ruleset: $rf ($(grep -c 'DOMAIN-SUFFIX' "$(P "$rf")" 2>/dev/null || echo '?') suffixes)"; else warn "ruleset empty/missing: $rf (sync step will create)"; fi
+  done
+  if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then info "mihomo -t: PASS"; else bad "mihomo -t: FAIL"; _need=1; fi
+  return $_need
+}
+step4_apply() {
+  _c="$(P $MIHOMO_CONF)"
+  _vpnu="$ZM_VPN_URL"; _aiu="$ZM_AI_URL"
+  if [ -s "$_c" ]; then
+    [ -z "$_vpnu" ] && _vpnu=$(sed -n 's/^[[:space:]]*url: "\(https:\/\/[^"]*\)".*/\1/p' "$_c" | sed -n 1p)
+    [ -z "$_aiu" ]  && _aiu=$(sed -n 's/^[[:space:]]*url: "\(https:\/\/[^"]*\)".*/\1/p' "$_c" | sed -n 2p)
+  fi
+  if [ -z "$_vpnu" ] || [ -z "$_aiu" ]; then
+    bad "subscription URLs unknown - pass --vpn-url and --ai-url (or keep existing config)"
+    return 1
+  fi
+  info "VPN provider URL: $(printf '%s' "$_vpnu" | sed 's/\/[^/]*$/\/.../')"
+  info "AI  provider URL: $(printf '%s' "$_aiu" | sed 's/\/[^/]*$/\/.../')"
+  ask "  Write mihomo config with these 2 providers (backup kept)?" || { warn "skipped"; return 1; }
+  _hwid=$(grep -A1 'x-hwid' "$_c" 2>/dev/null | sed -n 's/^[[:space:]]*-[[:space:]]*"\(.*\)"/\1/p' | head -1)
+  _tmpconf="$_c.zmnew"
+  {
+    printf '%s\n' 'mixed-port: 7890'
+    printf '%s\n' 'allow-lan: true'
+    printf '%s\n' 'bind-address: "0.0.0.0"'
+    printf '%s\n' 'tcp-concurrent: true'
+    printf '%s\n' 'mode: rule'
+    printf '%s\n' 'log-level: info'
+    printf '%s\n' 'ipv6: true'
+    printf '%s\n' 'external-controller: 0.0.0.0:9090'
+    printf '%s\n' 'external-ui: ui'
+    printf '%s\n' 'unified-delay: true'
+    printf '%s\n' 'find-process-mode: off'
+    printf '%s\n' 'profile:'
+    printf '%s\n' '  store-selected: true'
+    printf '%s\n' '  store-fake-ip: true'
+    printf '\n'
+    printf '%s\n' 'proxy-providers:'
+    printf '%s\n' '  sub:'
+    printf '%s\n' '    type: http'
+    printf '%s\n' '    proxy: DIRECT'
+    if [ -n "${_hwid:-}" ]; then
+      printf '%s\n' '    header:'
+      printf '%s\n' '      x-hwid:'
+      printf '%s\n' "        - \"$_hwid\""
+    fi
+    printf '%s\n' "    url: \"$_vpnu\""
+    printf '%s\n' '    interval: 3600'
+    printf '%s\n' '    health-check:'
+    printf '%s\n' '      enable: true'
+    printf '%s\n' '      interval: 180'
+    printf '%s\n' '      url: "https://www.gstatic.com/generate_204"'
+    printf '%s\n' '      expected-status: 204'
+    printf '%s\n' '  de5:'
+    printf '%s\n' '    type: http'
+    printf '%s\n' '    proxy: DIRECT'
+    printf '%s\n' "    url: \"$_aiu\""
+    printf '%s\n' '    interval: 3600'
+    printf '%s\n' '    health-check:'
+    printf '%s\n' '      enable: true'
+    printf '%s\n' '      interval: 180'
+    printf '%s\n' '      url: "https://www.gstatic.com/generate_204"'
+    printf '%s\n' '      expected-status: 204'
+    printf '\n'
+    printf '%s\n' 'proxy-groups:'
+    printf '%s\n' '  - name: VPN'
+    printf '%s\n' '    type: url-test'
+    printf '%s\n' '    use:'
+    printf '%s\n' '      - sub'
+    printf '%s\n' '    exclude-filter: "Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания"'
+    printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
+    printf '%s\n' '    interval: 180'
+    printf '%s\n' '    tolerance: 50'
+    printf '%s\n' '    lazy: false'
+    printf '%s\n' '  - name: AI'
+    printf '%s\n' '    type: url-test'
+    printf '%s\n' '    use:'
+    printf '%s\n' '      - de5'
+    printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
+    printf '%s\n' '    interval: 180'
+    printf '%s\n' '    tolerance: 50'
+    printf '%s\n' '    lazy: false'
+    printf '\n'
+    printf '%s\n' 'rule-providers:'
+    printf '%s\n' '  ai:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/ai.yaml'
+    printf '%s\n' '  mtrickle:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/mtrickle.yaml'
+    printf '%s\n' '  ytdirect:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/ytdirect.yaml'
+    printf '\n'
+    printf '%s\n' 'rules:'
+    printf '%s\n' '  # AUTO-SYNC from magitrickle: /root/sync_mtrickle_mihomo.sh - DO NOT EDIT MANUALLY'
+    printf '%s\n' '  - RULE-SET,ytdirect,DIRECT'
+    printf '%s\n' '  - DOMAIN-SUFFIX,cloudflare-ech.com,AI'
+    printf '%s\n' '  - RULE-SET,ai,AI'
+    printf '%s\n' '  - RULE-SET,mtrickle,VPN'
+    printf '%s\n' '  - MATCH,GLOBAL'
+    printf '\n'
+    printf '%s\n' 'sniffer:'
+    printf '%s\n' '  enable: true'
+    printf '%s\n' '  parse-pure-ip: true'
+    printf '%s\n' '  override-destination: true'
+    printf '%s\n' '  sniff:'
+    printf '%s\n' '    HTTP:'
+    printf '%s\n' '      ports: [80, 8080-8880]'
+    printf '%s\n' '    TLS:'
+    printf '%s\n' '      ports: [443, 8443]'
+    printf '%s\n' '    QUIC:'
+    printf '%s\n' '      ports: [443, 8443]'
+  } > "$_tmpconf" || { bad "cannot write $_tmpconf"; return 1; }
+  # ruleset files must exist before mihomo -t
+  mkdir -p "$(P /etc/mihomo/ruleset)"
+  for rf in mtrickle ai ytdirect; do
+    [ -s "$(P /etc/mihomo/ruleset/$rf.yaml)" ] || printf 'payload: []\n' > "$(P /etc/mihomo/ruleset/$rf.yaml)"
+  done
+  if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+    info "mihomo -t on new config: PASS"
+  else
+    bad "mihomo -t FAILED on new config - keeping old"; rm -f "$_tmpconf"; return 1
+  fi
+  if [ -f "$_c" ]; then cp -p "$_c" "$_c.bak_zmsetup_$(date +%s 2>/dev/null || echo bak)"; fi
+  mv -f "$_tmpconf" "$_c" || { bad "cannot install new config"; return 1; }
+  info "config installed"
+  if [ "$ZM_RESTART" = 1 ]; then
+    info "restarting mihomo (--restart)..."
+    initd mihomo restart >/dev/null 2>&1 || true
+    sleep 2
+  elif svc_alive mihomo; then
+    warn "mihomo is running: restart later to apply (panel Mixomo tab, or rerun with --restart)"
+  else
+    info "starting mihomo..."
+    initd mihomo start >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+step4_verify() { step4_check; }
+
+# ============================================================ STEP 5: magitrickle -> mihomo sync
+step5_check() {
+  _need=0
+  _s="$(P /root/sync_mtrickle_mihomo.sh)"
+  if [ -s "$_s" ]; then
+    info "sync script: present"
+    [ -x "$_s" ] || warn "sync script not executable (chmod +x on router)"
+  else
+    bad "sync script missing: /root/sync_mtrickle_mihomo.sh"; _need=1
+  fi
+  if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then info "cron */5: present"; else bad "cron entry missing"; _need=1; fi
+  svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
+  return $_need
+}
+step5_apply() {
+  save_stream /root/sync_mtrickle_mihomo.sh 755 <<'ASSET_EOF'
+@@ASSET:sync_mtrickle_mihomo.sh@@
+ASSET_EOF
+  save_stream /etc/mihomo/ruleset/ytdirect.yaml 644 <<'ASSET_EOF'
+@@ASSET:ytdirect.yaml@@
+ASSET_EOF
+  save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
+@@ASSET:99-default-vpn-route@@
+ASSET_EOF
+  if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
+    info "cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' ) | crontab - 2>/dev/null && info "cron added: */5 sync" || warn "cannot set crontab"
+  fi
+  if ! svc_alive magitrickled; then
+    info "starting magitrickle..."
+    initd magitrickle start >/dev/null 2>&1 || true
+  fi
+  if [ "$ZM_RESTART" = 1 ]; then
+    info "running sync once (--restart)..."
+    sh "$(P /root/sync_mtrickle_mihomo.sh)" 2>&1 | sed 's/^/  | /' || true
+  else
+    warn "sync not run (it may restart mihomo). Run later: sh /root/sync_mtrickle_mihomo.sh  or use --restart"
+  fi
+  return 0
+}
+step5_verify() { step5_check; }
+
+# ============================================================ STEP 6: services (start missing only)
+SVC_LIST="dnsmasq magitrickled mihomo hev-socks5-tunnel rpcd"
+step6_check() {
+  _need=0
+  for s in $SVC_LIST; do
+    case "$s" in
+      magitrickled) _p=magitrickled ;;
+      *) _p=$s ;;
+    esac
+    svc_alive "$_p" && info "$s: running" || { warn "$s: NOT running"; _need=1; }
+  done
+  return $_need
+}
+step6_apply() {
+  for s in $SVC_LIST; do
+    _p=$s; [ "$s" = magitrickled ] && _p=magitrickled
+    if svc_alive "$_p"; then info "$s: already running - untouched"; continue; fi
+    _init=$s; [ "$s" = magitrickled ] && _init=magitrickle
+    info "starting $_init (it was down)..."
+    initd "$_init" start >/dev/null 2>&1 || warn "cannot start $_init"
+  done
+  return 0
+}
+step6_verify() { step6_check; }
+
+# ============================================================ STEP 7: end-to-end verify (read-only)
+step7_check() {
+  _need=0
+  _r=$(nslookup ya.ru 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2}' | tail -1)
+  if [ -n "$_r" ] && [ "$_r" != "127.0.0.1" ]; then info "DNS normal (ya.ru -> $_r)"; else bad "DNS broken for normal domains"; _need=1; fi
+  _b=$(nslookup doubleclick.net 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2}' | tail -1)
+  case "$_b" in
+    ""|0.0.0.0|::) info "DNS adblock (doubleclick.net -> ${_b:-NXDOMAIN})" ;;
+    *) warn "adblock: doubleclick.net resolves to $_b (adblock-fast may be off)" ;;
+  esac
+  _code=$(curl -m 5 -s -o /dev/null -w '%{http_code}' http://www.gstatic.com/generate_204 2>/dev/null)
+  [ "$_code" = "204" ] && info "connectivity: 204 OK" || { bad "connectivity: HTTP ${_code:-none}"; _need=1; }
+  _px=$(curl -m 5 -s http://127.0.0.1:9090/proxies 2>/dev/null)
+  printf '%s' "$_px" | grep -q '"VPN"' && info "mihomo group VPN: in API" || { bad "mihomo group VPN missing"; _need=1; }
+  printf '%s' "$_px" | grep -q '"AI"' && info "mihomo group AI: in API" || { bad "mihomo group AI missing"; _need=1; }
+  if have ubus; then
+    ubus list 2>/dev/null | grep -qx 'zapret-manager' && info "panel ubus: OK" || { bad "panel ubus: missing"; _need=1; }
+    ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
+  fi
+  if ip rule show 2>/dev/null | grep -q '32666'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule (32666) absent - LAN ping may die in TUN"; fi
+  return $_need
+}
+step7_apply() { warn "verify-only step - nothing to apply"; return 0; }
+step7_verify() { step7_check; }
+
+# ============================================================ runner
+STEPS="1:env 2:panel 3:geo 4:subs 5:sync 6:services 7:verify"
+STEP_NAMES="env panel geo subs sync services verify"
+
+step_fn() { # step_fn N action -> call stepN_action
+  _n=$1; _a=$2
+  case "$_n-$_a" in
+    1-check) step1_check ;; 1-apply) step1_apply ;; 1-verify) step1_verify ;;
+    2-check) step2_check ;; 2-apply) step2_apply ;; 2-verify) step2_verify ;;
+    3-check) step3_check ;; 3-apply) step3_apply ;; 3-verify) step3_verify ;;
+    4-check) step4_check ;; 4-apply) step4_apply ;; 4-verify) step4_verify ;;
+    5-check) step5_check ;; 5-apply) step5_apply ;; 5-verify) step5_verify ;;
+    6-check) step6_check ;; 6-apply) step6_apply ;; 6-verify) step6_verify ;;
+    7-check) step7_check ;; 7-apply) step7_apply ;; 7-verify) step7_verify ;;
+    *) bad "unknown step $_n"; return 1 ;;
+  esac
+}
+
+run_step() { # run_step N  (interactive/auto common logic)
+  _n=$1
+  _name=$(echo "$STEP_NAMES" | cut -d' ' -f"$_n")
+  hdr "$_n/7" "$_name"
+  _fc_before=$FAILCNT
+  if step_fn "$_n" check; then
+    info "check: ALL GOOD"
+    step_fn "$_n" verify || true
+    SKIP=$((SKIP+1))
+    return 0
+  fi
+  info "check: issues found - apply needed"
+  if [ "$ZM_CHECK_ONLY" = 1 ]; then
+    info "(check-only mode: not applying)"
+    return 1
+  fi
+  if [ "$ZM_AUTO" = 1 ] || [ "$ZM_YES" = 1 ] || ask "Apply step $_n ($_name)?"; then
+    if step_fn "$_n" apply; then
+      info "--- verify ---"
+      if step_fn "$_n" verify; then
+        info "verify: PASS"
+        # check-phase failures were fixed by apply - drop them from the global count
+        FAILCNT=$_fc_before
+        return 0
+      else
+        bad "verify: FAILED after apply"
+        return 1
+      fi
+    else
+      bad "apply failed or was skipped"
+      return 1
+    fi
+  else
+    info "skipped by user"
+    SKIP=$((SKIP+1))
+    return 2
+  fi
+}
+
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ---- args ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --auto) ZM_AUTO=1 ;;
+    --check) ZM_CHECK_ONLY=1 ;;
+    --yes|-y) ZM_YES=1 ;;
+    --restart) ZM_RESTART=1 ;;
+    --step) shift; ZM_STEP="${1:-}" ;;
+    --vpn-url) shift; ZM_VPN_URL="${1:-}" ;;
+    --ai-url) shift; ZM_AI_URL="${1:-}" ;;
+    --help|-h) usage; exit 0 ;;
+    *) printf 'unknown option: %s (see --help)\n' "$1"; exit 2 ;;
+  esac
+  shift
+done
+
+log "zm-setup v$ZM_VERSION (prefix='${ZM_PREFIX:-/}')  mode: $([ "$ZM_CHECK_ONLY" = 1 ] && echo check || { [ "$ZM_AUTO" = 1 ] && echo auto || echo interactive; })"
+
+RC=0
+if [ -n "$ZM_STEP" ]; then
+  run_step "$ZM_STEP" || RC=1
+elif [ "$ZM_AUTO" = 1 ] || [ "$ZM_CHECK_ONLY" = 1 ]; then
+  for n in 1 2 3 4 5 6 7; do
+    if [ "$ZM_CHECK_ONLY" = 1 ]; then
+      run_step "$n" || true
+    else
+      run_step "$n" || { [ $? -eq 1 ] && { RC=1; bad "aborting on step $n failure"; break; }; }
+    fi
+  done
+else
+  log ""
+  log "Steps: 1=env 2=panel 3=geo 4=subs(2 subscriptions) 5=sync 6=services 7=verify"
+  log "Enter numbers to run (e.g. '1 2 3'), 'a' = all, 'q' = quit:"
+  printf '> '
+  read -r _sel || _sel=q
+  case "$_sel" in
+    q|Q) exit 0 ;;
+    a|A) for n in 1 2 3 4 5 6 7; do run_step "$n" || true; done ;;
+    *)
+      for n in $_sel; do run_step "$n" || true; done ;;
+  esac
+fi
+
+log ""
+log "== SUMMARY: pass=$PASS fail=$FAILCNT skipped_steps=$SKIP =="
+[ "$FAILCNT" -eq 0 ] || RC=1
+exit $RC

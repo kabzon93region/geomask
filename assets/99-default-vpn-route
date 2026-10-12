@@ -1,0 +1,38 @@
+#!/bin/sh
+# Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
+# Devices from /etc/geo-devices.list with mode=bypass go DIRECT (real IP), never via VPN.
+# Devices with mode=realtz follow normal mihomo routing (masked IP), only tz is real (PC-side).
+# NOTE: runs inside netifd's ifup path -> MUST NOT block here (would stall PPPoE auth / WAN).
+[ "$ACTION" = "ifup" ] || exit 0
+
+apply_routes() {
+  if ! ip route show table 100 | grep -q '^default'; then
+    ip route show table main | grep -v '^default' | while IFS= read -r r; do
+      ip route replace table 100 $r 2>/dev/null
+    done
+    ip route replace table 100 default dev Mihomo 2>/dev/null
+  fi
+  ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
+  # --- ICMP bypass (hev-socks5-tunnel TUN has no ICMP support) ---
+  # Must be < 32673 (magitrickle fwmark rules) so ping goes direct via pppoe-wan, not into TUN.
+  ip rule show | grep -q '32666:' || ip rule add priority 32666 iif br-lan ipproto icmp lookup main
+  # --- bypass-mode devices (32694 beats fwmark rules 32695+ and 32760) ---
+  if [ -f /etc/geo-devices.list ]; then
+    while read -r dip dmode dname; do
+      case "$dip" in ''|'#'*) continue ;; esac
+      [ "$dmode" = "bypass" ] || continue
+      ip rule show | grep -q "from $dip" || ip rule add priority 32694 from "$dip" lookup main
+    done < /etc/geo-devices.list
+  fi
+}
+
+if ip link show Mihomo >/dev/null 2>&1; then
+  apply_routes
+else
+  # Mihomo TUN not up yet: retry in BACKGROUND so netifd is never stalled (fixes PPPoE hangs).
+  ( i=0; while [ $i -lt 20 ]; do
+      ip link show Mihomo >/dev/null 2>&1 && { sleep 1; apply_routes; exit 0; }
+      i=$((i+1)); sleep 1
+    done ) >/dev/null 2>&1 &
+fi
+exit 0

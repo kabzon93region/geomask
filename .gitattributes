@@ -1,0 +1,12 @@
+# shell scripts and assets must keep LF (OpenWrt busybox)
+*.sh text eol=lf
+*.in text eol=lf
+*.py text eol=lf
+build.py text eol=lf
+assets/* text eol=lf
+sandbox/bin/* text eol=lf
+sandbox/run_tests.sh text eol=lf
+zm-setup.sh text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.js text eol=lf

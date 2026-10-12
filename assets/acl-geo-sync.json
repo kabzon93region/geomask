@@ -1,0 +1,16 @@
+{
+	"luci-app-geo-sync": {
+		"description": "Grant access to geo masking + AI routing panel",
+		"read": {
+			"ubus": {
+				"geo-sync": [ "status", "leases", "log" ],
+				"system": [ "info" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"geo-sync": [ "sync_lists", "google", "global", "ipv6", "dev_add", "dev_del" ]
+			}
+		}
+	}
+}

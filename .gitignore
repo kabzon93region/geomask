@@ -1,0 +1,6 @@
+# sandbox runtime artifacts
+sandbox/root_*/
+sandbox/state/
+sandbox/last_out.txt
+*.pyc
+__pycache__/

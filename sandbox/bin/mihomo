@@ -1,0 +1,14 @@
+#!/bin/sh
+# stub mihomo: only -t test mode; pass if $ZM_STATE/mihomo_t_ok exists
+# (in real life: mihomo -d /etc/mihomo -t)
+case "$*" in
+  *-t*)
+    if [ -f "${ZM_STATE:-/tmp}/mihomo_t_ok" ]; then
+      echo "configuration file test is successful"
+      exit 0
+    else
+      echo "configuration file test failed"
+      exit 1
+    fi ;;
+  *) exit 0 ;;
+esac

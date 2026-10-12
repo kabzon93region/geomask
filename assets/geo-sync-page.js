@@ -14,6 +14,8 @@ var callGlobal = rpc.declare({ object: 'geo-sync', method: 'global',  params: { 
 var callIpv6   = rpc.declare({ object: 'geo-sync', method: 'ipv6',    params: { state: null }, expect: {} });
 var callDevAdd = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
 var callDevDel = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
+var callAiSubGet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
+var callAiSubSet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -111,11 +113,12 @@ var E = (function(raw) {
 return view.extend({
 	load: function() {
 		injectStyle();
-		return Promise.all([ callStatus(), callLeases(), callLog() ]);
+		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet() ]);
 	},
 
 	render: function(all) {
 		var st = all[0] || {}, leases = (all[1] || {}).leases || [], lg = (all[2] || {}).log || '';
+		var aicfg = all[3] || {};
 		var view = this;
 		var wrap = E('div', { 'class': 'gs-wrap' });
 
@@ -149,6 +152,35 @@ return view.extend({
 			counters
 		]);
 		wrap.appendChild(hero);
+
+		/* ===================== AI subscription (de5) ===================== */
+		var aiUrlIn = E('input', { 'class': 'gs-input', 'style': 'flex:1;min-width:280px',
+			'placeholder': 'https://... подписка AI (de5)', 'value': aicfg.url || '' });
+		var btnAiApply = E('button', { 'class': 'gs-btn gs-btn-primary',
+			'click': function() {
+				var u = (aiUrlIn.value || '').trim();
+				if (!/^https?:\/\//.test(u)) {
+					ui.addNotification(null, E('p', {}, 'Ссылка должна начинаться с http:// или https://'), 'warning');
+					return;
+				}
+				btnAiApply.disabled = true; btnAiApply.textContent = 'Применение…';
+				callAiSubSet({ url: u }).then(function(res) {
+					btnAiApply.disabled = false; btnAiApply.textContent = 'Применить';
+					if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+					ui.addNotification(null, E('p', {}, 'AI-подписка обновлена' + (res && res.warn ? ' (' + res.warn + ')' : '')), 'info');
+					return view.reload();
+				}).catch(function(e) {
+					btnAiApply.disabled = false; btnAiApply.textContent = 'Применить';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Применить');
+		var subCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Подписка AI (de5)'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Ссылка немецкой подписки для Google/OpenAI/Claude. Применение обновляет провайдера de5 в работающем mihomo через API — без перезапуска, VPN не прерывается.'),
+			E('div', { 'class': 'gs-row' }, [ aiUrlIn, btnAiApply ])
+		]);
+		wrap.appendChild(subCard);
 
 		/* ===================== ACTIONS: sync / google check ===================== */
 		var listsOut = E('div', {});
@@ -293,7 +325,7 @@ return view.extend({
 
 	reload: function() {
 		var view = this;
-		return Promise.all([ callStatus(), callLeases(), callLog() ]).then(function(all) {
+		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);

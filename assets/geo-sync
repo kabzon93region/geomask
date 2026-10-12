@@ -17,6 +17,8 @@ list_methods() {
 	json_add_object "ipv6";       json_add_string "state" "string"; json_close_object
 	json_add_object "dev_add";    json_add_string "ip" "string"; json_add_string "mode" "string"; json_add_string "mac" "string"; json_add_string "name" "string"; json_close_object
 	json_add_object "dev_del";    json_add_string "ip" "string"; json_close_object
+	json_add_object "ai_sub_get"; json_close_object
+	json_add_object "ai_sub_set"; json_add_string "url" "string"; json_close_object
 	json_dump
 }
 
@@ -35,6 +37,8 @@ call_method() {
 		ipv6)       json_get_var state state; "$BACKEND" ipv6 "$state" ;;
 		dev_add)    json_get_var ip ip; json_get_var mode mode; json_get_var mac mac; json_get_var name name; "$BACKEND" dev_add "$ip" "$mode" "$mac" "$name" ;;
 		dev_del)    json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;
+		ai_sub_get) "$BACKEND" ai_sub_get ;;
+		ai_sub_set) json_get_var url url; "$BACKEND" ai_sub_set "$url" ;;
 		*) echo '{"error":"unknown method"}'; return 1 ;;
 	esac
 }

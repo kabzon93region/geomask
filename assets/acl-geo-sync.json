@@ -3,13 +3,13 @@
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log" ],
+				"geo-sync": [ "status", "leases", "log", "ai_sub_get" ],
 				"system": [ "info" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "google", "global", "ipv6", "dev_add", "dev_del" ]
+				"geo-sync": [ "sync_lists", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set" ]
 			}
 		}
 	}

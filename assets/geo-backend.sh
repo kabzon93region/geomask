@@ -4,6 +4,7 @@
 #   status | leases | log | sync_lists | google
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
+#   ai_sub_get | ai_sub_set <url>   (AI subscription / mihomo provider de5)
 # Device modes (per-device geo policy):
 #   bypass  - device routes DIRECT (real IP), beats fwmark+Mihomo; real tz (GeoSync off on PC)
 #   realtz  - device routes via mihomo (masked IP), but PC keeps real tz (GeoSync off on PC)
@@ -15,6 +16,7 @@ DEVICES=/etc/geo-devices.list
 EXCL_OLD=/etc/geo-exclude.list   # legacy (ip name) -> migrated to DEVICES as bypass
 LOG=/root/geo-sync.log
 MIHOMO_API=http://127.0.0.1:9090
+MIHOMO_CONF=/etc/mihomo/config.yaml
 TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
@@ -289,6 +291,57 @@ EOF
     echo '{"error":"hotplug syntax"}'
 }
 
+# ---- AI subscription (mihomo provider "de5") ----
+cmd_ai_sub_get() {
+  u=$(awk '/^  de5:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  printf '{"url":"%s"}' "$(json_esc "$u")"
+}
+
+# set AI subscription URL at runtime: rewrite de5 provider url + hot-refresh via API (no mihomo restart)
+cmd_ai_sub_set() {
+  URL="$1"
+  case "$URL" in
+    http://*|https://*) ;;
+    *) printf '{"error":"url must start with http:// or https://"}'; return 1 ;;
+  esac
+  if printf '%s' "$URL" | grep -qE '[[:space:]"]'; then
+    printf '{"error":"url contains forbidden characters"}'; return 1
+  fi
+  [ -f "$MIHOMO_CONF" ] || { printf '{"error":"mihomo config missing"}'; return 1; }
+  grep -q '^  de5:' "$MIHOMO_CONF" || { printf '{"error":"de5 provider not found in config"}'; return 1; }
+  cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_aisub_$(date +%s)"
+  TMPF="$MIHOMO_CONF.aisub"
+  if ! awk -v nu="$URL" '
+    BEGIN { f=0; done=0 }
+    /^  de5:/ { f=1; print; next }
+    f && /^    url:/ { print "    url: \"" nu "\""; done=1; next }
+    f && /^  [A-Za-z0-9_-]+:/ { f=0 }
+    f && /^[A-Za-z]/ { f=0 }
+    { print }
+    END { exit done ? 0 : 1 }
+  ' "$MIHOMO_CONF" > "$TMPF"; then
+    rm -f "$TMPF"
+    printf '{"error":"failed to patch de5 url"}'; return 1
+  fi
+  if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+    mv -f "$TMPF" "$MIHOMO_CONF"
+  else
+    rm -f "$TMPF"
+    printf '{"error":"mihomo config test failed - old config kept"}'; return 1
+  fi
+  if curl -s -m8 -f -X PUT "$MIHOMO_API/providers/proxies/de5" \
+      -H 'Content-Type: application/json' \
+      -d "{\"url\":\"$URL\",\"vehicle_type\":\"http\"}" >/dev/null 2>&1; then
+    WARN=''
+  else
+    WARN='provider refresh failed - restart mihomo later'
+  fi
+  echo "$(date +%FT%T) AI_SUB set $URL" >> "$LOG"
+  AI_NODE=$(_grp_node AI)
+  printf '{"ok":true,"url":"%s","ai_node":"%s","warn":"%s"}' \
+    "$(json_esc "$URL")" "$(json_esc "$AI_NODE")" "$(json_esc "$WARN")"
+}
+
 case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
@@ -299,5 +352,7 @@ case "$1" in
   ipv6)       cmd_ipv6 "$2" ;;
   dev_add)    cmd_dev_add "$2" "$3" "$4" "$5" ;;
   dev_del)    cmd_dev_del "$2" ;;
+  ai_sub_get) cmd_ai_sub_get ;;
+  ai_sub_set) cmd_ai_sub_set "$2" ;;
   *) printf '{"error":"usage"}'; exit 1 ;;
 esac

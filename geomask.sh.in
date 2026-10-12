@@ -3,14 +3,17 @@
 # Our fork workflow: panel (official) -> geo overlay (ours) -> mihomo 2 subs -> magitrickle sync -> verify
 #
 # Usage:
-#   sh geomask.sh              interactive step-by-step (check -> ask -> apply -> verify)
+#   sh geomask.sh              interactive menu (status dashboard + actions loop)
+#   sh geomask.sh --reinstall  delete -> install -> configure geomask (asks for 2 subscription URLs)
 #   sh geomask.sh --auto       all steps unattended: check, apply if needed, verify; stop on FAIL
 #   sh geomask.sh --check      read-only report of every step (no changes, no downloads)
 #   sh geomask.sh --step N     single step N interactively
-#   sh geomask.sh --yes        never ask (with --auto or --step)
+#   sh geomask.sh --yes        never ask (with --auto/--step/--reinstall)
 #   sh geomask.sh --restart    allow mihomo/magitrickle restarts where needed (drops VPN ~3s)
-#   sh geomask.sh --vpn-url U --ai-url U    set subscription URLs in step 4 (kept secret in config only)
+#   sh geomask.sh --vpn-url U --ai-url U    set subscription URLs (kept secret in config only)
 #   sh geomask.sh --help
+#
+# After publish it can be run as:  sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master/geomask.sh')
 #
 # After publish it can be run as:  sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master/geomask.sh')
 #
@@ -22,12 +25,13 @@
 
 set -u
 
-GM_VERSION="1.0.0"
+GM_VERSION="1.1.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
 GM_CHECK_ONLY=0
 GM_RESTART=0
+GM_REINSTALL=0
 GM_STEP=""
 GM_VPN_URL=""
 GM_AI_URL=""
@@ -52,6 +56,11 @@ ask() { # ask "question" -> 0=yes  (auto/yes modes never block)
 }
 
 P() { printf '%s%s' "$GM_PREFIX" "$1"; }
+
+# extract provider url from mihomo config: _prov_url <file> <provider-name>
+_prov_url() {
+  awk -v p="^  $2:" '$0 ~ p {f=1;next} f && /^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f && /^  [A-Za-z0-9_-]+:/{f=0} f && /^[A-Za-z]/{f=0}' "$1" 2>/dev/null
+}
 
 save_stream() { # save_stream <target-path> <mode>  (content on stdin)
   _t="$(P "$1")"; _m="$2"
@@ -195,16 +204,38 @@ step4_apply() {
   _c="$(P $MIHOMO_CONF)"
   _vpnu="$GM_VPN_URL"; _aiu="$GM_AI_URL"
   if [ -s "$_c" ]; then
-    [ -z "$_vpnu" ] && _vpnu=$(sed -n 's/^[[:space:]]*url: "\(https:\/\/[^"]*\)".*/\1/p' "$_c" | sed -n 1p)
-    [ -z "$_aiu" ]  && _aiu=$(sed -n 's/^[[:space:]]*url: "\(https:\/\/[^"]*\)".*/\1/p' "$_c" | sed -n 2p)
+    [ -z "$_vpnu" ] && _vpnu=$(_prov_url "$_c" sub)
+    [ -z "$_aiu" ]  && _aiu=$(_prov_url "$_c" de5)
   fi
   if [ -z "$_vpnu" ] || [ -z "$_aiu" ]; then
     bad "subscription URLs unknown - pass --vpn-url and --ai-url (or keep existing config)"
     return 1
   fi
-  info "VPN provider URL: $(printf '%s' "$_vpnu" | sed 's/\/[^/]*$/\/.../')"
-  info "AI  provider URL: $(printf '%s' "$_aiu" | sed 's/\/[^/]*$/\/.../')"
+  info "VPN provider URL: $(_maskurl "$_vpnu")"
+  info "AI  provider URL: $(_maskurl "$_aiu")"
   ask "  Write mihomo config with these 2 providers (backup kept)?" || { warn "skipped"; return 1; }
+  write_mihomo_config "$_vpnu" "$_aiu" || return 1
+  if [ "$GM_RESTART" = 1 ]; then
+    info "restarting mihomo (--restart)..."
+    initd mihomo restart >/dev/null 2>&1 || true
+    sleep 2
+  elif api_refresh_provider sub "$_vpnu" && api_refresh_provider de5 "$_aiu"; then
+    info "providers refreshed via API (no restart, VPN stays up)"
+  elif svc_alive mihomo; then
+    warn "mihomo is running: restart later to apply (panel Mixomo tab, or rerun with --restart)"
+  else
+    info "starting mihomo..."
+    initd mihomo start >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+step4_verify() { step4_check; }
+
+# write a fresh 2-provider mihomo config: write_mihomo_config <vpn_url> <ai_url>
+# validates with `mihomo -t`, keeps backup of the previous config; no restart here.
+write_mihomo_config() {
+  _c="$(P $MIHOMO_CONF)"
+  _vpnu="$1"; _aiu="$2"
   _hwid=$(grep -A1 'x-hwid' "$_c" 2>/dev/null | sed -n 's/^[[:space:]]*-[[:space:]]*"\(.*\)"/\1/p' | head -1)
   _tmpconf="$_c.zmnew"
   {
@@ -316,19 +347,16 @@ step4_apply() {
   if [ -f "$_c" ]; then cp -p "$_c" "$_c.bak_geomask_$(date +%s 2>/dev/null || echo bak)"; fi
   mv -f "$_tmpconf" "$_c" || { bad "cannot install new config"; return 1; }
   info "config installed"
-  if [ "$GM_RESTART" = 1 ]; then
-    info "restarting mihomo (--restart)..."
-    initd mihomo restart >/dev/null 2>&1 || true
-    sleep 2
-  elif svc_alive mihomo; then
-    warn "mihomo is running: restart later to apply (panel Mixomo tab, or rerun with --restart)"
-  else
-    info "starting mihomo..."
-    initd mihomo start >/dev/null 2>&1 || true
-  fi
   return 0
 }
-step4_verify() { step4_check; }
+
+# runtime provider refresh through mihomo API - NO restart, VPN stays up
+api_refresh_provider() { # api_refresh_provider <name> <url>
+  [ -n "${2:-}" ] || return 1
+  curl -s -m8 -f -X PUT "http://127.0.0.1:9090/providers/proxies/$1" \
+    -H 'Content-Type: application/json' \
+    -d "{\"url\":\"$2\",\"vehicle_type\":\"http\"}" >/dev/null 2>&1
+}
 
 # ============================================================ STEP 5: magitrickle -> mihomo sync
 step5_check() {
@@ -424,7 +452,6 @@ step7_apply() { warn "verify-only step - nothing to apply"; return 0; }
 step7_verify() { step7_check; }
 
 # ============================================================ runner
-STEPS="1:env 2:panel 3:geo 4:subs 5:sync 6:services 7:verify"
 STEP_NAMES="env panel geo subs sync services verify"
 
 step_fn() { # step_fn N action -> call stepN_action
@@ -480,7 +507,186 @@ run_step() { # run_step N  (interactive/auto common logic)
   fi
 }
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
+# ============================================================ terminal UI
+if [ -t 1 ]; then
+  C_R="$(printf '\033[1;31m')"; C_G="$(printf '\033[1;32m')"; C_Y="$(printf '\033[1;33m')"
+  C_B="$(printf '\033[1;36m')"; C_M="$(printf '\033[1;35m')"; C_DIM="$(printf '\033[38;5;244m')"
+  NC="$(printf '\033[0m')"
+else
+  C_R=""; C_G=""; C_Y=""; C_B=""; C_M=""; C_DIM=""; NC=""
+fi
+
+clr()   { [ -t 1 ] && command -v clear >/dev/null 2>&1 && clear; return 0; }
+PAUSE() { [ "$GM_YES" = 1 ] && return 0; [ -t 0 ] || return 0; printf '%sНажмите Enter...%s' "$C_DIM" "$NC"; read -r _p || true; echo; }
+
+_maskurl()  { printf '%s' "${1:-}" | sed 's|/[^/]*$|/...|'; }
+_row()      { printf '%s%-20s%s %s\n' "$C_Y" "$1:" "$NC" "$2"; }
+_api_node() { curl -s -m2 "http://127.0.0.1:9090/proxies/$1" 2>/dev/null | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//;s/"$//'; }
+
+_svc_row() { # _svc_row <label> <initd> <pidof-name>
+  if [ ! -x "$(P /etc/init.d/$2)" ]; then _row "$1" "${C_DIM}не установлен${NC}"; return; fi
+  if pidof "${3:-$2}" >/dev/null 2>&1; then _row "$1" "${C_G}запущен${NC}"; else _row "$1" "${C_R}остановлен${NC}"; fi
+}
+
+dashboard() {
+  _model=$(cat "$(P /tmp/sysinfo/model)" 2>/dev/null)
+  _rel=$(grep '^DISTRIB_RELEASE=' "$(P /etc/openwrt_release)" 2>/dev/null | cut -d"'" -f2)
+  _row "Роутер" "${_model:-OpenWrt}${_rel:+ ${C_DIM}/ OpenWrt $_rel${NC}}"
+  _svc_row "Zapret" zapret nfqws
+  _svc_row "Mihomo" mihomo
+  _svc_row "MagiTrickle" magitrickled magitrickled
+  _svc_row "HevSocks5" hev-socks5-tunnel
+  _svc_row "Dnsmasq" dnsmasq
+  if [ -x "$(P /etc/init.d/adblock-fast)" ]; then
+    _ab=$(grep -c 'server=/' "$(P /var/run/adblock-fast/dnsmasq.servers)" 2>/dev/null)
+    _row "Adblock" "${C_G}${_ab:-0} доменов${NC}"
+  fi
+  _vpn=$(_api_node VPN); _ai=$(_api_node AI)
+  _row "VPN узел" "${_vpn:-${C_DIM}нет ответа API${NC}}"
+  _row "AI узел"  "${_ai:-${C_DIM}нет ответа API${NC}}"
+  if [ -s "$(P /usr/bin/geo-backend.sh)" ] && ubus list 2>/dev/null | grep -qx 'geo-sync'; then
+    _row "Geo LuCI" "${C_G}установлена${NC}"
+  else
+    _row "Geo LuCI" "${C_R}не установлена${NC}"
+  fi
+  _mt=$(grep -c 'DOMAIN-SUFFIX' "$(P /etc/mihomo/ruleset/mtrickle.yaml)" 2>/dev/null)
+  _row "Sync правил" "${_mt:-0} в mtrickle.yaml"
+  if [ -f "$(P /root/.geomask-norestart)" ]; then
+    _row "VPN-рестарты" "${C_G}запрещены (pin)${NC}"
+  else
+    _row "VPN-рестарты" "${C_Y}разрешены${NC}"
+  fi
+  _zv=$(grep -m1 '^ZM_VERSION=' "$(P /opt/zapret-manager-luci/backend.sh)" 2>/dev/null | cut -d'"' -f2)
+  [ -n "${_zv:-}" ] && _row "Zapret-Manager" "v$_zv"
+}
+
+print_banner() {
+  printf '%s+========================================+%s\n' "$C_M" "$NC"
+  printf '%s|%s      %sGEOMASK%s  -  geo-masking stack   %s|%s\n' "$C_M" "$NC" "$C_B" "$NC" "$C_M" "$NC"
+  printf '%s+========================================+%s %sv%s%s\n' "$C_M" "$NC" "$C_DIM" "$GM_VERSION" "$NC"
+}
+
+show_menu() {
+  echo
+  printf '%s1)%s %sБыстрая диагностика%s %s(только чтение)%s\n'  "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%s2)%s %sПодписки VPN + AI%s (mihomo конфиг)\n'        "$C_B" "$NC" "$C_G" "$NC"
+  printf '%s3)%s %sГео-панель LuCI%s (оверлей)%s\n'              "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%s4)%s %sПанель Zapret-Manager%s\n'                    "$C_B" "$NC" "$C_G" "$NC"
+  printf '%s5)%s %sMagitrickle -> Mihomo%s (синхронизация)\n'     "$C_B" "$NC" "$C_G" "$NC"
+  printf '%s6)%s %sЗапустить остановленные сервисы%s\n'           "$C_B" "$NC" "$C_G" "$NC"
+  printf '%s7)%s %sПолная проверка%s (verify)\n'                 "$C_B" "$NC" "$C_G" "$NC"
+  printf '%s8)%s %sПошаговый мастер%s (все шаги с вопросами)\n'   "$C_B" "$NC" "$C_G" "$NC"
+  printf '%sf)%s %sУдалить -> установить -> настроить geomask%s\n' "$C_B" "$NC" "$C_Y" "$NC"
+  printf '%s0)%s Выход\n'                                        "$C_B" "$NC"
+}
+
+diag_quick() {
+  PASS=0; FAILCNT=0; SKIP=0
+  GM_CHECK_ONLY=1
+  for n in 1 2 3 4 5 6 7; do run_step "$n" || true; done
+  GM_CHECK_ONLY=0
+  echo
+  log "${C_DIM}== ДИАГНОСТИКА: pass=$PASS fail=$FAILCNT ==$NC"
+}
+
+# prompt for a subscription URL; keeps current value on Enter; honors flags/--yes
+prompt_url() { # prompt_url <label> <current> <flag-value>  -> prints url, rc=1 if none
+  _lbl="$1"; _cur="$2"; _flag="$3"
+  if [ -n "$_flag" ]; then printf '%s' "$_flag"; return 0; fi
+  if [ -n "$_cur" ]; then
+    if [ "$GM_YES" = 1 ] || [ ! -t 0 ]; then printf '%s' "$_cur"; return 0; fi
+    printf '%s [Enter = оставить %s]: ' "$_lbl" "$(_maskurl "$_cur")"
+    read -r _v || _v=""
+    printf '%s' "${_v:-$_cur}"
+    return 0
+  fi
+  if [ "$GM_YES" = 1 ] || [ ! -t 0 ]; then return 1; fi
+  while :; do
+    printf '%s: ' "$_lbl"
+    read -r _v || return 1
+    case "$_v" in
+      http://*|https://*) printf '%s' "$_v"; return 0 ;;
+      '') return 1 ;;
+      *) printf '  URL должен начинаться с http:// или https://\n' ;;
+    esac
+  done
+}
+
+# remove geomask parts (geo overlay, sync script, cron); keeps panel + mihomo config
+geomask_uninstall() {
+  for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
+           /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
+           /usr/share/luci/menu.d/luci-app-geo-sync.json; do
+    if [ -f "$(P "$f")" ]; then rm -f "$(P "$f")"; info "removed: $f"; fi
+  done
+  rm -f "$(P /www/luci-static/resources/view/geo-sync/main.js)" 2>/dev/null || true
+  rmdir "$(P /www/luci-static/resources/view/geo-sync)" 2>/dev/null || true
+  if [ -f "$(P /root/sync_mtrickle_mihomo.sh)" ]; then rm -f "$(P /root/sync_mtrickle_mihomo.sh)"; info "removed: sync script"; fi
+  if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
+    crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
+  fi
+  initd rpcd reload 2>/dev/null || true
+  return 0
+}
+
+# full flow: uninstall -> install geo -> rewrite mihomo 2-subs -> sync+cron -> services -> verify
+menu_reinstall() {
+  hdr "REINSTALL" "Удалить -> установить -> настроить geomask"
+  warn "Будут удалены и переустановлены: гео-оверлей LuCI, sync-скрипт, cron."
+  warn "Mihomo конфиг будет перезаписан шаблоном 2-подписок (старый — в бэкапе)."
+  warn "Mihomo НЕ перезапускается: подписки применяются через API без обрыва VPN."
+  _c="$(P $MIHOMO_CONF)"
+  _curv=""; _cura=""
+  if [ -s "$_c" ]; then
+    _curv=$(_prov_url "$_c" sub)
+    _cura=$(_prov_url "$_c" de5)
+  fi
+  ask "Продолжить пересстановку?" || { warn "отменено"; return 1; }
+  _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
+  _ai=$(prompt_url "Ссылка на AI-подписку (Германия)" "$_cura" "$GM_AI_URL") || { bad "URL AI-подписки не задан"; return 1; }
+  hdr "1/5" "удаление geomask"; geomask_uninstall || true
+  hdr "2/5" "гео-оверлей LuCI"; step3_apply || true
+  hdr "3/5" "mihomo: 2 подписки"
+  if write_mihomo_config "$_vpn" "$_ai"; then
+    api_refresh_provider sub "$_vpn" && info "provider sub refreshed (no restart)" || warn "provider sub: refresh failed, применится при старте mihomo"
+    api_refresh_provider de5 "$_ai" && info "provider de5 refreshed (no restart)" || warn "provider de5: refresh failed, применится при старте mihomo"
+  else
+    bad "конфиг mihomo не записан"; return 1
+  fi
+  hdr "4/5" "синхронизация + роутинг"; step5_apply || true
+  hdr "5/5" "сервисы"; step6_apply || true
+  hdr "VERIFY" "итоговая проверка"
+  if step7_check; then info "verify: PASS"; else bad "verify: FAIL"; return 1; fi
+  log "Пересстановка geomask завершена."
+  return 0
+}
+
+menu_loop() {
+  while :; do
+    clr
+    print_banner
+    echo
+    dashboard
+    show_menu
+    printf '\n%sВыберите пункт:%s ' "$C_Y" "$NC"
+    read -r _c || exit 0
+    case "$_c" in
+      1) diag_quick; PAUSE ;;
+      2) run_step 4 || true; PAUSE ;;
+      3) run_step 3 || true; PAUSE ;;
+      4) run_step 2 || true; PAUSE ;;
+      5) run_step 5 || true; PAUSE ;;
+      6) run_step 6 || true; PAUSE ;;
+      7) run_step 7 || true; PAUSE ;;
+      8) for n in 1 2 3 4 5 6 7; do run_step "$n" || true; done; PAUSE ;;
+      f|F) menu_reinstall || true; PAUSE ;;
+      0|q|Q|"") exit 0 ;;
+      *) printf '%sнеизвестный пункт%s\n' "$C_R" "$NC"; sleep 1 ;;
+    esac
+  done
+}
+
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---- args ----
 while [ $# -gt 0 ]; do
@@ -489,6 +695,7 @@ while [ $# -gt 0 ]; do
     --check) GM_CHECK_ONLY=1 ;;
     --yes|-y) GM_YES=1 ;;
     --restart) GM_RESTART=1 ;;
+    --reinstall) GM_REINSTALL=1 ;;
     --step) shift; GM_STEP="${1:-}" ;;
     --vpn-url) shift; GM_VPN_URL="${1:-}" ;;
     --ai-url) shift; GM_AI_URL="${1:-}" ;;
@@ -504,12 +711,13 @@ if [ "$GM_RESTART" = 1 ] && [ -f "$(P /root/.geomask-norestart)" ]; then
   GM_RESTART=0
 fi
 
-log "geomask v$GM_VERSION (prefix='${GM_PREFIX:-/}')  mode: $([ "$GM_CHECK_ONLY" = 1 ] && echo check || { [ "$GM_AUTO" = 1 ] && echo auto || echo interactive; })"
-
 RC=0
-if [ -n "$GM_STEP" ]; then
+if [ "$GM_REINSTALL" = 1 ]; then
+  menu_reinstall || RC=1
+elif [ -n "$GM_STEP" ]; then
   run_step "$GM_STEP" || RC=1
 elif [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
+  log "geomask v$GM_VERSION  mode: $([ "$GM_CHECK_ONLY" = 1 ] && echo check || echo auto)"
   for n in 1 2 3 4 5 6 7; do
     if [ "$GM_CHECK_ONLY" = 1 ]; then
       run_step "$n" || true
@@ -518,20 +726,10 @@ elif [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
     fi
   done
 else
-  log ""
-  log "Steps: 1=env 2=panel 3=geo 4=subs(2 subscriptions) 5=sync 6=services 7=verify"
-  log "Enter numbers to run (e.g. '1 2 3'), 'a' = all, 'q' = quit:"
-  printf '> '
-  read -r _sel || _sel=q
-  case "$_sel" in
-    q|Q) exit 0 ;;
-    a|A) for n in 1 2 3 4 5 6 7; do run_step "$n" || true; done ;;
-    *)
-      for n in $_sel; do run_step "$n" || true; done ;;
-  esac
+  menu_loop
 fi
 
 log ""
-log "== SUMMARY: pass=$PASS fail=$FAILCNT skipped_steps=$SKIP =="
+log "${C_DIM}== SUMMARY: pass=$PASS fail=$FAILCNT skipped_steps=$SKIP ==$NC"
 [ "$FAILCNT" -eq 0 ] || RC=1
 exit $RC

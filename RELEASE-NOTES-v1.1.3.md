@@ -1,4 +1,4 @@
-## geomask v1.1.3
+﻿## geomask v1.1.3
 
 Патч диагностики: дубли вывода и счётчики.
 
@@ -14,6 +14,6 @@
 curl -fL -m 60 -o /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/geomask@master/geomask.sh' && sh /tmp/geomask.sh
 ```
 
-Пин на релиз (если @master в кэше): `https://cdn.jsdelivr.net/gh/kabzon93region/geomask@<commit>/geomask.sh` — commit см. в теге.
+Пин на релиз (если @master в кэше): `https://cdn.jsdelivr.net/gh/kabzon93region/geomask@edb74e1/geomask.sh` — commit см. в теге.
 
 Тесты: 31/31 PASS (новые проверки: отсутствие дублей, версия OpenWrt, счётчики pass=7).

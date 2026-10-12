@@ -17,6 +17,8 @@
 # SAFETY: never reboots the router; never restarts working services (only starts missing ones);
 #         never touches network/pppoe config; backups before every file write; mihomo restart
 #         only with --restart or explicit interactive yes, and only after `mihomo -t` passes.
+#         HARD PIN: if /root/.geomask-norestart exists, --restart is ignored entirely -
+#         the router owner's decision wins; remove the file to re-enable restarts.
 
 set -u
 
@@ -1596,6 +1598,12 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# hard pin: router owner may forbid restarts permanently via flag file
+if [ "$GM_RESTART" = 1 ] && [ -f "$(P /root/.geomask-norestart)" ]; then
+  log "NOTE: /root/.geomask-norestart present - ignoring --restart (owner forbids VPN interruption)."
+  GM_RESTART=0
+fi
 
 log "geomask v$GM_VERSION (prefix='${GM_PREFIX:-/}')  mode: $([ "$GM_CHECK_ONLY" = 1 ] && echo check || { [ "$GM_AUTO" = 1 ] && echo auto || echo interactive; })"
 

@@ -1,5 +1,0 @@
-#!/bin/sh
-# stub pidof: alive if name listed in $ZM_STATE/services
-S="${ZM_STATE:-/tmp}/services"
-[ -f "$S" ] || exit 1
-grep -qx "$1" "$S" && exit 0 || exit 1

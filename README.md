@@ -1,4 +1,4 @@
-# zm-setup
+# geomask
 
 Автоматизированный установщик и конфигуратор домашнего стека обхода блокировок на OpenWrt (wwGate AX3000 / mediatek-filogic):
 
@@ -11,22 +11,41 @@
 ## Установка (на роутере)
 
 ```sh
-sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/zm-setup/master/zm-setup.sh')
+sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master/geomask.sh')
 ```
 
-Или локально: скопируйте `zm-setup.sh` на роутер и запустите `sh /root/zm-setup.sh`.
+Или локально: скопируйте `geomask.sh` на роутер и запустите `sh /root/geomask.sh`.
 
 ## Режимы
 
 | Режим | Команда | Что делает |
 |---|---|---|
-| Интерактив | `sh zm-setup.sh` | Меню: выбираешь шаги, каждый шаг — check → вопрос → apply → verify |
-| Полный авто | `sh zm-setup.sh --auto` | Все шаги без вопросов; остановка при verify-FAIL |
-| Только проверка | `sh zm-setup.sh --check` | Read-only отчёт по всем шагам, ничего не меняет |
-| Один шаг | `sh zm-setup.sh --step 4` | Только шаг N (нумерация ниже) |
+| Интерактив | `sh geomask.sh` | Меню: выбираешь шаги, каждый шаг — check → вопрос → apply → verify |
+| Полный авто | `sh geomask.sh --auto` | Все шаги без вопросов; остановка при verify-FAIL |
+| Только проверка | `sh geomask.sh --check` | Read-only отчёт по всем шагам, ничего не меняет |
+| Один шаг | `sh geomask.sh --step 4` | Только шаг N (нумерация ниже) |
 | Без вопросов | `+ --yes` | Не спрашивать подтверждений |
 | С рестартом | `+ --restart` | Разрешить перезапуск mihomo и однократный sync (обрыв VPN ~3с) |
 | С подписками | `+ --vpn-url URL --ai-url URL` | Задать URL подписок для шага 4 (в конфиг попадают только туда) |
+
+## Структура репозитория
+
+```
+geomask.sh       # готовый установщик (публикуется, его и качает wget)
+geomask.sh.in    # шаблон — править его
+build.py         # сборка: python build.py -> geomask.sh
+assets/          # файлы, вливаемые в установщик:
+  geo-backend.sh           # бэкенд гео-панели (Go/sh логика на роутере)
+  geo-sync                 # rpcd-плагин (ubus-объект geo-sync)
+  acl-geo-sync.json        # ACL: доступ LuCI к geo-sync
+  menu-geo-sync.json       # пункт меню «Гео-маскировка и AI»
+  geo-sync-page.js         # КОД СТРАНИЦЫ АДМИНКИ в LuCI (view/geo-sync/main.js)
+  sync_mtrickle_mihomo.sh  # magitrickle -> mihomo ruleset sync
+  ytdirect.yaml            # rule-provider DIRECT-доменов
+  99-default-vpn-route     # hotplug: LAN -> TUN роутинг
+```
+
+> Код страницы админки в LuCI — `assets/geo-sync-page.js` (устанавливается на роутер как `/www/luci-static/resources/view/geo-sync/main.js`).
 
 ## Шаги
 
@@ -42,42 +61,35 @@ sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/zm-setup/maste
 
 - **Никакого reboot** и никаких касаний network/pppoe-конфига.
 - Работающие сервисы не перезапускаются (только старт упавших).
-- Бэкап перед каждой записью файла (`.bak_zmsetup_<timestamp>`).
+- Бэкап перед каждой записью файла (`.bak_geomask_<timestamp>`).
 - `mihomo -t` обязан пройти до установки конфига; при провале — старый конфиг остаётся.
 - Перезапуск mihomo / однократный sync — только с `--restart` или явным «да» в интерактиве.
 - Секреты (URL подписок, hwid) не входят в скрипт — передаются аргументами и остаются в конфиге роутера.
 
 ## Разработка
 
-```
-zm-setup.sh.in   # шаблон (правьте его)
-assets/          # файлы, вливаемые в скрипт (сняты с рабочего роутера)
-build.py         # сборка: python build.py  ->  zm-setup.sh
-sandbox/         # тестовая песочница (fake root + стабы команд)
+```sh
+python build.py        # собирает geomask.sh из geomask.sh.in + assets/
 ```
 
-### Песочница (без роутера и без VM/WSL)
+После правки любого файла в `assets/` пересоберите установщик и прогоните тесты.
+
+### Тесты
+
+Локальная песочница `sandbox/` (fake root + стабы команд `pidof/ubus/mihomo/curl/crontab/nslookup/ip/wget/apk`) запускается на любой машине без роутера и без VM/WSL:
 
 ```sh
-bash sandbox/run_tests.sh
+bash sandbox/run_tests.sh     # ожидаемо: 13/13 PASS
 ```
 
-Стабы (`sandbox/bin/pidof, ubus, mihomo, curl, crontab, nslookup, ip, wget, apk, python3`) читают состояние из `sandbox/state/`, фейковая файловая система — `sandbox/root_*` через переменную `ZM_PREFIX`. Сценарии: пустой root (всё FAIL, rc=1), здоровый root (всё OK, rc=0), auto-ремонт подписок, CLI-края. Ожидаемо: **13/13 PASS**.
-
-### Сборка
-
-```sh
-python build.py        # собирает zm-setup.sh из zm-setup.sh.in + assets/
-```
-
-После правки любого файла в `assets/` пересоберите скрипт и прогоните песочницу.
+Песочница — локальный инструмент разработки, **в репозиторий не входит** (в `.gitignore`).
 
 ## Требования (роутер)
 
 - OpenWrt 24.10+ (проверено на 25.12, aarch64/cortex-a53)
 - `python3`, `curl`, `wget`, `ubus`/`rpcd`/`luci`
 - Для шага 2: доступ к GitHub raw
-- Для шага 4: mihomo бинарь (устанавливается панелью Zapret-Manager, Mixomo)
+- Для шага 4: mihomo бинарь (ставится панелью Zapret-Manager, Mixomo)
 
 ## Лицензия
 

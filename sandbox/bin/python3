@@ -1,4 +1,0 @@
-#!/bin/sh
-# stub python3 -> delegate to real python if found, else exit 0
-if command -v python >/dev/null 2>&1; then exec python "$@"; fi
-exit 0

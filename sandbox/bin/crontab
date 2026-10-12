@@ -1,8 +1,0 @@
-#!/bin/sh
-# stub crontab: -l reads state, - writes state
-C="${ZM_STATE:-/tmp}/crontab"
-case "${1:-}" in
-  -l) [ -f "$C" ] && cat "$C"; exit 0 ;;
-  -)  cat > "$C"; exit 0 ;;
-  *) exit 1 ;;
-esac

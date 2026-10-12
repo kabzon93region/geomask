@@ -1,6 +1,4 @@
-# sandbox runtime artifacts
-sandbox/root_*/
-sandbox/state/
-sandbox/last_out.txt
+# sandbox runtime artifacts (sandbox/ is local-only, never published)
+sandbox/
 *.pyc
 __pycache__/

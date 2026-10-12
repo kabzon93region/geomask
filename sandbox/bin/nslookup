@@ -1,8 +1,0 @@
-#!/bin/sh
-# stub nslookup: ya.ru/google -> public IP; doubleclick.net -> 0.0.0.0 (adblock); else NXDOMAIN
-case "${1:-}" in
-  ya.ru|www.google.ru) printf 'Address: 5.255.255.242\n' ;;
-  doubleclick.net) printf 'Address: 0.0.0.0\n' ;;
-  *) printf "** server can't find %s: NXDOMAIN\n" "${1:-}"; exit 1 ;;
-esac
-exit 0

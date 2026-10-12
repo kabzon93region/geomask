@@ -4,8 +4,8 @@
 import os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TPL = os.path.join(HERE, "zm-setup.sh.in")
-OUT = os.path.join(HERE, "zm-setup.sh")
+TPL = os.path.join(HERE, "geomask.sh.in")
+OUT = os.path.join(HERE, "geomask.sh")
 ASSETS = os.path.join(HERE, "assets")
 
 MAP = {
@@ -13,7 +13,7 @@ MAP = {
     "geo-sync":              "geo-sync",
     "acl.json":              "acl-geo-sync.json",
     "menu.json":             "menu-geo-sync.json",
-    "geo-main.js":           "main.js",
+    "geo-main.js":           "geo-sync-page.js",
     "sync_mtrickle_mihomo.sh": "sync_mtrickle_mihomo.sh",
     "ytdirect.yaml":         "ytdirect.yaml",
     "99-default-vpn-route":  "99-default-vpn-route",

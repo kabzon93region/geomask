@@ -1,7 +1,0 @@
-#!/bin/sh
-# stub ip: rule show -> state/ip_rules; link show -> fake Mihomo
-case "$*" in
-  "rule show") cat "${ZM_STATE:-/tmp}/ip_rules" 2>/dev/null; exit 0 ;;
-  *link*show*) echo "3: Mihomo: <POINTOPOINT,UP> mtu 8500"; exit 0 ;;
-  *) exit 0 ;;
-esac

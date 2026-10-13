@@ -1,6 +1,6 @@
 #!/bin/sh
-# geomask.sh - install & configure Zapret-Manager panel + geo overlay + 2-subscription mihomo
-# Our fork workflow: panel (official) -> geo overlay (ours) -> mihomo 2 subs -> magitrickle sync -> verify
+# geomask.sh - geo-masking overlay + 2-subscription mihomo stack for OpenWrt
+# Workflow: check -> geo overlay -> mihomo 2 subs -> magitrickle sync -> services -> verify
 #
 # Usage:
 #   sh geomask.sh              interactive menu (status dashboard + actions loop)
@@ -28,7 +28,7 @@
 
 set -u
 
-GM_VERSION="1.1.3"
+GM_VERSION="1.2.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -107,48 +107,10 @@ step1_check() {
 step1_apply() { warn "env issues cannot be auto-fixed here - fix manually, then re-run"; }
 step1_verify() { step1_check; }
 
-# ============================================================ STEP 2: panel (official Zapret-Manager)
-GM_OFFICIAL_URL="https://raw.githubusercontent.com/StressOzz/Zapret-Manager/main/ZapretManager_LuCI.sh"
+# ============================================================ STEP 2: geo overlay (ours)
 
+# ============================================================ STEP 2: geo overlay (ours)
 step2_check() {
-  _need=0
-  for f in /opt/zapret-manager-luci/backend.sh /usr/libexec/rpcd/zapret-manager \
-           /usr/share/rpcd/acl.d/luci-app-zapret-manager.json \
-           /www/luci-static/resources/zapret-manager/common.js; do
-    if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
-  done
-  if have ubus; then
-    if ubus list 2>/dev/null | grep -qx 'zapret-manager'; then
-      _m=$(ubus -v list zapret-manager 2>/dev/null | grep -c '"')
-      if [ "$_m" -ge 100 ] 2>/dev/null; then info "ubus zapret-manager: $_m methods"; else bad "ubus methods too few: ${_m:-0}"; _need=1; fi
-    else bad "ubus object zapret-manager not registered"; _need=1; fi
-  else warn "ubus not available in this environment"; _need=1; fi
-  return $_need
-}
-step2_apply() {
-  log "  Panel is installed from the official StressOzz installer."
-  log "  URL: $GM_OFFICIAL_URL"
-  log "  WARNING: this downloads and runs EXTERNAL code (2MB installer); it may restart rpcd/uhttpd."
-  ask "  Download and run official installer now?" || { warn "skipped - panel not installed"; return 1; }
-  _tmp=/tmp/GM_official_install.sh
-  info "downloading installer..."
-  if ! wget -q -O "$_tmp" "$GM_OFFICIAL_URL"; then bad "download failed"; return 1; fi
-  _sz=$(wc -c < "$_tmp" 2>/dev/null || echo 0)
-  if [ "$_sz" -lt 100000 ]; then bad "installer too small ($_sz b) - abort"; rm -f "$_tmp"; return 1; fi
-  if ! sh -n "$_tmp" 2>/dev/null; then bad "installer failed sh -n syntax check - abort"; rm -f "$_tmp"; return 1; fi
-  info "installer ok ($_sz b), running (may take a few minutes)..."
-  sh "$_tmp"; _rc=$?
-  rm -f "$_tmp"
-  [ $_rc -eq 0 ] || { bad "installer exited rc=$_rc"; return 1; }
-  info "reloading rpcd..."
-  initd rpcd reload 2>/dev/null || initd rpcd restart 2>/dev/null || true
-  sleep 1
-  return 0
-}
-step2_verify() { step2_check; }
-
-# ============================================================ STEP 3: geo overlay (ours)
-step3_check() {
   _need=0
   for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
            /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
@@ -159,7 +121,7 @@ step3_check() {
   if have ubus && ubus list 2>/dev/null | grep -qx 'geo-sync'; then info "ubus geo-sync: registered"; else bad "ubus geo-sync not registered"; _need=1; fi
   return $_need
 }
-step3_apply() {
+step2_apply() {
   save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
 @@ASSET:geo-backend.sh@@
 ASSET_EOF
@@ -180,12 +142,12 @@ ASSET_EOF
   sleep 1
   return 0
 }
-step3_verify() { step3_check; }
+step2_verify() { step2_check; }
 
-# ============================================================ STEP 4: mihomo 2-subscription config
+# ============================================================ STEP 3: mihomo 2-subscription config
 MIHOMO_CONF=/etc/mihomo/config.yaml
 
-step4_check() {
+step3_check() {
   _need=0
   if ! have mihomo; then bad "mihomo binary missing"; return 1; fi
   _c="$(P $MIHOMO_CONF)"
@@ -203,7 +165,7 @@ step4_check() {
   if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then info "mihomo -t: PASS"; else bad "mihomo -t: FAIL"; _need=1; fi
   return $_need
 }
-step4_apply() {
+step3_apply() {
   _c="$(P $MIHOMO_CONF)"
   _vpnu="$GM_VPN_URL"; _aiu="$GM_AI_URL"
   if [ -s "$_c" ]; then
@@ -225,14 +187,14 @@ step4_apply() {
   elif api_refresh_provider sub "$_vpnu" && api_refresh_provider de5 "$_aiu"; then
     info "providers refreshed via API (no restart, VPN stays up)"
   elif svc_alive mihomo; then
-    warn "mihomo is running: restart later to apply (panel Mixomo tab, or rerun with --restart)"
+    warn "mihomo is running: restart later to apply (rerun with --restart)"
   else
     info "starting mihomo..."
     initd mihomo start >/dev/null 2>&1 || true
   fi
   return 0
 }
-step4_verify() { step4_check; }
+step3_verify() { step3_check; }
 
 # write a fresh 2-provider mihomo config: write_mihomo_config <vpn_url> <ai_url>
 # validates with `mihomo -t`, keeps backup of the previous config; no restart here.
@@ -361,8 +323,8 @@ api_refresh_provider() { # api_refresh_provider <name> <url>
     -d "{\"url\":\"$2\",\"vehicle_type\":\"http\"}" >/dev/null 2>&1
 }
 
-# ============================================================ STEP 5: magitrickle -> mihomo sync
-step5_check() {
+# ============================================================ STEP 4: magitrickle -> mihomo sync
+step4_check() {
   _need=0
   _s="$(P /root/sync_mtrickle_mihomo.sh)"
   if [ -s "$_s" ]; then
@@ -375,7 +337,7 @@ step5_check() {
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
-step5_apply() {
+step4_apply() {
   save_stream /root/sync_mtrickle_mihomo.sh 755 <<'ASSET_EOF'
 @@ASSET:sync_mtrickle_mihomo.sh@@
 ASSET_EOF
@@ -402,11 +364,11 @@ ASSET_EOF
   fi
   return 0
 }
-step5_verify() { step5_check; }
+step4_verify() { step4_check; }
 
-# ============================================================ STEP 6: services (start missing only)
+# ============================================================ STEP 5: services (start missing only)
 SVC_LIST="dnsmasq magitrickled mihomo hev-socks5-tunnel rpcd"
-step6_check() {
+step5_check() {
   _need=0
   for s in $SVC_LIST; do
     case "$s" in
@@ -417,7 +379,7 @@ step6_check() {
   done
   return $_need
 }
-step6_apply() {
+step5_apply() {
   for s in $SVC_LIST; do
     _p=$s; [ "$s" = magitrickled ] && _p=magitrickled
     if svc_alive "$_p"; then info "$s: already running - untouched"; continue; fi
@@ -427,10 +389,10 @@ step6_apply() {
   done
   return 0
 }
-step6_verify() { step6_check; }
+step5_verify() { step5_check; }
 
-# ============================================================ STEP 7: end-to-end verify (read-only)
-step7_check() {
+# ============================================================ STEP 6: end-to-end verify (read-only)
+step6_check() {
   _need=0
   _r=$(nslookup ya.ru 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2}' | tail -1)
   if [ -n "$_r" ] && [ "$_r" != "127.0.0.1" ]; then info "DNS normal (ya.ru -> $_r)"; else bad "DNS broken for normal domains"; _need=1; fi
@@ -445,17 +407,16 @@ step7_check() {
   printf '%s' "$_px" | grep -q '"VPN"' && info "mihomo group VPN: in API" || { bad "mihomo group VPN missing"; _need=1; }
   printf '%s' "$_px" | grep -q '"AI"' && info "mihomo group AI: in API" || { bad "mihomo group AI missing"; _need=1; }
   if have ubus; then
-    ubus list 2>/dev/null | grep -qx 'zapret-manager' && info "panel ubus: OK" || { bad "panel ubus: missing"; _need=1; }
     ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
   fi
   if ip rule show 2>/dev/null | grep -q '32666'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule (32666) absent - LAN ping may die in TUN"; fi
   return $_need
 }
-step7_apply() { warn "verify-only step - nothing to apply"; return 0; }
-step7_verify() { step7_check; }
+step6_apply() { warn "verify-only step - nothing to apply"; return 0; }
+step6_verify() { step6_check; }
 
 # ============================================================ runner
-STEP_NAMES="env panel geo subs sync services verify"
+STEP_NAMES="env geo subs sync services verify"
 
 step_fn() { # step_fn N action -> call stepN_action
   _n=$1; _a=$2
@@ -466,7 +427,6 @@ step_fn() { # step_fn N action -> call stepN_action
     4-check) step4_check ;; 4-apply) step4_apply ;; 4-verify) step4_verify ;;
     5-check) step5_check ;; 5-apply) step5_apply ;; 5-verify) step5_verify ;;
     6-check) step6_check ;; 6-apply) step6_apply ;; 6-verify) step6_verify ;;
-    7-check) step7_check ;; 7-apply) step7_apply ;; 7-verify) step7_verify ;;
     *) bad "unknown step $_n"; return 1 ;;
   esac
 }
@@ -474,7 +434,7 @@ step_fn() { # step_fn N action -> call stepN_action
 run_step() { # run_step N  (interactive/auto common logic)
   _n=$1
   _name=$(echo "$STEP_NAMES" | cut -d' ' -f"$_n")
-  hdr "$_n/7" "$_name"
+  hdr "$_n/6" "$_name"
   _fc_before=$FAILCNT
   if step_fn "$_n" check; then
     info "check: ALL GOOD"
@@ -559,8 +519,6 @@ dashboard() {
   else
     _row "VPN-рестарты" "${C_Y}разрешены${NC}"
   fi
-  _zv=$(grep -m1 '^ZM_VERSION=' "$(P /opt/zapret-manager-luci/backend.sh)" 2>/dev/null | cut -d'"' -f2)
-  [ -n "${_zv:-}" ] && _row "Zapret-Manager" "v$_zv"
 }
 
 print_banner() {
@@ -572,13 +530,7 @@ print_banner() {
 show_menu() {
   echo
   printf '%s1)%s %sБыстрая диагностика%s %s(только чтение)%s\n'  "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
-  printf '%s2)%s %sПодписки VPN + AI%s (mihomo конфиг)\n'        "$C_B" "$NC" "$C_G" "$NC"
-  printf '%s3)%s %sГео-панель LuCI (оверлей)%s\n'                "$C_B" "$NC" "$C_G" "$NC"
-  printf '%s4)%s %sПанель Zapret-Manager%s\n'                    "$C_B" "$NC" "$C_G" "$NC"
-  printf '%s5)%s %sMagitrickle -> Mihomo%s (синхронизация)\n'     "$C_B" "$NC" "$C_G" "$NC"
-  printf '%s6)%s %sЗапустить остановленные сервисы%s\n'           "$C_B" "$NC" "$C_G" "$NC"
-  printf '%s7)%s %sПолная проверка%s (verify)\n'                 "$C_B" "$NC" "$C_G" "$NC"
-  printf '%s8)%s %sПошаговый мастер%s (все шаги с вопросами)\n'   "$C_B" "$NC" "$C_G" "$NC"
+  printf '%s2)%s %sПошаговый мастер%s %s(статус шагов, запуск любого отдельно)%s\n' "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
   printf '%sf)%s %sУдалить -> установить -> настроить geomask%s\n' "$C_B" "$NC" "$C_Y" "$NC"
   printf '%s0)%s Выход\n'                                        "$C_B" "$NC"
 }
@@ -586,10 +538,33 @@ show_menu() {
 diag_quick() {
   PASS=0; FAILCNT=0; SKIP=0
   GM_CHECK_ONLY=1
-  for n in 1 2 3 4 5 6 7; do run_step "$n" || true; done
+  for n in 1 2 3 4 5 6; do run_step "$n" || true; done
   GM_CHECK_ONLY=0
   echo
   log "${C_DIM}== ДИАГНОСТИКА: pass=$PASS fail=$FAILCNT ==$NC"
+}
+
+# step-by-step master: show status of every step, let the user run any single step
+menu_master() {
+  while :; do
+    _n=1
+    for _nm in $STEP_NAMES; do
+      if step_fn "$_n" check >/dev/null 2>&1; then
+        printf '  %s%d)%s %-14s %sвыполнено%s\n' "$C_B" "$_n" "$NC" "$_nm" "$C_G" "$NC"
+      else
+        printf '  %s%d)%s %-14s %sтребует внимания%s\n' "$C_B" "$_n" "$NC" "$_nm" "$C_R" "$NC"
+      fi
+      _n=$((_n+1))
+    done
+    echo
+    printf 'Номер шага для запуска (Enter - назад): '
+    read -r _sel || return
+    case "$_sel" in
+      ''|q|Q) return ;;
+      [1-6]) run_step "$_sel" || true; PAUSE ;;
+      *) printf '%sнет такого шага%s\n' "$C_R" "$NC"; sleep 1 ;;
+    esac
+  done
 }
 
 # prompt for a subscription URL; keeps current value on Enter; honors flags/--yes
@@ -615,7 +590,7 @@ prompt_url() { # prompt_url <label> <current> <flag-value>  -> prints url, rc=1 
   done
 }
 
-# remove geomask parts (geo overlay, sync script, cron); keeps panel + mihomo config
+# remove geomask parts (geo overlay, sync script, cron); keeps mihomo config
 geomask_uninstall() {
   for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
            /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
@@ -648,7 +623,7 @@ menu_reinstall() {
   _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
   _ai=$(prompt_url "Ссылка на AI-подписку (Германия)" "$_cura" "$GM_AI_URL") || { bad "URL AI-подписки не задан"; return 1; }
   hdr "1/5" "удаление geomask"; geomask_uninstall || true
-  hdr "2/5" "гео-оверлей LuCI"; step3_apply || true
+  hdr "2/5" "гео-оверлей LuCI"; step2_apply || true
   hdr "3/5" "mihomo: 2 подписки"
   if write_mihomo_config "$_vpn" "$_ai"; then
     api_refresh_provider sub "$_vpn" && info "provider sub refreshed (no restart)" || warn "provider sub: refresh failed, применится при старте mihomo"
@@ -656,10 +631,10 @@ menu_reinstall() {
   else
     bad "конфиг mihomo не записан"; return 1
   fi
-  hdr "4/5" "синхронизация + роутинг"; step5_apply || true
-  hdr "5/5" "сервисы"; step6_apply || true
+  hdr "4/5" "синхронизация + роутинг"; step4_apply || true
+  hdr "5/5" "сервисы"; step5_apply || true
   hdr "VERIFY" "итоговая проверка"
-  if step7_check; then info "verify: PASS"; else bad "verify: FAIL"; return 1; fi
+  if step6_check; then info "verify: PASS"; else bad "verify: FAIL"; return 1; fi
   log "Пересстановка geomask завершена."
   return 0
 }
@@ -675,13 +650,7 @@ menu_loop() {
     read -r _c || exit 0
     case "$_c" in
       1) diag_quick; PAUSE ;;
-      2) run_step 4 || true; PAUSE ;;
-      3) run_step 3 || true; PAUSE ;;
-      4) run_step 2 || true; PAUSE ;;
-      5) run_step 5 || true; PAUSE ;;
-      6) run_step 6 || true; PAUSE ;;
-      7) run_step 7 || true; PAUSE ;;
-      8) for n in 1 2 3 4 5 6 7; do run_step "$n" || true; done; PAUSE ;;
+      2) menu_master || true; PAUSE ;;
       f|F) menu_reinstall || true; PAUSE ;;
       0|q|Q|"") exit 0 ;;
       *) printf '%sнеизвестный пункт%s\n' "$C_R" "$NC"; sleep 1 ;;
@@ -721,7 +690,7 @@ elif [ -n "$GM_STEP" ]; then
   run_step "$GM_STEP" || RC=1
 elif [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
   log "geomask v$GM_VERSION  mode: $([ "$GM_CHECK_ONLY" = 1 ] && echo check || echo auto)"
-  for n in 1 2 3 4 5 6 7; do
+  for n in 1 2 3 4 5 6; do
     if [ "$GM_CHECK_ONLY" = 1 ]; then
       run_step "$n" || true
     else

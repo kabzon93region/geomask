@@ -2,7 +2,6 @@
 
 Автоматизированный установщик и конфигуратор домашнего стека обхода блокировок на OpenWrt (wwGate AX3000 / mediatek-filogic):
 
-- **Zapret-Manager** (админ-панель, форк StressOzz/Zapret-Manager) — установка/проверка;
 - **гео-оверлей** — панель «Гео-маскировка и AI» в LuCI (rpcd geo-sync + Web-страница);
 - **mihomo с 2 подписками** — группы `VPN` (основная подписка, exclude РФ/моб.) и `AI` (немецкая нода для Google/AI); AI-подписка меняется из LuCI-страницы (поле + «Применить») или терминала — без перезапуска mihomo;
 - **magitrickle → mihomo sync** — DNS-маршрутизация по доменам через cron каждые 5 минут;
@@ -34,16 +33,18 @@ sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master
 
 | Режим | Команда | Что делает |
 |---|---|---|
-| Интерактив | `sh geomask.sh` | Главное меню: сводка статусов (роутер, сервисы, VPN/AI узлы, geo, pin) + циклическое меню действий |
+| Интерактив | `sh geomask.sh` | Главное меню: сводка статусов (роутер, сервисы, VPN/AI узлы, geo, pin) + пункты: диагностика, пошаговый мастер, пересстановка |
 | Пересстановка | `sh geomask.sh --reinstall` | «Удалить → установить → настроить geomask»: сносит гео-оверлей/sync/cron, переустанавливает всё, спрашивает обе подписки; **mihomo не перезапускается** |
 | Полный авто | `sh geomask.sh --auto` | Все шаги без вопросов; остановка при verify-FAIL |
 | Только проверка | `sh geomask.sh --check` | Read-only отчёт по всем шагам, ничего не меняет |
-| Один шаг | `sh geomask.sh --step 4` | Только шаг N (нумерация ниже) |
+| Один шаг | `sh geomask.sh --step 3` | Только шаг N (нумерация ниже) |
 | Без вопросов | `+ --yes` | Не спрашивать подтверждений |
 | С рестартом | `+ --restart` | Разрешить перезапуск mihomo (обрыв VPN ~3с). **Игнорируется**, если на роутере есть флаг `/root/.geomask-norestart` |
 | С подписками | `+ --vpn-url URL --ai-url URL` | Задать URL подписок (в конфиг попадают только туда) |
 
-После каждого действия меню возвращается на главный экран со свежей сводкой. Пункты меню: диагностика, подписки, гео-панель, Zapret-Manager, sync, сервисы, verify, пошаговый мастер, пересстановка (`f`).
+После каждого действия меню возвращается на главный экран со свежей сводкой.
+
+**Пошаговый мастер** (пункт 2): показывает статус каждого шага («выполнено» / «требует внимания») и позволяет запустить любой шаг отдельно — в отличие от «Быстрой диагностики», которая только читает и ничего не меняет.
 
 Подписки применяются **без перезапуска mihomo**: конфиг пишется с бэкапом, затем провайдеры `sub`/`de5` обновляются через локальный API (`PUT /providers/proxies/...`) — VPN не прерывается. Полный рестарт только по `--restart`.
 
@@ -69,12 +70,11 @@ assets/          # файлы, вливаемые в установщик:
 ## Шаги
 
 1. **env** — проверка окружения: OpenWrt, apk/opkg, python3, curl, место, интернет.
-2. **panel** — официальная панель Zapret-Manager (по явному согласию скачивается внешний установщик StressOzz).
-3. **geo** — установка гео-оверлея: `/usr/bin/geo-backend.sh`, rpcd `geo-sync`, ACL, меню LuCI, страница `geo-sync/main.js`.
-4. **subs** — конфиг mihomo: два proxy-provider (`sub` + `de5`), группы `VPN`/`AI`, правила `ytdirect→DIRECT`, `cloudflare-ech→AI`, `ai→AI`, `mtrickle→VPN`, `MATCH→GLOBAL`, sniffer. Перед записью — бэкап и `mihomo -t`.
-5. **sync** — `/root/sync_mtrickle_mihomo.sh` + cron `*/5` + `ytdirect.yaml` + hotplug-роутинг (`99-default-vpn-route`).
-6. **services** — запуск **только упавших** сервисов; работающие не трогаются.
-7. **verify** — E2E: DNS обычный/adblock, HTTP 204, группы VPN/AI в mihomo API, ubus панели, ICMP-bypass правило.
+2. **geo** — установка гео-оверлея: `/usr/bin/geo-backend.sh`, rpcd `geo-sync`, ACL, меню LuCI, страница `geo-sync/main.js`.
+3. **subs** — конфиг mihomo: два proxy-provider (`sub` + `de5`), группы `VPN`/`AI`, правила `ytdirect→DIRECT`, `cloudflare-ech→AI`, `ai→AI`, `mtrickle→VPN`, `MATCH→GLOBAL`, sniffer. Перед записью — бэкап и `mihomo -t`.
+4. **sync** — `/root/sync_mtrickle_mihomo.sh` + cron `*/5` + `ytdirect.yaml` + hotplug-роутинг (`99-default-vpn-route`).
+5. **services** — запуск **только упавших** сервисов; работающие не трогаются.
+6. **verify** — E2E: DNS обычный/adblock, HTTP 204, группы VPN/AI в mihomo API, ubus geo-панели, ICMP-bypass правило.
 
 ## Безопасность
 
@@ -99,7 +99,7 @@ python build.py        # собирает geomask.sh из geomask.sh.in + assets
 Локальная песочница `sandbox/` (fake root + стабы команд `pidof/ubus/mihomo/curl/crontab/nslookup/ip/wget/apk`) запускается на любой машине без роутера и без VM/WSL:
 
 ```sh
-bash sandbox/run_tests.sh     # ожидаемо: 25/25 PASS
+bash sandbox/run_tests.sh     # ожидаемо: все PASS
 ```
 
 Песочница — локальный инструмент разработки, **в репозиторий не входит** (в `.gitignore`).
@@ -108,9 +108,9 @@ bash sandbox/run_tests.sh     # ожидаемо: 25/25 PASS
 
 - OpenWrt 24.10+ (проверено на 25.12, aarch64/cortex-a53)
 - `python3`, `curl`, `wget`, `ubus`/`rpcd`/`luci`
-- Для шага 2: доступ к GitHub raw
-- Для шага 4: mihomo бинарь (ставится панелью Zapret-Manager, Mixomo)
+- Для шага 4: доступ к сети (cron-sync магитрикла)
+- Для шага 3: mihomo бинарь (уже установлен на целевом роутере; на чистой системе ставится отдельно)
 
 ## Лицензия
 
-MIT. Гео-оверлей и синк-скрипты — собственные доработки; Zapret-Manager — © StressOzz, GPL-2.0.
+MIT. Гео-оверлей и синк-скрипты — собственные доработки.

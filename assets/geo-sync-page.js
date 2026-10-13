@@ -16,6 +16,11 @@ var callDevAdd = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { 
 var callDevDel = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
 var callAiSubGet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
 var callAiSubSet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
+var callSubsList = rpc.declare({ object: 'geo-sync', method: 'subs_list', expect: {} });
+var callSubAdd   = rpc.declare({ object: 'geo-sync', method: 'sub_add',   params: { name: null, url: null }, expect: {} });
+var callSubDel   = rpc.declare({ object: 'geo-sync', method: 'sub_del',   params: { id: null }, expect: {} });
+var callAiSubUse   = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use',   params: { id: null }, expect: {} });
+var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  params: { id: null }, expect: {} });
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -113,12 +118,13 @@ var E = (function(raw) {
 return view.extend({
 	load: function() {
 		injectStyle();
-		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet() ]);
+		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList() ]);
 	},
 
 	render: function(all) {
 		var st = all[0] || {}, leases = (all[1] || {}).leases || [], lg = (all[2] || {}).log || '';
 		var aicfg = all[3] || {};
+		var subs = (all[4] || {}).subs || [];
 		var view = this;
 		var wrap = E('div', { 'class': 'gs-wrap' });
 
@@ -153,34 +159,68 @@ return view.extend({
 		]);
 		wrap.appendChild(hero);
 
-		/* ===================== AI subscription (de5) ===================== */
-		var aiUrlIn = E('input', { 'class': 'gs-input', 'style': 'flex:1;min-width:280px',
-			'placeholder': 'https://... подписка AI (de5)', 'value': aicfg.url || '' });
-		var btnAiApply = E('button', { 'class': 'gs-btn gs-btn-primary',
+		/* ===================== Subscriptions registry ===================== */
+		function maskUrl(u) {
+			if (!u) return '—';
+			return String(u).replace(/\/[^/]*$/, '/...');
+		}
+		function subRow(s) {
+			var isActiveAi = (st.ai_sub && st.ai_sub === s.id);
+			var isActiveVpn = (st.vpn_sub && st.vpn_sub === s.id);
+			var tags = [];
+			if (isActiveVpn) tags.push(E('span', { 'class': 'gs-badge gs-on' }, 'VPN'));
+			if (isActiveAi) tags.push(E('span', { 'class': 'gs-badge gs-ok' }, 'AI'));
+			return E('tr', {}, [
+				E('td', {}, s.name || s.id),
+				E('td', { 'style': 'font-family:monospace;font-size:12px' }, maskUrl(s.url)),
+				E('td', {}, tags.length ? tags : '—'),
+				E('td', { 'style': 'white-space:nowrap' }, [
+					E('button', { 'class': 'gs-btn' + (isActiveVpn ? '' : ' gs-btn-primary'),
+						'title': 'Использовать эту подписку для общего VPN',
+						'disabled': isActiveVpn ? 'disabled' : null,
+						'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } }, '→ VPN'),
+					' ',
+					E('button', { 'class': 'gs-btn' + (isActiveAi ? '' : ' gs-btn-primary'),
+						'title': 'Использовать эту подписку для AI-маршрутов',
+						'disabled': isActiveAi ? 'disabled' : null,
+						'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } }, '→ AI'),
+					' ',
+					E('button', { 'class': 'gs-btn gs-btn-warn',
+						'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } }, 'Удалить')
+				])
+			]);
+		}
+		var subNameIn = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'Например: США' });
+		var subUrlIn  = E('input', { 'class': 'gs-input', 'style': 'flex:1;min-width:260px', 'placeholder': 'https://... ссылка подписки' });
+		var btnSubAdd = E('button', { 'class': 'gs-btn gs-btn-primary',
 			'click': function() {
-				var u = (aiUrlIn.value || '').trim();
+				var u = (subUrlIn.value || '').trim();
 				if (!/^https?:\/\//.test(u)) {
 					ui.addNotification(null, E('p', {}, 'Ссылка должна начинаться с http:// или https://'), 'warning');
 					return;
 				}
-				btnAiApply.disabled = true; btnAiApply.textContent = 'Применение…';
-				callAiSubSet({ url: u }).then(function(res) {
-					btnAiApply.disabled = false; btnAiApply.textContent = 'Применить';
+				btnSubAdd.disabled = true; btnSubAdd.textContent = 'Добавление…';
+				callSubAdd({ name: subNameIn.value || '', url: u }).then(function(res) {
+					btnSubAdd.disabled = false; btnSubAdd.textContent = 'Добавить';
 					if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
-					ui.addNotification(null, E('p', {}, 'AI-подписка обновлена' + (res && res.warn ? ' (' + res.warn + ')' : '')), 'info');
+					subNameIn.value = ''; subUrlIn.value = '';
+					ui.addNotification(null, E('p', {}, 'Подписка добавлена в реестр'), 'info');
 					return view.reload();
 				}).catch(function(e) {
-					btnAiApply.disabled = false; btnAiApply.textContent = 'Применить';
+					btnSubAdd.disabled = false; btnSubAdd.textContent = 'Добавить';
 					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
 				});
-			} }, 'Применить');
-		var subCard = E('div', { 'class': 'gs-card' }, [
-			E('h3', {}, 'Подписка AI (de5)'),
+			} }, 'Добавить');
+		var subsCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Подписки'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
-				'Ссылка немецкой подписки для Google/OpenAI/Claude. Применение обновляет провайдера de5 в работающем mihomo через API — без перезапуска, VPN не прерывается.'),
-			E('div', { 'class': 'gs-row' }, [ aiUrlIn, btnAiApply ])
+				'Реестр подписок. Кнопки «→ VPN»/«→ AI» переключают, какая подписка используется для общего VPN и для AI-маршрутов (Google/LLM). Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
+			E('table', { 'class': 'gs-table' },
+				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
+					.concat(subs.map(subRow))),
+			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ])
 		]);
-		wrap.appendChild(subCard);
+		wrap.appendChild(subsCard);
 
 		/* ===================== ACTIONS: sync / google check ===================== */
 		var listsOut = E('div', {});
@@ -257,11 +297,14 @@ return view.extend({
 			bypass: { label: 'Мимо VPN', klass: 'gs-warn',
 				hint: 'Реальный IP и часовой пояс ПК. Трафик напрямую или через zapret — mihomo не используется.' },
 			realtz: { label: 'Через VPN, часовой пояс ПК свой', klass: 'gs-ok',
-				hint: 'IP маскирован через mihomo, но часовой пояс самого ПК не трогается (GeoSync.ps1 на этом ПК выключен).' }
+				hint: 'IP маскирован через mihomo, но часовой пояс самого ПК не трогается (GeoSync.ps1 на этом ПК выключен).' },
+			ai: { label: 'Через AI-подписку', klass: 'gs-on',
+				hint: 'ВЕСЬ трафик устройства идёт через AI-подписку (сейчас: Германия). Отдельный туннель AI, VPN не прерывается.' }
 		};
-		var modeSel = E('select', { 'class': 'gs-input', 'style': 'width:180px' }, [
+		var modeSel = E('select', { 'class': 'gs-input', 'style': 'width:220px' }, [
 			E('option', { 'value': 'bypass' }, 'Мимо VPN (реальный IP)'),
-			E('option', { 'value': 'realtz' }, 'Через VPN, часовой пояс ПК свой')
+			E('option', { 'value': 'realtz' }, 'Через VPN, часовой пояс ПК свой'),
+			E('option', { 'value': 'ai' }, 'Через AI-подписку (весь трафик)')
 		]);
 		var ipIn = E('input', { 'class': 'gs-input', 'style': 'width:130px', 'placeholder': 'IP' });
 		var nameIn = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'Имя' });
@@ -288,8 +331,11 @@ return view.extend({
 		var devCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Персональные режимы устройств'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
-				'По умолчанию все устройства маскируются: IP идёт через mihomo, а часовой пояс каждого ПК настраивает его ОС (скрипт GeoSync.ps1). ' +
-				'Роутер часовой пояс ПК не меняет. Здесь задаются исключения по IP-маршрутизации (мимо VPN / через VPN).'),
+				'По умолчанию все устройства маскируются: IP идёт через mihomo, а часовой пояс каждого ПК настраивает его ОС. ' +
+				'Здесь задаются исключения: мимо VPN / через VPN / весь трафик через AI-подписку' +
+				(st.n_ai != null ? ' (сейчас через AI: ' + st.n_ai + ', туннель AI: ' + (st.ai_tun ? 'поднят' : 'нет') + ')' : '') + '.'),
+			(st.ai_tun && !st.ai_listener) ? E('div', { 'class': 'gs-hint', 'style': 'color:#d29922' },
+				'Внимание: слушатель AI-устройств (порт 7891) не активен — перезапустите mihomo один раз, когда будет удобно: sh /etc/init.d/mihomo restart. До этого устройства с режимом «Через AI» не получат трафик.') : E('div', {}),
 			devTable,
 			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ leaseSel, modeSel ]),
 			E('div', { 'class': 'gs-row' }, [ ipIn, nameIn,
@@ -325,7 +371,7 @@ return view.extend({
 
 	reload: function() {
 		var view = this;
-		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet() ]).then(function(all) {
+		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);

@@ -28,7 +28,7 @@
 
 set -u
 
-GM_VERSION="1.2.0"
+GM_VERSION="1.3.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -129,7 +129,10 @@ step2_apply() {
 #   status | leases | log | sync_lists | google
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
+#     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
 #   ai_sub_get | ai_sub_set <url>   (AI subscription / mihomo provider de5)
+#   subs_list | sub_add <name> <url> | sub_del <id>
+#   ai_sub_use <id> | vpn_sub_use <id>  (switch provider url from registry, no mihomo restart)
 # Device modes (per-device geo policy):
 #   bypass  - device routes DIRECT (real IP), beats fwmark+Mihomo; real tz (GeoSync off on PC)
 #   realtz  - device routes via mihomo (masked IP), but PC keeps real tz (GeoSync off on PC)
@@ -139,6 +142,10 @@ step2_apply() {
 
 DEVICES=/etc/geo-devices.list
 EXCL_OLD=/etc/geo-exclude.list   # legacy (ip name) -> migrated to DEVICES as bypass
+SUBS_FILE=/etc/geomask-subs.list # registry: id|name|url (one per line)
+AI_TUN_DEV=AI
+AI_TUN_IP=198.19.0.1
+AI_SOCKS_PORT=7891
 LOG=/root/geo-sync.log
 MIHOMO_API=http://127.0.0.1:9090
 MIHOMO_CONF=/etc/mihomo/config.yaml
@@ -209,13 +216,22 @@ cmd_status() {
   DEV_LIST="$DEV_LIST]"
   BYPASS=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"bypass"' | wc -l | tr -d ' ')
   REALTZ=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"realtz"' | wc -l | tr -d ' ')
+  N_AI=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"ai"' | wc -l | tr -d ' ')
   RULES=$(ip rule show | grep -c 'lookup main' || echo 0)
-  printf '{"vpn_node":"%s","vpn_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s}' \
+  _de5u=$(awk '/^  de5:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  _subu=$(awk '/^  sub:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  AI_SUB_ID=$(_sub_id_by_url "$_de5u" 2>/dev/null || echo '')
+  VPN_SUB_ID=$(_sub_id_by_url "$_subu" 2>/dev/null || echo '')
+  if ip link show "$AI_TUN_DEV" >/dev/null 2>&1; then AI_TUN=1; else AI_TUN=0; fi
+  if netstat -lntp 2>/dev/null | grep -q ':7891'; then AI_LST=1; else AI_LST=0; fi
+  printf '{"vpn_node":"%s","vpn_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","ai_url":"%s","vpn_url":"%s"}' \
     "$(json_esc "$VPN_NODE")" "$(_node_cc "$VPN_NODE")" \
     "$(json_esc "$AI_NODE")" "$(_node_cc "$AI_NODE")" \
     "$(json_esc "$GLOBAL")" "$LCRON" "$V6" "$(json_esc "$DOH")" \
     "$AI_RC" "$MT_RC" "$(json_esc "$GOOGLE_CC")" "$(json_esc "$SYNC_AT")" \
-    "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES"
+    "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES" \
+    "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPN_SUB_ID")" \
+    "$(json_esc "$_de5u")" "$(json_esc "$_subu")"
 }
 
 # country fragment from a node name (flag emoji or RU word) - coarse, for display
@@ -322,7 +338,7 @@ cmd_dev_add() {
   IP="$1"; MODE="$2"; MAC="$3"; NAME="${4:-$IP}"
   case "$IP" in ''|*[!0-9.]*) printf '{"error":"bad ip"}'; return 1 ;; esac
   echo "$IP" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || { printf '{"error":"bad ip"}'; return 1; }
-  case "$MODE" in bypass|realtz) ;; *) printf '{"error":"bad mode"}'; return 1 ;; esac
+  case "$MODE" in bypass|realtz|ai) ;; *) printf '{"error":"bad mode"}'; return 1 ;; esac
   NAME=$(printf '%s' "$NAME" | tr -d '"\\"\n\r\t' | head -c 64)
   mkdir -p "$(dirname "$DEVICES")"; touch "$DEVICES"
   # replace existing entry for this ip
@@ -356,22 +372,113 @@ cmd_dev_del() {
   cmd_status
 }
 
-# (re)apply routing for all managed devices: bypass -> direct (32694), realtz -> via mihomo (no rule)
+# (re)apply routing for all managed devices:
+#   bypass -> direct (32694) | realtz -> normal mihomo path | ai -> AI tunnel (32670 -> table 101 -> dev AI)
 _apply_routing() {
-  # drop stale per-device direct rules first (we re-add for bypass)
+  # drop stale per-device rules first (we re-add per mode)
   if [ -f "$DEVICES" ]; then
     while read -r dip dmode dname; do
       case "$dip" in ''|'#'*) continue ;; esac
       ip rule del from "$dip" lookup main 2>/dev/null || true
+      ip rule del from "$dip" lookup 101 2>/dev/null || true
     done < "$DEVICES"
     while read -r dip dmode dname; do
       case "$dip" in ''|'#'*) continue ;; esac
       if [ "$dmode" = "bypass" ]; then
         ip rule show | grep -q "from $dip" || ip rule add priority 32694 from "$dip" lookup main
+      elif [ "$dmode" = "ai" ]; then
+        _ai_tun_ensure
+        ip rule show | grep -q "from $dip" || ip rule add priority 32670 from "$dip" lookup 101
       fi
     done < "$DEVICES"
   fi
   _hotplug_sync
+}
+
+# provision AI tunnel on first use: hev-socks5-tunnel instance #2 (own TUN "AI",
+# socks 127.0.0.1:7891) + network iface + firewall zone. The WORKING main tunnel
+# is never restarted - hev-ai is a separate init.d service.
+_ai_tun_ensure() {
+  mkdir -p /etc/hev-socks5-tunnel
+  if [ ! -f /etc/hev-socks5-tunnel/ai.yml ]; then
+    cat > /etc/hev-socks5-tunnel/ai.yml <<'EOF'
+tunnel:
+  name: AI
+  mtu: 8500
+  multi-queue: false
+  ipv4: 198.19.0.1
+socks5:
+  port: 7891
+  address: 127.0.0.1
+  udp: 'udp'
+EOF
+  fi
+  if [ ! -x /etc/init.d/hev-ai ]; then
+    cat > /etc/init.d/hev-ai <<'EOF'
+#!/bin/sh /etc/rc.common
+USE_PROCD=1
+START=99
+start_service() {
+  procd_open_instance
+  procd_set_param command /usr/bin/hev-socks5-tunnel /etc/hev-socks5-tunnel/ai.yml
+  procd_set_param file /etc/hev-socks5-tunnel/ai.yml
+  procd_set_param limits core="unlimited"
+  procd_set_param limits nofile="1000000 1000000"
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_set_param respawn
+  procd_close_instance
+}
+EOF
+    chmod +x /etc/init.d/hev-ai
+  fi
+  ip link show "$AI_TUN_DEV" >/dev/null 2>&1 || {
+    /etc/init.d/hev-ai enable >/dev/null 2>&1
+    /etc/init.d/hev-ai start >/dev/null 2>&1
+    _i=0
+    while [ $_i -lt 10 ] && ! ip link show "$AI_TUN_DEV" >/dev/null 2>&1; do
+      sleep 1; _i=$((_i+1))
+    done
+  }
+  uci -q get network.AI >/dev/null 2>&1 || {
+    uci set network.AI=interface
+    uci set network.AI.proto='none'
+    uci set network.AI.device="$AI_TUN_DEV"
+    uci commit network
+  }
+  if ! uci -q show firewall 2>/dev/null | grep -q "name='AI'"; then
+    # clone the working Mihomo zone + its forwardings for the AI tunnel
+    ZN=''
+    for s in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=zone$/\1/p'); do
+      [ "$(uci -q get "$s.name")" = "Mihomo" ] && { ZN="$s"; break; }
+    done
+    if [ -n "$ZN" ]; then
+      NEW=$(uci add firewall zone)
+      uci set "firewall.$NEW.name=AI"
+      uci set "firewall.$NEW.input=$(uci -q get "$ZN.input")"
+      uci set "firewall.$NEW.output=$(uci -q get "$ZN.output")"
+      uci set "firewall.$NEW.forward=$(uci -q get "$ZN.forward")"
+      uci set "firewall.$NEW.masq=$(uci -q get "$ZN.masq")"
+      uci set "firewall.$NEW.mtu_fix=$(uci -q get "$ZN.mtu_fix")"
+      uci set "firewall.$NEW.network=AI"
+      for f in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=forwarding$/\1/p'); do
+        [ "$(uci -q get "$f.src")" = "lan" ] && [ "$(uci -q get "$f.dest")" = "Mihomo" ] || continue
+        NF=$(uci add firewall forwarding)
+        uci set "firewall.$NF.src=lan"
+        uci set "firewall.$NF.dest=AI"
+      done
+      for f in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=forwarding$/\1/p'); do
+        [ "$(uci -q get "$f.src")" = "Mihomo" ] && [ "$(uci -q get "$f.dest")" = "lan" ] || continue
+        NF=$(uci add firewall forwarding)
+        uci set "firewall.$NF.src=AI"
+        uci set "firewall.$NF.dest=lan"
+      done
+      uci commit firewall
+      /etc/init.d/firewall reload >/dev/null 2>&1
+    fi
+  fi
+  ip route replace table 101 default dev "$AI_TUN_DEV" 2>/dev/null
+  echo "$(date +%FT%T) AI_TUN provisioned" >> "$LOG"
 }
 
 _hotplug_sync() {
@@ -422,9 +529,10 @@ cmd_ai_sub_get() {
   printf '{"url":"%s"}' "$(json_esc "$u")"
 }
 
-# set AI subscription URL at runtime: rewrite de5 provider url + hot-refresh via API (no mihomo restart)
-cmd_ai_sub_set() {
-  URL="$1"
+# patch provider url in mihomo config + hot-refresh via API (no mihomo restart)
+# _mihomo_set_provider <provider> <url>
+_mihomo_set_provider() {
+  PN="$1"; URL="$2"
   case "$URL" in
     http://*|https://*) ;;
     *) printf '{"error":"url must start with http:// or https://"}'; return 1 ;;
@@ -433,12 +541,12 @@ cmd_ai_sub_set() {
     printf '{"error":"url contains forbidden characters"}'; return 1
   fi
   [ -f "$MIHOMO_CONF" ] || { printf '{"error":"mihomo config missing"}'; return 1; }
-  grep -q '^  de5:' "$MIHOMO_CONF" || { printf '{"error":"de5 provider not found in config"}'; return 1; }
-  cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_aisub_$(date +%s)"
-  TMPF="$MIHOMO_CONF.aisub"
-  if ! awk -v nu="$URL" '
+  grep -q "^  $PN:" "$MIHOMO_CONF" || { printf '{"error":"provider %s not found in config"}' "$(json_esc "$PN")"; return 1; }
+  cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_subswitch_$(date +%s)"
+  TMPF="$MIHOMO_CONF.subsw"
+  if ! awk -v pn="^  $PN:" -v nu="$URL" '
     BEGIN { f=0; done=0 }
-    /^  de5:/ { f=1; print; next }
+    $0 ~ pn { f=1; print; next }
     f && /^    url:/ { print "    url: \"" nu "\""; done=1; next }
     f && /^  [A-Za-z0-9_-]+:/ { f=0 }
     f && /^[A-Za-z]/ { f=0 }
@@ -446,7 +554,7 @@ cmd_ai_sub_set() {
     END { exit done ? 0 : 1 }
   ' "$MIHOMO_CONF" > "$TMPF"; then
     rm -f "$TMPF"
-    printf '{"error":"failed to patch de5 url"}'; return 1
+    printf '{"error":"failed to patch provider url"}'; return 1
   fi
   if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
     mv -f "$TMPF" "$MIHOMO_CONF"
@@ -454,17 +562,93 @@ cmd_ai_sub_set() {
     rm -f "$TMPF"
     printf '{"error":"mihomo config test failed - old config kept"}'; return 1
   fi
-  if curl -s -m8 -f -X PUT "$MIHOMO_API/providers/proxies/de5" \
+  if curl -s -m8 -f -X PUT "$MIHOMO_API/providers/proxies/$PN" \
       -H 'Content-Type: application/json' \
       -d "{\"url\":\"$URL\",\"vehicle_type\":\"http\"}" >/dev/null 2>&1; then
     WARN=''
   else
-    WARN='provider refresh failed - restart mihomo later'
+    WARN='provider refresh failed - reload mihomo later'
   fi
-  echo "$(date +%FT%T) AI_SUB set $URL" >> "$LOG"
+  echo "$(date +%FT%T) PROVIDER $PN <- $URL" >> "$LOG"
+  printf '{"ok":true,"provider":"%s","url":"%s","warn":"%s"}' \
+    "$(json_esc "$PN")" "$(json_esc "$URL")" "$(json_esc "$WARN")"
+}
+
+cmd_ai_sub_set() {
+  _mihomo_set_provider de5 "$1"
+}
+
+# ---- subscription registry (id|name|url) ----
+_subs_json() {
+  FIRST=1
+  printf '['
+  [ -f "$SUBS_FILE" ] || { printf ']'; return; }
+  while IFS='|' read -r sid sname surl; do
+    case "$sid" in ''|'#'*) continue ;; esac
+    [ "$FIRST" -eq 1 ] || printf ','
+    printf '{"id":"%s","name":"%s","url":"%s"}' \
+      "$(json_esc "${sid:-}")" "$(json_esc "${sname:-}")" "$(json_esc "${surl:-}")"
+    FIRST=0
+  done < "$SUBS_FILE"
+  printf ']'
+}
+
+_find_sub_url() { # _find_sub_url <id> -> url on stdout, rc=1 if not found
+  [ -f "$SUBS_FILE" ] || return 1
+  awk -F'|' -v id="$1" '$1==id {print $3; found=1; exit} END{exit found?0:1}' "$SUBS_FILE"
+}
+
+_sub_id_by_url() { # _sub_id_by_url <url> -> id, rc=1 if not found
+  [ -f "$SUBS_FILE" ] || return 1
+  awk -F'|' -v u="$1" '$3==u {print $1; found=1; exit} END{exit found?0:1}' "$SUBS_FILE"
+}
+
+cmd_subs_list() {
+  printf '{"subs":%s}' "$(_subs_json)"
+}
+
+cmd_sub_add() {
+  NAME="$1"; URL="$2"
+  case "$URL" in
+    http://*|https://*) ;;
+    *) printf '{"error":"url must start with http:// or https://"}'; return 1 ;;
+  esac
+  if printf '%s' "$URL" | grep -qE '[[:space:]"]'; then
+    printf '{"error":"url contains forbidden characters"}'; return 1
+  fi
+  [ -n "$NAME" ] || NAME=$(printf '%s' "$URL" | sed 's|^https\?://||; s|/.*||')
+  NAME=$(printf '%s' "$NAME" | tr -d '|' | head -c 48)
+  ID=$(date +%s | tail -c 9)
+  while grep -q "^$ID|" "$SUBS_FILE" 2>/dev/null; do ID=$((ID+1)); done
+  echo "$ID|$NAME|$URL" >> "$SUBS_FILE"
+  echo "$(date +%FT%T) SUB add $ID $NAME" >> "$LOG"
+  printf '{"ok":true,"subs":%s}' "$(_subs_json)"
+}
+
+cmd_sub_del() {
+  ID="$1"
+  case "$ID" in ''|*[!0-9]*) printf '{"error":"bad id"}'; return 1 ;; esac
+  [ -f "$SUBS_FILE" ] || { printf '{"error":"registry empty"}'; return 1; }
+  grep -v "^$ID|" "$SUBS_FILE" > "$SUBS_FILE.tmp" || true
+  mv -f "$SUBS_FILE.tmp" "$SUBS_FILE"
+  echo "$(date +%FT%T) SUB del $ID" >> "$LOG"
+  printf '{"ok":true,"subs":%s}' "$(_subs_json)"
+}
+
+cmd_ai_sub_use() {
+  ID="$1"
+  URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
+  _mihomo_set_provider de5 "$URL"
   AI_NODE=$(_grp_node AI)
-  printf '{"ok":true,"url":"%s","ai_node":"%s","warn":"%s"}' \
-    "$(json_esc "$URL")" "$(json_esc "$AI_NODE")" "$(json_esc "$WARN")"
+  printf '{"ok":true,"url":"%s","ai_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$AI_NODE")"
+}
+
+cmd_vpn_sub_use() {
+  ID="$1"
+  URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
+  _mihomo_set_provider sub "$URL"
+  VPN_NODE=$(_grp_node VPN)
+  printf '{"ok":true,"url":"%s","vpn_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$VPN_NODE")"
 }
 
 case "$1" in
@@ -479,6 +663,11 @@ case "$1" in
   dev_del)    cmd_dev_del "$2" ;;
   ai_sub_get) cmd_ai_sub_get ;;
   ai_sub_set) cmd_ai_sub_set "$2" ;;
+  subs_list)  cmd_subs_list ;;
+  sub_add)    cmd_sub_add "$2" "$3" ;;
+  sub_del)    cmd_sub_del "$2" ;;
+  ai_sub_use)   cmd_ai_sub_use "$2" ;;
+  vpn_sub_use)  cmd_vpn_sub_use "$2" ;;
   *) printf '{"error":"usage"}'; exit 1 ;;
 esac
 
@@ -505,6 +694,11 @@ list_methods() {
 	json_add_object "dev_del";    json_add_string "ip" "string"; json_close_object
 	json_add_object "ai_sub_get"; json_close_object
 	json_add_object "ai_sub_set"; json_add_string "url" "string"; json_close_object
+	json_add_object "subs_list";  json_close_object
+	json_add_object "sub_add";    json_add_string "name" "string"; json_add_string "url" "string"; json_close_object
+	json_add_object "sub_del";    json_add_string "id" "string"; json_close_object
+	json_add_object "ai_sub_use";   json_add_string "id" "string"; json_close_object
+	json_add_object "vpn_sub_use";  json_add_string "id" "string"; json_close_object
 	json_dump
 }
 
@@ -525,6 +719,11 @@ call_method() {
 		dev_del)    json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;
 		ai_sub_get) "$BACKEND" ai_sub_get ;;
 		ai_sub_set) json_get_var url url; "$BACKEND" ai_sub_set "$url" ;;
+		subs_list)  "$BACKEND" subs_list ;;
+		sub_add)    json_get_var name name; json_get_var url url; "$BACKEND" sub_add "$name" "$url" ;;
+		sub_del)    json_get_var id id; "$BACKEND" sub_del "$id" ;;
+		ai_sub_use)   json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;
+		vpn_sub_use)  json_get_var id id; "$BACKEND" vpn_sub_use "$id" ;;
 		*) echo '{"error":"unknown method"}'; return 1 ;;
 	esac
 }
@@ -552,13 +751,13 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "ai_sub_get" ],
+				"geo-sync": [ "status", "leases", "log", "ai_sub_get", "subs_list" ],
 				"system": [ "info" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set" ]
+				"geo-sync": [ "sync_lists", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use" ]
 			}
 		}
 	}
@@ -600,6 +799,11 @@ var callDevAdd = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { 
 var callDevDel = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
 var callAiSubGet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
 var callAiSubSet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
+var callSubsList = rpc.declare({ object: 'geo-sync', method: 'subs_list', expect: {} });
+var callSubAdd   = rpc.declare({ object: 'geo-sync', method: 'sub_add',   params: { name: null, url: null }, expect: {} });
+var callSubDel   = rpc.declare({ object: 'geo-sync', method: 'sub_del',   params: { id: null }, expect: {} });
+var callAiSubUse   = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use',   params: { id: null }, expect: {} });
+var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  params: { id: null }, expect: {} });
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -697,12 +901,13 @@ var E = (function(raw) {
 return view.extend({
 	load: function() {
 		injectStyle();
-		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet() ]);
+		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList() ]);
 	},
 
 	render: function(all) {
 		var st = all[0] || {}, leases = (all[1] || {}).leases || [], lg = (all[2] || {}).log || '';
 		var aicfg = all[3] || {};
+		var subs = (all[4] || {}).subs || [];
 		var view = this;
 		var wrap = E('div', { 'class': 'gs-wrap' });
 
@@ -737,34 +942,68 @@ return view.extend({
 		]);
 		wrap.appendChild(hero);
 
-		/* ===================== AI subscription (de5) ===================== */
-		var aiUrlIn = E('input', { 'class': 'gs-input', 'style': 'flex:1;min-width:280px',
-			'placeholder': 'https://... подписка AI (de5)', 'value': aicfg.url || '' });
-		var btnAiApply = E('button', { 'class': 'gs-btn gs-btn-primary',
+		/* ===================== Subscriptions registry ===================== */
+		function maskUrl(u) {
+			if (!u) return '—';
+			return String(u).replace(/\/[^/]*$/, '/...');
+		}
+		function subRow(s) {
+			var isActiveAi = (st.ai_sub && st.ai_sub === s.id);
+			var isActiveVpn = (st.vpn_sub && st.vpn_sub === s.id);
+			var tags = [];
+			if (isActiveVpn) tags.push(E('span', { 'class': 'gs-badge gs-on' }, 'VPN'));
+			if (isActiveAi) tags.push(E('span', { 'class': 'gs-badge gs-ok' }, 'AI'));
+			return E('tr', {}, [
+				E('td', {}, s.name || s.id),
+				E('td', { 'style': 'font-family:monospace;font-size:12px' }, maskUrl(s.url)),
+				E('td', {}, tags.length ? tags : '—'),
+				E('td', { 'style': 'white-space:nowrap' }, [
+					E('button', { 'class': 'gs-btn' + (isActiveVpn ? '' : ' gs-btn-primary'),
+						'title': 'Использовать эту подписку для общего VPN',
+						'disabled': isActiveVpn ? 'disabled' : null,
+						'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } }, '→ VPN'),
+					' ',
+					E('button', { 'class': 'gs-btn' + (isActiveAi ? '' : ' gs-btn-primary'),
+						'title': 'Использовать эту подписку для AI-маршрутов',
+						'disabled': isActiveAi ? 'disabled' : null,
+						'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } }, '→ AI'),
+					' ',
+					E('button', { 'class': 'gs-btn gs-btn-warn',
+						'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } }, 'Удалить')
+				])
+			]);
+		}
+		var subNameIn = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'Например: США' });
+		var subUrlIn  = E('input', { 'class': 'gs-input', 'style': 'flex:1;min-width:260px', 'placeholder': 'https://... ссылка подписки' });
+		var btnSubAdd = E('button', { 'class': 'gs-btn gs-btn-primary',
 			'click': function() {
-				var u = (aiUrlIn.value || '').trim();
+				var u = (subUrlIn.value || '').trim();
 				if (!/^https?:\/\//.test(u)) {
 					ui.addNotification(null, E('p', {}, 'Ссылка должна начинаться с http:// или https://'), 'warning');
 					return;
 				}
-				btnAiApply.disabled = true; btnAiApply.textContent = 'Применение…';
-				callAiSubSet({ url: u }).then(function(res) {
-					btnAiApply.disabled = false; btnAiApply.textContent = 'Применить';
+				btnSubAdd.disabled = true; btnSubAdd.textContent = 'Добавление…';
+				callSubAdd({ name: subNameIn.value || '', url: u }).then(function(res) {
+					btnSubAdd.disabled = false; btnSubAdd.textContent = 'Добавить';
 					if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
-					ui.addNotification(null, E('p', {}, 'AI-подписка обновлена' + (res && res.warn ? ' (' + res.warn + ')' : '')), 'info');
+					subNameIn.value = ''; subUrlIn.value = '';
+					ui.addNotification(null, E('p', {}, 'Подписка добавлена в реестр'), 'info');
 					return view.reload();
 				}).catch(function(e) {
-					btnAiApply.disabled = false; btnAiApply.textContent = 'Применить';
+					btnSubAdd.disabled = false; btnSubAdd.textContent = 'Добавить';
 					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
 				});
-			} }, 'Применить');
-		var subCard = E('div', { 'class': 'gs-card' }, [
-			E('h3', {}, 'Подписка AI (de5)'),
+			} }, 'Добавить');
+		var subsCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Подписки'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
-				'Ссылка немецкой подписки для Google/OpenAI/Claude. Применение обновляет провайдера de5 в работающем mihomo через API — без перезапуска, VPN не прерывается.'),
-			E('div', { 'class': 'gs-row' }, [ aiUrlIn, btnAiApply ])
+				'Реестр подписок. Кнопки «→ VPN»/«→ AI» переключают, какая подписка используется для общего VPN и для AI-маршрутов (Google/LLM). Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
+			E('table', { 'class': 'gs-table' },
+				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
+					.concat(subs.map(subRow))),
+			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ])
 		]);
-		wrap.appendChild(subCard);
+		wrap.appendChild(subsCard);
 
 		/* ===================== ACTIONS: sync / google check ===================== */
 		var listsOut = E('div', {});
@@ -841,11 +1080,14 @@ return view.extend({
 			bypass: { label: 'Мимо VPN', klass: 'gs-warn',
 				hint: 'Реальный IP и часовой пояс ПК. Трафик напрямую или через zapret — mihomo не используется.' },
 			realtz: { label: 'Через VPN, часовой пояс ПК свой', klass: 'gs-ok',
-				hint: 'IP маскирован через mihomo, но часовой пояс самого ПК не трогается (GeoSync.ps1 на этом ПК выключен).' }
+				hint: 'IP маскирован через mihomo, но часовой пояс самого ПК не трогается (GeoSync.ps1 на этом ПК выключен).' },
+			ai: { label: 'Через AI-подписку', klass: 'gs-on',
+				hint: 'ВЕСЬ трафик устройства идёт через AI-подписку (сейчас: Германия). Отдельный туннель AI, VPN не прерывается.' }
 		};
-		var modeSel = E('select', { 'class': 'gs-input', 'style': 'width:180px' }, [
+		var modeSel = E('select', { 'class': 'gs-input', 'style': 'width:220px' }, [
 			E('option', { 'value': 'bypass' }, 'Мимо VPN (реальный IP)'),
-			E('option', { 'value': 'realtz' }, 'Через VPN, часовой пояс ПК свой')
+			E('option', { 'value': 'realtz' }, 'Через VPN, часовой пояс ПК свой'),
+			E('option', { 'value': 'ai' }, 'Через AI-подписку (весь трафик)')
 		]);
 		var ipIn = E('input', { 'class': 'gs-input', 'style': 'width:130px', 'placeholder': 'IP' });
 		var nameIn = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'Имя' });
@@ -872,8 +1114,11 @@ return view.extend({
 		var devCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Персональные режимы устройств'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
-				'По умолчанию все устройства маскируются: IP идёт через mihomo, а часовой пояс каждого ПК настраивает его ОС (скрипт GeoSync.ps1). ' +
-				'Роутер часовой пояс ПК не меняет. Здесь задаются исключения по IP-маршрутизации (мимо VPN / через VPN).'),
+				'По умолчанию все устройства маскируются: IP идёт через mihomo, а часовой пояс каждого ПК настраивает его ОС. ' +
+				'Здесь задаются исключения: мимо VPN / через VPN / весь трафик через AI-подписку' +
+				(st.n_ai != null ? ' (сейчас через AI: ' + st.n_ai + ', туннель AI: ' + (st.ai_tun ? 'поднят' : 'нет') + ')' : '') + '.'),
+			(st.ai_tun && !st.ai_listener) ? E('div', { 'class': 'gs-hint', 'style': 'color:#d29922' },
+				'Внимание: слушатель AI-устройств (порт 7891) не активен — перезапустите mihomo один раз, когда будет удобно: sh /etc/init.d/mihomo restart. До этого устройства с режимом «Через AI» не получат трафик.') : E('div', {}),
 			devTable,
 			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ leaseSel, modeSel ]),
 			E('div', { 'class': 'gs-row' }, [ ipIn, nameIn,
@@ -909,7 +1154,7 @@ return view.extend({
 
 	reload: function() {
 		var view = this;
-		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet() ]).then(function(all) {
+		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);
@@ -999,6 +1244,13 @@ write_mihomo_config() {
     printf '%s\n' 'profile:'
     printf '%s\n' '  store-selected: true'
     printf '%s\n' '  store-fake-ip: true'
+    printf '\n'
+    printf '%s\n' 'listeners:'
+    printf '%s\n' '  ai-devices:'
+    printf '%s\n' '    type: mixed'
+    printf '%s\n' '    port: 7891'
+    printf '%s\n' '    listen: 127.0.0.1'
+    printf '%s\n' '    proxy: AI'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
     printf '%s\n' '  sub:'
@@ -1704,6 +1956,9 @@ dashboard() {
   else
     _row "Geo LuCI" "${C_R}не установлена${NC}"
   fi
+  if ip link show AI >/dev/null 2>&1; then _ait="${C_G}поднят${NC}"; else _ait="${C_DIM}нет${NC}"; fi
+  _naic=$(grep -c ' ai ' "$(P /etc/geo-devices.list)" 2>/dev/null)
+  _row "AI-туннель" "$_ait${_naic:+ · устройств: ${_naic:-0}}"
   _mt=$(grep -c 'DOMAIN-SUFFIX' "$(P /etc/mihomo/ruleset/mtrickle.yaml)" 2>/dev/null)
   _row "Sync правил" "${_mt:-0} в mtrickle.yaml"
   if [ -f "$(P /root/.geomask-norestart)" ]; then

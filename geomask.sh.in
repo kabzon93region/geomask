@@ -28,7 +28,7 @@
 
 set -u
 
-GM_VERSION="1.2.0"
+GM_VERSION="1.3.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -218,6 +218,13 @@ write_mihomo_config() {
     printf '%s\n' 'profile:'
     printf '%s\n' '  store-selected: true'
     printf '%s\n' '  store-fake-ip: true'
+    printf '\n'
+    printf '%s\n' 'listeners:'
+    printf '%s\n' '  ai-devices:'
+    printf '%s\n' '    type: mixed'
+    printf '%s\n' '    port: 7891'
+    printf '%s\n' '    listen: 127.0.0.1'
+    printf '%s\n' '    proxy: AI'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
     printf '%s\n' '  sub:'
@@ -512,6 +519,9 @@ dashboard() {
   else
     _row "Geo LuCI" "${C_R}не установлена${NC}"
   fi
+  if ip link show AI >/dev/null 2>&1; then _ait="${C_G}поднят${NC}"; else _ait="${C_DIM}нет${NC}"; fi
+  _naic=$(grep -c ' ai ' "$(P /etc/geo-devices.list)" 2>/dev/null)
+  _row "AI-туннель" "$_ait${_naic:+ · устройств: ${_naic:-0}}"
   _mt=$(grep -c 'DOMAIN-SUFFIX' "$(P /etc/mihomo/ruleset/mtrickle.yaml)" 2>/dev/null)
   _row "Sync правил" "${_mt:-0} в mtrickle.yaml"
   if [ -f "$(P /root/.geomask-norestart)" ]; then

@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.0"
+GM_VERSION="1.5.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -477,6 +477,18 @@ EOF
         uci set "firewall.$NF.dest=lan"
       done
       uci commit firewall
+      # uci forwarding lan->AI alone does NOT generate an accept rule (the zone
+      # subnet is a /32 assigned by the TUN itself, so fw4 leaves accept_to_AI
+      # empty and forwarded LAN packets are dropped). Drop-in adds the accept.
+      mkdir -p /usr/share/nftables.d/ruleset-post
+      cat > /usr/share/nftables.d/ruleset-post/99-ai-accept.nft <<'EOF'
+table inet fw4 {
+    chain accept_to_AI {
+        iifname "br-lan" oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
+        iifname "Wireguard" oifname "AI" counter accept comment "custom: WG peers to AI tunnel"
+    }
+}
+EOF
       /etc/init.d/firewall reload >/dev/null 2>&1
     fi
   fi

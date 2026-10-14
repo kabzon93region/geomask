@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.4.2"
+GM_VERSION="1.4.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -901,6 +901,15 @@ var STYLE = [
 	'.gs-log{background:#0d1117;color:#8b949e;font-family:monospace;font-size:12px;padding:10px;border-radius:7px;max-height:220px;overflow:auto;white-space:pre-wrap}',
 	'.gs-table{width:100%;border-collapse:collapse;font-size:13px}',
 	'.gs-table td,.gs-table th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left}',
+	'.gs-subs{width:100%;table-layout:fixed}',
+	'.gs-subs td{overflow-wrap:anywhere;vertical-align:middle}',
+	'.gs-subs td:first-child{width:110px;font-weight:600}',
+	'.gs-subs td:nth-child(2){font-family:monospace;font-size:12px;color:#8b949e}',
+	'.gs-subs td:nth-child(3){width:110px}',
+	'.gs-subs td:last-child{width:200px;white-space:nowrap}',
+	'.gs-subs .gs-btn-use{background:#21262d;border-color:#30363d;color:#c9d1d9;padding:5px 10px;margin-right:4px}',
+	'.gs-subs .gs-btn-use:hover{background:#30363d}',
+	'.gs-subs .gs-btn-warn{padding:5px 10px}',
 	'.gs-input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;font-size:13px}',
 	'.gs-hint{color:#8b949e;font-size:12px;margin-top:6px}',
 	'.gs-out{background:#0d1117;color:#8b949e;font-family:monospace;font-size:12px;padding:9px 11px;border-radius:7px;margin-top:10px;white-space:pre-wrap;max-height:130px;overflow:auto}'
@@ -999,28 +1008,25 @@ return view.extend({
 			return String(u).replace(/\/[^/]*$/, '/...');
 		}
 		function subRow(s) {
-			var isActiveAi = (st.ai_sub && st.ai_sub === s.id);
-			var isActiveVpn = (st.vpn_sub && st.vpn_sub === s.id);
-			var tags = [];
-			if (isActiveVpn) tags.push(E('span', { 'class': 'gs-badge gs-on' }, 'VPN'));
-			if (isActiveAi) tags.push(E('span', { 'class': 'gs-badge gs-ok' }, 'AI'));
+			var isVpn = !!(st.vpn_sub && st.vpn_sub === s.id);
+			var isAi = !!(st.ai_sub && st.ai_sub === s.id);
+			var dest = '—';
+			if (isVpn && isAi) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN + AI');
+			else if (isVpn) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN');
+			else if (isAi) dest = E('span', { 'class': 'gs-badge gs-ok' }, 'AI');
+			var bV = { 'class': 'gs-btn gs-btn-use', 'title': 'Переключить общий VPN на эту подписку', 'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } };
+			var bA = { 'class': 'gs-btn gs-btn-use', 'title': 'Переключить AI-маршруты на эту подписку', 'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } };
+			var bD = { 'class': 'gs-btn gs-btn-warn', 'title': 'Убрать из реестра', 'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } };
+			if (isVpn) bV['disabled'] = 'disabled';
+			if (isAi) bA['disabled'] = 'disabled';
 			return E('tr', {}, [
 				E('td', {}, s.name || s.id),
-				E('td', { 'style': 'font-family:monospace;font-size:12px' }, maskUrl(s.url)),
-				E('td', {}, tags.length ? tags : '—'),
-				E('td', { 'style': 'white-space:nowrap' }, [
-					E('button', { 'class': 'gs-btn' + (isActiveVpn ? '' : ' gs-btn-primary'),
-						'title': 'Использовать эту подписку для общего VPN',
-						'disabled': isActiveVpn ? 'disabled' : null,
-						'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } }, '→ VPN'),
-					' ',
-					E('button', { 'class': 'gs-btn' + (isActiveAi ? '' : ' gs-btn-primary'),
-						'title': 'Использовать эту подписку для AI-маршрутов',
-						'disabled': isActiveAi ? 'disabled' : null,
-						'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } }, '→ AI'),
-					' ',
-					E('button', { 'class': 'gs-btn gs-btn-warn',
-						'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } }, 'Удалить')
+				E('td', { 'class': 'gs-subs-url' }, maskUrl(s.url)),
+				E('td', {}, dest),
+				E('td', { 'class': 'gs-subs-actions' }, [
+					E('button', bV, '→ VPN'),
+					E('button', bA, '→ AI'),
+					E('button', bD, 'Удалить')
 				])
 			]);
 		}
@@ -1062,8 +1068,8 @@ return view.extend({
 		var subsCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Подписки'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
-				'Реестр подписок. Кнопки «→ VPN»/«→ AI» переключают, какая подписка используется для общего VPN и для AI-маршрутов (Google/LLM). Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
-			E('table', { 'class': 'gs-table' },
+				'Реестр подписок. В колонке «Назначение» показано, чем подписка занята СЕЙЧАС; кнопки «→ VPN»/«→ AI» переключают соответствующий маршрут на эту подписку (активная кнопка неактивна). Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
+			E('table', { 'class': 'gs-table gs-subs' },
 				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
 					.concat(subs.map(subRow))),
 			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ]),

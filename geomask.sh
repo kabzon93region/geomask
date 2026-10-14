@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.1"
+GM_VERSION="1.5.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -603,14 +603,25 @@ _mihomo_set_provider() {
     rm -f "$TMPF"
     printf '{"error":"mihomo config test failed - old config kept"}'; return 1
   fi
-  if curl -s -m8 -f -X PUT "$MIHOMO_API/providers/proxies/$PN" \
+  # apply to the RUNNING mihomo without restart:
+  # PUT /configs with config path forces re-read of the config file,
+  # which re-fetches the provider subscription (old node list replaced)
+  if curl -s -m15 -f -X PUT "$MIHOMO_API/configs" \
       -H 'Content-Type: application/json' \
-      -d "{\"url\":\"$URL\",\"vehicle_type\":\"http\"}" >/dev/null 2>&1; then
+      -d "{\"path\":\"$MIHOMO_CONF\"}" >/dev/null 2>&1; then
     WARN=''
   else
-    WARN='provider refresh failed - reload mihomo later'
+    WARN='mihomo reload failed - reload via service/restart needed'
   fi
-  echo "$(date +%FT%T) PROVIDER $PN <- $URL" >> "$LOG"
+  # verify the running provider actually serves nodes after reload
+  sleep 2
+  _n=$(curl -s -m6 "$MIHOMO_API/providers/proxies/$PN" 2>/dev/null \
+       | tr ',' '\n' | grep -c "\"provider-name\":\"$PN\"")
+  case "${_n:-0}" in ''|*[!0-9]*) _n=0 ;; esac
+  if [ "$_n" -eq 0 ]; then
+    WARN='subscription returned no nodes - check the link, mihomo kept previous node list'
+  fi
+  echo "$(date +%FT%T) PROVIDER $PN <- $URL (nodes=$_n)" >> "$LOG"
   printf '{"ok":true,"provider":"%s","url":"%s","warn":"%s"}' \
     "$(json_esc "$PN")" "$(json_esc "$URL")" "$(json_esc "$WARN")"
 }
@@ -1479,9 +1490,10 @@ write_mihomo_config() {
 # runtime provider refresh through mihomo API - NO restart, VPN stays up
 api_refresh_provider() { # api_refresh_provider <name> <url>
   [ -n "${2:-}" ] || return 1
-  curl -s -m8 -f -X PUT "http://127.0.0.1:9090/providers/proxies/$1" \
+  # re-read config from file (re-fetches provider subscription)
+  curl -s -m15 -f -X PUT "http://127.0.0.1:9090/configs" \
     -H 'Content-Type: application/json' \
-    -d "{\"url\":\"$2\",\"vehicle_type\":\"http\"}" >/dev/null 2>&1
+    -d "{\"path\":\"/etc/mihomo/config.yaml\"}" >/dev/null 2>&1
 }
 
 # ============================================================ SAFETY layer

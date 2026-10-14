@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.1"
+GM_VERSION="1.5.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -365,9 +365,10 @@ write_mihomo_config() {
 # runtime provider refresh through mihomo API - NO restart, VPN stays up
 api_refresh_provider() { # api_refresh_provider <name> <url>
   [ -n "${2:-}" ] || return 1
-  curl -s -m8 -f -X PUT "http://127.0.0.1:9090/providers/proxies/$1" \
+  # re-read config from file (re-fetches provider subscription)
+  curl -s -m15 -f -X PUT "http://127.0.0.1:9090/configs" \
     -H 'Content-Type: application/json' \
-    -d "{\"url\":\"$2\",\"vehicle_type\":\"http\"}" >/dev/null 2>&1
+    -d "{\"path\":\"/etc/mihomo/config.yaml\"}" >/dev/null 2>&1
 }
 
 # ============================================================ SAFETY layer

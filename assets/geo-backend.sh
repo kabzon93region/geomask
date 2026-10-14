@@ -240,7 +240,11 @@ cmd_dev_del() {
   case "$IP" in ''|*[!0-9.]*) printf '{"error":"bad ip"}'; return 1 ;; esac
   echo "$IP" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || { printf '{"error":"bad ip"}'; return 1; }
   [ -f "$DEVICES" ] && sed -i "\|^$IP |d" "$DEVICES"
+  # remove rules for this ip explicitly per table (bypass -> main, ai -> 101).
+  # NEVER delete by pref alone: all per-device rules share priority 32611, so
+  # `ip rule del pref` would drop another device's rule (and _apply_routing re-adds it)
   ip rule del from "$IP" lookup main 2>/dev/null || true
+  ip rule del from "$IP" lookup 101 2>/dev/null || true
   SEC=$(uci show dhcp | grep "\.ip='$IP'" | head -1 | sed "s/\.ip=.*//")
   if [ -n "$SEC" ]; then uci delete "$SEC"; uci commit dhcp; fi
   _apply_routing

@@ -352,6 +352,10 @@ EOF
       /etc/init.d/firewall reload >/dev/null 2>&1
     fi
   fi
+  # table 101: LAN/host routes must stay local, only internet goes to AI tunnel
+  ip route show table main | grep -v '^default' | while IFS= read -r _r; do
+    ip route replace table 101 $_r 2>/dev/null
+  done
   ip route replace table 101 default dev "$AI_TUN_DEV" 2>/dev/null
   echo "$(date +%FT%T) AI_TUN provisioned" >> "$LOG"
 }
@@ -380,6 +384,23 @@ apply_routes() {
       [ "$dmode" = "bypass" ] || continue
       ip rule show | grep -q "from $dip" || ip rule add priority 32694 from "$dip" lookup main
     done < /etc/geo-devices.list
+    # --- ai-mode devices (32670 beats fwmark rules 32673+, so the whole
+    #     device goes through the AI tunnel; LAN routes stay local in table 101) ---
+    if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
+      if ip link show AI >/dev/null 2>&1; then
+        if ! ip route show table 101 | grep -q '^default'; then
+          ip route show table main | grep -v '^default' | while IFS= read -r r; do
+            ip route replace table 101 $r 2>/dev/null
+          done
+          ip route replace table 101 default dev AI 2>/dev/null
+        fi
+        while read -r dip dmode dname; do
+          case "$dip" in ''|'#'*) continue ;; esac
+          [ "$dmode" = "ai" ] || continue
+          ip rule show | grep -q "from $dip" || ip rule add priority 32670 from "$dip" lookup 101
+        done < /etc/geo-devices.list
+      fi
+    fi
   fi
 }
 

@@ -145,7 +145,7 @@ return view.extend({
 		/* ===================== HERO: dual subscription ===================== */
 		var aiCc = st.ai_cc || '', vpnCc = st.vpn_cc || '';
 		var aiSub = E('div', { 'class': 'gs-sub-card' }, [
-			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → Германия'),
+			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
 			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc), cleanName(st.ai_node) || '—' ]),
 			E('div', { 'class': 'gs-meta' }, 'Подписка de5 · выход ' + ((CCNAME[aiCc] || aiCc) ? (CCNAME[aiCc] || aiCc) : '—') +
 				(st.google ? ' · Google видит: ' + st.google : ''))
@@ -158,7 +158,7 @@ return view.extend({
 
 		var counters = E('div', { 'class': 'gs-counters' }, [
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.ai_rules != null ? st.ai_rules : '—')),
-				E('div', { 'class': 'gs-cap' }, 'правил ИИ-пути (ai.yaml → Германия)') ]),
+				E('div', { 'class': 'gs-cap' }, 'правил ИИ-пути (ai.yaml → AI)') ]),
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.mt_rules != null ? st.mt_rules : '—')),
 				E('div', { 'class': 'gs-cap' }, 'правил общего пути (mtrickle.yaml → VPN)') ]),
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.n_bypass != null ? st.n_bypass : (st.devices || []).length)),
@@ -167,7 +167,7 @@ return view.extend({
 
 		var hero = E('div', { 'class': 'gs-hero' }, [
 			E('h2', {}, 'Гео-маскировка и маршрутизация AI'),
-			E('div', { 'class': 'gs-sub' }, 'Google и ИИ-сервисы идут через немецкую подписку (Google видит Германию), всё остальное — через общую VPN.'),
+			E('div', { 'class': 'gs-sub' }, 'Google и ИИ-сервисы идут через AI-подписку (какую страну видит Google — показывает блок выше), всё остальное — через общую VPN.'),
 			E('div', { 'class': 'gs-duo' }, [ aiSub, vpnSub ]),
 			counters
 		]);

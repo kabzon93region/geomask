@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.2"
+GM_VERSION="1.5.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -291,12 +291,13 @@ cmd_sync_lists() {
   printf '{"ai_rules":%s,"mt_rules":%s,"output":"%s"}' "$AI_RC" "$MT_RC" "$(json_esc "$OUT")"
 }
 
-# quick Google geo-check through the tunnel (AI group handles google via RuleSet(ai))
+# quick Google geo-check: country of the exit that Google traffic actually uses.
+# Google/AI domains are routed to group AI (ai.yaml), so asking an IP-geo service
+# through the AI listener (mihomo listeners: proxy=AI) reports exactly what Google sees.
 cmd_google() {
-  CC=$(curl -s -m25 -x "$TUN" \
-    -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' \
-    -H 'Accept-Language: en-US,en;q=0.9' -b 'CONSENT=YES+' \
-    'https://www.google.com/?hl=en' 2>/dev/null | grep -oE 'class="O3yKUb">[^<]+' | head -1 | sed 's/.*>//')
+  CC=$(curl -s -m15 -x "http://127.0.0.1:$AI_SOCKS_PORT" \
+    'https://ipinfo.io/country' 2>/dev/null | tr -d '[:space:]')
+  case "$CC" in [A-Z][A-Z]) ;; *) CC='' ;; esac
   [ -n "$CC" ] && printf '%s\n' "$CC" > /tmp/geo-google
   AI_NODE=$(_grp_node AI)
   printf '{"google":"%s","ai_node":"%s"}' "$(json_esc "$CC")" "$(json_esc "$AI_NODE")"
@@ -1006,7 +1007,7 @@ return view.extend({
 		/* ===================== HERO: dual subscription ===================== */
 		var aiCc = st.ai_cc || '', vpnCc = st.vpn_cc || '';
 		var aiSub = E('div', { 'class': 'gs-sub-card' }, [
-			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → Германия'),
+			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
 			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc), cleanName(st.ai_node) || '—' ]),
 			E('div', { 'class': 'gs-meta' }, 'Подписка de5 · выход ' + ((CCNAME[aiCc] || aiCc) ? (CCNAME[aiCc] || aiCc) : '—') +
 				(st.google ? ' · Google видит: ' + st.google : ''))
@@ -1019,7 +1020,7 @@ return view.extend({
 
 		var counters = E('div', { 'class': 'gs-counters' }, [
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.ai_rules != null ? st.ai_rules : '—')),
-				E('div', { 'class': 'gs-cap' }, 'правил ИИ-пути (ai.yaml → Германия)') ]),
+				E('div', { 'class': 'gs-cap' }, 'правил ИИ-пути (ai.yaml → AI)') ]),
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.mt_rules != null ? st.mt_rules : '—')),
 				E('div', { 'class': 'gs-cap' }, 'правил общего пути (mtrickle.yaml → VPN)') ]),
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.n_bypass != null ? st.n_bypass : (st.devices || []).length)),
@@ -1028,7 +1029,7 @@ return view.extend({
 
 		var hero = E('div', { 'class': 'gs-hero' }, [
 			E('h2', {}, 'Гео-маскировка и маршрутизация AI'),
-			E('div', { 'class': 'gs-sub' }, 'Google и ИИ-сервисы идут через немецкую подписку (Google видит Германию), всё остальное — через общую VPN.'),
+			E('div', { 'class': 'gs-sub' }, 'Google и ИИ-сервисы идут через AI-подписку (какую страну видит Google — показывает блок выше), всё остальное — через общую VPN.'),
 			E('div', { 'class': 'gs-duo' }, [ aiSub, vpnSub ]),
 			counters
 		]);

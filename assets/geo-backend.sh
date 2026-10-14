@@ -163,12 +163,13 @@ cmd_sync_lists() {
   printf '{"ai_rules":%s,"mt_rules":%s,"output":"%s"}' "$AI_RC" "$MT_RC" "$(json_esc "$OUT")"
 }
 
-# quick Google geo-check through the tunnel (AI group handles google via RuleSet(ai))
+# quick Google geo-check: country of the exit that Google traffic actually uses.
+# Google/AI domains are routed to group AI (ai.yaml), so asking an IP-geo service
+# through the AI listener (mihomo listeners: proxy=AI) reports exactly what Google sees.
 cmd_google() {
-  CC=$(curl -s -m25 -x "$TUN" \
-    -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' \
-    -H 'Accept-Language: en-US,en;q=0.9' -b 'CONSENT=YES+' \
-    'https://www.google.com/?hl=en' 2>/dev/null | grep -oE 'class="O3yKUb">[^<]+' | head -1 | sed 's/.*>//')
+  CC=$(curl -s -m15 -x "http://127.0.0.1:$AI_SOCKS_PORT" \
+    'https://ipinfo.io/country' 2>/dev/null | tr -d '[:space:]')
+  case "$CC" in [A-Z][A-Z]) ;; *) CC='' ;; esac
   [ -n "$CC" ] && printf '%s\n' "$CC" > /tmp/geo-google
   AI_NODE=$(_grp_node AI)
   printf '{"google":"%s","ai_node":"%s"}' "$(json_esc "$CC")" "$(json_esc "$AI_NODE")"

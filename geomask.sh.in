@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.4.0"
+GM_VERSION="1.4.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -162,6 +162,7 @@ step3_check() {
   done
   grep -q 'RULE-SET,ai,AI' "$_c" 2>/dev/null && info "rule ai->AI: present" || { bad "rule ai->AI missing"; _need=1; }
   grep -q 'RULE-SET,mtrickle,VPN' "$_c" 2>/dev/null && info "rule mtrickle->VPN: present" || { bad "rule mtrickle->VPN missing"; _need=1; }
+  grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
   for rf in /etc/mihomo/ruleset/mtrickle.yaml /etc/mihomo/ruleset/ai.yaml /etc/mihomo/ruleset/ytdirect.yaml; do
     if [ -s "$(P "$rf")" ]; then info "ruleset: $rf ($(grep -c 'DOMAIN-SUFFIX' "$(P "$rf")" 2>/dev/null || echo '?') suffixes)"; else warn "ruleset empty/missing: $rf (sync step will create)"; fi
   done
@@ -202,6 +203,44 @@ step3_verify() { step3_check; }
 write_mihomo_config() {
   _c="$(P $MIHOMO_CONF)"
   _vpnu="$1"; _aiu="$2"
+  # --- existing 2-subscription config: keep it as-is (custom rules, headers, sniffer)
+  #     and only patch provider urls / ensure the ai-devices listener ---
+  if [ -s "$_c" ] && grep -q '^  sub:' "$_c" && grep -q '^  de5:' "$_c" \
+     && grep -q 'name: VPN' "$_c" && grep -q 'name: AI' "$_c"; then
+    _curv=$(_prov_url "$_c" sub)
+    _cura=$(_prov_url "$_c" de5)
+    if [ -n "${_vpnu:-}" ] && [ "$_vpnu" != "$_curv" ]; then _swap=1; fi
+    if [ -n "${_aiu:-}" ] && [ "$_aiu" != "$_cura" ]; then _swap=1; fi
+    if [ "${_swap:-0}" = 1 ]; then
+      cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+      if ! awk -v pn="^  $([ "$_vpnu" != "$_curv" ] && echo sub || echo de5):" -v nu="$([ "$_vpnu" != "$_curv" ] && printf '%s' "$_vpnu" || printf '%s' "$_aiu")" '
+        BEGIN{f=0;done=0}
+        $0 ~ pn {f=1; print; next}
+        f && /^    url:/{print "    url: \"" nu "\""; done=1; next}
+        f && /^  [A-Za-z0-9_-]+:/{f=0}
+        f && /^[A-Za-z]/{f=0}
+        {print}
+        END{exit done?0:1}' "$_c" > "$_c.urlnew"; then
+        rm -f "$_c.urlnew"; bad "provider url patch failed"; return 1
+      fi
+      mihomo -d /etc/mihomo -t >/dev/null 2>&1 && mv -f "$_c.urlnew" "$_c" || { rm -f "$_c.urlnew"; bad "mihomo -t failed - config kept"; return 1; }
+      info "provider url(s) updated in place (sub=$( [ "$_vpnu" != "$_curv" ] && echo sub || echo de5))"
+    fi
+    if ! grep -q 'ai-devices' "$_c"; then
+      cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+      awk 'BEGIN{d=0}
+        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "";d=1}
+        {print}' "$_c" > "$_c.zmnew" || return 1
+      if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+        mv -f "$_c.zmnew" "$_c"; info "listeners block added to existing config (custom rules preserved)"
+      else
+        rm -f "$_c.zmnew"; bad "mihomo -t failed after adding listeners - config kept"; return 1
+      fi
+    else
+      info "existing 2-subscription config kept as-is (ai-devices already present)"
+    fi
+    return 0
+  fi
   _hwid=$(grep -A1 'x-hwid' "$_c" 2>/dev/null | sed -n 's/^[[:space:]]*-[[:space:]]*"\(.*\)"/\1/p' | head -1)
   _tmpconf="$_c.zmnew"
   {
@@ -366,7 +405,8 @@ mihomo_trial_run() {
     warn "trial: cannot copy mihomo dir"; rm -rf "$_td"; return 1; }
   sed -i -e 's/^mixed-port:.*/mixed-port: 17890/' \
          -e 's/^external-controller:.*/external-controller: 0.0.0.0:19090/' \
-         -e 's/^[[:space:]]*port: 7891/    port: 17901/' "$_td/config.yaml" 2>/dev/null
+         -e 's/^[[:space:]]*port: 7891/    port: 17901/' \
+         -e "s|path: /etc/mihomo/|path: $_td/|g" "$_td/config.yaml" 2>/dev/null
   mihomo -d "$_td" -f config.yaml > "$_td/trial.log" 2>&1 &
   _tp=$!
   sleep 3

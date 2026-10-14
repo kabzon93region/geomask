@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.4.3"
+GM_VERSION="1.4.4"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -682,10 +682,11 @@ print_banner() {
 
 show_menu() {
   echo
-  printf '%s1)%s %sБыстрая диагностика%s %s(только чтение)%s\n'  "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%s1)%s %sБыстрая диагностика%s %s(только чтение)%s\n'    "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
   printf '%s2)%s %sПошаговый мастер%s %s(статус шагов, запуск любого отдельно)%s\n' "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
-  printf '%sf)%s %sУдалить -> установить -> настроить geomask%s\n' "$C_B" "$NC" "$C_Y" "$NC"
-  printf '%s0)%s Выход\n'                                        "$C_B" "$NC"
+  printf '%s3)%s %sПанель Гео%s %s(переустановить / обновить)%s\n'  "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%sf)%s %sУдалить -> установить -> настроить geomask%s\n'  "$C_B" "$NC" "$C_Y" "$NC"
+  printf '%s0)%s Выход\n'                                          "$C_B" "$NC"
 }
 
 diag_quick() {
@@ -804,6 +805,9 @@ menu_loop() {
     case "$_c" in
       1) diag_quick; PAUSE ;;
       2) menu_master || true; PAUSE ;;
+      3) hdr "PANEL" "Панель Гео: переустановка/обновление"
+         warn "Обновляет файлы панели (backend/rpcd/acl/страница); mihomo не трогается."
+         run_step 2 || true; PAUSE ;;
       f|F) menu_reinstall || true; PAUSE ;;
       0|q|Q|"") exit 0 ;;
       *) printf '%sнеизвестный пункт%s\n' "$C_R" "$NC"; sleep 1 ;;

@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.4.3"
+GM_VERSION="1.4.4"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -908,6 +908,10 @@ var STYLE = [
 	'.gs-subs td:nth-child(3){width:110px}',
 	'.gs-subs td:last-child{width:200px;white-space:nowrap}',
 	'.gs-subs .gs-btn-use{background:#21262d;border-color:#30363d;color:#c9d1d9;padding:5px 10px;margin-right:4px}',
+	'.gs-btn-vpn-on{background:#1f6feb;border-color:#58a6ff;color:#fff}',
+	'.gs-btn-vpn-on:hover{background:#388bfd}',
+	'.gs-btn-ai-on{background:#238636;border-color:#3fb950;color:#fff}',
+	'.gs-btn-ai-on:hover{background:#2ea043}',
 	'.gs-subs .gs-btn-use:hover{background:#30363d}',
 	'.gs-subs .gs-btn-warn{padding:5px 10px}',
 	'.gs-input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;font-size:13px}',
@@ -1014,11 +1018,9 @@ return view.extend({
 			if (isVpn && isAi) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN + AI');
 			else if (isVpn) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN');
 			else if (isAi) dest = E('span', { 'class': 'gs-badge gs-ok' }, 'AI');
-			var bV = { 'class': 'gs-btn gs-btn-use', 'title': 'Переключить общий VPN на эту подписку', 'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } };
-			var bA = { 'class': 'gs-btn gs-btn-use', 'title': 'Переключить AI-маршруты на эту подписку', 'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } };
+			var bV = { 'class': 'gs-btn gs-btn-use' + (isVpn ? ' gs-btn-vpn-on' : ''), 'title': isVpn ? 'Эта подписка используется для общего VPN' : 'Переключить общий VPN на эту подписку', 'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } };
+			var bA = { 'class': 'gs-btn gs-btn-use' + (isAi ? ' gs-btn-ai-on' : ''), 'title': isAi ? 'Эта подписка используется для AI-маршрутов' : 'Переключить AI-маршруты на эту подписку', 'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } };
 			var bD = { 'class': 'gs-btn gs-btn-warn', 'title': 'Убрать из реестра', 'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } };
-			if (isVpn) bV['disabled'] = 'disabled';
-			if (isAi) bA['disabled'] = 'disabled';
 			return E('tr', {}, [
 				E('td', {}, s.name || s.id),
 				E('td', { 'class': 'gs-subs-url' }, maskUrl(s.url)),
@@ -2204,10 +2206,11 @@ print_banner() {
 
 show_menu() {
   echo
-  printf '%s1)%s %sБыстрая диагностика%s %s(только чтение)%s\n'  "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%s1)%s %sБыстрая диагностика%s %s(только чтение)%s\n'    "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
   printf '%s2)%s %sПошаговый мастер%s %s(статус шагов, запуск любого отдельно)%s\n' "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
-  printf '%sf)%s %sУдалить -> установить -> настроить geomask%s\n' "$C_B" "$NC" "$C_Y" "$NC"
-  printf '%s0)%s Выход\n'                                        "$C_B" "$NC"
+  printf '%s3)%s %sПанель Гео%s %s(переустановить / обновить)%s\n'  "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%sf)%s %sУдалить -> установить -> настроить geomask%s\n'  "$C_B" "$NC" "$C_Y" "$NC"
+  printf '%s0)%s Выход\n'                                          "$C_B" "$NC"
 }
 
 diag_quick() {
@@ -2326,6 +2329,9 @@ menu_loop() {
     case "$_c" in
       1) diag_quick; PAUSE ;;
       2) menu_master || true; PAUSE ;;
+      3) hdr "PANEL" "Панель Гео: переустановка/обновление"
+         warn "Обновляет файлы панели (backend/rpcd/acl/страница); mihomo не трогается."
+         run_step 2 || true; PAUSE ;;
       f|F) menu_reinstall || true; PAUSE ;;
       0|q|Q|"") exit 0 ;;
       *) printf '%sнеизвестный пункт%s\n' "$C_R" "$NC"; sleep 1 ;;

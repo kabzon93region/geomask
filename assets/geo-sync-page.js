@@ -75,6 +75,10 @@ var STYLE = [
 	'.gs-subs td:nth-child(3){width:110px}',
 	'.gs-subs td:last-child{width:200px;white-space:nowrap}',
 	'.gs-subs .gs-btn-use{background:#21262d;border-color:#30363d;color:#c9d1d9;padding:5px 10px;margin-right:4px}',
+	'.gs-btn-vpn-on{background:#1f6feb;border-color:#58a6ff;color:#fff}',
+	'.gs-btn-vpn-on:hover{background:#388bfd}',
+	'.gs-btn-ai-on{background:#238636;border-color:#3fb950;color:#fff}',
+	'.gs-btn-ai-on:hover{background:#2ea043}',
 	'.gs-subs .gs-btn-use:hover{background:#30363d}',
 	'.gs-subs .gs-btn-warn{padding:5px 10px}',
 	'.gs-input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;font-size:13px}',
@@ -181,11 +185,9 @@ return view.extend({
 			if (isVpn && isAi) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN + AI');
 			else if (isVpn) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN');
 			else if (isAi) dest = E('span', { 'class': 'gs-badge gs-ok' }, 'AI');
-			var bV = { 'class': 'gs-btn gs-btn-use', 'title': 'Переключить общий VPN на эту подписку', 'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } };
-			var bA = { 'class': 'gs-btn gs-btn-use', 'title': 'Переключить AI-маршруты на эту подписку', 'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } };
+			var bV = { 'class': 'gs-btn gs-btn-use' + (isVpn ? ' gs-btn-vpn-on' : ''), 'title': isVpn ? 'Эта подписка используется для общего VPN' : 'Переключить общий VPN на эту подписку', 'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } };
+			var bA = { 'class': 'gs-btn gs-btn-use' + (isAi ? ' gs-btn-ai-on' : ''), 'title': isAi ? 'Эта подписка используется для AI-маршрутов' : 'Переключить AI-маршруты на эту подписку', 'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } };
 			var bD = { 'class': 'gs-btn gs-btn-warn', 'title': 'Убрать из реестра', 'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } };
-			if (isVpn) bV['disabled'] = 'disabled';
-			if (isAi) bA['disabled'] = 'disabled';
 			return E('tr', {}, [
 				E('td', {}, s.name || s.id),
 				E('td', { 'class': 'gs-subs-url' }, maskUrl(s.url)),

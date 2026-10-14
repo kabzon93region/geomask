@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.4"
+GM_VERSION="1.5.5"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -699,15 +699,29 @@ diag_quick() {
   log "${C_DIM}== ДИАГНОСТИКА: pass=$PASS fail=$FAILCNT ==$NC"
 }
 
+# human-readable description of each step (bypasses ANY memory of "what is what")
+step_desc() {
+  case "$1" in
+    env)      printf 'проверка окружения: версия OpenWrt, место на диске, зависимости (только чтение)' ;;
+    geo)      printf 'гео-оверлей: панель "Гео-маскировка и AI" в LuCI + бэкенд geo-sync' ;;
+    subs)     printf 'подписки: ссылки VPN/AI и группы VPN/AI в mihomo (проверка доступности)' ;;
+    sync)     printf 'sync: списки доменов magitrickle для mihomo + cron каждые 5 минут' ;;
+    services) printf 'сервисы: mihomo, magitrickle, hev-туннели, dnsmasq, веб-интерфейс' ;;
+    verify)   printf 'сквозная проверка: выходы VPN/AI, DNS, группа AI, интернет (ничего не меняет)' ;;
+    *)        printf '' ;;
+  esac
+}
+
 # step-by-step master: show status of every step, let the user run any single step
 menu_master() {
   while :; do
     _n=1
     for _nm in $STEP_NAMES; do
+      _d=$(step_desc "$_nm")
       if step_fn "$_n" check >/dev/null 2>&1; then
-        printf '  %s%d)%s %-14s %sвыполнено%s\n' "$C_B" "$_n" "$NC" "$_nm" "$C_G" "$NC"
+        printf '  %s%d)%s %s%-9s%s %s — %s %sвыполнено%s\n' "$C_B" "$_n" "$NC" "$C_Y" "$_nm" "$NC" "$_d" "$C_G" "$NC"
       else
-        printf '  %s%d)%s %-14s %sтребует внимания%s\n' "$C_B" "$_n" "$NC" "$_nm" "$C_R" "$NC"
+        printf '  %s%d)%s %s%-9s%s %s — %s %sтребует внимания%s\n' "$C_B" "$_n" "$NC" "$C_Y" "$_nm" "$NC" "$_d" "$C_R" "$NC"
       fi
       _n=$((_n+1))
     done

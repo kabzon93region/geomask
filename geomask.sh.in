@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.5"
+GM_VERSION="1.5.6"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -154,7 +154,7 @@ step3_check() {
   _need=0
   if ! have mihomo; then bad "mihomo binary missing"; return 1; fi
   _c="$(P $MIHOMO_CONF)"
-  if [ ! -s "$_c" ]; then bad "$MIHOMO_CONF missing"; return 1; fi
+  if [ ! -s "$_c" ]; then bad "$MIHOMO_CONF missing (шаг subs при запуске создаст конфиг и спросит обе ссылки)"; return 1; fi
   _np=$(grep -c 'type: http' "$_c" 2>/dev/null || echo 0)
   if [ "$_np" -ge 2 ] 2>/dev/null; then info "proxy-providers: $_np (need >=2)"; else bad "proxy-providers: $_np (need 2: VPN + AI)"; _need=1; fi
   for g in VPN AI; do
@@ -177,8 +177,15 @@ step3_apply() {
     [ -z "$_aiu" ]  && _aiu=$(_prov_url "$_c" de5)
   fi
   if [ -z "$_vpnu" ] || [ -z "$_aiu" ]; then
-    bad "subscription URLs unknown - pass --vpn-url and --ai-url (or keep existing config)"
-    return 1
+    # fresh router (no config / no flags): ask for both subscription URLs interactively
+    if [ "$GM_AUTO" != 1 ] && [ "$GM_YES" != 1 ] && [ -t 0 ]; then
+      info "Подписки не заданы — введите ссылки (общая VPN-подписка и AI-подписка)"
+      _vpnu=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку" "" "") || { bad "URL VPN-подписки не задан"; return 1; }
+      _aiu=$(prompt_url "Ссылка на AI-подписку (для Google/AI)" "" "") || { bad "URL AI-подписки не задан"; return 1; }
+    else
+      bad "subscription URLs unknown - pass --vpn-url and --ai-url (or keep existing config)"
+      return 1
+    fi
   fi
   info "VPN provider URL: $(_maskurl "$_vpnu")"
   info "AI  provider URL: $(_maskurl "$_aiu")"

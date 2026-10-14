@@ -5,6 +5,7 @@
 # Usage:
 #   sh geomask.sh              interactive menu (status dashboard + actions loop)
 #   sh geomask.sh --reinstall  delete -> install -> configure geomask (asks for 2 subscription URLs)
+#   sh geomask.sh --backup     create a full settings backup (LuCI-restorable) and exit
 #   sh geomask.sh --auto       all steps unattended: check, apply if needed, verify; stop on FAIL
 #   sh geomask.sh --check      read-only report of every step (no changes, no downloads)
 #   sh geomask.sh --step N     single step N interactively
@@ -21,19 +22,21 @@
 #   sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master/geomask.sh')
 #
 # SAFETY: never reboots the router; never restarts working services (only starts missing ones);
-#         never touches network/pppoe config; backups before every file write; mihomo restart
-#         only with --restart or explicit interactive yes, and only after `mihomo -t` passes.
-#         HARD PIN: if /root/.geomask-norestart exists, --restart is ignored entirely -
-#         the router owner's decision wins; remove the file to re-enable restarts.
+#         never touches network/pppoe config; backups before every file write and before ANY
+#         mihomo restart (full settings backup via sysupgrade -b -> /root/geomask-backups/);
+#         mihomo restart = trial-run on shifted ports FIRST, restart only if the trial starts,
+#         and automatic rollback to the previous config if the restarted service does not
+#         answer. Hard pin: /root/.geomask-norestart disables --restart entirely.
 
 set -u
 
-GM_VERSION="1.3.0"
+GM_VERSION="1.4.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
 GM_CHECK_ONLY=0
 GM_RESTART=0
+GM_BACKUP=0
 GM_REINSTALL=0
 GM_STEP=""
 GM_VPN_URL=""
@@ -604,7 +607,31 @@ _sub_id_by_url() { # _sub_id_by_url <url> -> id, rc=1 if not found
 }
 
 cmd_subs_list() {
+  # fresh/empty registry: auto-import the providers currently in mihomo config
+  if [ ! -s "$SUBS_FILE" ] || ! grep -qE '^[^#]' "$SUBS_FILE" 2>/dev/null; then
+    _subs_seed_internal
+  fi
   printf '{"subs":%s}' "$(_subs_json)"
+}
+
+_subs_count() { grep -cE '^[^#]' "$SUBS_FILE" 2>/dev/null || echo 0; }
+
+# import current config providers into the registry (skips urls already present)
+_subs_seed_internal() {
+  _subu=$(awk '/^  sub:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  _de5u=$(awk '/^  de5:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  if [ -n "$_subu" ]; then
+    _subs_json | grep -Fq "$_subu" || cmd_sub_add "VPN (текущая)" "$_subu" >/dev/null
+  fi
+  if [ -n "$_de5u" ]; then
+    _subs_json | grep -Fq "$_de5u" || cmd_sub_add "AI (текущая)" "$_de5u" >/dev/null
+  fi
+  echo "$(date +%FT%T) SUB seed (auto)" >> "$LOG"
+}
+
+cmd_subs_seed() {
+  _subs_seed_internal
+  printf '{"ok":true,"subs":%s}' "$(_subs_json)"
 }
 
 cmd_sub_add() {
@@ -695,6 +722,7 @@ list_methods() {
 	json_add_object "ai_sub_get"; json_close_object
 	json_add_object "ai_sub_set"; json_add_string "url" "string"; json_close_object
 	json_add_object "subs_list";  json_close_object
+	json_add_object "subs_seed"; json_close_object
 	json_add_object "sub_add";    json_add_string "name" "string"; json_add_string "url" "string"; json_close_object
 	json_add_object "sub_del";    json_add_string "id" "string"; json_close_object
 	json_add_object "ai_sub_use";   json_add_string "id" "string"; json_close_object
@@ -720,6 +748,7 @@ call_method() {
 		ai_sub_get) "$BACKEND" ai_sub_get ;;
 		ai_sub_set) json_get_var url url; "$BACKEND" ai_sub_set "$url" ;;
 		subs_list)  "$BACKEND" subs_list ;;
+		subs_seed)  "$BACKEND" subs_seed ;;
 		sub_add)    json_get_var name name; json_get_var url url; "$BACKEND" sub_add "$name" "$url" ;;
 		sub_del)    json_get_var id id; "$BACKEND" sub_del "$id" ;;
 		ai_sub_use)   json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;
@@ -757,7 +786,7 @@ ASSET_EOF
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use" ]
+				"geo-sync": [ "sync_lists", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed" ]
 			}
 		}
 	}
@@ -800,6 +829,7 @@ var callDevDel = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { 
 var callAiSubGet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
 var callAiSubSet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
 var callSubsList = rpc.declare({ object: 'geo-sync', method: 'subs_list', expect: {} });
+var callSubsSeed = rpc.declare({ object: 'geo-sync', method: 'subs_seed', expect: {} });
 var callSubAdd   = rpc.declare({ object: 'geo-sync', method: 'sub_add',   params: { name: null, url: null }, expect: {} });
 var callSubDel   = rpc.declare({ object: 'geo-sync', method: 'sub_del',   params: { id: null }, expect: {} });
 var callAiSubUse   = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use',   params: { id: null }, expect: {} });
@@ -994,6 +1024,20 @@ return view.extend({
 					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
 				});
 			} }, 'Добавить');
+		var btnSubSeed = E('button', { 'class': 'gs-btn',
+			'title': 'Импортировать текущие подписки из конфига mihomo в реестр',
+			'click': function() {
+				btnSubSeed.disabled = true; btnSubSeed.textContent = 'Импорт…';
+				callSubsSeed().then(function(res) {
+					btnSubSeed.disabled = false; btnSubSeed.textContent = 'Подтянуть текущие из конфига';
+					if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+					ui.addNotification(null, E('p', {}, 'Текущие подписки добавлены в реестр'), 'info');
+					return view.reload();
+				}).catch(function(e) {
+					btnSubSeed.disabled = false; btnSubSeed.textContent = 'Подтянуть текущие из конфига';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Подтянуть текущие из конфига');
 		var subsCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Подписки'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
@@ -1001,7 +1045,8 @@ return view.extend({
 			E('table', { 'class': 'gs-table' },
 				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
 					.concat(subs.map(subRow))),
-			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ])
+			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ]),
+			E('div', { 'class': 'gs-row' }, [ btnSubSeed ])
 		]);
 		wrap.appendChild(subsCard);
 
@@ -1207,9 +1252,7 @@ step3_apply() {
   ask "  Write mihomo config with these 2 providers (backup kept)?" || { warn "skipped"; return 1; }
   write_mihomo_config "$_vpnu" "$_aiu" || return 1
   if [ "$GM_RESTART" = 1 ]; then
-    info "restarting mihomo (--restart)..."
-    initd mihomo restart >/dev/null 2>&1 || true
-    sleep 2
+    safe_mihomo_restart || true
   elif api_refresh_provider sub "$_vpnu" && api_refresh_provider de5 "$_aiu"; then
     info "providers refreshed via API (no restart, VPN stays up)"
   elif svc_alive mihomo; then
@@ -1246,7 +1289,7 @@ write_mihomo_config() {
     printf '%s\n' '  store-fake-ip: true'
     printf '\n'
     printf '%s\n' 'listeners:'
-    printf '%s\n' '  ai-devices:'
+    printf '%s\n' '  - name: ai-devices'
     printf '%s\n' '    type: mixed'
     printf '%s\n' '    port: 7891'
     printf '%s\n' '    listen: 127.0.0.1'
@@ -1354,6 +1397,108 @@ api_refresh_provider() { # api_refresh_provider <name> <url>
   curl -s -m8 -f -X PUT "http://127.0.0.1:9090/providers/proxies/$1" \
     -H 'Content-Type: application/json' \
     -d "{\"url\":\"$2\",\"vehicle_type\":\"http\"}" >/dev/null 2>&1
+}
+
+# ============================================================ SAFETY layer
+# full settings backup (restorable via LuCI) - MANDATORY before any router change
+ensure_backup() { # -> path on stdout, rc=1 on failure
+  _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
+  _bkdir="$(P /root/geomask-backups)"
+  mkdir -p "$_bkdir" 2>/dev/null
+  _out="$_bkdir/router-backup-$_ts.tar.gz"
+  if have sysupgrade; then
+    if ! sysupgrade -b "$_out" >/dev/null 2>&1 || [ ! -s "$_out" ]; then _out=""; fi
+  else
+    _out=""
+  fi
+  if [ -z "$_out" ] || [ ! -s "$_out" ]; then
+    _out="$_bkdir/router-backup-$_ts-min.tar.gz"
+    tar czf "$_out" -C "$(P /)" etc 2>/dev/null || { _out=""; }
+  fi
+  if [ -z "$_out" ] || [ ! -s "$_out" ]; then
+    bad "cannot create backup"
+    return 1
+  fi
+  printf '%s' "$_out"
+  return 0
+}
+
+# dry-run: start a COPY of the mihomo config on shifted ports in a temp dir.
+# rc=0 only if mihomo actually starts with the new config. Never touches live service.
+mihomo_trial_run() {
+  _c="$(P $MIHOMO_CONF)"
+  [ -s "$_c" ] || { bad "config missing for trial"; return 1; }
+  _td="$(P /tmp)/gm-trial-$$"
+  rm -rf "$_td"; mkdir -p "$_td"
+  cp -a "$(dirname "$_c")/." "$_td/" 2>/dev/null || cp -a "$(P /etc/mihomo)" "$_td" 2>/dev/null || {
+    warn "trial: cannot copy mihomo dir"; rm -rf "$_td"; return 1; }
+  sed -i -e 's/^mixed-port:.*/mixed-port: 17890/' \
+         -e 's/^external-controller:.*/external-controller: 0.0.0.0:19090/' \
+         -e 's/^[[:space:]]*port: 7891/    port: 17901/' "$_td/config.yaml" 2>/dev/null
+  mihomo -d "$_td" -f config.yaml > "$_td/trial.log" 2>&1 &
+  _tp=$!
+  sleep 3
+  if kill -0 "$_tp" 2>/dev/null; then
+    info "trial run: OK (config starts, no restart done)"
+    kill "$_tp" 2>/dev/null
+    wait "$_tp" 2>/dev/null
+    rm -rf "$_td"
+    return 0
+  fi
+  bad "trial run FAILED - live mihomo NOT touched"
+  sed 's/^/    | /' "$_td/trial.log" 2>/dev/null | tail -5
+  rm -rf "$_td"
+  return 1
+}
+
+# restart mihomo and verify it really came back (pid + API). NO silent failures.
+mihomo_restart_verified() {
+  initd mihomo restart >/dev/null 2>&1
+  sleep 3
+  if ! svc_alive mihomo; then
+    bad "mihomo did NOT come back after restart!"
+    return 1
+  fi
+  if ! curl -s -m3 "http://127.0.0.1:9090/version" 2>/dev/null | grep -qi 'mihomo\|meta'; then
+    bad "mihomo API not responding after restart!"
+    return 1
+  fi
+  info "mihomo restarted and verified (pid $(pidof mihomo))"
+  return 0
+}
+
+# full safe mihomo restart: backup -> trial -> restart -> verify -> rollback on failure
+safe_mihomo_restart() {
+  _c="$(P $MIHOMO_CONF)"
+  if [ "$GM_RESTART" != 1 ]; then
+    warn "restart skipped (no --restart); will apply at next mihomo start"
+    return 0
+  fi
+  _bk=$(ensure_backup) || { bad "no backup - restart ABORTED"; return 1; }
+  info "backup: $_bk"
+  cp -p "$_c" "$_c.pre-restart" 2>/dev/null || true
+  if ! mihomo_trial_run; then
+    bad "trial failed - live mihomo NOT restarted; config left for manual review"
+    return 1
+  fi
+  if mihomo_restart_verified; then
+    info "restart verified OK"
+    return 0
+  fi
+  bad "restart FAILED - rolling back config and re-starting"
+  if [ -s "$_c.pre-restart" ]; then
+    cp -p "$_c.pre-restart" "$_c"
+    /etc/init.d/mihomo restart >/dev/null 2>&1
+    sleep 3
+    if svc_alive mihomo; then
+      info "rollback OK: previous config restored, mihomo running"
+    else
+      bad "rollback FAILED - RESTORE FROM BACKUP: $_bk"
+    fi
+  else
+    bad "no pre-restart copy; RESTORE FROM BACKUP: $_bk"
+  fi
+  return 1
 }
 
 # ============================================================ STEP 4: magitrickle -> mihomo sync
@@ -2114,6 +2259,7 @@ while [ $# -gt 0 ]; do
     --check) GM_CHECK_ONLY=1 ;;
     --yes|-y) GM_YES=1 ;;
     --restart) GM_RESTART=1 ;;
+    --backup) GM_BACKUP=1 ;;
     --reinstall) GM_REINSTALL=1 ;;
     --step) shift; GM_STEP="${1:-}" ;;
     --vpn-url) shift; GM_VPN_URL="${1:-}" ;;
@@ -2131,7 +2277,9 @@ if [ "$GM_RESTART" = 1 ] && [ -f "$(P /root/.geomask-norestart)" ]; then
 fi
 
 RC=0
-if [ "$GM_REINSTALL" = 1 ]; then
+if [ "$GM_BACKUP" = 1 ]; then
+  _b=$(ensure_backup) && { info "full backup created: $_b"; RC=0; } || RC=1
+elif [ "$GM_REINSTALL" = 1 ]; then
   menu_reinstall || RC=1
 elif [ -n "$GM_STEP" ]; then
   run_step "$GM_STEP" || RC=1

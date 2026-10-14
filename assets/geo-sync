@@ -20,6 +20,7 @@ list_methods() {
 	json_add_object "ai_sub_get"; json_close_object
 	json_add_object "ai_sub_set"; json_add_string "url" "string"; json_close_object
 	json_add_object "subs_list";  json_close_object
+	json_add_object "subs_seed"; json_close_object
 	json_add_object "sub_add";    json_add_string "name" "string"; json_add_string "url" "string"; json_close_object
 	json_add_object "sub_del";    json_add_string "id" "string"; json_close_object
 	json_add_object "ai_sub_use";   json_add_string "id" "string"; json_close_object
@@ -45,6 +46,7 @@ call_method() {
 		ai_sub_get) "$BACKEND" ai_sub_get ;;
 		ai_sub_set) json_get_var url url; "$BACKEND" ai_sub_set "$url" ;;
 		subs_list)  "$BACKEND" subs_list ;;
+		subs_seed)  "$BACKEND" subs_seed ;;
 		sub_add)    json_get_var name name; json_get_var url url; "$BACKEND" sub_add "$name" "$url" ;;
 		sub_del)    json_get_var id id; "$BACKEND" sub_del "$id" ;;
 		ai_sub_use)   json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;

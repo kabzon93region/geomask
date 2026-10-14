@@ -17,6 +17,7 @@ var callDevDel = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { 
 var callAiSubGet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
 var callAiSubSet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
 var callSubsList = rpc.declare({ object: 'geo-sync', method: 'subs_list', expect: {} });
+var callSubsSeed = rpc.declare({ object: 'geo-sync', method: 'subs_seed', expect: {} });
 var callSubAdd   = rpc.declare({ object: 'geo-sync', method: 'sub_add',   params: { name: null, url: null }, expect: {} });
 var callSubDel   = rpc.declare({ object: 'geo-sync', method: 'sub_del',   params: { id: null }, expect: {} });
 var callAiSubUse   = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use',   params: { id: null }, expect: {} });
@@ -211,6 +212,20 @@ return view.extend({
 					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
 				});
 			} }, 'Добавить');
+		var btnSubSeed = E('button', { 'class': 'gs-btn',
+			'title': 'Импортировать текущие подписки из конфига mihomo в реестр',
+			'click': function() {
+				btnSubSeed.disabled = true; btnSubSeed.textContent = 'Импорт…';
+				callSubsSeed().then(function(res) {
+					btnSubSeed.disabled = false; btnSubSeed.textContent = 'Подтянуть текущие из конфига';
+					if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+					ui.addNotification(null, E('p', {}, 'Текущие подписки добавлены в реестр'), 'info');
+					return view.reload();
+				}).catch(function(e) {
+					btnSubSeed.disabled = false; btnSubSeed.textContent = 'Подтянуть текущие из конфига';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Подтянуть текущие из конфига');
 		var subsCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Подписки'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
@@ -218,7 +233,8 @@ return view.extend({
 			E('table', { 'class': 'gs-table' },
 				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
 					.concat(subs.map(subRow))),
-			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ])
+			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ]),
+			E('div', { 'class': 'gs-row' }, [ btnSubSeed ])
 		]);
 		wrap.appendChild(subsCard);
 

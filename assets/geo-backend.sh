@@ -479,7 +479,31 @@ _sub_id_by_url() { # _sub_id_by_url <url> -> id, rc=1 if not found
 }
 
 cmd_subs_list() {
+  # fresh/empty registry: auto-import the providers currently in mihomo config
+  if [ ! -s "$SUBS_FILE" ] || ! grep -qE '^[^#]' "$SUBS_FILE" 2>/dev/null; then
+    _subs_seed_internal
+  fi
   printf '{"subs":%s}' "$(_subs_json)"
+}
+
+_subs_count() { grep -cE '^[^#]' "$SUBS_FILE" 2>/dev/null || echo 0; }
+
+# import current config providers into the registry (skips urls already present)
+_subs_seed_internal() {
+  _subu=$(awk '/^  sub:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  _de5u=$(awk '/^  de5:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  if [ -n "$_subu" ]; then
+    _subs_json | grep -Fq "$_subu" || cmd_sub_add "VPN (текущая)" "$_subu" >/dev/null
+  fi
+  if [ -n "$_de5u" ]; then
+    _subs_json | grep -Fq "$_de5u" || cmd_sub_add "AI (текущая)" "$_de5u" >/dev/null
+  fi
+  echo "$(date +%FT%T) SUB seed (auto)" >> "$LOG"
+}
+
+cmd_subs_seed() {
+  _subs_seed_internal
+  printf '{"ok":true,"subs":%s}' "$(_subs_json)"
 }
 
 cmd_sub_add() {

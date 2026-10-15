@@ -99,14 +99,20 @@ cmd_status() {
   VPN_SUB_ID=$(_sub_id_by_url "$_subu" 2>/dev/null || echo '')
   if ip link show "$AI_TUN_DEV" >/dev/null 2>&1; then AI_TUN=1; else AI_TUN=0; fi
   if netstat -lntp 2>/dev/null | grep -q ':7891'; then AI_LST=1; else AI_LST=0; fi
-  printf '{"vpn_node":"%s","vpn_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","ai_url":"%s","vpn_url":"%s"}' \
+  # AI-DNS (no DNS leak for AI devices): 0=off/absent, 1=working, 2=partial
+  # working = ip rule routes marked DNS to the AI tunnel AND the AI DNS chain listens
+  if [ -f /etc/geomask-aidns.off ] || [ ! -f /etc/geomask-aidns.uid ]; then AIDNS=0
+  elif ip route get 1.1.1.1 mark 0x64 2>/dev/null | grep -q 'dev AI' \
+       && netstat -ltnpu 2>/dev/null | grep -q '192.168.0.53:5353 '; then AIDNS=1
+  else AIDNS=2; fi
+  printf '{"vpn_node":"%s","vpn_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","ai_url":"%s","vpn_url":"%s","aidns":%s}' \
     "$(json_esc "$VPN_NODE")" "$(_node_cc "$VPN_NODE")" \
     "$(json_esc "$AI_NODE")" "$(_node_cc "$AI_NODE")" \
     "$(json_esc "$GLOBAL")" "$LCRON" "$V6" "$(json_esc "$DOH")" \
     "$AI_RC" "$MT_RC" "$(json_esc "$GOOGLE_CC")" "$(json_esc "$SYNC_AT")" \
     "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES" \
     "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPN_SUB_ID")" \
-    "$(json_esc "$_de5u")" "$(json_esc "$_subu")"
+    "$(json_esc "$_de5u")" "$(json_esc "$_subu")" "$AIDNS"
 }
 
 # country fragment from a node name (flag emoji or RU word) - coarse, for display
@@ -209,6 +215,29 @@ net.ipv6.conf.default.disable_ipv6 = 1' > /etc/sysctl.d/99-disable-ipv6.conf
   cmd_status
 }
 
+# AI-DNS on demand: regenerate the nft DNAT list for ai-mode devices + reload firewall.
+# Installs nothing (that is the installer's aidns step); only re-syncs the device list.
+cmd_aidns_apply() {
+  if [ -f /etc/geomask-aidns.off ]; then
+    printf '{"ok":true,"warn":"AI-DNS disabled (/etc/geomask-aidns.off)"}'
+    return 0
+  fi
+  if [ ! -f /etc/geomask-aidns.uid ]; then
+    printf '{"ok":false,"warn":"AI-DNS not installed - run the aidns step of geomask"}'
+    return 0
+  fi
+  _before=$(cat /tmp/geomask-aidns-last 2>/dev/null)
+  _aidns_sync
+  _after=$(cat /tmp/geomask-aidns-last 2>/dev/null)
+  if [ "$_before" != "$_after" ]; then
+    echo "$(date +%FT%T) AI-DNS apply (manual)" >> "$LOG"
+    printf '{"ok":true,"warn":""}'
+  else
+    printf '{"ok":true,"warn":"no changes"}'
+  fi
+  return 0
+}
+
 # add/update a device geo-policy: dev_add <ip> <mode> [mac] [name]
 cmd_dev_add() {
   IP="$1"; MODE="$2"; MAC="$3"; NAME="${4:-$IP}"
@@ -252,6 +281,48 @@ cmd_dev_del() {
   cmd_status
 }
 
+# AI-DNS: keep the nft DNAT list in sync with the ai-mode devices of /etc/geo-devices.list.
+# No-op when the step was not installed (/etc/geomask-aidns.uid absent) or disabled
+# (/etc/geomask-aidns.off present). Firewall is reloaded only when the list changes.
+# NOTE: the AI dnsmasq listens on 192.168.0.53:5353 (NOT :53) - the main dnsmasq
+# rebinds every interface address including our alias, so :53 there is taken.
+_aidns_sync() {
+  [ -f /etc/geomask-aidns.uid ] || return 0
+  [ -f /etc/geomask-aidns.off ] && return 0
+  _uid=$(cat /etc/geomask-aidns.uid 2>/dev/null | tr -dc '0-9')
+  [ -n "$_uid" ] || return 0
+  _ips=$(awk '$2=="ai" && $1 !~ /^#/ {print $1}' "$DEVICES" 2>/dev/null)
+  _list=""
+  for _ip in $_ips; do _list="$_list $_ip,"; done
+  _list=${_list%,}
+  {
+    printf '# geomask AI-DNS (auto-generated from /etc/geo-devices.list - do not edit)\n'
+    printf '# DNS of AI-mode devices goes into the AI tunnel: no DNS leak, no geo mismatch.\n'
+    printf '# idempotent include pattern (same as 20-https-dns-proxy-notrack.nft)\n'
+    printf 'add table inet geomask_ai_dns\n'
+    printf 'flush table inet geomask_ai_dns\n'
+    printf 'add chain inet geomask_ai_dns pre_nat { type nat hook prerouting priority -110; policy accept; }\n'
+    printf 'add chain inet geomask_ai_dns out_mark { type route hook output priority -150; policy accept; }\n'
+    printf 'add rule inet geomask_ai_dns out_mark meta skuid %s mark set 0x64\n' "$_uid"
+    if [ -n "$_list" ]; then
+      printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to 192.168.0.53:5353\n' "$_list"
+    fi
+  } > /tmp/geomask-aidns.nft 2>/dev/null || return 0
+  if ! nft -c -f /tmp/geomask-aidns.nft >/dev/null 2>&1; then
+    rm -f /tmp/geomask-aidns.nft
+    echo "$(date +%FT%T) AI-DNS: generated rules failed syntax check" >> "$LOG"
+    return 0
+  fi
+  cp /tmp/geomask-aidns.nft /usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft 2>/dev/null
+  rm -f /tmp/geomask-aidns.nft
+  if [ "${_list}" != "$(cat /tmp/geomask-aidns-last 2>/dev/null)" ]; then
+    printf '%s' "$_list" > /tmp/geomask-aidns-last
+    /etc/init.d/firewall reload >/dev/null 2>&1 || true
+    echo "$(date +%FT%T) AI-DNS: device list updated -> firewall reloaded" >> "$LOG"
+  fi
+  return 0
+}
+
 # (re)apply routing for all managed devices:
 #   bypass -> direct (32611) | realtz -> normal mihomo path | ai -> AI tunnel (32611 -> table 101 -> dev AI)
 _apply_routing() {
@@ -273,6 +344,7 @@ _apply_routing() {
     done < "$DEVICES"
   fi
   _hotplug_sync
+  _aidns_sync
 }
 
 # provision AI tunnel on first use: hev-socks5-tunnel instance #2 (own TUN "AI",
@@ -609,6 +681,7 @@ case "$1" in
   leases)     cmd_leases ;;
   log)        cmd_log ;;
   sync_lists) cmd_sync_lists ;;
+  aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;
   global)     cmd_global "$2" ;;
   ipv6)       cmd_ipv6 "$2" ;;

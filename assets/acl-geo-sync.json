@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed" ]
+				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed" ]
 			}
 		}
 	}

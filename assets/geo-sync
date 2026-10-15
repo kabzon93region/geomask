@@ -38,6 +38,7 @@ call_method() {
 		leases)     "$BACKEND" leases ;;
 		log)        "$BACKEND" log ;;
 		sync_lists) "$BACKEND" sync_lists ;;
+		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;
 		global)     json_get_var mode mode;   "$BACKEND" global "$mode" ;;
 		ipv6)       json_get_var state state; "$BACKEND" ipv6 "$state" ;;

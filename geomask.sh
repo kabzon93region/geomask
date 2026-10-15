@@ -1,6 +1,6 @@
 #!/bin/sh
 # geomask.sh - geo-masking overlay + 2-subscription mihomo stack for OpenWrt
-# Workflow: check -> geo overlay -> mihomo 2 subs -> magitrickle sync -> services -> verify
+# Workflow: check -> geo overlay -> mihomo 2 subs -> AI-DNS (no DNS leak) -> magitrickle sync -> services -> verify
 #
 # Usage:
 #   sh geomask.sh              interactive menu (status dashboard + actions loop)
@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.6"
+GM_VERSION="1.5.7"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -227,14 +227,20 @@ cmd_status() {
   VPN_SUB_ID=$(_sub_id_by_url "$_subu" 2>/dev/null || echo '')
   if ip link show "$AI_TUN_DEV" >/dev/null 2>&1; then AI_TUN=1; else AI_TUN=0; fi
   if netstat -lntp 2>/dev/null | grep -q ':7891'; then AI_LST=1; else AI_LST=0; fi
-  printf '{"vpn_node":"%s","vpn_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","ai_url":"%s","vpn_url":"%s"}' \
+  # AI-DNS (no DNS leak for AI devices): 0=off/absent, 1=working, 2=partial
+  # working = ip rule routes marked DNS to the AI tunnel AND the AI DNS chain listens
+  if [ -f /etc/geomask-aidns.off ] || [ ! -f /etc/geomask-aidns.uid ]; then AIDNS=0
+  elif ip route get 1.1.1.1 mark 0x64 2>/dev/null | grep -q 'dev AI' \
+       && netstat -ltnpu 2>/dev/null | grep -q '192.168.0.53:5353 '; then AIDNS=1
+  else AIDNS=2; fi
+  printf '{"vpn_node":"%s","vpn_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","ai_url":"%s","vpn_url":"%s","aidns":%s}' \
     "$(json_esc "$VPN_NODE")" "$(_node_cc "$VPN_NODE")" \
     "$(json_esc "$AI_NODE")" "$(_node_cc "$AI_NODE")" \
     "$(json_esc "$GLOBAL")" "$LCRON" "$V6" "$(json_esc "$DOH")" \
     "$AI_RC" "$MT_RC" "$(json_esc "$GOOGLE_CC")" "$(json_esc "$SYNC_AT")" \
     "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES" \
     "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPN_SUB_ID")" \
-    "$(json_esc "$_de5u")" "$(json_esc "$_subu")"
+    "$(json_esc "$_de5u")" "$(json_esc "$_subu")" "$AIDNS"
 }
 
 # country fragment from a node name (flag emoji or RU word) - coarse, for display
@@ -337,6 +343,29 @@ net.ipv6.conf.default.disable_ipv6 = 1' > /etc/sysctl.d/99-disable-ipv6.conf
   cmd_status
 }
 
+# AI-DNS on demand: regenerate the nft DNAT list for ai-mode devices + reload firewall.
+# Installs nothing (that is the installer's aidns step); only re-syncs the device list.
+cmd_aidns_apply() {
+  if [ -f /etc/geomask-aidns.off ]; then
+    printf '{"ok":true,"warn":"AI-DNS disabled (/etc/geomask-aidns.off)"}'
+    return 0
+  fi
+  if [ ! -f /etc/geomask-aidns.uid ]; then
+    printf '{"ok":false,"warn":"AI-DNS not installed - run the aidns step of geomask"}'
+    return 0
+  fi
+  _before=$(cat /tmp/geomask-aidns-last 2>/dev/null)
+  _aidns_sync
+  _after=$(cat /tmp/geomask-aidns-last 2>/dev/null)
+  if [ "$_before" != "$_after" ]; then
+    echo "$(date +%FT%T) AI-DNS apply (manual)" >> "$LOG"
+    printf '{"ok":true,"warn":""}'
+  else
+    printf '{"ok":true,"warn":"no changes"}'
+  fi
+  return 0
+}
+
 # add/update a device geo-policy: dev_add <ip> <mode> [mac] [name]
 cmd_dev_add() {
   IP="$1"; MODE="$2"; MAC="$3"; NAME="${4:-$IP}"
@@ -380,6 +409,48 @@ cmd_dev_del() {
   cmd_status
 }
 
+# AI-DNS: keep the nft DNAT list in sync with the ai-mode devices of /etc/geo-devices.list.
+# No-op when the step was not installed (/etc/geomask-aidns.uid absent) or disabled
+# (/etc/geomask-aidns.off present). Firewall is reloaded only when the list changes.
+# NOTE: the AI dnsmasq listens on 192.168.0.53:5353 (NOT :53) - the main dnsmasq
+# rebinds every interface address including our alias, so :53 there is taken.
+_aidns_sync() {
+  [ -f /etc/geomask-aidns.uid ] || return 0
+  [ -f /etc/geomask-aidns.off ] && return 0
+  _uid=$(cat /etc/geomask-aidns.uid 2>/dev/null | tr -dc '0-9')
+  [ -n "$_uid" ] || return 0
+  _ips=$(awk '$2=="ai" && $1 !~ /^#/ {print $1}' "$DEVICES" 2>/dev/null)
+  _list=""
+  for _ip in $_ips; do _list="$_list $_ip,"; done
+  _list=${_list%,}
+  {
+    printf '# geomask AI-DNS (auto-generated from /etc/geo-devices.list - do not edit)\n'
+    printf '# DNS of AI-mode devices goes into the AI tunnel: no DNS leak, no geo mismatch.\n'
+    printf '# idempotent include pattern (same as 20-https-dns-proxy-notrack.nft)\n'
+    printf 'add table inet geomask_ai_dns\n'
+    printf 'flush table inet geomask_ai_dns\n'
+    printf 'add chain inet geomask_ai_dns pre_nat { type nat hook prerouting priority -110; policy accept; }\n'
+    printf 'add chain inet geomask_ai_dns out_mark { type route hook output priority -150; policy accept; }\n'
+    printf 'add rule inet geomask_ai_dns out_mark meta skuid %s mark set 0x64\n' "$_uid"
+    if [ -n "$_list" ]; then
+      printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to 192.168.0.53:5353\n' "$_list"
+    fi
+  } > /tmp/geomask-aidns.nft 2>/dev/null || return 0
+  if ! nft -c -f /tmp/geomask-aidns.nft >/dev/null 2>&1; then
+    rm -f /tmp/geomask-aidns.nft
+    echo "$(date +%FT%T) AI-DNS: generated rules failed syntax check" >> "$LOG"
+    return 0
+  fi
+  cp /tmp/geomask-aidns.nft /usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft 2>/dev/null
+  rm -f /tmp/geomask-aidns.nft
+  if [ "${_list}" != "$(cat /tmp/geomask-aidns-last 2>/dev/null)" ]; then
+    printf '%s' "$_list" > /tmp/geomask-aidns-last
+    /etc/init.d/firewall reload >/dev/null 2>&1 || true
+    echo "$(date +%FT%T) AI-DNS: device list updated -> firewall reloaded" >> "$LOG"
+  fi
+  return 0
+}
+
 # (re)apply routing for all managed devices:
 #   bypass -> direct (32611) | realtz -> normal mihomo path | ai -> AI tunnel (32611 -> table 101 -> dev AI)
 _apply_routing() {
@@ -401,6 +472,7 @@ _apply_routing() {
     done < "$DEVICES"
   fi
   _hotplug_sync
+  _aidns_sync
 }
 
 # provision AI tunnel on first use: hev-socks5-tunnel instance #2 (own TUN "AI",
@@ -737,6 +809,7 @@ case "$1" in
   leases)     cmd_leases ;;
   log)        cmd_log ;;
   sync_lists) cmd_sync_lists ;;
+  aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;
   global)     cmd_global "$2" ;;
   ipv6)       cmd_ipv6 "$2" ;;
@@ -794,6 +867,7 @@ call_method() {
 		leases)     "$BACKEND" leases ;;
 		log)        "$BACKEND" log ;;
 		sync_lists) "$BACKEND" sync_lists ;;
+		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;
 		global)     json_get_var mode mode;   "$BACKEND" global "$mode" ;;
 		ipv6)       json_get_var state state; "$BACKEND" ipv6 "$state" ;;
@@ -840,7 +914,7 @@ ASSET_EOF
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed" ]
+				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed" ]
 			}
 		}
 	}
@@ -1014,7 +1088,10 @@ return view.extend({
 			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
 			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc), cleanName(st.ai_node) || '—' ]),
 			E('div', { 'class': 'gs-meta' }, 'Подписка de5 · выход ' + ((CCNAME[aiCc] || aiCc) ? (CCNAME[aiCc] || aiCc) : '—') +
-				(st.google ? ' · Google видит: ' + st.google : ''))
+				(st.google ? ' · Google видит: ' + st.google : '')),
+			E('div', { 'class': 'gs-meta' }, 'DNS AI-устройств: ' + (
+				st.aidns === 1 ? 'через AI-туннель (утечки нет)' :
+				st.aidns === 2 ? 'ПРОБЛЕМА — не через туннель (проверьте шаг aidns)' : 'не настроено (утечка DNS!)'))
 		]);
 		var vpnSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'Общая VPN · всё магитрикле (не-ИИ)'),
@@ -1611,8 +1688,182 @@ safe_mihomo_restart() {
   return 1
 }
 
-# ============================================================ STEP 4: magitrickle -> mihomo sync
+# ============================================================ STEP 4: AI-DNS - no DNS leak for AI devices
+# Browsing of AI-mode devices goes through the AI tunnel, but their DNS used to be
+# resolved by the router itself and left via the real ISP IP -> DNS leak: geo checkers
+# see "page from <AI country>, DNS from <ISP country>" and flag VPN usage.
+# This step puts DNS of AI-mode devices into the same AI tunnel:
+#   device DNS (any dst, port 53)
+#     --DNAT (nat priority -110; wins over ALL other DNS interception on this router)-->
+#     192.168.0.53:53 (2nd dnsmasq) -> 127.0.0.1:5055 (2nd DoH worker as user dnsai)
+#     --nft mark 0x64 (skuid)--> ip rule fwmark 0x64 table 101 -> dev AI (exit = AI node)
+# Permanent opt-out: touch /etc/geomask-aidns.off  (step becomes a no-op)
+
+AIDNS_IP=192.168.0.53
+AIDNS_PORT=5055
+AIDNS_DNS_PORT=5353
+AIDNS_USER=dnsai
+AIDNS_MARK=0x64
+AIDNS_RULE_PREF=32620
+
+aidns_user_exists() { grep -q "^$AIDNS_USER:" "$(P /etc/passwd)" 2>/dev/null; }
+
+aidns_generate_nft() { # (re)write the nft include from the current ai device list
+  _uid=$(cat "$(P /etc/geomask-aidns.uid)" 2>/dev/null)
+  [ -n "$_uid" ] || _uid=$(awk -F: -v u="$AIDNS_USER" '$1==u{print $3}' "$(P /etc/passwd)" 2>/dev/null)
+  [ -n "$_uid" ] || _uid=65533
+  _ips=$(awk '$2=="ai" && $1 !~ /^#/ {print $1}' "$(P /etc/geo-devices.list)" 2>/dev/null)
+  _list=""
+  for _ip in $_ips; do _list="$_list $_ip,"; done
+  _list=${_list%,}
+  {
+    printf '# geomask AI-DNS (auto-generated from /etc/geo-devices.list - do not edit)\n'
+    printf '# DNS of AI-mode devices goes into the AI tunnel: no DNS leak, no geo mismatch.\n'
+    printf '# idempotent include pattern (same as 20-https-dns-proxy-notrack.nft)\n'
+    printf 'add table inet geomask_ai_dns\n'
+    printf 'flush table inet geomask_ai_dns\n'
+    printf 'add chain inet geomask_ai_dns pre_nat { type nat hook prerouting priority -110; policy accept; }\n'
+    printf 'add chain inet geomask_ai_dns out_mark { type route hook output priority -150; policy accept; }\n'
+    printf 'add rule inet geomask_ai_dns out_mark meta skuid %s mark set %s\n' "$_uid" "$AIDNS_MARK"
+    if [ -n "$_list" ]; then
+      printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to %s:%s\n' "$_list" "$AIDNS_IP" "$AIDNS_DNS_PORT"
+    fi
+  } > /tmp/geomask-aidns.nft
+  if nft -c -f /tmp/geomask-aidns.nft >/dev/null 2>&1; then
+    save_stream /usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft 644 < /tmp/geomask-aidns.nft
+    rm -f /tmp/geomask-aidns.nft
+    return 0
+  fi
+  rm -f /tmp/geomask-aidns.nft
+  bad "generated AI-DNS nft rules failed syntax check"
+  return 1
+}
+
 step4_check() {
+  _need=0
+  if [ -f "$(P /etc/geomask-aidns.off)" ]; then
+    info "AI-DNS: disabled (/etc/geomask-aidns.off present)"
+    return 0
+  fi
+  aidns_user_exists && info "user $AIDNS_USER: present" || { warn "user $AIDNS_USER: missing"; _need=1; }
+  [ -x "$(P /usr/sbin/https-dns-proxy)" ] && info "https-dns-proxy: present" || { warn "https-dns-proxy: missing"; _need=1; }
+  if have netstat; then
+    netstat -ltnu 2>/dev/null | grep -q "127.0.0.1:$AIDNS_PORT " && info "AI DoH worker (:$AIDNS_PORT): listening" || { warn "AI DoH worker not listening on :$AIDNS_PORT"; _need=1; }
+    netstat -ltnu 2>/dev/null | grep -q "$AIDNS_IP:$AIDNS_DNS_PORT " && info "AI dnsmasq ($AIDNS_IP:$AIDNS_DNS_PORT): listening" || { warn "AI dnsmasq not listening on $AIDNS_IP:$AIDNS_DNS_PORT"; _need=1; }
+  else
+    warn "netstat unavailable - listener checks skipped"
+  fi
+  _alias=$(ip -4 addr show br-lan 2>/dev/null)
+  if [ -z "$_alias" ]; then
+    warn "cannot read br-lan addresses (ip unavailable?)"
+  elif printf '%s' "$_alias" | grep -q " $AIDNS_IP/"; then
+    info "alias $AIDNS_IP on br-lan: present"
+  else
+    warn "alias $AIDNS_IP missing on br-lan"; _need=1
+  fi
+  ip rule show 2>/dev/null | grep -q "fwmark $AIDNS_MARK" && info "ip rule fwmark $AIDNS_MARK -> table 101: present" || { warn "ip rule fwmark $AIDNS_MARK -> 101 missing"; _need=1; }
+  nft list table inet geomask_ai_dns >/dev/null 2>&1 && info "nft AI-DNS table: loaded" || { warn "nft AI-DNS table missing"; _need=1; }
+  _aiips=$(awk '$2=="ai" && $1 !~ /^#/ {print $1}' "$(P /etc/geo-devices.list)" 2>/dev/null)
+  if [ -z "$_aiips" ]; then
+    info "ai-mode devices: none (nothing to DNAT)"
+  else
+    _tbl=$(nft list table inet geomask_ai_dns 2>/dev/null)
+    if [ -z "$_tbl" ]; then
+      warn "AI-DNS DNAT: cannot read rules (nft list empty)"
+    else
+      _miss=0
+      for _ip in $_aiips; do
+        printf '%s' "$_tbl" | grep -q "$_ip" || _miss=1
+      done
+      if [ "$_miss" = 0 ]; then info "AI-DNS DNAT: all ai devices covered"
+      else warn "AI-DNS DNAT: some ai devices missing from rules"; _need=1; fi
+    fi
+  fi
+  return $_need
+}
+step4_apply() {
+  if [ -f "$(P /etc/geomask-aidns.off)" ]; then info "AI-DNS disabled by flag - nothing to do"; return 0; fi
+  _bk=$(ensure_backup) || { bad "no backup - ABORTED"; return 1; }
+  info "backup: $_bk"
+  # 1) dedicated user for the AI DoH worker (sockets get marked by uid)
+  if ! aidns_user_exists; then
+    _uid=65533
+    while awk -F: -v u="$_uid" '$3==u{found=1} END{exit found?0:1}' "$(P /etc/passwd)" 2>/dev/null; do _uid=$((_uid-1)); done
+    printf '%s:x:%s:%s:geomask AI-DNS:/var/run/%s:/bin/false\n' "$AIDNS_USER" "$_uid" "$_uid" "$AIDNS_USER" >> "$(P /etc/passwd)"
+    grep -q "^$AIDNS_USER:" "$(P /etc/group)" 2>/dev/null || printf '%s:x:%s:\n' "$AIDNS_USER" "$_uid" >> "$(P /etc/group)"
+    save_stream /etc/geomask-aidns.uid 644 <<ASSET_EOF
+$_uid
+ASSET_EOF
+    info "user $AIDNS_USER created (uid $_uid)"
+  fi
+  # 2) alias IP on br-lan for the AI dnsmasq
+  if ! ip -4 addr show br-lan 2>/dev/null | grep -q " $AIDNS_IP/"; then
+    if ! uci -q get network.lanai >/dev/null; then uci set network.lanai=interface; fi
+    uci set network.lanai.proto='static'
+    uci set network.lanai.device='br-lan'
+    uci set network.lanai.ipaddr="$AIDNS_IP"
+    uci set network.lanai.netmask='255.255.255.0'
+    uci commit network
+    /etc/init.d/network reload >/dev/null 2>&1 || warn "network reload rc!=0 - alias may need reboot"
+    sleep 1
+    ip -4 addr show br-lan | grep -q " $AIDNS_IP/" && info "alias $AIDNS_IP: up" || warn "alias $AIDNS_IP: NOT up"
+  fi
+  # 3) AI DoH worker (second https-dns-proxy instance, runs as dnsai)
+  save_stream /etc/init.d/ai-doh 755 <<'ASSET_EOF'
+#!/bin/sh /etc/rc.common
+# geomask: DNS-over-HTTPS worker for AI-mode devices (marked -> AI tunnel)
+START=21
+USE_PROCD=1
+start_service() {
+  procd_open_instance
+  procd_set_param command /usr/sbin/https-dns-proxy -a 127.0.0.1 -p 5055 -r https://cloudflare-dns.com/dns-query -u dnsai -g dnsai
+  procd_set_param respawn
+  procd_close_instance
+}
+ASSET_EOF
+  # 4) AI dnsmasq (upstream = the AI DoH worker; RU-domain resolvers copied from main dnsmasq)
+  {
+    printf 'listen-address=%s\n' "$AIDNS_IP"
+    printf 'bind-interfaces\n'
+    printf 'port=%s\n' "$AIDNS_DNS_PORT"
+    printf 'no-resolv\n'
+    printf 'no-poll\n'
+    printf 'cache-size=1000\n'
+    printf 'domain-needed\n'
+    printf 'bogus-priv\n'
+    printf 'server=127.0.0.1#%s\n' "$AIDNS_PORT"
+    _s=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
+    for _e in $_s; do case "$_e" in /*) printf 'server=%s\n' "$_e" ;; esac; done
+  } > "$(P /etc/dnsmasq-ai.conf)"
+  save_stream /etc/init.d/dnsmasq-ai 755 <<'ASSET_EOF'
+#!/bin/sh /etc/rc.common
+# geomask: dnsmasq for AI-mode devices (upstream = AI DoH worker in the AI tunnel)
+START=61
+USE_PROCD=1
+start_service() {
+  procd_open_instance
+  procd_set_param command /usr/sbin/dnsmasq -C /etc/dnsmasq-ai.conf -k
+  procd_set_param respawn
+  procd_close_instance
+}
+ASSET_EOF
+  # 5) nft rules (DNAT for ai devices + mark for dnsai sockets)
+  aidns_generate_nft || return 1
+  # 6) ip rule: marked DNS sockets go through the AI tunnel
+  ip rule show 2>/dev/null | grep -q "fwmark $AIDNS_MARK" || ip rule add pref "$AIDNS_RULE_PREF" fwmark "$AIDNS_MARK" table 101
+  # 7) services on + reload firewall to apply nft file
+  initd ai-doh enable >/dev/null 2>&1 || true
+  initd dnsmasq-ai enable >/dev/null 2>&1 || true
+  initd ai-doh restart >/dev/null 2>&1 || warn "ai-doh did not start"
+  initd dnsmasq-ai restart >/dev/null 2>&1 || warn "dnsmasq-ai did not start"
+  /etc/init.d/firewall reload >/dev/null 2>&1 || warn "firewall reload failed"
+  sleep 1
+  return 0
+}
+step4_verify() { step4_check; }
+
+# ============================================================ STEP 5: magitrickle -> mihomo sync
+step5_check() {
   _need=0
   _s="$(P /root/sync_mtrickle_mihomo.sh)"
   if [ -s "$_s" ]; then
@@ -1625,7 +1876,7 @@ step4_check() {
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
-step4_apply() {
+step5_apply() {
   save_stream /root/sync_mtrickle_mihomo.sh 755 <<'ASSET_EOF'
 #!/bin/sh
 # Sync magitrickle (enabled groups with interface Mihomo) -> TWO mihomo rule-provider files:
@@ -2025,6 +2276,15 @@ apply_routes() {
   #     (~32645, grows upward with group count) or ping to a marked IP dies
   #     inside the TUN. Direct via pppoe-wan. ---
   ip rule show | grep -q '32610:' || ip rule add priority 32610 iif br-lan ipproto icmp lookup main
+  # --- AI-DNS: DNS of AI-mode devices exits through the AI tunnel (no DNS leak).
+  #     The DoH worker runs as user dnsai; its sockets are marked 0x64 by the
+  #     nft table geomask_ai_dns, and this rule sends the marked traffic to
+  #     table 101 -> dev AI. Pref 32620 stays BELOW the magitrickle fwmark
+  #     base (~32645) so magitrickle marks are never preempted.
+  #     Opt-out: touch /etc/geomask-aidns.off ---
+  if [ ! -f /etc/geomask-aidns.off ] && [ -f /etc/geomask-aidns.uid ]; then
+    ip rule show | grep -q 'fwmark 0x64' || ip rule add pref 32620 fwmark 0x64 table 101
+  fi
   # --- per-device rules: 32611 < magitrickle fwmark base ~32645, so a device
   #     rule is never preempted by magitrickle marking; LAN stays local ---
   # --- bypass-mode devices (32611 vs fwmark rules 32645+) ---
@@ -2082,35 +2342,63 @@ ASSET_EOF
   fi
   return 0
 }
-step4_verify() { step4_check; }
+step5_verify() { step5_check; }
 
-# ============================================================ STEP 5: services (start missing only)
-SVC_LIST="dnsmasq magitrickled mihomo hev-socks5-tunnel rpcd"
-step5_check() {
+# ============================================================ STEP 6: services (start missing only)
+SVC_LIST="dnsmasq magitrickled mihomo hev-socks5-tunnel rpcd ai-doh dnsmasq-ai"
+# ai-doh/dnsmasq-ai run as generic binaries (https-dns-proxy/dnsmasq), so pidof
+# by service name never matches - check their listening ports instead.
+aidns_svc_ok() {
+  case "$1" in
+    ai-doh)     netstat -ltnu 2>/dev/null | grep -q '127.0.0.1:5055 ' ;;
+    dnsmasq-ai) netstat -ltnu 2>/dev/null | grep -q '192.168.0.53:5353 ' ;;
+  esac
+}
+step6_check() {
   _need=0
   for s in $SVC_LIST; do
     case "$s" in
       magitrickled) _p=magitrickled ;;
       *) _p=$s ;;
     esac
-    svc_alive "$_p" && info "$s: running" || { warn "$s: NOT running"; _need=1; }
+    if [ -f "$(P /etc/geomask-aidns.off)" ] && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
+      info "$s: AI-DNS disabled - skipped"; continue
+    fi
+    case "$s" in
+      ai-doh|dnsmasq-ai)
+        if aidns_svc_ok "$s"; then info "$s: listening"
+        else warn "$s: NOT listening"; _need=1; fi
+        ;;
+      *) svc_alive "$_p" && info "$s: running" || { warn "$s: NOT running"; _need=1; } ;;
+    esac
   done
   return $_need
 }
-step5_apply() {
+step6_apply() {
   for s in $SVC_LIST; do
-    _p=$s; [ "$s" = magitrickled ] && _p=magitrickled
-    if svc_alive "$_p"; then info "$s: already running - untouched"; continue; fi
-    _init=$s; [ "$s" = magitrickled ] && _init=magitrickle
-    info "starting $_init (it was down)..."
-    initd "$_init" start >/dev/null 2>&1 || warn "cannot start $_init"
+    _p=$s; [ "$s" = magitrickled ] && _p=magitrickle
+    if [ -f "$(P /etc/geomask-aidns.off)" ] && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
+      info "$s: AI-DNS disabled - skipped"; continue
+    fi
+    case "$s" in
+      ai-doh|dnsmasq-ai)
+        if aidns_svc_ok "$s"; then info "$s: already listening - untouched"; continue; fi
+        info "starting $s (not listening)..."
+        initd "$s" start >/dev/null 2>&1 || warn "cannot start $s"
+        ;;
+      *)
+        if svc_alive "$s"; then info "$s: already running - untouched"; continue; fi
+        info "starting $s (it was down)..."
+        initd "$_p" start >/dev/null 2>&1 || warn "cannot start $s"
+        ;;
+    esac
   done
   return 0
 }
-step5_verify() { step5_check; }
+step6_verify() { step6_check; }
 
-# ============================================================ STEP 6: end-to-end verify (read-only)
-step6_check() {
+# ============================================================ STEP 7: end-to-end verify (read-only)
+step7_check() {
   _need=0
   _r=$(nslookup ya.ru 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2}' | tail -1)
   if [ -n "$_r" ] && [ "$_r" != "127.0.0.1" ]; then info "DNS normal (ya.ru -> $_r)"; else bad "DNS broken for normal domains"; _need=1; fi
@@ -2128,13 +2416,39 @@ step6_check() {
     ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
   fi
   if ip rule show 2>/dev/null | grep -q '32666'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule (32666) absent - LAN ping may die in TUN"; fi
+  # AI-DNS: DNS of AI devices must exit through the AI tunnel (mark -> table 101)
+  if [ -f "$(P /etc/geomask-aidns.off)" ] || [ ! -f "$(P /etc/geomask-aidns.uid)" ]; then
+    info "AI-DNS: not installed (DNS of AI devices resolves via router - run the aidns step)"
+  else
+    _rt=$(ip route get 1.1.1.1 mark 0x64 2>/dev/null)
+    if [ -z "$_rt" ]; then
+      warn "AI-DNS: routing check returned nothing (ip route unavailable?)"
+    elif printf '%s' "$_rt" | grep -q 'dev AI'; then
+      info "AI-DNS: marked DNS exits via AI tunnel (no leak)"
+    else
+      bad "AI-DNS: marked DNS does NOT route via AI tunnel (leak!)"; _need=1
+    fi
+  fi
   return $_need
 }
-step6_apply() { warn "verify-only step - nothing to apply"; return 0; }
-step6_verify() { step6_check; }
+step7_apply() { warn "verify-only step - nothing to apply"; return 0; }
+step7_verify() { step7_check; }
 
 # ============================================================ runner
-STEP_NAMES="env geo subs sync services verify"
+STEP_NAMES="env geo subs aidns sync services verify"
+
+step_desc() {
+  case "$1" in
+    env)      printf 'проверка окружения: версия OpenWrt, место на диске, зависимости (только чтение)' ;;
+    geo)      printf 'гео-оверлей: панель "Гео-маскировка и AI" в LuCI + бэкенд geo-sync' ;;
+    subs)     printf 'подписки: ссылки VPN/AI и группы VPN/AI в mihomo (проверка доступности)' ;;
+    aidns)    printf 'AI-DNS: DNS AI-устройств через их же туннель — нет утечки DNS (ставится по умолчанию)' ;;
+    sync)     printf 'sync: списки доменов magitrickle для mihomo + cron каждые 5 минут' ;;
+    services) printf 'сервисы: mihomo, magitrickle, hev-туннели, dnsmasq, веб-интерфейс' ;;
+    verify)   printf 'сквозная проверка: выходы VPN/AI, DNS, группа AI, интернет (ничего не меняет)' ;;
+    *)        printf '' ;;
+  esac
+}
 
 step_fn() { # step_fn N action -> call stepN_action
   _n=$1; _a=$2
@@ -2145,6 +2459,7 @@ step_fn() { # step_fn N action -> call stepN_action
     4-check) step4_check ;; 4-apply) step4_apply ;; 4-verify) step4_verify ;;
     5-check) step5_check ;; 5-apply) step5_apply ;; 5-verify) step5_verify ;;
     6-check) step6_check ;; 6-apply) step6_apply ;; 6-verify) step6_verify ;;
+    7-check) step7_check ;; 7-apply) step7_apply ;; 7-verify) step7_verify ;;
     *) bad "unknown step $_n"; return 1 ;;
   esac
 }
@@ -2152,7 +2467,7 @@ step_fn() { # step_fn N action -> call stepN_action
 run_step() { # run_step N  (interactive/auto common logic)
   _n=$1
   _name=$(echo "$STEP_NAMES" | cut -d' ' -f"$_n")
-  hdr "$_n/6" "$_name"
+  hdr "$_n/7" "$_name"
   _fc_before=$FAILCNT
   if step_fn "$_n" check; then
     info "check: ALL GOOD"
@@ -2260,7 +2575,7 @@ show_menu() {
 diag_quick() {
   PASS=0; FAILCNT=0; SKIP=0
   GM_CHECK_ONLY=1
-  for n in 1 2 3 4 5 6; do run_step "$n" || true; done
+  for n in 1 2 3 4 5 6 7; do run_step "$n" || true; done
   GM_CHECK_ONLY=0
   echo
   log "${C_DIM}== ДИАГНОСТИКА: pass=$PASS fail=$FAILCNT ==$NC"
@@ -2297,7 +2612,7 @@ menu_master() {
     read -r _sel || return
     case "$_sel" in
       ''|q|Q) return ;;
-      [1-6]) run_step "$_sel" || true; PAUSE ;;
+      [1-7]) run_step "$_sel" || true; PAUSE ;;
       *) printf '%sнет такого шага%s\n' "$C_R" "$NC"; sleep 1 ;;
     esac
   done
@@ -2358,19 +2673,20 @@ menu_reinstall() {
   ask "Продолжить пересстановку?" || { warn "отменено"; return 1; }
   _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
   _ai=$(prompt_url "Ссылка на AI-подписку (Германия)" "$_cura" "$GM_AI_URL") || { bad "URL AI-подписки не задан"; return 1; }
-  hdr "1/5" "удаление geomask"; geomask_uninstall || true
-  hdr "2/5" "гео-оверлей LuCI"; step2_apply || true
-  hdr "3/5" "mihomo: 2 подписки"
+  hdr "1/6" "удаление geomask"; geomask_uninstall || true
+  hdr "2/6" "гео-оверлей LuCI"; step2_apply || true
+  hdr "3/6" "mihomo: 2 подписки"
   if write_mihomo_config "$_vpn" "$_ai"; then
     api_refresh_provider sub "$_vpn" && info "provider sub refreshed (no restart)" || warn "provider sub: refresh failed, применится при старте mihomo"
     api_refresh_provider de5 "$_ai" && info "provider de5 refreshed (no restart)" || warn "provider de5: refresh failed, применится при старте mihomo"
   else
     bad "конфиг mihomo не записан"; return 1
   fi
-  hdr "4/5" "синхронизация + роутинг"; step4_apply || true
-  hdr "5/5" "сервисы"; step5_apply || true
+  hdr "4/6" "AI-DNS (нет утечки DNS)"; step4_apply || true
+  hdr "5/6" "синхронизация + роутинг"; step5_apply || true
+  hdr "6/6" "сервисы"; step6_apply || true
   hdr "VERIFY" "итоговая проверка"
-  if step6_check; then info "verify: PASS"; else bad "verify: FAIL"; return 1; fi
+  if step7_check; then info "verify: PASS"; else bad "verify: FAIL"; return 1; fi
   log "Пересстановка geomask завершена."
   return 0
 }
@@ -2432,7 +2748,7 @@ elif [ -n "$GM_STEP" ]; then
   run_step "$GM_STEP" || RC=1
 elif [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
   log "geomask v$GM_VERSION  mode: $([ "$GM_CHECK_ONLY" = 1 ] && echo check || echo auto)"
-  for n in 1 2 3 4 5 6; do
+  for n in 1 2 3 4 5 6 7; do
     if [ "$GM_CHECK_ONLY" = 1 ]; then
       run_step "$n" || true
     else

@@ -1,0 +1,10 @@
+Write-Output "BK [1/3] Fresh full backup (MANDATORY before router change)..."
+$ts = Get-Date -Format "yyyyMMdd-HHmmss"
+$Key = "$env:USERPROFILE\.ssh\openwrt_final"
+$Router = "root@192.168.0.1"
+ssh -i $Key -o StrictHostKeyChecking=no -o ConnectTimeout=10 $Router "mkdir -p /root/geomask-backups; sysupgrade -b /tmp/router-backup-aidns.tar.gz"
+Write-Output "BK [2/3] downloading..."
+scp -i $Key -o StrictHostKeyChecking=no -o ConnectTimeout=30 "${Router}:/tmp/router-backup-aidns.tar.gz" "Y:\openwrt\backup\router-backup-pre-aidns-$ts.tar.gz"
+Write-Output "BK [3/3] local backups:"
+Get-ChildItem Y:\openwrt\backup -Filter *.tar.gz | Sort-Object LastWriteTime -Descending | Select-Object -First 2 Name,Length | Format-Table -AutoSize | Out-String
+Write-Output "BACKUP_DONE $ts"

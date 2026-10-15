@@ -148,7 +148,10 @@ return view.extend({
 			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
 			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc), cleanName(st.ai_node) || '—' ]),
 			E('div', { 'class': 'gs-meta' }, 'Подписка de5 · выход ' + ((CCNAME[aiCc] || aiCc) ? (CCNAME[aiCc] || aiCc) : '—') +
-				(st.google ? ' · Google видит: ' + st.google : ''))
+				(st.google ? ' · Google видит: ' + st.google : '')),
+			E('div', { 'class': 'gs-meta' }, 'DNS AI-устройств: ' + (
+				st.aidns === 1 ? 'через AI-туннель (утечки нет)' :
+				st.aidns === 2 ? 'ПРОБЛЕМА — не через туннель (проверьте шаг aidns)' : 'не настроено (утечка DNS!)'))
 		]);
 		var vpnSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'Общая VPN · всё магитрикле (не-ИИ)'),

@@ -74,9 +74,10 @@ assets/          # файлы, вливаемые в установщик:
 1. **env** — проверка окружения: OpenWrt, apk/opkg, python3, curl, место, интернет.
 2. **geo** — установка гео-оверлея: `/usr/bin/geo-backend.sh`, rpcd `geo-sync`, ACL, меню LuCI, страница `geo-sync/main.js`.
 3. **subs** — конфиг mihomo: два proxy-provider (`sub` + `de5`), группы `VPN`/`AI`, правила `ytdirect→DIRECT`, `cloudflare-ech→AI`, `ai→AI`, `mtrickle→VPN`, `MATCH→GLOBAL`, sniffer. Перед записью — бэкап и `mihomo -t`.
-4. **sync** — `/root/sync_mtrickle_mihomo.sh` + cron `*/5` + `ytdirect.yaml` + hotplug-роутинг (`99-default-vpn-route`).
-5. **services** — запуск **только упавших** сервисов; работающие не трогаются.
-6. **verify** — E2E: DNS обычный/adblock, HTTP 204, группы VPN/AI в mihomo API, ubus geo-панели, ICMP-bypass правило.
+4. **aidns** — **нет утечки DNS** для AI-устройств (по умолчанию): DNS AI-устройств уходит в их же AI-туннель. Цепочка: nft-DNAT (приоритет -110, выигрывает у magitrickle/adblock/force_dns) → второй dnsmasq `192.168.0.53:5353` → второй DoH-воркер `127.0.0.1:5055` (пользователь `dnsai`) → метка `0x64` → `ip rule fwmark 0x64 table 101` → `dev AI`. RU-домены резолвятся как прежде. Отключение: `touch /etc/geomask-aidns.off`.
+5. **sync** — `/root/sync_mtrickle_mihomo.sh` + cron `*/5` + `ytdirect.yaml` + hotplug-роутинг (`99-default-vpn-route`).
+6. **services** — запуск **только упавших** сервисов; работающие не трогаются (ai-doh/dnsmasq-ai проверяются по слушающим портам).
+7. **verify** — E2E: DNS обычный/adblock, HTTP 204, группы VPN/AI в mihomo API, ubus geo-панели, ICMP-bypass правило, AI-DNS через туннель.
 
 ## Безопасность
 

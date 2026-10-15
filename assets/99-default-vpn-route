@@ -17,6 +17,15 @@ apply_routes() {
   #     (~32645, grows upward with group count) or ping to a marked IP dies
   #     inside the TUN. Direct via pppoe-wan. ---
   ip rule show | grep -q '32610:' || ip rule add priority 32610 iif br-lan ipproto icmp lookup main
+  # --- AI-DNS: DNS of AI-mode devices exits through the AI tunnel (no DNS leak).
+  #     The DoH worker runs as user dnsai; its sockets are marked 0x64 by the
+  #     nft table geomask_ai_dns, and this rule sends the marked traffic to
+  #     table 101 -> dev AI. Pref 32620 stays BELOW the magitrickle fwmark
+  #     base (~32645) so magitrickle marks are never preempted.
+  #     Opt-out: touch /etc/geomask-aidns.off ---
+  if [ ! -f /etc/geomask-aidns.off ] && [ -f /etc/geomask-aidns.uid ]; then
+    ip rule show | grep -q 'fwmark 0x64' || ip rule add pref 32620 fwmark 0x64 table 101
+  fi
   # --- per-device rules: 32611 < magitrickle fwmark base ~32645, so a device
   #     rule is never preempted by magitrickle marking; LAN stays local ---
   # --- bypass-mode devices (32611 vs fwmark rules 32645+) ---

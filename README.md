@@ -1,138 +1,120 @@
 # geomask
 
-Автоматизированный установщик и конфигуратор домашнего стека обхода блокировок на OpenWrt (wwGate AX3000 / mediatek-filogic):
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/badge/release-v1.5.8-blue)](https://github.com/kabzon93region/geomask/releases/tag/v1.5.8)
+[![Language: Shell](https://img.shields.io/badge/language-POSIX%20sh-informational)](geomask.sh)
+[![Platform: OpenWrt](https://img.shields.io/badge/platform-OpenWrt%2024.10%2B-00b5e2)](https://openwrt.org)
+[![LuCI](https://img.shields.io/badge/UI-LuCI-ff6d00)](https://github.com/openwrt/luci)
+[![Build](https://img.shields.io/badge/build-python%20build.py-success)](build.py)
 
-- **гео-оверлей** — панель «Гео-маскировка и AI» в LuCI (rpcd geo-sync + Web-страница);
-- **mihomo с 2 подписками** — группы `VPN` (основная подписка, exclude РФ/моб.) и `AI` (немецкая нода для Google/AI); AI-подписка меняется из LuCI-страницы (поле + «Применить») или терминала — без перезапуска mihomo;
-- **magitrickle → mihomo sync** — DNS-маршрутизация по доменам через cron каждые 5 минут;
-- **реестр подписок** — добавление ссылок в админке, переключение: какая подписка обслуживает общий VPN и какая — AI-маршруты (кнопки «→ VPN» / «→ AI», без перезапуска mihomo);
-- **AI-устройства** — режим устройства «Через AI-подписку»: весь трафик конкретного устройства уходит через AI-подписку по отдельному туннелю (hev-инстанс AI + mihomo-слушатель7891), основной VPN не прерывается;
-- **сервисы и E2E-проверки** — dnsmasq/magitrickle/mihomo/hev-socks5-tunnel + сквозной verify.
+Автоматизированный установщик и конфигуратор домашнего стека обхода блокировок на OpenWrt.
+Целевое устройство — **wwGate AX3000** (MediaTek Filogic, aarch64), прошивка OpenWrt 25.12.
 
-## Установка (на роутере)
+> **Одна команда** поднимает гео-панель в LuCI, mihomo с двумя подписками, DNS-маршрутизацию
+> magitrickle → mihomo, отдельный AI-туннель для выбранных устройств и сквозные E2E-проверки.
 
-Рекомендуется jsDelivr (быстрее GitHub raw, виден прогресс скачивания):
+---
+
+## Что делает
+
+| Компонент | Назначение |
+|---|---|
+| **Гео-оверлей LuCI** | Панель «Гео-маскировка и AI»: статусы, подписки, устройства (`rpcd`-объект `geo-sync` + web-view) |
+| **mihomo, 2 подписки** | Группы `VPN` (основная) и `AI` (для Google/сервисов, чувствительных к гео) |
+| **magitrickle → mihomo sync** | DNS-маршрутизация по доменам, cron `*/5`, `rule-providers` в mihomo |
+| **AI-устройства** | Режим «весь трафик через AI-подписку»: отдельный hev-туннель + слушатель mihomo `7891` |
+| **AI-DNS (без утечки)** | DNS AI-устройств уходит в их же AI-туннель (метка → `ip rule` → `dev AI`) |
+| **Сервисы и verify** | dnsmasq / magitrickle / mihomo / hev-socks5-tunnel + E2E-проверка 7 шагов |
+
+## Установка
+
+Рекомендуется **jsDelivr** (быстрее GitHub raw, виден прогресс скачивания):
 
 ```sh
 curl -fL -m 60 -o /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/geomask@master/geomask.sh' && sh /tmp/geomask.sh
 ```
 
-Если curl отсутствует:
+Если `curl` отсутствует:
 
 ```sh
 wget -T 30 -O /tmp/geomask.sh 'https://cdn.jsdelivr.net/gh/kabzon93region/geomask@master/geomask.sh' && sh /tmp/geomask.sh
 ```
 
-Классический one-liner через GitHub raw (может быть **очень медленным** с некоторых сетей — выглядит как зависание пустого экрана, используйте варианты выше):
+Классический one-liner через GitHub raw (может быть **очень медленным** с некоторых сетей —
+выглядит как зависание пустого экрана, используйте варианты выше):
 
 ```sh
 sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master/geomask.sh')
 ```
 
-Или локально: скопируйте `geomask.sh` на роутер и запустите `sh /root/geomask.sh`.
+Из релиза (пин на конкретную версию):
 
-## Режимы
+```sh
+opkg install https://github.com/kabzon93region/geomask/releases/download/v1.5.8/geomask.sh
+```
 
-| Режим | Команда | Что делает |
-|---|---|---|
-| Интерактив | `sh geomask.sh` | Главное меню: сводка статусов (роутер, сервисы, VPN/AI узлы, geo, pin) + пункты: диагностика, пошаговый мастер, пересстановка |
-| Пересстановка | `sh geomask.sh --reinstall` | «Удалить → установить → настроить geomask»: сносит гео-оверлей/sync/cron, переустанавливает всё, спрашивает обе подписки; **mihomo не перезапускается** |
-| Полный авто | `sh geomask.sh --auto` | Все шаги без вопросов; остановка при verify-FAIL |
-| Только проверка | `sh geomask.sh --check` | Read-only отчёт по всем шагам, ничего не меняет |
-| Один шаг | `sh geomask.sh --step 3` | Только шаг N (нумерация ниже) |
-| Без вопросов | `+ --yes` | Не спрашивать подтверждений |
-| С рестартом | `+ --restart` | Разрешить перезапуск mihomo (обрыв VPN ~3с). **Игнорируется**, если на роутере есть флаг `/root/.geomask-norestart` |
-| С подписками | `+ --vpn-url URL --ai-url URL` | Задать URL подписок (в конфиг попадают только туда) |
+## Быстрый старт
 
-После каждого действия меню возвращается на главный экран со свежей сводкой.
+```sh
+sh /tmp/geomask.sh            # интерактивное меню + сводка статусов
+sh /tmp/geomask.sh --check    # read-only отчёт по всем шагам
+sh /tmp/geomask.sh --auto     # всё без вопросов (стоп при verify-FAIL)
+```
 
-**Пошаговый мастер** (пункт 2): показывает статус каждого шага («выполнено» / «требует внимания») и позволяет запустить любой шаг отдельно — в отличие от «Быстрой диагностики», которая только читает и ничего не меняет.
+Полный список режимов — в [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
-Подписки применяются **без перезапуска mihomo**: конфиг пишется с бэкапом, затем mihomo перечитывает конфиг через API (`PUT /configs` с путём конфига) — провайдеры `sub`/`de5` перечитывают подписку, VPN не прерывается. Полный рестарт только по `--restart`.
+## Документация
+
+| Документ | О чём |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Архитектура, компоненты, что и куда ставится на роутер |
+| [docs/ROUTING.md](docs/ROUTING.md) | Модель маршрутизации: таблицы, `ip rule`, приоритеты, magitrickle |
+| [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) | Подписки `sub`/`de5`, переключение, `x-hwid` |
+| [docs/AI-DEVICES.md](docs/AI-DEVICES.md) | AI-туннель, hev-инстанс, слушатель 7891, STUN/WebRTC |
+| [docs/AIDNS.md](docs/AIDNS.md) | Цепочка AI-DNS без утечки |
+| [docs/SYNC.md](docs/SYNC.md) | sync magitrickle → mihomo |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Режимы запуска, бэкапы, безопасность |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Диагностика типовых проблем |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Сборка, песочница, тесты |
+| [docs/releases/](docs/releases/) | Release notes по версиям |
 
 ## Структура репозитория
 
 ```
-geomask.sh       # готовый установщик (публикуется, его и качает wget)
-geomask.sh.in    # шаблон — править его
-build.py         # сборка: python build.py -> geomask.sh
-assets/          # файлы, вливаемые в установщик:
-  geo-backend.sh           # бэкенд гео-панели (Go/sh логика на роутере)
-  geo-sync                 # rpcd-плагин (ubus-объект geo-sync)
-  acl-geo-sync.json        # ACL: доступ LuCI к geo-sync
-  menu-geo-sync.json       # пункт меню «Гео-маскировка и AI»
-  geo-sync-page.js         # КОД СТРАНИЦЫ АДМИНКИ в LuCI (view/geo-sync/main.js): статусы, AI-подписка, устройства
-  sync_mtrickle_mihomo.sh  # magitrickle -> mihomo ruleset sync
-  ytdirect.yaml            # rule-provider DIRECT-доменов
-  99-default-vpn-route     # hotplug: LAN -> TUN роутинг
+geomask.sh        # готовый установщик (публикуется, его и качает wget)
+geomask.sh.in     # шаблон — править его
+build.py          # сборка: python build.py -> geomask.sh
+assets/           # файлы, вливаемые в установщик (@@ASSET:<name>@@)
+  geo-backend.sh           бэкенд гео-панели (роутер)
+  geo-sync                 rpcd-плагин (ubus geo-sync)
+  acl-geo-sync.json        ACL для LuCI
+  menu-geo-sync.json       пункт меню LuCI
+  geo-sync-page.js         view/geo-sync/main.js (код страницы админки)
+  sync_mtrickle_mihomo.sh  magitrickle -> mihomo ruleset sync
+  ytdirect.yaml            rule-provider DIRECT-доменов
+  99-default-vpn-route     hotplug: LAN -> TUN роутинг
+docs/             # техническая документация
+sandbox/          # локальная песочница (в git не входит)
 ```
 
-> Код страницы админки в LuCI — `assets/geo-sync-page.js` (устанавливается на роутер как `/www/luci-static/resources/view/geo-sync/main.js`).
+## Требования
 
-## Шаги
-
-1. **env** — проверка окружения: OpenWrt, apk/opkg, python3, curl, место, интернет.
-2. **geo** — установка гео-оверлея: `/usr/bin/geo-backend.sh`, rpcd `geo-sync`, ACL, меню LuCI, страница `geo-sync/main.js`.
-3. **subs** — конфиг mihomo: два proxy-provider (`sub` + `de5`), группы `VPN`/`AI`, правила `ytdirect→DIRECT`, `cloudflare-ech→AI`, `ai→AI`, `mtrickle→VPN`, `MATCH→GLOBAL`, sniffer. Перед записью — бэкап и `mihomo -t`.
-4. **aidns** — **нет утечки DNS** для AI-устройств (по умолчанию): DNS AI-устройств уходит в их же AI-туннель. Цепочка: nft-DNAT (приоритет -110, выигрывает у magitrickle/adblock/force_dns) → второй dnsmasq `192.168.0.53:5353` → второй DoH-воркер `127.0.0.1:5055` (пользователь `dnsai`) → метка `0x64` → `ip rule fwmark 0x64 table 101` → `dev AI`. RU-домены резолвятся как прежде. Отключение: `touch /etc/geomask-aidns.off`.
-5. **sync** — `/root/sync_mtrickle_mihomo.sh` + cron `*/5` + `ytdirect.yaml` + hotplug-роутинг (`99-default-vpn-route`).
-6. **services** — запуск **только упавших** сервисов; работающие не трогаются (ai-doh/dnsmasq-ai проверяются по слушающим портам).
-7. **verify** — E2E: DNS обычный/adblock, HTTP 204, группы VPN/AI в mihomo API, ubus geo-панели, ICMP-bypass правило, AI-DNS через туннель.
+- OpenWrt 24.10+ (проверено на 25.12, aarch64/cortex-a53)
+- `python3`, `curl`, `wget`, `ubus`/`rpcd`, LuCI
+- mihomo (бинарь уже на целевом роутере; на чистой системе — отдельно)
+- Шаг 3 требует рабочую подписку; шаг 4 — cron-sync magitrickle
 
 ## Безопасность
 
-- **Никакого reboot** и никаких касаний network/pppoe-конфига.
+- Никаких `reboot` и касаний `network`/`pppoe`-конфига.
 - Работающие сервисы не перезапускаются (только старт упавших).
 - Бэкап перед каждой записью файла (`.bak_geomask_<timestamp>`).
-- **Полный бэкап настроек роутера** перед любой рискованной операцией:
-  `sh geomask.sh --backup` (= `sysupgrade -b`, LuCI-совместимый архив в
-  `/root/geomask-backups/`).
-- **Перед любым рестартом mihomo** (шаг 3 c `--restart`): автоматический
-  полный бэкап → trial-run копии конфига в `/tmp/gm-trial-*` на портах
-  17890/17901/19090 → рестарт → проверка pid + API → при провале
-  **автоматический откат** предыдущего конфига с повторным стартом.
-  Живой сервис не трогается, пока trial не прошёл.
-- **Приоритеты ip rule**: наше icmp-правило (32610) и per-device src-правила
-  (32611) стоят **ниже** базы fwmark-правил magitrickle (~32645, растёт вверх
-  с числом групп). Иначе помеченная группами таблица перехватывает трафик
-  устройства до per-device правила (симптом: устройство «всё через AI»
-  выходит вперемешку). Меняя приоритеты — проверяй `ip rule show`.
+- Полный бэкап настроек: `sh geomask.sh --backup` (= `sysupgrade -b`).
 - `mihomo -t` перед установкой конфига; при провале — старый конфиг остаётся.
-- Перезапуск mihomo — только с `--restart` или явным «да»; по умолчанию подписки применяются через API без перезапуска.
-- **Жёсткая pin-блокировка**: файл `/root/.geomask-norestart` на роутере полностью отключает `--restart` (даже с флагом соединение не прервётся). Чтобы вернуть рестарты — удалите файл.
-- Секреты (URL подписок, hwid) не входят в скрипт — передаются аргументами и остаются в конфиге роутера.
-
-## Подписки и AI-устройства (панель «Гео-маскировка и AI»)
-
-- **Подписки**: карточка «Подписки» — добавьте имя+ссылку, кнопки «→ VPN»/«→ AI» переключают провайдеров `sub`/`de5` в mihomo через API (конфиг переписывается с бэкапом и `mihomo -t`, провайдер обновляется на лету — соединения не рвутся).
-- **AI-устройства**: в «Персональных режимах устройств» выберите режим «Через AI-подписку (весь трафик)». При первом таком устройстве автоматически поднимается второй инстанс hev-socks5-tunnel (TUN `AI`, socks `127.0.0.1:7891`), сетевой интерфейс и firewall-зона; рабочий туннель VPN не трогается.
-- Слушатель mihomo `ai-devices:7891` входит в конфиг, но активируется при старте mihomo: после установки этого релиза выполните один раз `sh /etc/init.d/mihomo restart` (≈3с, обрыв) — панель сама предупредит, пока слушатель не активен.
-
-## Разработка
-
-```sh
-python build.py        # собирает geomask.sh из geomask.sh.in + assets/
-```
-
-После правки любого файла в `assets/` пересоберите установщик и прогоните тесты.
-
-### Тесты
-
-Локальная песочница `sandbox/` (fake root + стабы команд `pidof/ubus/mihomo/curl/crontab/nslookup/ip/wget/apk`) запускается на любой машине без роутера и без VM/WSL:
-
-```sh
-bash sandbox/run_tests.sh     # ожидаемо: все PASS
-```
-
-Песочница — локальный инструмент разработки, **в репозиторий не входит** (в `.gitignore`).
-
-## Требования (роутер)
-
-- OpenWrt 24.10+ (проверено на 25.12, aarch64/cortex-a53)
-- `python3`, `curl`, `wget`, `ubus`/`rpcd`/`luci`
-- Для шага 4: доступ к сети (cron-sync магитрикла)
-- Для шага 3: mihomo бинарь (уже установлен на целевом роутере; на чистой системе ставится отдельно)
+- Подписки применяются через API без перезапуска mihomo; полный рестарт — только по `--restart`.
+- Жёсткая pin-блокировка рестартов: файл `/root/.geomask-norestart`.
+- Секреты (URL подписок, hwid) не входят в скрипт — передаются аргументами и остаются на роутере.
 
 ## Лицензия
 
-MIT. Гео-оверлей и синк-скрипты — собственные доработки.
+[MIT](LICENSE). Гео-оверлей и синк-скрипты — собственные доработки.

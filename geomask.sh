@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.7"
+GM_VERSION="1.5.8"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -398,7 +398,7 @@ cmd_dev_del() {
   echo "$IP" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || { printf '{"error":"bad ip"}'; return 1; }
   [ -f "$DEVICES" ] && sed -i "\|^$IP |d" "$DEVICES"
   # remove rules for this ip explicitly per table (bypass -> main, ai -> 101).
-  # NEVER delete by pref alone: all per-device rules share priority 32580, so
+  # NEVER delete by pref alone: all per-device rules share priority 20000, so
   # `ip rule del pref` would drop another device's rule (and _apply_routing re-adds it)
   ip rule del from "$IP" lookup main 2>/dev/null || true
   ip rule del from "$IP" lookup 101 2>/dev/null || true
@@ -452,7 +452,7 @@ _aidns_sync() {
 }
 
 # (re)apply routing for all managed devices:
-#   bypass -> direct (32580) | realtz -> normal mihomo path | ai -> AI tunnel (32580 -> table 101 -> dev AI)
+#   bypass -> direct (20000) | realtz -> normal mihomo path | ai -> AI tunnel (20000 -> table 101 -> dev AI)
 _apply_routing() {
   # drop stale per-device rules first (we re-add per mode)
   if [ -f "$DEVICES" ]; then
@@ -464,10 +464,10 @@ _apply_routing() {
     while read -r dip dmode dname; do
       case "$dip" in ''|'#'*) continue ;; esac
       if [ "$dmode" = "bypass" ]; then
-        ip rule show | grep -q "from $dip" || ip rule add priority 32580 from "$dip" lookup main
+        ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup main
       elif [ "$dmode" = "ai" ]; then
         _ai_tun_ensure
-           ip rule show | grep -q "from $dip" || ip rule add priority 32580 from "$dip" lookup 101
+           ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup 101
       fi
     done < "$DEVICES"
   fi
@@ -594,19 +594,19 @@ apply_routes() {
     ip route replace table 100 default dev Mihomo 2>/dev/null
   fi
   ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
-  # --- ICMP bypass: 32579 must stay ABOVE the magitrickle fwmark rule base
-  #     (magitrickle now uses 32589+, and lower pref wins) or ping to a marked
-  #     IP dies inside the TUN. Direct via pppoe-wan. ---
-  ip rule show | grep -q '32579:' || ip rule add priority 32579 iif br-lan ipproto icmp lookup main
-  # --- bypass-mode devices (32580 > magitrickle fwmark base ~32589, so marking
-  #     cannot preempt a device rule; LAN stays local) ---
+  # --- ICMP bypass: 20001 stays ABOVE the magitrickle fwmark rule base
+  #     (dynamic, observed 32558..32609) so ping to a marked IP never dies
+  #     inside the TUN. Direct via pppoe-wan. ---
+  ip rule show | grep -q '20001:' || ip rule add priority 20001 iif br-lan ipproto icmp lookup main
+  # --- bypass-mode devices (20000 is safely above the magitrickle fwmark base,
+  #     so marking cannot preempt a device rule; LAN stays local) ---
   if [ -f /etc/geo-devices.list ]; then
     while read -r dip dmode dname; do
       case "$dip" in ''|'#'*) continue ;; esac
       [ "$dmode" = "bypass" ] || continue
-      ip rule show | grep -q "from $dip" || ip rule add priority 32580 from "$dip" lookup main
+      ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup main
     done < /etc/geo-devices.list
-    # --- ai-mode devices (32580 > magitrickle fwmark base ~32589, so the whole
+    # --- ai-mode devices (20000 is safely above the magitrickle fwmark base, so the whole
     #     device goes through the AI tunnel; LAN routes stay local in table 101) ---
     if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
       if ip link show AI >/dev/null 2>&1; then
@@ -619,7 +619,7 @@ apply_routes() {
         while read -r dip dmode dname; do
           case "$dip" in ''|'#'*) continue ;; esac
           [ "$dmode" = "ai" ] || continue
-        ip rule show | grep -q "from $dip" || ip rule add priority 32580 from "$dip" lookup 101
+        ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup 101
         done < /etc/geo-devices.list
       fi
     fi
@@ -1718,7 +1718,7 @@ AIDNS_PORT=5055
 AIDNS_DNS_PORT=5353
 AIDNS_USER=dnsai
 AIDNS_MARK=0x64
-AIDNS_RULE_PREF=32581
+AIDNS_RULE_PREF=20002
 
 aidns_user_exists() { grep -q "^$AIDNS_USER:" "$(P /etc/passwd)" 2>/dev/null; }
 
@@ -2286,29 +2286,31 @@ apply_routes() {
     ip route replace table 100 default dev Mihomo 2>/dev/null
   fi
   ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
-  # --- ICMP bypass: 32579 must stay ABOVE the magitrickle fwmark rule base
-  #     (magitrickle now uses 32589+, and lower pref wins) or ping to a marked
-  #     IP dies inside the TUN. Direct via pppoe-wan. ---
-  ip rule show | grep -q '32579:' || ip rule add priority 32579 iif br-lan ipproto icmp lookup main
+  # --- ICMP bypass: must stay ABOVE the magitrickle fwmark rule base. That base
+  #     is dynamic (drifts down as groups grow): observed 32558..32609 over time.
+  #     A low pref (20001) is always above it, so ping to a marked IP never dies
+  #     inside the TUN. Direct via pppoe-wan. ---
+  ip rule show | grep -q '20001:' || ip rule add priority 20001 iif br-lan ipproto icmp lookup main
   # --- AI-DNS: DNS of AI-mode devices exits through the AI tunnel (no DNS leak).
   #     The DoH worker runs as user dnsai; its sockets are marked 0x64 by the
   #     nft table geomask_ai_dns, and this rule sends the marked traffic to
-  #     table 101 -> dev AI. Pref 32581 stays ABOVE the magitrickle fwmark
-  #     base (32589+) so magitrickle marks are never preempted.
+  #     table 101 -> dev AI. Pref 20002 stays ABOVE the magitrickle fwmark base
+  #     (dynamic, observed 32558..32609) so magitrickle marks never preempt it.
   #     Opt-out: touch /etc/geomask-aidns.off ---
   if [ ! -f /etc/geomask-aidns.off ] && [ -f /etc/geomask-aidns.uid ]; then
-    ip rule show | grep -q 'fwmark 0x64' || ip rule add pref 32581 fwmark 0x64 table 101
+    ip rule show | grep -q 'fwmark 0x64' || ip rule add pref 20002 fwmark 0x64 table 101
   fi
-  # --- per-device rules: 32580 > magitrickle fwmark base ~32589, so a device
-  #     rule is never preempted by magitrickle marking; LAN stays local ---
-  # --- bypass-mode devices (32580 vs fwmark rules 32589+) ---
+  # --- per-device rules: a low pref (20000) keeps a device rule ABOVE the
+  #     magitrickle fwmark base (dynamic, observed 32558..32609), so marking can
+  #     never preempt it; LAN stays local ---
+  # --- bypass-mode devices ---
   if [ -f /etc/geo-devices.list ]; then
     while read -r dip dmode dname; do
       case "$dip" in ''|'#'*) continue ;; esac
       [ "$dmode" = "bypass" ] || continue
-      ip rule show | grep -q "from $dip" || ip rule add priority 32580 from "$dip" lookup main
+      ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup main
     done < /etc/geo-devices.list
-    # --- ai-mode devices (32580 vs fwmark rules 32589+; LAN stays local in table 101) ---
+    # --- ai-mode devices (the whole device goes through the AI tunnel; LAN stays local in table 101) ---
     if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
       if ip link show AI >/dev/null 2>&1; then
         if ! ip route show table 101 | grep -q '^default'; then
@@ -2320,7 +2322,7 @@ apply_routes() {
         while read -r dip dmode dname; do
           case "$dip" in ''|'#'*) continue ;; esac
           [ "$dmode" = "ai" ] || continue
-           ip rule show | grep -q "from $dip" || ip rule add priority 32580 from "$dip" lookup 101
+           ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup 101
         done < /etc/geo-devices.list
       fi
     fi

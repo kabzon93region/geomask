@@ -1,0 +1,54 @@
+# Подписки
+
+## Провайдеры
+
+В `/etc/config/mihomo` объявлены два `proxy-providers`:
+
+| Имя | Роль | Тип | Группа |
+|---|---|---|---|
+| `sub` | основная (VPN) | HTTP | `VPN` |
+| `de5` | для AI/Google | HTTP | `AI` |
+
+Группы — `url-test` (`https://www.gstatic.com/generate_204`, `interval: 180`, `tolerance: 50`).
+Группа `VPN` имеет `exclude-filter` (исключает РФ/мобильные/Авто и т.п. узлы).
+
+```yaml
+proxy-groups:
+  - name: VPN
+    type: url-test
+    use: [sub]
+    exclude-filter: "Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания"
+  - name: AI
+    type: url-test
+    use: [de5]
+```
+
+## Переключение подписок из панели
+
+Кнопки «→ VPN» / «→ AI» вызывают бэкенд (`geo-backend.sh`, `_mihomo_set_provider`), который:
+
+1. делает бэкап конфига (`config.yaml.bak_subswitch_<ts>`);
+2. в целевом провайдере подменяет `url:` на новую ссылку;
+3. сохраняет заголовок `x-hwid`, если он был (переносит `header.x-hwid` в провайдер);
+4. проверяет `mihomo -d /etc/mihomo -t`; при успехе — устанавливает конфиг;
+5. обновляет провайдер на лету через API (`PUT /configs`), **без перезапуска mihomo** (VPN не рвётся).
+
+```sh
+# вручную: перечитать конфиг (провайдеры переподтянут подписку), без рестарта
+curl -s -X PUT http://127.0.0.1:9090/configs \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/etc/mihomo/config.yaml"}'
+```
+
+## Задание URL при установке
+
+```sh
+sh geomask.sh --vpn-url 'https://.../sub' --ai-url 'https://.../de5'
+```
+
+URL попадают только в конфиг роутера; в репозиторий/скрипт не пишутся.
+
+## x-hwid
+
+Некоторые панели подписок привязывают ключ к HWID и требуют заголовок `x-hwid`. При переключении
+подписок панель сохраняет ранее установленный `x-hwid` в новый провайдер, чтобы не потерять привязку.

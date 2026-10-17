@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.7"
+GM_VERSION="1.5.8"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -500,7 +500,7 @@ AIDNS_PORT=5055
 AIDNS_DNS_PORT=5353
 AIDNS_USER=dnsai
 AIDNS_MARK=0x64
-AIDNS_RULE_PREF=32581
+AIDNS_RULE_PREF=20002
 
 aidns_user_exists() { grep -q "^$AIDNS_USER:" "$(P /etc/passwd)" 2>/dev/null; }
 

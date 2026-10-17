@@ -500,7 +500,7 @@ AIDNS_PORT=5055
 AIDNS_DNS_PORT=5353
 AIDNS_USER=dnsai
 AIDNS_MARK=0x64
-AIDNS_RULE_PREF=32620
+AIDNS_RULE_PREF=32581
 
 aidns_user_exists() { grep -q "^$AIDNS_USER:" "$(P /etc/passwd)" 2>/dev/null; }
 

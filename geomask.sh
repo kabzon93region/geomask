@@ -662,7 +662,8 @@ _mihomo_set_provider() {
   grep -q "^  $PN:" "$MIHOMO_CONF" || { printf '{"error":"provider %s not found in config"}' "$(json_esc "$PN")"; return 1; }
   cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_subswitch_$(date +%s)"
   TMPF="$MIHOMO_CONF.subsw"
-  if ! awk -v pn="^  $PN:" -v nu="$URL" '
+  _hwid=$(grep -A1 'x-hwid' "$MIHOMO_CONF" 2>/dev/null | sed -n 's/^[[:space:]]*-[[:space:]]*"\(.*\)"/\1/p' | head -1)
+  if ! awk -v pn="^  $PN:" -v nu="$URL" -v hwid="$_hwid" '
     BEGIN { f=0; done=0 }
     $0 ~ pn { f=1; print; next }
     f && /^    url:/ { print "    url: \"" nu "\""; done=1; next }
@@ -673,6 +674,16 @@ _mihomo_set_provider() {
   ' "$MIHOMO_CONF" > "$TMPF"; then
     rm -f "$TMPF"
     printf '{"error":"failed to patch provider url"}'; return 1
+  fi
+  if [ -n "$_hwid" ]; then
+    awk -v pn="^  $PN:" -v hwid="$_hwid" '
+      BEGIN { f=0; added=0 }
+      $0 ~ pn { f=1; print; next }
+      f && !added && /^    url:/ { print; print "    header:"; print "      x-hwid:"; print "        - \"" hwid "\""; added=1; next }
+      f && /^  [A-Za-z0-9_-]+:/ { f=0 }
+      f && /^[A-Za-z]/ { f=0 }
+      { print }
+    ' "$TMPF" > "$TMPF.hwid" && mv -f "$TMPF.hwid" "$TMPF"
   fi
   if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
     mv -f "$TMPF" "$MIHOMO_CONF"
@@ -1546,6 +1557,9 @@ write_mihomo_config() {
     printf '%s\n' '  - DOMAIN-SUFFIX,cloudflare-ech.com,AI'
     printf '%s\n' '  - RULE-SET,ai,AI'
     printf '%s\n' '  - RULE-SET,mtrickle,VPN'
+    printf '%s\n' '  # STUN via VPN: stop WebRTC leaking the real (RU) IP, keep calls working'
+    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN'
+    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,19302)),VPN'
     printf '%s\n' '  - MATCH,GLOBAL'
     printf '\n'
     printf '%s\n' 'sniffer:'

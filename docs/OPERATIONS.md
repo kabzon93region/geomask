@@ -39,7 +39,7 @@
 
 ```sh
 sh /tmp/geomask.sh --check            # сводка по всем шагам
-ip rule show                          # приоритеты 20000/20001/20002 выше magitrickle
+ip rule show                          # приоритеты 19900/19901/19902 выше magitrickle
 netstat -tlnp | grep -E '7890|7891'   # слушатели mihomo
 pidof mihomo magitrickled             # живые сервисы
 ```

@@ -17,6 +17,7 @@ MAP = {
     "sync_mtrickle_mihomo.sh": "sync_mtrickle_mihomo.sh",
     "ytdirect.yaml":         "ytdirect.yaml",
     "99-default-vpn-route":  "99-default-vpn-route",
+    "geomask-guard.sh":      "geomask-guard.sh",
 }
 
 # menu.json asset file on disk (same acl download name collision): we saved menu as second luci-app-geo-sync.json

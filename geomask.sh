@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.8"
+GM_VERSION="1.6.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -398,7 +398,7 @@ cmd_dev_del() {
   echo "$IP" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || { printf '{"error":"bad ip"}'; return 1; }
   [ -f "$DEVICES" ] && sed -i "\|^$IP |d" "$DEVICES"
   # remove rules for this ip explicitly per table (bypass -> main, ai -> 101).
-  # NEVER delete by pref alone: all per-device rules share priority 20000, so
+  # NEVER delete by pref alone: all per-device rules share priority 19900, so
   # `ip rule del pref` would drop another device's rule (and _apply_routing re-adds it)
   ip rule del from "$IP" lookup main 2>/dev/null || true
   ip rule del from "$IP" lookup 101 2>/dev/null || true
@@ -452,7 +452,7 @@ _aidns_sync() {
 }
 
 # (re)apply routing for all managed devices:
-#   bypass -> direct (20000) | realtz -> normal mihomo path | ai -> AI tunnel (20000 -> table 101 -> dev AI)
+#   bypass -> direct (19900) | realtz -> normal mihomo path | ai -> AI tunnel (19900 -> table 101 -> dev AI)
 _apply_routing() {
   # drop stale per-device rules first (we re-add per mode)
   if [ -f "$DEVICES" ]; then
@@ -464,10 +464,10 @@ _apply_routing() {
     while read -r dip dmode dname; do
       case "$dip" in ''|'#'*) continue ;; esac
       if [ "$dmode" = "bypass" ]; then
-        ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup main
+        ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup main
       elif [ "$dmode" = "ai" ]; then
         _ai_tun_ensure
-           ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup 101
+           ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
       fi
     done < "$DEVICES"
   fi
@@ -594,19 +594,19 @@ apply_routes() {
     ip route replace table 100 default dev Mihomo 2>/dev/null
   fi
   ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
-  # --- ICMP bypass: 20001 stays ABOVE the magitrickle fwmark rule base
+  # --- ICMP bypass: 19901 stays ABOVE the magitrickle fwmark rule base
   #     (dynamic, observed 32558..32609) so ping to a marked IP never dies
   #     inside the TUN. Direct via pppoe-wan. ---
-  ip rule show | grep -q '20001:' || ip rule add priority 20001 iif br-lan ipproto icmp lookup main
-  # --- bypass-mode devices (20000 is safely above the magitrickle fwmark base,
+  ip rule show | grep -q '19901:' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
+  # --- bypass-mode devices (19900 is safely above the magitrickle fwmark base,
   #     so marking cannot preempt a device rule; LAN stays local) ---
   if [ -f /etc/geo-devices.list ]; then
     while read -r dip dmode dname; do
       case "$dip" in ''|'#'*) continue ;; esac
       [ "$dmode" = "bypass" ] || continue
-      ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup main
+      ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup main
     done < /etc/geo-devices.list
-    # --- ai-mode devices (20000 is safely above the magitrickle fwmark base, so the whole
+    # --- ai-mode devices (19900 is safely above the magitrickle fwmark base, so the whole
     #     device goes through the AI tunnel; LAN routes stay local in table 101) ---
     if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
       if ip link show AI >/dev/null 2>&1; then
@@ -619,7 +619,7 @@ apply_routes() {
         while read -r dip dmode dname; do
           case "$dip" in ''|'#'*) continue ;; esac
           [ "$dmode" = "ai" ] || continue
-        ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup 101
+        ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
         done < /etc/geo-devices.list
       fi
     fi
@@ -1718,7 +1718,7 @@ AIDNS_PORT=5055
 AIDNS_DNS_PORT=5353
 AIDNS_USER=dnsai
 AIDNS_MARK=0x64
-AIDNS_RULE_PREF=20002
+AIDNS_RULE_PREF=19902
 
 aidns_user_exists() { grep -q "^$AIDNS_USER:" "$(P /etc/passwd)" 2>/dev/null; }
 
@@ -1887,6 +1887,9 @@ step5_check() {
     bad "sync script missing: /root/sync_mtrickle_mihomo.sh"; _need=1
   fi
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then info "cron */5: present"; else bad "cron entry missing"; _need=1; fi
+  if [ -x "$(P /usr/bin/geomask-guard.sh)" ]; then info "guard: present"; else bad "guard missing: /usr/bin/geomask-guard.sh"; _need=1; fi
+  if [ -x "$(P /etc/hotplug.d/iface/99-geomask-guard)" ]; then info "guard hotplug: present"; else bad "guard hotplug missing"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then info "guard cron */5: present"; else bad "guard cron missing"; _need=1; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -2288,19 +2291,19 @@ apply_routes() {
   ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
   # --- ICMP bypass: must stay ABOVE the magitrickle fwmark rule base. That base
   #     is dynamic (drifts down as groups grow): observed 32558..32609 over time.
-  #     A low pref (20001) is always above it, so ping to a marked IP never dies
+  #     A low pref (19901) is always above it, so ping to a marked IP never dies
   #     inside the TUN. Direct via pppoe-wan. ---
-  ip rule show | grep -q '20001:' || ip rule add priority 20001 iif br-lan ipproto icmp lookup main
+  ip rule show | grep -q '19901:' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
   # --- AI-DNS: DNS of AI-mode devices exits through the AI tunnel (no DNS leak).
   #     The DoH worker runs as user dnsai; its sockets are marked 0x64 by the
   #     nft table geomask_ai_dns, and this rule sends the marked traffic to
-  #     table 101 -> dev AI. Pref 20002 stays ABOVE the magitrickle fwmark base
+  #     table 101 -> dev AI. pref 19902 stays ABOVE the magitrickle fwmark base
   #     (dynamic, observed 32558..32609) so magitrickle marks never preempt it.
   #     Opt-out: touch /etc/geomask-aidns.off ---
   if [ ! -f /etc/geomask-aidns.off ] && [ -f /etc/geomask-aidns.uid ]; then
-    ip rule show | grep -q 'fwmark 0x64' || ip rule add pref 20002 fwmark 0x64 table 101
+    ip rule show | grep -q 'fwmark 0x64' || ip rule add pref 19902 fwmark 0x64 table 101
   fi
-  # --- per-device rules: a low pref (20000) keeps a device rule ABOVE the
+  # --- per-device rules: a low pref (19900) keeps a device rule ABOVE the
   #     magitrickle fwmark base (dynamic, observed 32558..32609), so marking can
   #     never preempt it; LAN stays local ---
   # --- bypass-mode devices ---
@@ -2308,7 +2311,7 @@ apply_routes() {
     while read -r dip dmode dname; do
       case "$dip" in ''|'#'*) continue ;; esac
       [ "$dmode" = "bypass" ] || continue
-      ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup main
+      ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup main
     done < /etc/geo-devices.list
     # --- ai-mode devices (the whole device goes through the AI tunnel; LAN stays local in table 101) ---
     if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
@@ -2322,7 +2325,7 @@ apply_routes() {
         while read -r dip dmode dname; do
           case "$dip" in ''|'#'*) continue ;; esac
           [ "$dmode" = "ai" ] || continue
-           ip rule show | grep -q "from $dip" || ip rule add priority 20000 from "$dip" lookup 101
+           ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
         done < /etc/geo-devices.list
       fi
     fi
@@ -2341,6 +2344,173 @@ fi
 exit 0
 
 ASSET_EOF
+  save_stream /usr/bin/geomask-guard.sh 755 <<'ASSET_EOF'
+#!/bin/sh
+# geomask-guard.sh - durable fix for the B-001 class bug (TD-01).
+# (A) Source-IP exclusion for ai/bypass devices at the HEAD of ip mangle
+#     PREROUTING (before magitrickle MT_* jumps) so their packets never get
+#     a magitrickle fwmark.
+# (B) ip-rule watchdog: our per-device/icmp/aidns rules must exist and sit
+#     ABOVE (numerically below) the magitrickle fwmark base; re-seat them at
+#     MT_MIN-100 and flush conntrack when violated.
+# (C) Safety: table 101 must keep "default dev AI".
+# Logs actions only via logger -t geomask-guard (silent when healthy, cron
+# runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
+
+log() { logger -t geomask-guard "$*"; }
+
+DEVS=/etc/geo-devices.list
+CHAIN="ip mangle PREROUTING"
+[ -f "$DEVS" ] || { log "SKIP: $DEVS missing"; exit 0; }
+
+IPS=$(awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && ($2=="ai" || $2=="bypass") {print $1}' "$DEVS" | tr '\n' ' ')
+NEED_FLUSH=""
+
+# ---------- (A) nft exclusion ----------
+OUT=$(nft -a list chain $CHAIN 2>/dev/null)
+if [ -z "$OUT" ]; then
+  log "FAIL: cannot list $CHAIN"
+else
+  FIRST_MT=$(printf '%s\n' "$OUT" | grep -n 'jump MT_' | head -1 | cut -d: -f1)
+  for ip in $IPS; do
+    OURS=$(printf '%s\n' "$OUT" | grep -n "ip saddr $ip return" | head -1)
+    if [ -z "$OURS" ]; then
+      if nft insert rule $CHAIN ip saddr "$ip" return comment "geomask-excl" 2>/dev/null; then
+        log "excl ADD $ip"
+        NEED_FLUSH="1"
+      else
+        log "FAIL excl add $ip"
+      fi
+    else
+      OUR_LINE=${OURS%%:*}
+      if [ -n "$FIRST_MT" ] && [ "$OUR_LINE" -gt "$FIRST_MT" ]; then
+        # our rule slid below the MT_ jumps (magitrickle re-seated) - rebuild at head
+        printf '%s\n' "$OUT" | grep "ip saddr $ip return" | sed -n 's/.*handle \([0-9][0-9]*\).*/\1/p' | while read -r H; do
+          nft delete rule $CHAIN handle "$H" 2>/dev/null
+        done
+        if nft insert rule $CHAIN ip saddr "$ip" return comment "geomask-excl" 2>/dev/null; then
+          log "excl RESEAT $ip (was below MT_ jumps)"
+          NEED_FLUSH="1"
+        else
+          log "FAIL excl reseat $ip"
+        fi
+      fi
+    fi
+  done
+  # drop exclusions for devices no longer in the list (mode changed / removed)
+  STALE=$(printf '%s\n' "$OUT" | grep 'geomask-excl')
+  if [ -n "$STALE" ]; then
+    OLDIFS2=$IFS
+    IFS='
+'
+    for line in $STALE; do
+      rip=$(printf '%s' "$line" | awk '{print $3}')
+      case " $IPS " in
+        *" $rip "*) ;;
+        *)
+          h=$(printf '%s' "$line" | sed -n 's/.*handle \([0-9][0-9]*\).*/\1/p')
+          if [ -n "$h" ] && nft delete rule $CHAIN handle "$h" 2>/dev/null; then
+            log "excl DEL stale $rip"
+            NEED_FLUSH="1"
+          fi
+          ;;
+      esac
+    done
+    IFS=$OLDIFS2
+  fi
+fi
+
+# ---------- (B) ip-rule watchdog ----------
+MT_MIN=$(ip rule show 2>/dev/null | grep 'fwmark 0x4d61' | awk -F: '{print $1}' | sort -n | head -1)
+
+CHECKLIST="iif br-lan ipproto icmp lookup main
+fwmark 0x64 lookup 101"
+for ip in $IPS; do
+  mode=$(awk -v i="$ip" '$1==i {print $2}' "$DEVS")
+  case "$mode" in
+    ai) CHECKLIST="$CHECKLIST
+from $ip lookup 101" ;;
+    bypass) CHECKLIST="$CHECKLIST
+from $ip lookup main" ;;
+  esac
+done
+
+RULES_OK=1
+OLDIFS=$IFS
+IFS='
+'
+for pat in $CHECKLIST; do
+  [ -z "$pat" ] && continue
+  LINE=$(ip rule show | grep -F "$pat" | head -1)
+  if [ -z "$LINE" ]; then RULES_OK=0; break; fi
+  PREF=${LINE%%:*}
+  case "$PREF" in
+    ''|*[!0-9]*) RULES_OK=0; break ;;
+  esac
+  if [ -n "$MT_MIN" ] && [ "$PREF" -ge "$MT_MIN" ]; then RULES_OK=0; break; fi
+done
+IFS=$OLDIFS
+
+if [ "$RULES_OK" = "0" ]; then
+  if [ -n "$MT_MIN" ] && [ "$MT_MIN" -gt 100 ]; then
+    BASE=$((MT_MIN - 100))
+  else
+    BASE=19900
+  fi
+  for ip in $IPS; do
+    mode=$(awk -v i="$ip" '$1==i {print $2}' "$DEVS")
+    case "$mode" in
+      ai)
+        while ip rule del from "$ip" lookup 101 2>/dev/null; do :; done
+        while ip rule del from "$ip" lookup main 2>/dev/null; do :; done
+        ip rule add priority "$BASE" from "$ip" lookup 101
+        ;;
+      bypass)
+        while ip rule del from "$ip" lookup main 2>/dev/null; do :; done
+        while ip rule del from "$ip" lookup 101 2>/dev/null; do :; done
+        ip rule add priority "$BASE" from "$ip" lookup main
+        ;;
+    esac
+  done
+  while ip rule del iif br-lan ipproto icmp lookup main 2>/dev/null; do :; done
+  ip rule add priority $((BASE + 1)) iif br-lan ipproto icmp lookup main
+  while ip rule del fwmark 0x64 table 101 2>/dev/null; do :; done
+  ip rule add priority $((BASE + 2)) fwmark 0x64 table 101
+  NEED_FLUSH="1"
+  log "ip rules re-seated at $BASE (magitrickle base: ${MT_MIN:-none})"
+fi
+
+# ---------- (C) table 101 safety ----------
+if ! ip route show table 101 2>/dev/null | grep -q '^default'; then
+  if ip route replace default dev AI table 101 2>/dev/null; then
+    log "table 101 default restored (dev AI)"
+  else
+    log "WARN: table 101 has no default route (AI tun down?)"
+  fi
+fi
+
+# ---------- conntrack flush when something changed ----------
+if [ -n "$NEED_FLUSH" ]; then
+  for ip in $IPS; do
+    conntrack -D -s "$ip" >/dev/null 2>&1
+    conntrack -D -d "$ip" >/dev/null 2>&1
+  done
+  log "conntrack flushed for: $IPS"
+fi
+
+exit 0
+
+ASSET_EOF
+  save_stream /etc/hotplug.d/iface/99-geomask-guard 755 <<'ASSET_EOF'
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || exit 0
+( /usr/bin/geomask-guard.sh >/dev/null 2>&1 & )
+ASSET_EOF
+  if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then
+    info "guard cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard' ) | crontab - 2>/dev/null && info "cron added: */5 guard" || warn "cannot set crontab"
+  fi
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     info "cron already present"
   else
@@ -2431,7 +2601,7 @@ step7_check() {
   if have ubus; then
     ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
   fi
-  if ip rule show 2>/dev/null | grep -q '32666'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule (32666) absent - LAN ping may die in TUN"; fi
+  if ip rule show 2>/dev/null | grep -q 'iif br-lan ipproto icmp'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule absent - LAN ping may die in TUN"; fi
   # AI-DNS: DNS of AI devices must exit through the AI tunnel (mark -> table 101)
   if [ -f "$(P /etc/geomask-aidns.off)" ] || [ ! -f "$(P /etc/geomask-aidns.uid)" ]; then
     info "AI-DNS: not installed (DNS of AI devices resolves via router - run the aidns step)"

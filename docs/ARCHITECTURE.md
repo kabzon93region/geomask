@@ -34,9 +34,9 @@ geomask ставит на OpenWrt-роутер домашний стек обх�
 1. LAN-клиент → dnsmasq (маршрутизация по домену через magitrickle) → DoH.
 2. Трафик клиента:
    - обычный LAN → `ip rule 32760` → table 100 → `dev Mihomo` → hev main → mihomo `7890` → правила (`RULE-SET` → VPN/AI/DIRECT);
-   - AI-устройство → `ip rule 20000 from <ip> lookup 101` → table 101 → `dev AI` → hev ai → mihomo `7891` (proxy форсит `AI`);
-   - bypass-устройство → `ip rule 20000 from <ip> lookup main` → напрямую;
-   - DNS AI-устройства → nft-DNAT → `192.168.0.53:5353` → DoH (user `dnsai`) → метка `0x64` → `ip rule 20002` → table 101 → `dev AI`.
+   - AI-устройство → `ip rule 19900 from <ip> lookup 101` → table 101 → `dev AI` → hev ai → mihomo `7891` (proxy форсит `AI`);
+   - bypass-устройство → `ip rule 19900 from <ip> lookup main` → напрямую;
+   - DNS AI-устройства → nft-DNAT → `192.168.0.53:5353` → DoH (user `dnsai`) → метка `0x64` → `ip rule 19902` → table 101 → `dev AI`.
 
 ## Карта установленных файлов (роутер)
 

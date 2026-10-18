@@ -18,7 +18,7 @@ ip route get 8.8.8.8 mark 0x64        # должно: dev AI table 101
 conntrack -L 2>/dev/null | grep <ip>  # dst=198.19.0.1 → AI; dst=198.18.0.1 → основной
 ```
 
-**Решение.** Per-device правила должны иметь приоритет `<` базы magitrickle (используется `20000`).
+**Решение.** Per-device правила должны иметь приоритет `<` базы magitrickle (используется `19900`).
 Обновить hotplug/`geo-backend.sh` и переприменить:
 
 ```sh

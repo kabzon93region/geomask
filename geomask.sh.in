@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.5.8"
+GM_VERSION="1.6.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -500,7 +500,7 @@ AIDNS_PORT=5055
 AIDNS_DNS_PORT=5353
 AIDNS_USER=dnsai
 AIDNS_MARK=0x64
-AIDNS_RULE_PREF=20002
+AIDNS_RULE_PREF=19902
 
 aidns_user_exists() { grep -q "^$AIDNS_USER:" "$(P /etc/passwd)" 2>/dev/null; }
 
@@ -669,6 +669,9 @@ step5_check() {
     bad "sync script missing: /root/sync_mtrickle_mihomo.sh"; _need=1
   fi
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then info "cron */5: present"; else bad "cron entry missing"; _need=1; fi
+  if [ -x "$(P /usr/bin/geomask-guard.sh)" ]; then info "guard: present"; else bad "guard missing: /usr/bin/geomask-guard.sh"; _need=1; fi
+  if [ -x "$(P /etc/hotplug.d/iface/99-geomask-guard)" ]; then info "guard hotplug: present"; else bad "guard hotplug missing"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then info "guard cron */5: present"; else bad "guard cron missing"; _need=1; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -682,6 +685,19 @@ ASSET_EOF
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 @@ASSET:99-default-vpn-route@@
 ASSET_EOF
+  save_stream /usr/bin/geomask-guard.sh 755 <<'ASSET_EOF'
+@@ASSET:geomask-guard.sh@@
+ASSET_EOF
+  save_stream /etc/hotplug.d/iface/99-geomask-guard 755 <<'ASSET_EOF'
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || exit 0
+( /usr/bin/geomask-guard.sh >/dev/null 2>&1 & )
+ASSET_EOF
+  if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then
+    info "guard cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard' ) | crontab - 2>/dev/null && info "cron added: */5 guard" || warn "cannot set crontab"
+  fi
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     info "cron already present"
   else
@@ -772,7 +788,7 @@ step7_check() {
   if have ubus; then
     ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
   fi
-  if ip rule show 2>/dev/null | grep -q '32666'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule (32666) absent - LAN ping may die in TUN"; fi
+  if ip rule show 2>/dev/null | grep -q 'iif br-lan ipproto icmp'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule absent - LAN ping may die in TUN"; fi
   # AI-DNS: DNS of AI devices must exit through the AI tunnel (mark -> table 101)
   if [ -f "$(P /etc/geomask-aidns.off)" ] || [ ! -f "$(P /etc/geomask-aidns.uid)" ]; then
     info "AI-DNS: not installed (DNS of AI devices resolves via router - run the aidns step)"

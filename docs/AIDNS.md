@@ -13,7 +13,7 @@ AI-device DNS (any dst, :53)
   ──nft DNAT (nat prerouting priority -110; выигрывает у magitrickle/adblock/force_dns)──►
      192.168.0.53:5353   (второй dnsmasq, AI)
      └─► 127.0.0.1:5055  (второй DoH-воркер, user dnsai)
-          ──nft mark 0x64 (по skuid)──► ip rule 20002 fwmark 0x64 lookup 101 ──► dev AI ──► AI-нода
+          ──nft mark 0x64 (по skuid)──► ip rule 19902 fwmark 0x64 lookup 101 ──► dev AI ──► AI-нода
 ```
 
 RU-домены при этом резолвятся как прежде (через обычный путь) на других устройствах.
@@ -27,7 +27,7 @@ RU-домены при этом резолвятся как прежде (чер
 | Второй DoH | `https-dns-proxy` как user `dnsai`, `127.0.0.1:5055` (`init.d/ai-doh`) |
 | nft-таблица | `geomask_ai_dns` (файл `/usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft`) |
 | Метка | `0x64` (skuid `dnsai`) |
-| ip rule | `20002 fwmark 0x64 lookup 101` |
+| ip rule | `19902 fwmark 0x64 lookup 101` |
 
 Nft-таблица содержит:
 - `pre_nat` (hook `prerouting`, priority `-110`): DNAT порта 53 AI-устройств на `192.168.0.53:5353`;

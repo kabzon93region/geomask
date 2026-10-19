@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.6.0"
+GM_VERSION="1.6.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -2350,6 +2350,10 @@ ASSET_EOF
 # (A) Source-IP exclusion for ai/bypass devices at the HEAD of ip mangle
 #     PREROUTING (before magitrickle MT_* jumps) so their packets never get
 #     a magitrickle fwmark.
+# (A2) Mark-clear: own nft table (prerouting, priority -149) wipes ONLY
+#     magitrickle-space marks (0x4d61xxxx) for those devices. Position-
+#     independent: survives any magitrickle/fw4 PREROUTING rebuild, so fwmark
+#     rules can NEVER hijack our devices even during the watchdog window.
 # (B) ip-rule watchdog: our per-device/icmp/aidns rules must exist and sit
 #     ABOVE (numerically below) the magitrickle fwmark base; re-seat them at
 #     MT_MIN-100 and flush conntrack when violated.
@@ -2419,6 +2423,40 @@ else
     IFS=$OLDIFS2
   fi
 fi
+
+# ---------- (A2) mark-clear table (survives PREROUTING rebuilds) ----------
+# Own table is invisible to magitrickle (ip mangle) and fw4 (inet fw4).
+# Hook at -149 = right after magitrickle's mangle (-150), before geomask
+# AI-DNS mark 0x64 (-110). Clears ONLY 0x4d61xxxx marks - zapret/aidns marks
+# are untouched.
+MC_T=geomask_excl
+nft list table ip "$MC_T" >/dev/null 2>&1 || nft add table ip "$MC_T" 2>/dev/null
+if ! nft list chain ip "$MC_T" prerouting >/dev/null 2>&1; then
+  nft add chain ip "$MC_T" prerouting '{ type filter hook prerouting priority -149; policy accept; }' 2>/dev/null \
+    || log "FAIL mclear chain add"
+fi
+if ! nft list set ip "$MC_T" excl_ips >/dev/null 2>&1; then
+  nft add set ip "$MC_T" excl_ips '{ type ipv4_addr; }' 2>/dev/null || log "FAIL mclear set add"
+fi
+if ! nft list chain ip "$MC_T" prerouting 2>/dev/null | grep -q '@excl_ips'; then
+  nft add rule ip "$MC_T" prerouting ip saddr @excl_ips \
+      meta mark and 0xffff0000 eq 0x4d610000 counter meta mark set 0 \
+      comment "geomask-mclear" 2>/dev/null || log "FAIL mclear rule add"
+  log "mclear rule installed"
+fi
+MC_CUR=$(nft list set ip "$MC_T" excl_ips 2>/dev/null | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | tr '\n' ' ')
+for ip in $IPS; do
+  case " $MC_CUR " in
+    *" $ip "*) ;;
+    *) nft add element ip "$MC_T" excl_ips "{ $ip }" 2>/dev/null && log "mclear ADD $ip" ;;
+  esac
+done
+for rip in $MC_CUR; do
+  case " $IPS " in
+    *" $rip "*) ;;
+    *) nft delete element ip "$MC_T" excl_ips "{ $rip }" 2>/dev/null && log "mclear DEL $rip" ;;
+  esac
+done
 
 # ---------- (B) ip-rule watchdog ----------
 MT_MIN=$(ip rule show 2>/dev/null | grep 'fwmark 0x4d61' | awk -F: '{print $1}' | sort -n | head -1)

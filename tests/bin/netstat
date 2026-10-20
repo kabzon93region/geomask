@@ -1,0 +1,7 @@
+#!/bin/sh
+# stub netstat: emulates the AI-DNS listeners after a successful aidns step apply.
+echo "tcp        0      0 127.0.0.1:5055           0.0.0.0:*               LISTEN      1/https-dns-prox"
+echo "udp        0      0 127.0.0.1:5055           0.0.0.0:*                           1/https-dns-prox"
+echo "tcp        0      0 192.168.0.53:5353        0.0.0.0:*               LISTEN      2/dnsmasq"
+echo "udp        0      0 192.168.0.53:5353        0.0.0.0:*                           2/dnsmasq"
+exit 0

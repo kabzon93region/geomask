@@ -468,8 +468,10 @@ apply_routes() {
   ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
   # --- ICMP bypass: 19901 stays ABOVE the magitrickle fwmark rule base
   #     (dynamic, observed 32558..32609) so ping to a marked IP never dies
-  #     inside the TUN. Direct via pppoe-wan. ---
-  ip rule show | grep -q '19901:' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
+  #     inside the TUN. Direct via pppoe-wan. Guard reseats the rule to
+  #     (base - 100) when the base drifts, so presence is checked by SEMANTICS,
+  #     never by the 19901 prefix (v1.6.2: no duplicates after a reseat). ---
+  ip rule show | grep -q 'iif br-lan ipproto icmp lookup main' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
   # --- bypass-mode devices (19900 is safely above the magitrickle fwmark base,
   #     so marking cannot preempt a device rule; LAN stays local) ---
   if [ -f /etc/geo-devices.list ]; then

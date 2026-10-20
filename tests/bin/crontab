@@ -1,0 +1,8 @@
+#!/bin/sh
+# stub crontab: -l reads state, - writes state (atomic: tmp+mv, no read race with -l)
+C="${GM_STATE:-/tmp}/crontab"
+case "${1:-}" in
+  -l) [ -f "$C" ] && cat "$C"; exit 0 ;;
+  -)  T="$C.tmp.$$"; cat > "$T" && mv -f "$T" "$C"; exit 0 ;;
+  *) exit 1 ;;
+esac

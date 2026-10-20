@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Build consistency (geomask.sh == build of geomask.sh.in + assets)
+        run: python tools/check_build.py
+
+      - name: Syntax check
+        run: sh -n geomask.sh
+
+      - name: Sandbox tests
+        run: bash tests/run_tests.sh

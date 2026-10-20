@@ -1,0 +1,238 @@
+#!/bin/sh
+# Sandbox test runner for geomask.sh (runs under Git-bash on Windows, no router access).
+# Layout:
+#   sandbox/bin/*     - stub commands (pidof, ubus, mihomo, curl, crontab, nslookup, ip, wget, apk)
+#   sandbox/state/*   - state files consumed by stubs
+#   sandbox/root/*    - fake filesystem (GM_PREFIX)
+# Scenarios: S1 empty (all FAIL), S2 healthy (all OK), S3 apply (auto repairs subs).
+
+set -u
+HERE=$(cd "$(dirname "$0")" && pwd)
+SCRIPT="$HERE/../geomask.sh"
+STUB="$HERE/bin"
+export PATH="$STUB:$PATH"
+
+pass=0; failn=0
+t() { # t <name> <expected_rc> <cmd...>
+  _name="$1"; _want="$2"; shift 2
+  "$@" >"$HERE/last_out.txt" 2>&1
+  _rc=$?
+  if [ "$_rc" = "$_want" ]; then
+    echo "PASS: $_name (rc=$_rc)"
+    pass=$((pass+1))
+  else
+    echo "FAIL: $_name (rc=$_rc, want $_want)"
+    sed 's/^/    | /' "$HERE/last_out.txt" | tail -25
+    failn=$((failn+1))
+  fi
+}
+
+contains() { # contains <file> <pattern> <name>
+  if grep -q "$2" "$1" 2>/dev/null; then echo "PASS: $3"; pass=$((pass+1));
+  else echo "FAIL: $3 (pattern '$2' not found)"; tail -15 "$1" | sed 's/^/    | /'; failn=$((failn+1)); fi
+}
+
+rm -rf "$HERE/root_empty" "$HERE/root_healthy" "$HERE/root_apply" "$HERE/state"
+mkdir -p "$HERE/state" "$HERE/root_empty/tmp" "$HERE/root_healthy/tmp" "$HERE/root_apply/tmp"
+
+# ---------- scenario 1: empty root -> everything FAILs, script still exits cleanly ----------
+echo "=== S1: empty root, --check ==="
+: > "$HERE/state/services"; : > "$HERE/state/ubus_objects"; : > "$HERE/state/crontab"; : > "$HERE/state/ip_rules"
+export GM_STATE="$HERE/state"
+export GM_PREFIX="$HERE/root_empty"
+t "S1 check exits nonzero" 1 sh "$SCRIPT" --check
+contains "$HERE/last_out.txt" "SUMMARY" "S1 prints summary"
+contains "$HERE/last_out.txt" "\[FAIL\]" "S1 reports failures"
+
+# ---------- scenario 2: healthy root -> all OK ----------
+echo "=== S2: healthy root, --check ==="
+R="$HERE/root_healthy"
+mkdir -p "$R/etc/openwrt" "$R/opt/zapret-manager-luci" "$R/usr/libexec/rpcd" \
+         "$R/usr/share/rpcd/acl.d" "$R/www/luci-static/resources/zapret-manager" \
+         "$R/usr/bin" "$R/etc/mihomo/ruleset" "$R/root" "$R/etc/hotplug.d/iface"
+printf "DISTRIB_RELEASE='24.10'\n" > "$R/etc/openwrt_release"
+echo x > "$R/opt/zapret-manager-luci/backend.sh"
+echo x > "$R/usr/libexec/rpcd/zapret-manager"
+echo x > "$R/usr/share/rpcd/acl.d/luci-app-zapret-manager.json"
+echo x > "$R/www/luci-static/resources/zapret-manager/common.js"
+mkdir -p "$R/etc/init.d"
+for s in magitrickle mihomo zapret hev-socks5-tunnel dnsmasq; do
+  printf '#!/bin/sh\nexit 0\n' > "$R/etc/init.d/$s"
+done
+# AI-DNS step deps (v1.5.7): DoH binary + rc.common for the services it installs
+mkdir -p "$R/usr/sbin"
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/sbin/https-dns-proxy"; chmod +x "$R/usr/sbin/https-dns-proxy"
+printf '#!/bin/sh\nexit 0\n' > "$R/etc/rc.common"; chmod +x "$R/etc/rc.common"
+echo x > "$R/usr/bin/geo-backend.sh"
+echo x > "$R/usr/libexec/rpcd/geo-sync"
+echo x > "$R/usr/share/rpcd/acl.d/luci-app-geo-sync.json"
+mkdir -p "$R/usr/share/luci/menu.d"
+echo x > "$R/usr/share/luci/menu.d/luci-app-geo-sync.json"
+mkdir -p "$R/www/luci-static/resources/view/geo-sync"; echo x > "$R/www/luci-static/resources/view/geo-sync/main.js"
+echo x > "$R/root/sync_mtrickle_mihomo.sh"; chmod +x "$R/root/sync_mtrickle_mihomo.sh"
+# routing guard (v1.6.0): script + hotplug fixtures for step5 checks
+# (shebang required: Git-bash derives +x from shebang for non-exe files)
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-guard.sh"; chmod +x "$R/usr/bin/geomask-guard.sh"
+printf '#!/bin/sh\nexit 0\n' > "$R/etc/hotplug.d/iface/99-geomask-guard"; chmod +x "$R/etc/hotplug.d/iface/99-geomask-guard"
+printf 'payload: []\n' > "$R/etc/mihomo/ruleset/mtrickle.yaml"
+printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ai.yaml"
+printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytdirect.yaml"
+cat > "$R/etc/mihomo/config.yaml" <<'YAMLEOF'
+proxy-providers:
+  sub:
+    type: http
+    url: "https://example.com/a"
+  de5:
+    type: http
+    url: "https://example.com/b"
+proxy-groups:
+  - name: VPN
+  - name: AI
+rule-providers:
+  ai:
+    type: file
+  mtrickle:
+    type: file
+  ytdirect:
+    type: file
+rules:
+  - RULE-SET,ytdirect,DIRECT
+  - RULE-SET,ai,AI
+  - RULE-SET,mtrickle,VPN
+  - MATCH,GLOBAL
+listeners:
+  - name: ai-devices
+    type: mixed
+    port: 7891
+    listen: 127.0.0.1
+    proxy: AI
+YAMLEOF
+# healthy state
+printf 'dnsmasq\nmagitrickled\nmihomo\nhev-socks5-tunnel\nrpcd\n' > "$HERE/state/services"
+printf 'zapret-manager\ngeo-sync\n' > "$HERE/state/ubus_objects"
+echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' > "$HERE/state/crontab"
+echo '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard' >> "$HERE/state/crontab"
+echo '32666: from all iif br-lan ipproto icmp lookup main' > "$HERE/state/ip_rules"
+: > "$HERE/state/mihomo_t_ok"
+export GM_PREFIX="$HERE/root_healthy"
+t "S2 check exits zero" 0 sh "$SCRIPT" --check
+contains "$HERE/last_out.txt" "fail=0" "S2 zero failures"
+
+# ---------- scenario 3: broken subs config -> --auto repairs with URLs ----------
+echo "=== S3: broken subs, --auto --restart with urls ==="
+R="$HERE/root_apply"
+cp -a "$HERE/root_healthy/." "$R/"
+rm -f "$R/etc/mihomo/config.yaml"   # break it
+: > "$HERE/state/mihomo_t_ok"        # stub mihomo -t will pass
+export GM_PREFIX="$HERE/root_apply"
+t "S3 auto exits zero" 0 sh "$SCRIPT" --auto --yes --restart --vpn-url "https://vpn.example/sub1" --ai-url "https://ai.example/sub2"
+contains "$R/etc/mihomo/config.yaml" 'url: "https://vpn.example/sub1"' "S3 vpn url written"
+contains "$R/etc/mihomo/config.yaml" 'url: "https://ai.example/sub2"' "S3 ai url written"
+contains "$R/etc/mihomo/config.yaml" "name: VPN" "S3 VPN group written"
+contains "$R/etc/mihomo/config.yaml" "RULE-SET,mtrickle,VPN" "S3 mtrickle rule written"
+contains "$R/etc/mihomo/config.yaml" "port: 7891" "S3 AI-devices listener written"
+contains "$HERE/last_out.txt" "verify: PASS" "S3 verify passed"
+
+# ---------- scenario 4: help + bad flag ----------
+echo "=== S4: CLI edges ==="
+t "S4 help exits 0" 0 sh "$SCRIPT" --help
+t "S4 bad flag exits 2" 2 sh "$SCRIPT" --wat
+
+# ---------- scenario 5: /root/.geomask-norestart pin blocks --restart ----------
+echo "=== S5: restart pin ==="
+R="$HERE/root_apply"
+rm -f "$R/root/.geomask-norestart"
+rm -f "$R/etc/mihomo/config.yaml"
+echo "restarts forbidden" > "$R/root/.geomask-norestart"
+export GM_PREFIX="$R"
+sh "$SCRIPT" --step 3 --restart --yes --vpn-url "https://vpn.example/p1" --ai-url "https://ai.example/p2" >"$HERE/last_out.txt" 2>&1 || true
+contains "$HERE/last_out.txt" "ignoring --restart" "S5 pin ignores --restart"
+if grep -q "restarting mihomo" "$HERE/last_out.txt"; then
+  echo "FAIL: S5 restart happened despite pin"; failn=$((failn+1))
+else
+  echo "PASS: S5 no restart with pin"; pass=$((pass+1))
+fi
+rm -f "$R/root/.geomask-norestart"
+
+# ---------- scenario 6: menu + step-by-step master ----------
+echo "=== S6: interactive menu + master ==="
+export GM_PREFIX="$HERE/root_healthy"
+printf '2\nq\nq\n' | sh "$SCRIPT" >"$HERE/last_out.txt" 2>&1
+_rc=$?
+if [ "$_rc" = 0 ]; then echo "PASS: S6 menu exits 0"; pass=$((pass+1)); else echo "FAIL: S6 menu rc=$_rc"; failn=$((failn+1)); fi
+contains "$HERE/last_out.txt" "GEOMASK" "S6 banner shown"
+contains "$HERE/last_out.txt" "Выберите пункт" "S6 prompt shown"
+contains "$HERE/last_out.txt" "Роутер:" "S6 dashboard shown"
+contains "$HERE/last_out.txt" "Пошаговый мастер" "S6 master menu item shown"
+_st_n=$(grep -cE 'выполнено|требует внимания' "$HERE/last_out.txt")
+if [ "$_st_n" = 7 ]; then echo "PASS: S6 master shows 7 step statuses once"; pass=$((pass+1)); else echo "FAIL: S6 master status lines=$_st_n (want 7)"; failn=$((failn+1)); fi
+if grep 'MagiTrickle:' "$HERE/last_out.txt" | grep -q 'запущен'; then echo "PASS: S6 MagiTrickle shows running"; pass=$((pass+1)); else echo "FAIL: S6 MagiTrickle status wrong"; grep 'MagiTrickle' "$HERE/last_out.txt" | sed 's/^/    | /'; failn=$((failn+1)); fi
+
+# ---------- scenario 7: reinstall keeps current URLs, no mihomo restart ----------
+echo "=== S7: --reinstall --yes (keep current subscription URLs) ==="
+R="$HERE/root_apply"
+export GM_PREFIX="$R"
+sh "$SCRIPT" --reinstall --yes >"$HERE/last_out.txt" 2>&1
+_rc=$?
+if [ "$_rc" = 0 ]; then echo "PASS: S7 reinstall rc=0"; pass=$((pass+1)); else echo "FAIL: S7 reinstall rc=$_rc"; sed 's/^/    | /' "$HERE/last_out.txt" | tail -25; failn=$((failn+1)); fi
+contains "$R/etc/mihomo/config.yaml" 'url: "https://vpn.example/p1"' "S7 kept VPN url"
+contains "$R/etc/mihomo/config.yaml" 'url: "https://ai.example/p2"' "S7 kept AI url"
+contains "$HERE/last_out.txt" "verify: PASS" "S7 verify passed"
+if grep -q "restarting mihomo" "$HERE/last_out.txt"; then
+  echo "FAIL: S7 restarted mihomo despite no-restart policy"; failn=$((failn+1))
+else
+  echo "PASS: S7 no mihomo restart"; pass=$((pass+1))
+fi
+[ -s "$R/usr/bin/geo-backend.sh" ] && { echo "PASS: S7 geo reinstalled"; pass=$((pass+1)); } || { echo "FAIL: S7 geo missing"; failn=$((failn+1)); }
+
+# ---------- scenario 8: --check has no duplicate lines, real counters ----------
+echo "=== S8: check-only output sanity ==="
+export GM_PREFIX="$HERE/root_healthy"
+sh "$SCRIPT" --check >"$HERE/last_out.txt" 2>&1
+_rc=$?
+if [ "$_rc" = 0 ]; then echo "PASS: S8 check rc=0"; pass=$((pass+1)); else echo "FAIL: S8 check rc=$_rc"; failn=$((failn+1)); fi
+_n=$(grep -c 'proxy-providers: 2' "$HERE/last_out.txt")
+if [ "$_n" = 1 ]; then echo "PASS: S8 no duplicate detail lines"; pass=$((pass+1)); else echo "FAIL: S8 detail lines printed $_n times"; failn=$((failn+1)); fi
+contains "$HERE/last_out.txt" "OpenWrt: 24.10" "S8 OpenWrt version shown"
+contains "$HERE/last_out.txt" "aidns" "S8 AI-DNS step present in report"
+if grep -q 'pass=6' "$HERE/last_out.txt"; then echo "PASS: S8 summary counts passing steps"; pass=$((pass+1)); else echo "FAIL: S8 summary pass count: $(grep -o 'pass=[0-9]*' "$HERE/last_out.txt")"; failn=$((failn+1)); fi
+
+# ---------- scenario 9: no third-party panel references in the installer ----------
+echo "=== S9: no Zapret-Manager references ==="
+_n=$(grep -cE 'Zapret-Manager|zapret-manager|StressOzz' "$SCRIPT")
+if [ "$_n" = 0 ]; then echo "PASS: S9 installer has no panel references"; pass=$((pass+1)); else echo "FAIL: S9 found $_n panel references"; grep -nE 'Zapret-Manager|zapret-manager|StressOzz' "$SCRIPT" | head -5; failn=$((failn+1)); fi
+
+# ---------- scenario 10: safe restart path (backup -> trial -> verified restart) ----------
+echo "=== S10: safe mihomo restart path ==="
+R="$HERE/root_apply"
+rm -f "$R/root/.geomask-norestart"
+rm -f "$R/etc/mihomo/config.yaml"
+export GM_PREFIX="$R"
+sh "$SCRIPT" --step 3 --restart --yes --vpn-url "https://vpn.example/p1" --ai-url "https://ai.example/p2" >"$HERE/last_out.txt" 2>&1 || true
+cp -f "$HERE/last_out.txt" "$HERE/s10_out.txt" 2>/dev/null || true
+contains "$HERE/last_out.txt" "trial run: OK" "S10 trial run before restart"
+contains "$HERE/last_out.txt" "restarted and verified" "S10 verified restart"
+contains "$HERE/last_out.txt" "router-backup" "S10 full backup created"
+
+# ---------- scenario 11: ICMP rule presence check is semantic (v1.6.2) ----------
+# Guard reseats our rules to pref (base - 100) when the magitrickle base drifts;
+# the hotplug must NOT add a duplicate when the ICMP rule lives at another pref.
+echo "=== S11: ICMP check semantic (no dup after reseat) ==="
+if grep -q "grep -q '19901:'" "$SCRIPT"; then
+  echo "FAIL: S11 installer still checks ICMP by pref 19901"; failn=$((failn+1))
+else
+  echo "PASS: S11 no pref-based ICMP check in installer"; pass=$((pass+1))
+fi
+echo '20100: from all iif br-lan ipproto icmp lookup main' > "$HERE/state/ip_rules"
+ACTION=ifup sh "$HERE/../assets/99-default-vpn-route" >"$HERE/last_out.txt" 2>&1
+_icmp_n=$(grep -c 'ipproto icmp' "$HERE/state/ip_rules")
+if [ "$_icmp_n" = 1 ]; then
+  echo "PASS: S11 reseated ICMP rule not duplicated"; pass=$((pass+1))
+else
+  echo "FAIL: S11 icmp rules now: $_icmp_n (want 1)"; sed 's/^/    | /' "$HERE/state/ip_rules"; failn=$((failn+1))
+fi
+contains "$HERE/state/ip_rules" "priority 32760" "S11 hotplug actually ran"
+
+echo ""
+echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
+[ "$failn" -eq 0 ]

@@ -2,3 +2,11 @@
 sandbox/
 *.pyc
 __pycache__/
+
+# tests runtime artifacts (tests/ is published; its generated state is not)
+tests/last_out.txt
+tests/s10_out.txt
+tests/state/
+tests/root_empty/
+tests/root_healthy/
+tests/root_apply/

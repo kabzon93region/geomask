@@ -1,0 +1,17 @@
+#!/bin/sh
+# stub mihomo:
+#   exact arg "-t"  -> config test verdict from state file (fast)
+#   otherwise       -> daemon mode for trial run: stay alive ~30s
+for a in "$@"; do
+  if [ "$a" = "-t" ]; then
+    if [ -f "${GM_STATE:-/tmp}/mihomo_t_ok" ]; then
+      echo "configuration file test is successful"
+      exit 0
+    else
+      echo "configuration file test failed"
+      exit 1
+    fi
+  fi
+done
+sleep 30
+exit 0

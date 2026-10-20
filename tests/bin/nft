@@ -1,0 +1,17 @@
+#!/bin/sh
+# sandbox stub: nft - emulates the router's nftables CLI well enough for tests.
+#   nft -c -f <file> / nft -f <file>  -> syntax "ok" (exit 0)
+#   nft list / list table ...         -> empty output, exit 0
+case "$1" in
+  -c|-f)
+    case "$2" in
+      -f) exit 0 ;;
+    esac
+    exit 0
+    ;;
+  list|delete|add|flush)
+    # 'list table inet x' etc: print nothing; checks grep for absence -> not installed
+    exit 0
+    ;;
+esac
+exit 0

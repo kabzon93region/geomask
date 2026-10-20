@@ -1,0 +1,20 @@
+#!/bin/sh
+# stub curl: canned responses
+#   *9090/version*   -> mihomo version line
+#   *9090/proxies*   -> proxies JSON with VPN+AI groups
+#   *generate_204*   -> 204
+SUPPORT=1
+for a in "$@"; do
+  case "$a" in
+    http://127.0.0.1:9090/version*|http://127.0.0.1:9090/version)
+      printf 'Mihomo Meta v1.19.32\n'
+      exit 0 ;;
+    *9090/proxies*)
+      printf '{"proxies":{"AI":{"alive":true},"VPN":{"alive":true},"GLOBAL":{}}}\n'
+      exit 0 ;;
+    *generate_204*)
+      printf '204'
+      exit 0 ;;
+  esac
+done
+exit 0

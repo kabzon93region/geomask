@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.6.1"
+GM_VERSION="1.6.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -596,8 +596,10 @@ apply_routes() {
   ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
   # --- ICMP bypass: 19901 stays ABOVE the magitrickle fwmark rule base
   #     (dynamic, observed 32558..32609) so ping to a marked IP never dies
-  #     inside the TUN. Direct via pppoe-wan. ---
-  ip rule show | grep -q '19901:' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
+  #     inside the TUN. Direct via pppoe-wan. Guard reseats the rule to
+  #     (base - 100) when the base drifts, so presence is checked by SEMANTICS,
+  #     never by the 19901 prefix (v1.6.2: no duplicates after a reseat). ---
+  ip rule show | grep -q 'iif br-lan ipproto icmp lookup main' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
   # --- bypass-mode devices (19900 is safely above the magitrickle fwmark base,
   #     so marking cannot preempt a device rule; LAN stays local) ---
   if [ -f /etc/geo-devices.list ]; then
@@ -2292,8 +2294,10 @@ apply_routes() {
   # --- ICMP bypass: must stay ABOVE the magitrickle fwmark rule base. That base
   #     is dynamic (drifts down as groups grow): observed 32558..32609 over time.
   #     A low pref (19901) is always above it, so ping to a marked IP never dies
-  #     inside the TUN. Direct via pppoe-wan. ---
-  ip rule show | grep -q '19901:' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
+  #     inside the TUN. Direct via pppoe-wan. Guard reseats the rule to
+  #     (base - 100) when the base drifts, so presence is checked by SEMANTICS,
+  #     never by the 19901 prefix (v1.6.2: ifup never adds a duplicate). ---
+  ip rule show | grep -q 'iif br-lan ipproto icmp lookup main' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
   # --- AI-DNS: DNS of AI-mode devices exits through the AI tunnel (no DNS leak).
   #     The DoH worker runs as user dnsai; its sockets are marked 0x64 by the
   #     nft table geomask_ai_dns, and this rule sends the marked traffic to

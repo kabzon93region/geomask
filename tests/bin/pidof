@@ -1,0 +1,7 @@
+#!/bin/sh
+# stub pidof: prints a fake pid if service listed in $GM_STATE/services,
+# or if the service has an init script in the sandbox root (AI-DNS installs its own)
+S="${GM_STATE:-/tmp}/services"
+if [ -f "$S" ] && grep -qx "$1" "$S"; then echo 12345; exit 0; fi
+if [ -n "${GM_PREFIX:-}" ] && [ -f "$GM_PREFIX/etc/init.d/$1" ]; then echo 12345; exit 0; fi
+exit 1

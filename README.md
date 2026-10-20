@@ -1,11 +1,12 @@
 # geomask
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v1.6.1-blue)](https://github.com/kabzon93region/geomask/releases/tag/v1.6.1)
+[![Release](https://img.shields.io/badge/release-v1.6.2-blue)](https://github.com/kabzon93region/geomask/releases/tag/v1.6.2)
 [![Language: Shell](https://img.shields.io/badge/language-POSIX%20sh-informational)](geomask.sh)
 [![Platform: OpenWrt](https://img.shields.io/badge/platform-OpenWrt%2024.10%2B-00b5e2)](https://openwrt.org)
 [![LuCI](https://img.shields.io/badge/UI-LuCI-ff6d00)](https://github.com/openwrt/luci)
 [![Build](https://img.shields.io/badge/build-python%20build.py-success)](build.py)
+[![CI](https://github.com/kabzon93region/geomask/actions/workflows/ci.yml/badge.svg)](https://github.com/kabzon93region/geomask/actions/workflows/ci.yml)
 
 Автоматизированный установщик и конфигуратор домашнего стека обхода блокировок на OpenWrt.
 Целевое устройство — **wwGate AX3000** (MediaTek Filogic, aarch64), прошивка OpenWrt 25.12.
@@ -50,7 +51,7 @@ sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master
 Из релиза (пин на конкретную версию):
 
 ```sh
-opkg install https://github.com/kabzon93region/geomask/releases/download/v1.6.1/geomask.sh
+opkg install https://github.com/kabzon93region/geomask/releases/download/v1.6.2/geomask.sh
 ```
 
 ## Быстрый старт

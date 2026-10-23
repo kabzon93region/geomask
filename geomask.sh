@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.7.0"
+GM_VERSION="1.7.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -157,7 +157,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.7.0"
+BACKEND_VERSION="1.7.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1169,7 +1169,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.7.0';
+var PANEL_VERSION = '1.7.1';
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -1682,6 +1682,10 @@ ASSET_EOF
   info "reloading rpcd + luci menu..."
   initd rpcd reload 2>/dev/null || true
   sleep 1
+  # procd can coalesce the uninstall+install reload pair in --reinstall and drop
+  # the second signal -> geo-sync stays unregistered; re-send until it appears.
+  ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
+  ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
   return 0
 }
 step2_verify() { step2_check; }
@@ -2683,7 +2687,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.7.0"
+GUARD_VERSION="1.7.1"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -3190,6 +3194,7 @@ prompt_url() { # prompt_url <label> <current> <flag-value>  -> prints url, rc=1 
 }
 
 # remove geomask parts (geo overlay, sync script, cron); keeps mihomo config
+# $1 = noreload: skip the rpcd reload (caller re-registers right after install)
 geomask_uninstall() {
   for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
            /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
@@ -3202,7 +3207,7 @@ geomask_uninstall() {
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi
-  initd rpcd reload 2>/dev/null || true
+  [ "$1" = "noreload" ] || initd rpcd reload 2>/dev/null || true
   return 0
 }
 
@@ -3221,7 +3226,7 @@ menu_reinstall() {
   ask "Продолжить пересстановку?" || { warn "отменено"; return 1; }
   _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
   _ai=$(prompt_url "Ссылка на AI-подписку (Германия)" "$_cura" "$GM_AI_URL") || { bad "URL AI-подписки не задан"; return 1; }
-  hdr "1/6" "удаление geomask"; geomask_uninstall || true
+  hdr "1/6" "удаление geomask"; geomask_uninstall noreload || true
   hdr "2/6" "гео-оверлей LuCI"; step2_apply || true
   hdr "3/6" "mihomo: 2 подписки"
   if write_mihomo_config "$_vpn" "$_ai"; then

@@ -60,6 +60,21 @@ netstat -tlnp | grep -E '5055|5353'
 - Панель хранит бэкапы `config.yaml.bak_subswitch_*` и `.bak_geomask_*` — откат возможен вручную.
 - Полный бэкап: `sh geomask.sh --backup`.
 
+## Тротлинг YouTube/QUIC и ловушки диагностики (опыт 23.10)
+
+- **QUIC (UDP 443) к googlevideo/ГКК провайдера тротлингится ТСПУ** (~130 КБ/с) при быстрых
+  TCP-потоках (6–12 МБ/с в ту же минуту). Симптом: видео «прерывается и не грузится дальше»
+  на одном устройстве (обычно ТВ/SmartTube с высоким битрейтом), а другие играют.
+  Решение без туннелей: в mihomo `config.yaml` **до** правила `RULE-SET,ytdirect` —
+  `REJECT` для `UDP 443` к `googlevideo.com`/`youtube.com`/`youtu.be` (форс TCP).
+- **`/proc/PID/cmdline` nfqws показывает пост-парсинговый argv**: значение
+  `--dpi-desync=fake,multisplit` выглядит двумя токенами (`fake` + `multisplit`) — nfqws
+  разрезает буфер по запятым при разборе стратегий. Это НЕ поломка конфига: проверяйте файл
+  (`/opt/zapret/config` / uci), а не cmdline.
+- **`--dpi-desync-fooling=ts,badseq` для google-хостов ломает TLS-handshake к youtube**
+  (страница не открывается, yt-dlp — handshake timeout). Оставляйте `ts`; эксперименты с
+  fooling — только с немедленной проверкой `curl youtube` и готовым откатом.
+
 ## Сменил подписку — «интернет пропал на всех устройствах»
 
 **Так и бывает — это не поломка.** Применение подписки делает `PUT /configs` (reload mihomo):

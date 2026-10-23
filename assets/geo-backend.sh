@@ -8,6 +8,7 @@
 #   ai_sub_get | ai_sub_set <url>   (AI subscription / mihomo provider de5)
 #   subs_list | sub_add <name> <url> | sub_del <id>
 #   ai_sub_use <id> | vpn_sub_use <id>  (switch provider url from registry, no mihomo restart)
+#   upd_check [force] | upd_status | upd_apply   (self-update from GitHub releases, v1.7.0+)
 # Device modes (per-device geo policy):
 #   bypass  - device routes DIRECT (real IP), beats fwmark+Mihomo; real tz (GeoSync off on PC)
 #   realtz  - device routes via mihomo (masked IP), but PC keeps real tz (GeoSync off on PC)
@@ -28,6 +29,17 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
+BACKEND_VERSION="@@BACKEND_VERSION@@"
+# self-update state (panel button): check cache, status file, detached runner
+UPD_DIR=/tmp/geomask-upd
+UPD_CHECK=$UPD_DIR/check.json
+UPD_STATUS=$UPD_DIR/status.json
+UPD_PIDF=$UPD_DIR/pid
+UPD_TTL=3600
+UPD_REPO=kabzon93region/geomask
+DEPLOY_JS=/www/luci-static/resources/view/geo-sync/main.js
+DEPLOY_GUARD=/usr/bin/geomask-guard.sh
+DEPLOY_BACKEND=/usr/bin/geo-backend.sh
 
 # escape a string for JSON: backslash, quote, tab; CR stripped; newline -> \n
 json_esc() {
@@ -689,6 +701,176 @@ cmd_vpn_sub_use() {
   printf '{"ok":true,"url":"%s","vpn_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$VPN_NODE")"
 }
 
+# ---------------- self-update (v1.7.0): check / status / apply ----------------
+# check -> $UPD_CHECK (cache TTL), apply -> detached runner writes $UPD_STATUS.
+# Flow: full backup -> download release artifact -> sh -n + version + sha256
+# -> "sh new --reinstall --yes" (module files only, no service restarts) -> rpcd reload.
+
+_upd_esc() { sed 's/\\/\\\\/g; s/"/\\"/g'; }   # stdin -> json-safe
+
+_upd_mark() { # $1=file, $2=marker name; supports NAME="v" and NAME = 'v'
+  [ -f "$1" ] || { printf 'none'; return 0; }
+  sed -n "s/.*$2[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" "$1" 2>/dev/null | head -1
+}
+
+_upd_core_ver() { # installed installer copy (may be absent)
+  for f in /tmp/geomask.sh /root/geomask.sh; do
+    [ -f "$f" ] || continue
+    _v=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+  done
+  printf 'none'
+}
+
+_upd_newer() { # $1 candidate > $2 current ? (numeric X.Y.Z, missing parts = 0)
+  _a=$(printf '%s' "$1" | sed 's/^v//; s/[^0-9.].*$//')
+  _b=$(printf '%s' "$2" | sed 's/^v//; s/[^0-9.].*$//')
+  [ -n "$_a" ] && [ -n "$_b" ] || return 1
+  _i=1
+  while [ "$_i" -le 3 ]; do
+    _x=$(printf '%s' "$_a" | cut -d. -f"$_i"); _y=$(printf '%s' "$_b" | cut -d. -f"$_i")
+    _x=${_x:-0}; _y=${_y:-0}
+    case "$_x$_y" in *[!0-9]*) return 1 ;; esac
+    [ "$_x" -gt "$_y" ] && return 0
+    [ "$_x" -lt "$_y" ] && return 1
+    _i=$((_i+1))
+  done
+  return 1
+}
+
+_upd_bin_info() { # first existing path -> "file YYYY-MM-DD"
+  for f in "$@"; do
+    if [ -f "$f" ]; then printf 'file %s' "$(date -r "$f" +%F 2>/dev/null || printf '?')"; return 0; fi
+  done
+  printf 'not found'
+}
+
+_upd_stack_json() { # display-only versions of the managed stack
+  _mv=none
+  if command -v mihomo >/dev/null 2>&1; then
+    _mv=$(mihomo -v 2>&1 | head -1 | tr -d '\r' | head -c 90)
+    [ -n "$_mv" ] || _mv=none
+  fi
+  _o="{\"n\":\"mihomo\",\"v\":\"$(printf '%s' "$_mv" | _upd_esc)\"}"
+  _o="$_o,{\"n\":\"magitrickle\",\"v\":\"$(_upd_bin_info /usr/bin/magitrickled)\"}"
+  _o="$_o,{\"n\":\"hev-socks5-tunnel\",\"v\":\"$(_upd_bin_info /usr/sbin/hev-socks5-tunnel /usr/bin/hev-socks5-tunnel)\"}"
+  _o="$_o,{\"n\":\"tg-ws-proxy\",\"v\":\"$(_upd_bin_info /usr/bin/tg-ws-proxy)\"}"
+  _o="$_o,{\"n\":\"https-dns-proxy\",\"v\":\"$(_upd_bin_info /usr/sbin/https-dns-proxy)\"}"
+  _o="$_o,{\"n\":\"zapret / nfqws\",\"v\":\"$(_upd_bin_info /opt/zapret/nfq/nfqws)\"}"
+  printf '[%s]' "$_o"
+}
+
+_upd_check_now() { # $1 = "force" bypasses the TTL cache
+  mkdir -p "$UPD_DIR" 2>/dev/null
+  _age=$(( $(date +%s) - $(date -r "$UPD_CHECK" +%s 2>/dev/null || echo 0) ))
+  if [ "$1" != "force" ] && [ -s "$UPD_CHECK" ] && [ "$_age" -lt "$UPD_TTL" ]; then
+    cat "$UPD_CHECK"; return 0
+  fi
+  _j=$(curl -fsS -m 10 -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/$UPD_REPO/releases/latest" 2>/dev/null)
+  # GitHub answers pretty-printed JSON -> allow whitespace around ':'
+  _tag=$(printf '%s' "$_j" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  if [ -n "$_tag" ]; then
+    _src=github
+    _dig=$(printf '%s' "$_j" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\(sha256:[0-9a-f]*\)".*/\1/p' | head -1)
+    _pub=$(printf '%s' "$_j" | sed -n 's/.*"published_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  else
+    # fallback: version from raw master (no digest -> sha256 check skipped at apply)
+    _rv=$(curl -fsS -m 12 "https://raw.githubusercontent.com/$UPD_REPO/master/geomask.sh" 2>/dev/null \
+      | sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$_rv" ] || { printf '{"ok":false,"error":"version source unreachable"}'; return 1; }
+    _tag="v$_rv"; _src=raw; _dig=""; _pub=""
+  fi
+  _ver=$(printf '%s' "$_tag" | sed 's/^v//')
+  _core=$(_upd_core_ver)
+  _panel=$(_upd_mark "$DEPLOY_JS" PANEL_VERSION)
+  _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION)
+  _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION)
+  [ -n "$_panel" ] || _panel=none
+  [ -n "$_guard" ] || _guard=none
+  [ -n "$_backend" ] || _backend=none
+  _need=false
+  if [ "$_core" = "none" ]; then _need=true
+  elif _upd_newer "$_ver" "$_core"; then _need=true
+  elif [ "$_core" = "$_ver" ] && { [ "$_panel" != "$_ver" ] || [ "$_guard" != "$_ver" ] || [ "$_backend" != "$_ver" ]; }; then
+    _need=true   # partial/misaligned deploy of the same release -> repair
+  fi
+  _now=$(date '+%F %T')
+  printf '{"ok":true,"checked_at":"%s","src":"%s","local":{"core":"%s","panel":"%s","guard":"%s","backend":"%s"},"latest":{"tag":"%s","version":"%s","digest":"%s","published":"%s"},"need":%s,"stack":%s}\n' \
+    "$_now" "$_src" "$_core" "$_panel" "$_guard" "$_backend" \
+    "$_tag" "$_ver" "$_dig" "$_pub" "$_need" "$(_upd_stack_json)" > "$UPD_CHECK.tmp" \
+    && mv -f "$UPD_CHECK.tmp" "$UPD_CHECK"
+  cat "$UPD_CHECK"
+}
+
+_upd_running() {
+  [ -f "$UPD_PIDF" ] || return 1
+  _p=$(cat "$UPD_PIDF" 2>/dev/null)
+  [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null
+}
+
+cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
+
+cmd_upd_status() {
+  mkdir -p "$UPD_DIR" 2>/dev/null
+  if [ -s "$UPD_STATUS" ]; then cat "$UPD_STATUS"; else printf '{"phase":"idle"}'; fi
+  printf '\n'
+}
+
+cmd_upd_apply() {
+  mkdir -p "$UPD_DIR" 2>/dev/null
+  if _upd_running; then printf '{"ok":false,"err":"already running"}\n'; return 1; fi
+  _upd_check_now "" >/dev/null 2>&1 || true
+  [ -s "$UPD_CHECK" ] || { printf '{"ok":false,"err":"version source unreachable - check network"}\n'; return 1; }
+  _tag=$(sed -n 's/.*"tag":"\([^"]*\)".*/\1/p' "$UPD_CHECK" | head -1)
+  [ -n "$_tag" ] || { printf '{"ok":false,"err":"bad check cache"}\n'; return 1; }
+  cat > "$UPD_DIR/run.sh" <<'RUNEOF'
+#!/bin/sh
+# geomask self-update runner (detached): backup -> download -> validate -> reinstall
+D=/tmp/geomask-upd
+ST=$D/status.json
+say() { printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$2" "$(date '+%F %T')" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; }
+trap 'rm -f "$D/pid"' EXIT
+TAG="$1"
+say backup "creating full router backup..."
+TS=$(date +%Y%m%d-%H%M%S)
+BK=/tmp/router-backup-$TS.tar.gz
+if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
+  say error "backup failed - update aborted"; exit 1
+fi
+echo "file=$BK md5=$(md5sum "$BK" | awk '{print $1}')" > "$D/backup.info"
+say download "downloading geomask $TAG..."
+rm -f "$D/geomask.sh.new"
+if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon93region/geomask@${TAG}/geomask.sh" && \
+   ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://github.com/kabzon93region/geomask/releases/download/${TAG}/geomask.sh"; then
+  say error "download failed (jsdelivr + github)"; exit 1
+fi
+say validate "validating download..."
+if ! sh -n "$D/geomask.sh.new"; then say error "syntax check failed"; exit 1; fi
+NEWV=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$D/geomask.sh.new" | head -1)
+if [ -z "$NEWV" ] || [ "v$NEWV" != "$TAG" ]; then
+  say error "version mismatch (file=${NEWV:-none} tag=$TAG)"; exit 1
+fi
+DIG=$(sed -n 's/.*"digest":"\(sha256:[0-9a-f]*\)".*/\1/p' "$D/check.json" | head -1)
+if [ -n "$DIG" ]; then
+  ACT="sha256:$(sha256sum "$D/geomask.sh.new" | awk '{print $1}')"
+  [ "$ACT" = "$DIG" ] || { say error "sha256 mismatch"; exit 1; }
+fi
+say apply "installing modules and panel (no service restarts)..."
+if ! sh "$D/geomask.sh.new" --reinstall --yes >> "$D/upd.log" 2>&1; then
+  say error "install failed - see $D/upd.log"; exit 1
+fi
+cp -f "$D/geomask.sh.new" /tmp/geomask.sh 2>/dev/null && chmod +x /tmp/geomask.sh 2>/dev/null
+/etc/init.d/rpcd reload >/dev/null 2>&1 || true
+sleep 1
+say done "updated to $NEWV - refresh the panel page (Ctrl+F5)"
+RUNEOF
+  printf '{"phase":"queued","msg":"starting update to %s","ts":"%s"}\n' "$_tag" "$(date '+%F %T')" > "$UPD_STATUS"
+  sh "$UPD_DIR/run.sh" "$_tag" >/dev/null 2>&1 &
+  echo $! > "$UPD_PIDF"
+  printf '{"ok":true,"to":"%s"}\n' "$_tag"
+}
+
 case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
@@ -707,5 +889,8 @@ case "$1" in
   sub_del)    cmd_sub_del "$2" ;;
   ai_sub_use)   cmd_ai_sub_use "$2" ;;
   vpn_sub_use)  cmd_vpn_sub_use "$2" ;;
+  upd_check)    cmd_upd_check "$2" ;;
+  upd_status)   cmd_upd_status ;;
+  upd_apply)    cmd_upd_apply ;;
   *) printf '{"error":"usage"}'; exit 1 ;;
 esac

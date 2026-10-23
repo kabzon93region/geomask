@@ -233,6 +233,33 @@ else
 fi
 contains "$HERE/state/ip_rules" "priority 32760" "S11 hotplug actually ran"
 
+# ---------- scenario 12: self-update feature wiring (v1.7.0) ----------
+echo "=== S12: self-update markers/methods ==="
+# 1) every @@...@@ marker stamped by build.py (no leftovers)
+if grep -q '@@' "$SCRIPT"; then
+  echo "FAIL: S12 unreplaced markers:"; grep -o '@@[A-Za-z0-9_]*@@' "$SCRIPT" | head -3 | sed 's/^/    /'
+  failn=$((failn+1))
+else
+  echo "PASS: S12 no unreplaced markers"; pass=$((pass+1))
+fi
+# 2) component versions == GM_VERSION
+_gv=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$SCRIPT" | head -1)
+for _m in "PANEL_VERSION = '$_gv'" "BACKEND_VERSION=\"$_gv\"" "GUARD_VERSION=\"$_gv\""; do
+  if grep -qF "$_m" "$SCRIPT"; then echo "PASS: S12 stamped: $_m"; pass=$((pass+1))
+  else echo "FAIL: S12 stamp missing: $_m"; failn=$((failn+1)); fi
+done
+# 3) upd_* methods wired through backend + rpcd + acl + js (>=3 refs each)
+for _m in upd_check upd_apply upd_status; do
+  _c=$(grep -c "$_m" "$SCRIPT")
+  if [ "$_c" -ge 3 ]; then echo "PASS: S12 $_m wired ($_c refs)"; pass=$((pass+1))
+  else echo "FAIL: S12 $_m refs=$_c (want >=3)"; failn=$((failn+1)); fi
+done
+# 4) update runner sanity: backup first, digest check, no-restart install
+for _p in 'sysupgrade -b' 'sha256 mismatch' 'reinstall --yes' 'rpcd reload'; do
+  if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S12 runner has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S12 runner missing: $_p"; failn=$((failn+1)); fi
+done
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

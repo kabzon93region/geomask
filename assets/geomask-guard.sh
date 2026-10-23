@@ -13,6 +13,7 @@
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
+GUARD_VERSION="@@GUARD_VERSION@@"
 
 log() { logger -t geomask-guard "$*"; }
 

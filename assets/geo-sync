@@ -25,6 +25,9 @@ list_methods() {
 	json_add_object "sub_del";    json_add_string "id" "string"; json_close_object
 	json_add_object "ai_sub_use";   json_add_string "id" "string"; json_close_object
 	json_add_object "vpn_sub_use";  json_add_string "id" "string"; json_close_object
+	json_add_object "upd_check";    json_add_string "force" "string"; json_close_object
+	json_add_object "upd_status";   json_close_object
+	json_add_object "upd_apply";    json_close_object
 	json_dump
 }
 
@@ -52,6 +55,9 @@ call_method() {
 		sub_del)    json_get_var id id; "$BACKEND" sub_del "$id" ;;
 		ai_sub_use)   json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;
 		vpn_sub_use)  json_get_var id id; "$BACKEND" vpn_sub_use "$id" ;;
+		upd_check)    json_get_var force force; "$BACKEND" upd_check "$force" ;;
+		upd_status)   "$BACKEND" upd_status ;;
+		upd_apply)    "$BACKEND" upd_apply ;;
 		*) echo '{"error":"unknown method"}'; return 1 ;;
 	esac
 }

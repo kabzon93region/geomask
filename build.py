@@ -52,6 +52,17 @@ def main():
     if missing:
         raise SystemExit("unreplaced placeholders: %s" % missing)
 
+    # stamp component versions (panel/backend/guard) from the template GM_VERSION
+    gvm = re.search(r'^GM_VERSION="([^"]+)"', out, re.M)
+    if not gvm:
+        raise SystemExit("GM_VERSION not found in template")
+    gv = gvm.group(1)
+    for marker in ("@@PANEL_VERSION@@", "@@BACKEND_VERSION@@", "@@GUARD_VERSION@@"):
+        out = out.replace(marker, gv)
+    left = re.findall(r"@@[A-Za-z0-9_]+@@", out)
+    if left:
+        raise SystemExit("unreplaced markers: %s" % left)
+
     with open(OUT, "w", encoding="utf-8", newline="\n") as f:
         f.write(out)
     os.chmod(OUT, 0o755)

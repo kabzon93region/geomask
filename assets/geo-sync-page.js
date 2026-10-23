@@ -22,6 +22,10 @@ var callSubAdd   = rpc.declare({ object: 'geo-sync', method: 'sub_add',   params
 var callSubDel   = rpc.declare({ object: 'geo-sync', method: 'sub_del',   params: { id: null }, expect: {} });
 var callAiSubUse   = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use',   params: { id: null }, expect: {} });
 var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  params: { id: null }, expect: {} });
+var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
+var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
+var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
+var PANEL_VERSION = '@@PANEL_VERSION@@';
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -83,7 +87,12 @@ var STYLE = [
 	'.gs-subs .gs-btn-warn{padding:5px 10px}',
 	'.gs-input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;font-size:13px}',
 	'.gs-hint{color:#8b949e;font-size:12px;margin-top:6px}',
-	'.gs-out{background:#0d1117;color:#8b949e;font-family:monospace;font-size:12px;padding:9px 11px;border-radius:7px;margin-top:10px;white-space:pre-wrap;max-height:130px;overflow:auto}'
+	'.gs-out{background:#0d1117;color:#8b949e;font-family:monospace;font-size:12px;padding:9px 11px;border-radius:7px;margin-top:10px;white-space:pre-wrap;max-height:130px;overflow:auto}',
+	'.gs-mono{font-family:monospace}',
+	'.gs-upd-meta{color:#8b949e;font-size:12px}',
+	'.gs-stack{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:#8b949e;margin-top:6px}',
+	'.gs-stack span b{color:#c9d1d9;font-weight:600}',
+	'.gs-upd-status{margin-top:8px;font-size:13px;min-height:18px}'
 ].join('\n');
 
 function injectStyle() {
@@ -132,14 +141,18 @@ var E = (function(raw) {
 return view.extend({
 	load: function() {
 		injectStyle();
-		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList() ]);
+		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
+			callUpdCheck({ force: null }), callUpdStatus() ]);
 	},
 
 	render: function(all) {
 		var st = all[0] || {}, leases = (all[1] || {}).leases || [], lg = (all[2] || {}).log || '';
 		var aicfg = all[3] || {};
 		var subs = (all[4] || {}).subs || [];
+		var upd = all[5] || {};
+		var upds = all[6] || {};
 		var view = this;
+		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
 
 		/* ===================== HERO: dual subscription ===================== */
@@ -382,6 +395,120 @@ return view.extend({
 		]);
 		wrap.appendChild(logCard);
 
+		/* ===================== Updates (bottom - rarely used block) ===================== */
+		var updStatus = E('div', { 'class': 'gs-upd-status' });
+		var latest = upd.latest || {}, loc = upd.local || {};
+		var stack = upd.stack || [];
+		var updErr = upd.error || null;
+		var coreV = loc.core || 'none', latV = latest.version || '', latTag = latest.tag || '';
+		var UPD_RUNNING = ['queued', 'backup', 'download', 'validate', 'apply'];
+
+		function verRow(label, val, hint) {
+			return E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, label),
+				E('span', { 'class': 'gs-val gs-mono' }, val || '—'),
+				hint || E('span', {})
+			]);
+		}
+
+		function updPoll() {
+			if (view._updTimer) clearInterval(view._updTimer);
+			view._updTimer = setInterval(function() {
+				callUpdStatus().then(function(s) {
+					s = s || {};
+					var ph = s.phase || 'idle';
+					if (ph === 'done') {
+						clearInterval(view._updTimer); view._updTimer = null;
+						updStatus.style.color = '';
+						updStatus.textContent = '';
+						updStatus.appendChild(E('span', { 'class': 'gs-badge gs-ok' }, 'Готово: ' + (s.msg || '')));
+						updStatus.appendChild(' ');
+						updStatus.appendChild(E('button', { 'class': 'gs-btn gs-btn-primary',
+							'click': function() { location.reload(); } }, 'Обновить страницу'));
+					} else if (ph === 'error') {
+						clearInterval(view._updTimer); view._updTimer = null;
+						updStatus.style.color = '#f85149';
+						updStatus.textContent = 'Ошибка: ' + (s.msg || 'unknown');
+					} else if (UPD_RUNNING.indexOf(ph) >= 0) {
+						updStatus.style.color = '#d29922';
+						updStatus.textContent = (s.msg || ph) + '  [' + (s.ts || '') + ']';
+					}
+				});
+			}, 2000);
+		}
+
+		var updChildren = [
+			E('h3', {}, 'Обновления'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Проверка версий — при открытии страницы (кэш 1 ч) и по кнопке. ' +
+				'Обновление geomask: полный бэкап роутера → скачивание релиза с GitHub (sha256) → ' +
+				'установка модулей и панели без перезапуска сервисов → после «Готово» обнови страницу (Ctrl+F5).')
+		];
+		if (updErr) {
+			updChildren.push(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Проверка версий'),
+				E('span', { 'class': 'gs-badge gs-warn' }, 'ошибка'),
+				E('span', { 'class': 'gs-upd-meta' }, String(updErr))
+			]));
+		} else {
+			updChildren.push(verRow('geomask (ядро)', coreV,
+				(latV && coreV !== 'none' && coreV !== latV && !upd.need) ? E('span', { 'class': 'gs-upd-meta' }, 'локальная новее релиза') : null));
+			updChildren.push(verRow('Админка LuCI', loc.panel,
+				(loc.panel && loc.backend && loc.panel !== loc.backend) ? E('span', { 'class': 'gs-badge gs-warn' }, 'панель≠бэкенд') : null));
+			updChildren.push(verRow('geomask-guard', loc.guard));
+			updChildren.push(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Доступно на GitHub'),
+				latV ? E('span', { 'class': 'gs-val gs-upd-latest' }, latTag) : E('span', {}, '—'),
+				upd.need === true
+					? E('span', { 'class': 'gs-badge gs-warn' }, 'доступно обновление')
+					: E('span', { 'class': 'gs-badge gs-ok' }, 'актуально')
+			]));
+			if (upd.need === true) {
+				var btnUpd = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+					if (!confirm('Обновить geomask до ' + latTag + '?\n\n' +
+						'Будет создан полный бэкап роутера, файлы модулей и панель заменятся на ' + latTag + '.\n' +
+						'Сервисы (mihomo, magitrickle и т.д.) не перезапускаются.')) return;
+					btnUpd.disabled = true; btnUpd.textContent = 'Запуск…';
+					callUpdApply().then(function(res) {
+						btnUpd.disabled = false; btnUpd.textContent = 'Обновить до ' + latTag;
+						if (res && (res.error || res.ok === false)) {
+							updStatus.style.color = '#f85149';
+							updStatus.textContent = 'Ошибка: ' + (res.error || res.err || 'отклонено');
+							return;
+						}
+						updStatus.style.color = '#d29922';
+						updStatus.textContent = 'Обновление запущено…';
+						updPoll();
+					}).catch(function(e) {
+						btnUpd.disabled = false; btnUpd.textContent = 'Обновить до ' + latTag;
+						updStatus.style.color = '#f85149';
+						updStatus.textContent = 'Ошибка: ' + e;
+					});
+				} }, 'Обновить до ' + latTag);
+				updChildren.push(E('div', { 'class': 'gs-actions' }, [ btnUpd ]));
+			}
+			updChildren.push(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Стек (справочно)'),
+				(function() {
+					var btnCh = E('button', { 'class': 'gs-btn', 'click': function() {
+						btnCh.disabled = true; btnCh.textContent = 'Проверка…';
+						callUpdCheck({ force: '1' }).then(function() { return view.reload(); })
+							.catch(function() { btnCh.disabled = false; btnCh.textContent = 'Проверить ещё раз'; });
+					} }, 'Проверить ещё раз');
+					return btnCh;
+				})()
+			]));
+			updChildren.push(E('div', { 'class': 'gs-stack' }, stack.length
+				? stack.map(function(s) { return E('span', {}, [ E('b', {}, (s.n || '?') + ': '), String(s.v || '?') ]); })
+				: [ E('span', {}, 'нет данных') ]));
+			if (upd.checked_at) updChildren.push(E('div', { 'class': 'gs-upd-meta' },
+				'Проверено: ' + upd.checked_at + ' · источник: ' + (upd.src || '?') + (upd.need === true && latest.digest ? ' · sha256: ' + String(latest.digest).slice(0, 19) + '…' : '')));
+		}
+		updChildren.push(updStatus);
+		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
+		wrap.appendChild(updCard);
+		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) { updStatus.textContent = 'Обновление: ' + (upds.msg || upds.phase); updPoll(); }
+
 		return wrap;
 	},
 
@@ -398,7 +525,8 @@ return view.extend({
 
 	reload: function() {
 		var view = this;
-		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList() ]).then(function(all) {
+		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
+			callUpdCheck({ force: null }), callUpdStatus() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);

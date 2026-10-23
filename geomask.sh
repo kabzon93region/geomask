@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.7.1"
+GM_VERSION="1.7.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -157,7 +157,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.7.1"
+BACKEND_VERSION="1.7.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1169,7 +1169,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.7.1';
+var PANEL_VERSION = '1.7.2';
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -1544,7 +1544,8 @@ return view.extend({
 		var latest = upd.latest || {}, loc = upd.local || {};
 		var stack = upd.stack || [];
 		var updErr = upd.error || null;
-		var coreV = loc.core || 'none', latV = latest.version || '', latTag = latest.tag || '';
+		var coreV = loc.core || 'none', latV = latest.version || '',
+			latTag = (latest.tag || '').replace(/^v/, '');   /* display without the tag 'v': 1.7.2 */
 		var UPD_RUNNING = ['queued', 'backup', 'download', 'validate', 'apply'];
 
 		function verRow(label, val, hint) {
@@ -2687,7 +2688,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.7.1"
+GUARD_VERSION="1.7.2"
 
 log() { logger -t geomask-guard "$*"; }
 

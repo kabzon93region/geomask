@@ -400,7 +400,8 @@ return view.extend({
 		var latest = upd.latest || {}, loc = upd.local || {};
 		var stack = upd.stack || [];
 		var updErr = upd.error || null;
-		var coreV = loc.core || 'none', latV = latest.version || '', latTag = latest.tag || '';
+		var coreV = loc.core || 'none', latV = latest.version || '',
+			latTag = (latest.tag || '').replace(/^v/, '');   /* display without the tag 'v': 1.7.2 */
 		var UPD_RUNNING = ['queued', 'backup', 'download', 'validate', 'apply'];
 
 		function verRow(label, val, hint) {

@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.7.2"
+GM_VERSION="1.7.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -157,7 +157,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.7.2"
+BACKEND_VERSION="1.7.3"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1169,7 +1169,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.7.2';
+var PANEL_VERSION = '1.7.3';
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -1545,7 +1545,7 @@ return view.extend({
 		var stack = upd.stack || [];
 		var updErr = upd.error || null;
 		var coreV = loc.core || 'none', latV = latest.version || '',
-			latTag = (latest.tag || '').replace(/^v/, '');   /* display without the tag 'v': 1.7.2 */
+			latTag = (latest.tag || '').replace(/^v/, '');   /* display without the tag 'v': 1.7.3 */
 		var UPD_RUNNING = ['queued', 'backup', 'download', 'validate', 'apply'];
 
 		function verRow(label, val, hint) {
@@ -1707,6 +1707,9 @@ step3_check() {
   grep -q 'RULE-SET,ai,AI' "$_c" 2>/dev/null && info "rule ai->AI: present" || { bad "rule ai->AI missing"; _need=1; }
   grep -q 'RULE-SET,mtrickle,VPN' "$_c" 2>/dev/null && info "rule mtrickle->VPN: present" || { bad "rule mtrickle->VPN missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
+  grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
+  grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
+  grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
   for rf in /etc/mihomo/ruleset/mtrickle.yaml /etc/mihomo/ruleset/ai.yaml /etc/mihomo/ruleset/ytdirect.yaml; do
     if [ -s "$(P "$rf")" ]; then info "ruleset: $rf ($(grep -c 'DOMAIN-SUFFIX' "$(P "$rf")" 2>/dev/null || echo '?') suffixes)"; else warn "ruleset empty/missing: $rf (sync step will create)"; fi
   done
@@ -1801,7 +1804,7 @@ write_mihomo_config() {
     printf '%s\n' 'tcp-concurrent: true'
     printf '%s\n' 'mode: rule'
     printf '%s\n' 'log-level: info'
-    printf '%s\n' 'ipv6: true'
+    printf '%s\n' 'ipv6: false'
     printf '%s\n' 'external-controller: 0.0.0.0:9090'
     printf '%s\n' 'external-ui: ui'
     printf '%s\n' 'unified-delay: true'
@@ -1879,6 +1882,22 @@ write_mihomo_config() {
     printf '\n'
     printf '%s\n' 'rules:'
     printf '%s\n' '  # AUTO-SYNC from magitrickle: /root/sync_mtrickle_mihomo.sh - DO NOT EDIT MANUALLY'
+    printf '%s\n' '  - DST-PORT,1337,VPN'
+    printf '%s\n' '  - DST-PORT,6969,VPN'
+    printf '%s\n' '  - DST-PORT,451,VPN'
+    printf '%s\n' '  - DST-PORT,5944,VPN'
+    printf '%s\n' '  - DST-PORT,2710,VPN'
+    printf '%s\n' '  - DST-PORT,8081,VPN'
+    printf '%s\n' '  # direct fallback: these SNIs are filtered at VPN exit (verified: all 19 nodes fail, direct works)'
+    printf '%s\n' '  - DOMAIN-SUFFIX,thepiratebay.org,DIRECT'
+    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.org,DIRECT'
+    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.net,DIRECT'
+    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.wiki,DIRECT'
+    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.cc,DIRECT'
+    printf '%s\n' '  # QUIC forced to TCP for video hosts (RKN UDP-443 throttle, B-016)'
+    printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT'
+    printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT'
+    printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT'
     printf '%s\n' '  - RULE-SET,ytdirect,DIRECT'
     printf '%s\n' '  - DOMAIN-SUFFIX,cloudflare-ech.com,AI'
     printf '%s\n' '  - RULE-SET,ai,AI'
@@ -1896,7 +1915,7 @@ write_mihomo_config() {
     printf '%s\n' '    HTTP:'
     printf '%s\n' '      ports: [80, 8080-8880]'
     printf '%s\n' '    TLS:'
-    printf '%s\n' '      ports: [443, 8443]'
+    printf '%s\n' '      ports: [443, 8443, 5228]'
     printf '%s\n' '    QUIC:'
     printf '%s\n' '      ports: [443, 8443]'
   } > "$_tmpconf" || { bad "cannot write $_tmpconf"; return 1; }
@@ -2688,7 +2707,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.7.2"
+GUARD_VERSION="1.7.3"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -3215,8 +3234,9 @@ geomask_uninstall() {
 # full flow: uninstall -> install geo -> rewrite mihomo 2-subs -> sync+cron -> services -> verify
 menu_reinstall() {
   hdr "REINSTALL" "Удалить -> установить -> настроить geomask"
-  warn "Будут удалены и переустановлены: гео-оверлей LuCI, sync-скрипт, cron."
-  warn "Mihomo конфиг будет перезаписан шаблоном 2-подписок (старый — в бэкапе)."
+  warn "Удалены и переустановлены: гео-оверлей LuCI, sync-скрипт, cron."
+  warn "Mihomo конфиг: существующий 2-подписочный сохраняется (патчатся только ссылки подписок);"
+  warn "без конфига/маркеров подписок — запись шаблоном (старый — в бэкапе)."
   warn "Mihomo НЕ перезапускается: подписки применяются через API без обрыва VPN."
   _c="$(P $MIHOMO_CONF)"
   _curv=""; _cura=""

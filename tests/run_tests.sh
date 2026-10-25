@@ -78,6 +78,7 @@ printf 'payload: []\n' > "$R/etc/mihomo/ruleset/mtrickle.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ai.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytdirect.yaml"
 cat > "$R/etc/mihomo/config.yaml" <<'YAMLEOF'
+ipv6: false
 proxy-providers:
   sub:
     type: http
@@ -96,6 +97,9 @@ rule-providers:
   ytdirect:
     type: file
 rules:
+  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT
   - RULE-SET,ytdirect,DIRECT
   - RULE-SET,ai,AI
   - RULE-SET,mtrickle,VPN
@@ -106,6 +110,17 @@ listeners:
     port: 7891
     listen: 127.0.0.1
     proxy: AI
+sniffer:
+  enable: true
+  parse-pure-ip: true
+  override-destination: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443, 8443, 5228]
+    QUIC:
+      ports: [443, 8443]
 YAMLEOF
 # healthy state
 printf 'dnsmasq\nmagitrickled\nmihomo\nhev-socks5-tunnel\nrpcd\n' > "$HERE/state/services"

@@ -36,13 +36,23 @@ sha256 = digest релиза → sh new --reinstall --yes (файлы модул
 → rpcd reload`. Статус — `/tmp/geomask-upd/status.json`, панель опрашивает его каждые 2 с и по
 «Готово» предлагает обновить страницу (Ctrl+F5).
 
+v1.8.0: каждый шаг — отдельная строка в тёмной консоли блока (источник —
+`/tmp/geomask-upd/steps.log`, поле `lines` в `upd_status`) и дубль в `/root/geo-sync.log`
+(`GEOMASK-UPD [...]`). Там же виден **путь, размер и md5 бэкапа**, созданного перед обновлением
+(`/tmp/router-backup-<ts>.tar.gz`, tmpfs — **исчезает после перезагрузки**): забрать на ПК —
+`powershell -File fetch_backup.ps1` (сам находит свежий архив, сверяет md5, кладёт в
+`Y:\openwrt\backup\`, копию на роутере удаляет). После успешного применения кэш `check.json`
+сбрасывается — версии на странице сразу показываются новые (фикс «после обновления показывает
+старую версию» из кэша 1 ч).
+
 Проверить/починить вручную:
 
 ```sh
 cat /tmp/geomask-upd/status.json                 # фаза/сообщение
+tail -40 /tmp/geomask-upd/steps.log              # пошаговая консоль обновления
 cat /tmp/geomask-upd/backup.info                 # бэкап: файл + md5
-tail -20 /tmp/geomask-upd/upd.log                 # вывод установки
-sh /usr/bin/geo-backend.sh upd_check force        # перепроверить версии минуя кэш
+tail -20 /tmp/geomask-upd/upd.log                # вывод установки
+sh /usr/bin/geo-backend.sh upd_check force       # перепроверить версии минуя кэш
 ```
 
 Ограничение: первая установка новой панели — обычным способом (синк/установщик): у старой панели

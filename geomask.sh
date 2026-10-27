@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.7.3"
+GM_VERSION="1.8.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -157,7 +157,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.7.3"
+BACKEND_VERSION="1.8.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -941,8 +941,10 @@ cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
 
 cmd_upd_status() {
   mkdir -p "$UPD_DIR" 2>/dev/null
-  if [ -s "$UPD_STATUS" ]; then cat "$UPD_STATUS"; else printf '{"phase":"idle"}'; fi
-  printf '\n'
+  if [ -s "$UPD_STATUS" ]; then _b=$(cat "$UPD_STATUS"); else _b='{"phase":"idle"}'; fi
+  # v1.8.0 console list: tail of steps.log as a "lines" JSON array (each say() appends there)
+  _lines=$(tail -60 "$UPD_DIR/steps.log" 2>/dev/null | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  printf '%s,"lines":[%s]}\n' "${_b%\}}" "$_lines"
 }
 
 cmd_upd_apply() {
@@ -955,25 +957,34 @@ cmd_upd_apply() {
   cat > "$UPD_DIR/run.sh" <<'RUNEOF'
 #!/bin/sh
 # geomask self-update runner (detached): backup -> download -> validate -> reinstall
+# v1.8.0: every step appended to $D/steps.log (panel console list) + /root/geo-sync.log;
+#         check cache removed after success so the page shows real fresh versions.
 D=/tmp/geomask-upd
 ST=$D/status.json
-say() { printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$2" "$(date '+%F %T')" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; }
+SL=$D/steps.log
+LOGF=/root/geo-sync.log
+say() { _t=$(date '+%F %T'); printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$2" "$_t" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; printf '%s [%s] %s\n' "$_t" "$1" "$2" >> "$SL"; printf '%s GEOMASK-UPD [%s] %s\n' "$_t" "$1" "$2" >> "$LOGF"; }
 trap 'rm -f "$D/pid"' EXIT
 TAG="$1"
-say backup "creating full router backup..."
+say queued "update to $TAG started"
+say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/tmp/router-backup-$TS.tar.gz
 if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
   say error "backup failed - update aborted"; exit 1
 fi
-echo "file=$BK md5=$(md5sum "$BK" | awk '{print $1}')" > "$D/backup.info"
+_md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
+echo "file=$BK md5=$_md" > "$D/backup.info"
+say backup "backup OK: $BK ($(stat -c %s "$BK") bytes, md5 $_md)"
+say backup "backup saved on router in RAM (/tmp) - copy it to PC now: run fetch_backup.ps1 or scp root@<lan-ip>:$BK; lost after reboot. Restore: LuCI System -> Backup / Flash Firmware -> Restore"
 say download "downloading geomask $TAG..."
 rm -f "$D/geomask.sh.new"
 if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon93region/geomask@${TAG}/geomask.sh" && \
    ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://github.com/kabzon93region/geomask/releases/download/${TAG}/geomask.sh"; then
   say error "download failed (jsdelivr + github)"; exit 1
 fi
-say validate "validating download..."
+say download "downloaded $(stat -c %s "$D/geomask.sh.new") bytes"
+say validate "checking syntax (sh -n)..."
 if ! sh -n "$D/geomask.sh.new"; then say error "syntax check failed"; exit 1; fi
 NEWV=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$D/geomask.sh.new" | head -1)
 if [ -z "$NEWV" ] || [ "v$NEWV" != "$TAG" ]; then
@@ -983,6 +994,9 @@ DIG=$(sed -n 's/.*"digest":"\(sha256:[0-9a-f]*\)".*/\1/p' "$D/check.json" | head
 if [ -n "$DIG" ]; then
   ACT="sha256:$(sha256sum "$D/geomask.sh.new" | awk '{print $1}')"
   [ "$ACT" = "$DIG" ] || { say error "sha256 mismatch"; exit 1; }
+  say validate "version $NEWV ok, sha256 matches release digest"
+else
+  say validate "version $NEWV ok (digest check skipped - no cached digest)"
 fi
 say apply "installing modules and panel (no service restarts)..."
 if ! sh "$D/geomask.sh.new" --reinstall --yes >> "$D/upd.log" 2>&1; then
@@ -990,6 +1004,7 @@ if ! sh "$D/geomask.sh.new" --reinstall --yes >> "$D/upd.log" 2>&1; then
 fi
 cp -f "$D/geomask.sh.new" /tmp/geomask.sh 2>/dev/null && chmod +x /tmp/geomask.sh 2>/dev/null
 /etc/init.d/rpcd reload >/dev/null 2>&1 || true
+rm -f "$D/check.json"   # force fresh version check on the next page load
 sleep 1
 say done "updated to $NEWV - refresh the panel page (Ctrl+F5)"
 RUNEOF
@@ -1169,7 +1184,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.7.3';
+var PANEL_VERSION = '1.8.0';
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -1236,7 +1251,12 @@ var STYLE = [
 	'.gs-upd-meta{color:#8b949e;font-size:12px}',
 	'.gs-stack{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:#8b949e;margin-top:6px}',
 	'.gs-stack span b{color:#c9d1d9;font-weight:600}',
-	'.gs-upd-status{margin-top:8px;font-size:13px;min-height:18px}'
+	'.gs-upd-status{margin-top:8px;font-size:13px;min-height:18px}',
+	'.gs-console{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px 12px;margin-top:8px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.5;max-height:300px;overflow-y:auto;white-space:pre-wrap;color:#c9d1d9}',
+	'.gs-console .c-err{color:#f85149}',
+	'.gs-console .c-done{color:#3fb950}',
+	'.gs-console .c-run{color:#d29922}',
+	'.gs-console .c-dim{color:#8b949e}'
 ].join('\n');
 
 function injectStyle() {
@@ -1541,6 +1561,26 @@ return view.extend({
 
 		/* ===================== Updates (bottom - rarely used block) ===================== */
 		var updStatus = E('div', { 'class': 'gs-upd-status' });
+		var updLog = E('pre', { 'class': 'gs-console' });
+		updLog.style.display = 'none';
+		var lastLogKey = null;
+		function updLineClass(l) {
+			if (l.indexOf('[error]') >= 0) return 'c-err';
+			if (l.indexOf('[done]') >= 0) return 'c-done';
+			if (/\[(queued|backup|download|validate|apply)\]/.test(l)) return 'c-run';
+			return 'c-dim';
+		}
+		function updRenderLines(lines) {
+			lines = lines || [];
+			var key = lines.join('\n');
+			if (key === lastLogKey) return;
+			lastLogKey = key;
+			updLog.textContent = '';
+			if (!lines.length) { updLog.style.display = 'none'; return; }
+			updLog.style.display = '';
+			lines.forEach(function(l) { updLog.appendChild(E('div', { 'class': updLineClass(l) }, l)); });
+			updLog.scrollTop = updLog.scrollHeight;
+		}
 		var latest = upd.latest || {}, loc = upd.local || {};
 		var stack = upd.stack || [];
 		var updErr = upd.error || null;
@@ -1562,6 +1602,7 @@ return view.extend({
 				callUpdStatus().then(function(s) {
 					s = s || {};
 					var ph = s.phase || 'idle';
+					updRenderLines(s.lines);
 					if (ph === 'done') {
 						clearInterval(view._updTimer); view._updTimer = null;
 						updStatus.style.color = '';
@@ -1587,7 +1628,10 @@ return view.extend({
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
 				'Проверка версий — при открытии страницы (кэш 1 ч) и по кнопке. ' +
 				'Обновление geomask: полный бэкап роутера → скачивание релиза с GitHub (sha256) → ' +
-				'установка модулей и панели без перезапуска сервисов → после «Готово» обнови страницу (Ctrl+F5).')
+				'установка модулей и панели без перезапуска сервисов → после «Готово» обнови страницу (Ctrl+F5). ' +
+				'Каждый шаг пишется отдельной строкой в консоль ниже и в общий журнал (/root/geo-sync.log). ' +
+				'Бэкап перед обновлением кладется в /tmp роутера (исчезает после перезагрузки) — заберите его на ПК: ' +
+				'geomask\\fetch_backup.ps1 (путь и md5 видны в логе); восстановление — LuCI System → Backup / Flash Firmware → Restore.')
 		];
 		if (updErr) {
 			updChildren.push(E('div', { 'class': 'gs-row' }, [
@@ -1650,9 +1694,15 @@ return view.extend({
 				'Проверено: ' + upd.checked_at + ' · источник: ' + (upd.src || '?') + (upd.need === true && latest.digest ? ' · sha256: ' + String(latest.digest).slice(0, 19) + '…' : '')));
 		}
 		updChildren.push(updStatus);
+		updChildren.push(updLog);
 		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
 		wrap.appendChild(updCard);
-		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) { updStatus.textContent = 'Обновление: ' + (upds.msg || upds.phase); updPoll(); }
+		updRenderLines((upds || {}).lines);
+		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) {
+			updStatus.style.color = '#d29922';
+			updStatus.textContent = 'Идет обновление… подробности в консоли ниже.';
+			updPoll();
+		}
 
 		return wrap;
 	},
@@ -2707,7 +2757,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.7.3"
+GUARD_VERSION="1.8.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -3315,7 +3365,7 @@ fi
 
 RC=0
 if [ "$GM_BACKUP" = 1 ]; then
-  _b=$(ensure_backup) && { info "full backup created: $_b"; RC=0; } || RC=1
+  _b=$(ensure_backup) && { info "full backup created: $_b"; info "policy: copy it to the PC now (scp / geomask fetch_backup.ps1) - do NOT keep backups on the router (overlay space); LuCI Backup/Restore accepts this file"; RC=0; } || RC=1
 elif [ "$GM_REINSTALL" = 1 ]; then
   menu_reinstall || RC=1
 elif [ -n "$GM_STEP" ]; then

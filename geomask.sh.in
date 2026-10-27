@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.7.3"
+GM_VERSION="1.8.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -1139,7 +1139,7 @@ fi
 
 RC=0
 if [ "$GM_BACKUP" = 1 ]; then
-  _b=$(ensure_backup) && { info "full backup created: $_b"; RC=0; } || RC=1
+  _b=$(ensure_backup) && { info "full backup created: $_b"; info "policy: copy it to the PC now (scp / geomask fetch_backup.ps1) - do NOT keep backups on the router (overlay space); LuCI Backup/Restore accepts this file"; RC=0; } || RC=1
 elif [ "$GM_REINSTALL" = 1 ]; then
   menu_reinstall || RC=1
 elif [ -n "$GM_STEP" ]; then

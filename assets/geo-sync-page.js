@@ -92,7 +92,12 @@ var STYLE = [
 	'.gs-upd-meta{color:#8b949e;font-size:12px}',
 	'.gs-stack{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:#8b949e;margin-top:6px}',
 	'.gs-stack span b{color:#c9d1d9;font-weight:600}',
-	'.gs-upd-status{margin-top:8px;font-size:13px;min-height:18px}'
+	'.gs-upd-status{margin-top:8px;font-size:13px;min-height:18px}',
+	'.gs-console{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px 12px;margin-top:8px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.5;max-height:300px;overflow-y:auto;white-space:pre-wrap;color:#c9d1d9}',
+	'.gs-console .c-err{color:#f85149}',
+	'.gs-console .c-done{color:#3fb950}',
+	'.gs-console .c-run{color:#d29922}',
+	'.gs-console .c-dim{color:#8b949e}'
 ].join('\n');
 
 function injectStyle() {
@@ -397,6 +402,26 @@ return view.extend({
 
 		/* ===================== Updates (bottom - rarely used block) ===================== */
 		var updStatus = E('div', { 'class': 'gs-upd-status' });
+		var updLog = E('pre', { 'class': 'gs-console' });
+		updLog.style.display = 'none';
+		var lastLogKey = null;
+		function updLineClass(l) {
+			if (l.indexOf('[error]') >= 0) return 'c-err';
+			if (l.indexOf('[done]') >= 0) return 'c-done';
+			if (/\[(queued|backup|download|validate|apply)\]/.test(l)) return 'c-run';
+			return 'c-dim';
+		}
+		function updRenderLines(lines) {
+			lines = lines || [];
+			var key = lines.join('\n');
+			if (key === lastLogKey) return;
+			lastLogKey = key;
+			updLog.textContent = '';
+			if (!lines.length) { updLog.style.display = 'none'; return; }
+			updLog.style.display = '';
+			lines.forEach(function(l) { updLog.appendChild(E('div', { 'class': updLineClass(l) }, l)); });
+			updLog.scrollTop = updLog.scrollHeight;
+		}
 		var latest = upd.latest || {}, loc = upd.local || {};
 		var stack = upd.stack || [];
 		var updErr = upd.error || null;
@@ -418,6 +443,7 @@ return view.extend({
 				callUpdStatus().then(function(s) {
 					s = s || {};
 					var ph = s.phase || 'idle';
+					updRenderLines(s.lines);
 					if (ph === 'done') {
 						clearInterval(view._updTimer); view._updTimer = null;
 						updStatus.style.color = '';
@@ -443,7 +469,10 @@ return view.extend({
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
 				'Проверка версий — при открытии страницы (кэш 1 ч) и по кнопке. ' +
 				'Обновление geomask: полный бэкап роутера → скачивание релиза с GitHub (sha256) → ' +
-				'установка модулей и панели без перезапуска сервисов → после «Готово» обнови страницу (Ctrl+F5).')
+				'установка модулей и панели без перезапуска сервисов → после «Готово» обнови страницу (Ctrl+F5). ' +
+				'Каждый шаг пишется отдельной строкой в консоль ниже и в общий журнал (/root/geo-sync.log). ' +
+				'Бэкап перед обновлением кладется в /tmp роутера (исчезает после перезагрузки) — заберите его на ПК: ' +
+				'geomask\\fetch_backup.ps1 (путь и md5 видны в логе); восстановление — LuCI System → Backup / Flash Firmware → Restore.')
 		];
 		if (updErr) {
 			updChildren.push(E('div', { 'class': 'gs-row' }, [
@@ -506,9 +535,15 @@ return view.extend({
 				'Проверено: ' + upd.checked_at + ' · источник: ' + (upd.src || '?') + (upd.need === true && latest.digest ? ' · sha256: ' + String(latest.digest).slice(0, 19) + '…' : '')));
 		}
 		updChildren.push(updStatus);
+		updChildren.push(updLog);
 		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
 		wrap.appendChild(updCard);
-		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) { updStatus.textContent = 'Обновление: ' + (upds.msg || upds.phase); updPoll(); }
+		updRenderLines((upds || {}).lines);
+		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) {
+			updStatus.style.color = '#d29922';
+			updStatus.textContent = 'Идет обновление… подробности в консоли ниже.';
+			updPoll();
+		}
 
 		return wrap;
 	},

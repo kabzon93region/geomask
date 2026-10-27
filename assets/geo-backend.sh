@@ -813,8 +813,10 @@ cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
 
 cmd_upd_status() {
   mkdir -p "$UPD_DIR" 2>/dev/null
-  if [ -s "$UPD_STATUS" ]; then cat "$UPD_STATUS"; else printf '{"phase":"idle"}'; fi
-  printf '\n'
+  if [ -s "$UPD_STATUS" ]; then _b=$(cat "$UPD_STATUS"); else _b='{"phase":"idle"}'; fi
+  # v1.8.0 console list: tail of steps.log as a "lines" JSON array (each say() appends there)
+  _lines=$(tail -60 "$UPD_DIR/steps.log" 2>/dev/null | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  printf '%s,"lines":[%s]}\n' "${_b%\}}" "$_lines"
 }
 
 cmd_upd_apply() {
@@ -827,25 +829,34 @@ cmd_upd_apply() {
   cat > "$UPD_DIR/run.sh" <<'RUNEOF'
 #!/bin/sh
 # geomask self-update runner (detached): backup -> download -> validate -> reinstall
+# v1.8.0: every step appended to $D/steps.log (panel console list) + /root/geo-sync.log;
+#         check cache removed after success so the page shows real fresh versions.
 D=/tmp/geomask-upd
 ST=$D/status.json
-say() { printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$2" "$(date '+%F %T')" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; }
+SL=$D/steps.log
+LOGF=/root/geo-sync.log
+say() { _t=$(date '+%F %T'); printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$2" "$_t" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; printf '%s [%s] %s\n' "$_t" "$1" "$2" >> "$SL"; printf '%s GEOMASK-UPD [%s] %s\n' "$_t" "$1" "$2" >> "$LOGF"; }
 trap 'rm -f "$D/pid"' EXIT
 TAG="$1"
-say backup "creating full router backup..."
+say queued "update to $TAG started"
+say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/tmp/router-backup-$TS.tar.gz
 if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
   say error "backup failed - update aborted"; exit 1
 fi
-echo "file=$BK md5=$(md5sum "$BK" | awk '{print $1}')" > "$D/backup.info"
+_md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
+echo "file=$BK md5=$_md" > "$D/backup.info"
+say backup "backup OK: $BK ($(stat -c %s "$BK") bytes, md5 $_md)"
+say backup "backup saved on router in RAM (/tmp) - copy it to PC now: run fetch_backup.ps1 or scp root@<lan-ip>:$BK; lost after reboot. Restore: LuCI System -> Backup / Flash Firmware -> Restore"
 say download "downloading geomask $TAG..."
 rm -f "$D/geomask.sh.new"
 if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon93region/geomask@${TAG}/geomask.sh" && \
    ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://github.com/kabzon93region/geomask/releases/download/${TAG}/geomask.sh"; then
   say error "download failed (jsdelivr + github)"; exit 1
 fi
-say validate "validating download..."
+say download "downloaded $(stat -c %s "$D/geomask.sh.new") bytes"
+say validate "checking syntax (sh -n)..."
 if ! sh -n "$D/geomask.sh.new"; then say error "syntax check failed"; exit 1; fi
 NEWV=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$D/geomask.sh.new" | head -1)
 if [ -z "$NEWV" ] || [ "v$NEWV" != "$TAG" ]; then
@@ -855,6 +866,9 @@ DIG=$(sed -n 's/.*"digest":"\(sha256:[0-9a-f]*\)".*/\1/p' "$D/check.json" | head
 if [ -n "$DIG" ]; then
   ACT="sha256:$(sha256sum "$D/geomask.sh.new" | awk '{print $1}')"
   [ "$ACT" = "$DIG" ] || { say error "sha256 mismatch"; exit 1; }
+  say validate "version $NEWV ok, sha256 matches release digest"
+else
+  say validate "version $NEWV ok (digest check skipped - no cached digest)"
 fi
 say apply "installing modules and panel (no service restarts)..."
 if ! sh "$D/geomask.sh.new" --reinstall --yes >> "$D/upd.log" 2>&1; then
@@ -862,6 +876,7 @@ if ! sh "$D/geomask.sh.new" --reinstall --yes >> "$D/upd.log" 2>&1; then
 fi
 cp -f "$D/geomask.sh.new" /tmp/geomask.sh 2>/dev/null && chmod +x /tmp/geomask.sh 2>/dev/null
 /etc/init.d/rpcd reload >/dev/null 2>&1 || true
+rm -f "$D/check.json"   # force fresh version check on the next page load
 sleep 1
 say done "updated to $NEWV - refresh the panel page (Ctrl+F5)"
 RUNEOF

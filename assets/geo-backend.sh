@@ -863,14 +863,15 @@ say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
 BKD=/root/geomask-backups
 BK=/tmp/geomask-bk-$TS.tar.gz
+# purge BEFORE creating: files under /root are embedded by sysupgrade -b (nesting),
+# and /tmp legacy copies bloat tmpfs. Retention on router: only the freshest backup.
+mkdir -p "$BKD" 2>/dev/null
+rm -f /tmp/router-backup-*.tar.gz "$BKD"/router-backup-*.tar.gz 2>/dev/null
 if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
   say error "backup failed - update aborted"; exit 1
 fi
 SZ=$(wc -c < "$BK")
 _md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
-mkdir -p "$BKD" 2>/dev/null
-rm -f /tmp/router-backup-*.tar.gz 2>/dev/null
-for f in "$BKD"/router-backup-*.tar.gz; do [ -f "$f" ] && rm -f "$f"; done
 BKF="$BKD/router-backup-$TS.tar.gz"
 mv -f "$BK" "$BKF" 2>/dev/null || BKF="$BK"
 [ -s "$BKF" ] || { say error "backup vanished after create - update aborted"; exit 1; }

@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.9.1"
+GM_VERSION="1.9.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -423,6 +423,11 @@ ensure_backup() { # -> path on stdout, rc=1 on failure
   _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
   _dir="$(P /root/geomask-backups)"
   mkdir -p "$_dir" 2>/dev/null
+  # remove previous copies BEFORE creating: they live under /root, which sysupgrade -b
+  # archives - leaving them in place embeds them into the new archive (observed 19->28 MB).
+  # If creation then fails there is no on-router copy; caller aborts the change and the PC
+  # history (fetch_backup.ps1) remains.
+  rm -f "$_dir"/router-backup-*.tar.gz 2>/dev/null
   _out=""
   if have sysupgrade; then
     _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
@@ -436,9 +441,6 @@ ensure_backup() { # -> path on stdout, rc=1 on failure
     bad "cannot create backup"
     return 1
   fi
-  for f in "$_dir"/router-backup-*.tar.gz; do
-    [ -f "$f" ] && rm -f "$f"
-  done
   _dest="$_dir/router-backup-$_ts.tar.gz"
   mv -f "$_out" "$_dest" || { bad "cannot store backup into $_dir"; return 1; }
   chmod 644 "$_dest" 2>/dev/null
@@ -475,8 +477,8 @@ ensure_smb_share() {
     [ -n "$_sec" ] || { warn "uci add failed - SMB share skipped"; return 0; }
     uci set "ksmbd.$_sec.name=$SMB_SHARE_NAME"
     uci set "ksmbd.$_sec.path=$BACKUP_DIR"
-    uci set "ksmbd.$_sec.read_only='1'"
-    uci set "ksmbd.$_sec.guest_ok='1'"
+    uci set "ksmbd.$_sec.read_only=yes"
+    uci set "ksmbd.$_sec.guest_ok=yes"
     uci commit ksmbd
     _changed=1
     info "SMB share '$SMB_SHARE_NAME' -> $BACKUP_DIR (guest, read-only): created (section $_sec)"
@@ -484,11 +486,18 @@ ensure_smb_share() {
     _p=$(uci -q get "$_found.path" 2>/dev/null)
     if [ "$_p" != "$BACKUP_DIR" ]; then
       uci set "$_found.path=$BACKUP_DIR"
-      uci set "$_found.read_only='1'"
-      uci set "$_found.guest_ok='1'"
+      uci set "$_found.read_only=yes"
+      uci set "$_found.guest_ok=yes"
       uci commit ksmbd
       _changed=1
       info "SMB share '$SMB_SHARE_NAME': path fixed -> $BACKUP_DIR"
+    else
+      # path ok, but v1.9.0/1.9.1 may have stored quoted values ('1') - normalize to yes
+      _ro=$(uci -q get "$_found.read_only" 2>/dev/null)
+      case "$_ro" in
+        1|yes) : ;;
+        *) uci set "$_found.read_only=yes"; uci set "$_found.guest_ok=yes"; uci commit ksmbd; _changed=1 ;;
+      esac
     fi
   fi
   if [ "$_changed" = 1 ]; then

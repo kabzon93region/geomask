@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.9.1"
+GM_VERSION="1.9.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -163,7 +163,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.9.1"
+BACKEND_VERSION="1.9.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -997,14 +997,15 @@ say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
 BKD=/root/geomask-backups
 BK=/tmp/geomask-bk-$TS.tar.gz
+# purge BEFORE creating: files under /root are embedded by sysupgrade -b (nesting),
+# and /tmp legacy copies bloat tmpfs. Retention on router: only the freshest backup.
+mkdir -p "$BKD" 2>/dev/null
+rm -f /tmp/router-backup-*.tar.gz "$BKD"/router-backup-*.tar.gz 2>/dev/null
 if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
   say error "backup failed - update aborted"; exit 1
 fi
 SZ=$(wc -c < "$BK")
 _md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
-mkdir -p "$BKD" 2>/dev/null
-rm -f /tmp/router-backup-*.tar.gz 2>/dev/null
-for f in "$BKD"/router-backup-*.tar.gz; do [ -f "$f" ] && rm -f "$f"; done
 BKF="$BKD/router-backup-$TS.tar.gz"
 mv -f "$BK" "$BKF" 2>/dev/null || BKF="$BK"
 [ -s "$BKF" ] || { say error "backup vanished after create - update aborted"; exit 1; }
@@ -1223,7 +1224,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.9.1';
+var PANEL_VERSION = '1.9.2';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2117,6 +2118,11 @@ ensure_backup() { # -> path on stdout, rc=1 on failure
   _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
   _dir="$(P /root/geomask-backups)"
   mkdir -p "$_dir" 2>/dev/null
+  # remove previous copies BEFORE creating: they live under /root, which sysupgrade -b
+  # archives - leaving them in place embeds them into the new archive (observed 19->28 MB).
+  # If creation then fails there is no on-router copy; caller aborts the change and the PC
+  # history (fetch_backup.ps1) remains.
+  rm -f "$_dir"/router-backup-*.tar.gz 2>/dev/null
   _out=""
   if have sysupgrade; then
     _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
@@ -2130,9 +2136,6 @@ ensure_backup() { # -> path on stdout, rc=1 on failure
     bad "cannot create backup"
     return 1
   fi
-  for f in "$_dir"/router-backup-*.tar.gz; do
-    [ -f "$f" ] && rm -f "$f"
-  done
   _dest="$_dir/router-backup-$_ts.tar.gz"
   mv -f "$_out" "$_dest" || { bad "cannot store backup into $_dir"; return 1; }
   chmod 644 "$_dest" 2>/dev/null
@@ -2169,8 +2172,8 @@ ensure_smb_share() {
     [ -n "$_sec" ] || { warn "uci add failed - SMB share skipped"; return 0; }
     uci set "ksmbd.$_sec.name=$SMB_SHARE_NAME"
     uci set "ksmbd.$_sec.path=$BACKUP_DIR"
-    uci set "ksmbd.$_sec.read_only='1'"
-    uci set "ksmbd.$_sec.guest_ok='1'"
+    uci set "ksmbd.$_sec.read_only=yes"
+    uci set "ksmbd.$_sec.guest_ok=yes"
     uci commit ksmbd
     _changed=1
     info "SMB share '$SMB_SHARE_NAME' -> $BACKUP_DIR (guest, read-only): created (section $_sec)"
@@ -2178,11 +2181,18 @@ ensure_smb_share() {
     _p=$(uci -q get "$_found.path" 2>/dev/null)
     if [ "$_p" != "$BACKUP_DIR" ]; then
       uci set "$_found.path=$BACKUP_DIR"
-      uci set "$_found.read_only='1'"
-      uci set "$_found.guest_ok='1'"
+      uci set "$_found.read_only=yes"
+      uci set "$_found.guest_ok=yes"
       uci commit ksmbd
       _changed=1
       info "SMB share '$SMB_SHARE_NAME': path fixed -> $BACKUP_DIR"
+    else
+      # path ok, but v1.9.0/1.9.1 may have stored quoted values ('1') - normalize to yes
+      _ro=$(uci -q get "$_found.read_only" 2>/dev/null)
+      case "$_ro" in
+        1|yes) : ;;
+        *) uci set "$_found.read_only=yes"; uci set "$_found.guest_ok=yes"; uci commit ksmbd; _changed=1 ;;
+      esac
     fi
   fi
   if [ "$_changed" = 1 ]; then
@@ -2937,7 +2947,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.9.1"
+GUARD_VERSION="1.9.2"
 
 log() { logger -t geomask-guard "$*"; }
 

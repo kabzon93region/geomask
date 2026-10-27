@@ -306,6 +306,17 @@ if grep -qF '_sec=$(uci add ksmbd share' "$SCRIPT" && ! grep -qF '@share[last]' 
 else
   echo "FAIL: S13 bad uci section handling"; failn=$((failn+1))
 fi
+# v1.9.2: plain yes/no values (quoted '1' leaked into ksmbd.conf) + purge strictly BEFORE create
+if grep -qF 'read_only=yes' "$SCRIPT" && ! grep -qE "read_only='1'" "$SCRIPT"; then
+  echo "PASS: S13 uci yes/no values"; pass=$((pass+1))
+else
+  echo "FAIL: S13 quoted uci values present"; failn=$((failn+1))
+fi
+if grep -qF 'rm -f "$_dir"/router-backup-*.tar.gz 2>/dev/null' "$SCRIPT" && grep -qF 'rm -f /tmp/router-backup-*.tar.gz "$BKD"/router-backup-*.tar.gz' "$SCRIPT"; then
+  echo "PASS: S13 old copies purged before sysupgrade (no embedding)"; pass=$((pass+1))
+else
+  echo "FAIL: S13 purge order wrong"; failn=$((failn+1))
+fi
 # backup must be built in /tmp then moved (never let an older /root copy nest into sysupgrade -b)
 if grep -qF 'geomask-bk-$' "$SCRIPT" && grep -qF 'mv -f "$_out" "$_dest"' "$SCRIPT"; then
   echo "PASS: S13 ensure_backup: build in tmp + move (no nesting)"; pass=$((pass+1))

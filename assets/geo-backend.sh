@@ -1,7 +1,7 @@
 #!/bin/sh
 # geo-backend.sh - backend for LuCI "Гео-маскировка и AI" panel (geo-sync ubus object).
 # Commands:
-#   status | leases | log | sync_lists | google | backups
+#   status | leases | log | sync_lists | google | backups | stack
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
 #     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
@@ -811,6 +811,29 @@ _upd_running() {
 
 cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
 
+# v1.10.0: "stack state" for the panel - sync/last-run, guard events, pins, DPI strategy, health
+cmd_stack() {
+  LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$LANIP" ] || LANIP=192.168.0.1
+  _sync=$(cat /tmp/geomask-sync.state 2>/dev/null)
+  case "$_sync" in '{'*'}'*) : ;; *) _sync='{"ts":"","changed":false,"reload":null,"mt":0,"ai":0,"moved":0}' ;; esac
+  _sd=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _sd=true
+  _guard=$(logread 2>/dev/null | grep geomask-guard | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  _pin=false; [ -e /root/.geomask-norestart ] && _pin=true
+  _strat=$(sed -n "/option NFQWS_OPT '/,+1p" /etc/config/zapret 2>/dev/null | tail -1 | tr -d " \t'" | json_esc)
+  _nu=$(grep -c . /opt/zapret/ipset/zapret-hosts-user.txt 2>/dev/null)
+  _ne=$(grep -c . /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)
+  _nc=$(grep -cE '#[[:space:]]*nochange' /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)
+  _ng=$(grep -c . /opt/zapret/ipset/zapret-hosts-google.txt 2>/dev/null)
+  _nr=$(grep -c . /opt/zapret/ipset/zapret-hosts-rkn.txt 2>/dev/null)
+  _nt=$(pgrep -c -f tg-ws-proxy 2>/dev/null)
+  _land=false; wget -q -T 3 -O /dev/null http://127.0.0.1:8000/ 2>/dev/null && _land=true
+  printf '{"ok":true,"sync":%s,"syncd":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
+    "$_sync" "$_sd" "$_guard" "$_pin" "$_strat" \
+    "${_nu:-0}" "${_ne:-0}" "${_nc:-0}" "${_ng:-0}" "${_nr:-0}" \
+    "${_nt:-0}" "$_land" "$LANIP" "$LANIP" "$LANIP" "$LANIP"
+}
+
 # v1.9.0: backup folder inventory for the panel (SMB link + files list, newest first)
 # v1.9.4: UNC contains backslashes - MUST go through json_esc (raw \g breaks rpcd parsing)
 cmd_backups() {
@@ -925,6 +948,7 @@ case "$1" in
   leases)     cmd_leases ;;
   log)        cmd_log ;;
   backups)    cmd_backups ;;
+  stack)      cmd_stack ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;

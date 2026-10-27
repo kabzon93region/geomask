@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.9.6"
+GM_VERSION="1.10.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -135,7 +135,7 @@ step2_apply() {
 #!/bin/sh
 # geo-backend.sh - backend for LuCI "Гео-маскировка и AI" panel (geo-sync ubus object).
 # Commands:
-#   status | leases | log | sync_lists | google | backups
+#   status | leases | log | sync_lists | google | backups | stack
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
 #     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
@@ -163,7 +163,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.9.6"
+BACKEND_VERSION="1.10.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -945,6 +945,29 @@ _upd_running() {
 
 cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
 
+# v1.10.0: "stack state" for the panel - sync/last-run, guard events, pins, DPI strategy, health
+cmd_stack() {
+  LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$LANIP" ] || LANIP=192.168.0.1
+  _sync=$(cat /tmp/geomask-sync.state 2>/dev/null)
+  case "$_sync" in '{'*'}'*) : ;; *) _sync='{"ts":"","changed":false,"reload":null,"mt":0,"ai":0,"moved":0}' ;; esac
+  _sd=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _sd=true
+  _guard=$(logread 2>/dev/null | grep geomask-guard | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  _pin=false; [ -e /root/.geomask-norestart ] && _pin=true
+  _strat=$(sed -n "/option NFQWS_OPT '/,+1p" /etc/config/zapret 2>/dev/null | tail -1 | tr -d " \t'" | json_esc)
+  _nu=$(grep -c . /opt/zapret/ipset/zapret-hosts-user.txt 2>/dev/null)
+  _ne=$(grep -c . /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)
+  _nc=$(grep -cE '#[[:space:]]*nochange' /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)
+  _ng=$(grep -c . /opt/zapret/ipset/zapret-hosts-google.txt 2>/dev/null)
+  _nr=$(grep -c . /opt/zapret/ipset/zapret-hosts-rkn.txt 2>/dev/null)
+  _nt=$(pgrep -c -f tg-ws-proxy 2>/dev/null)
+  _land=false; wget -q -T 3 -O /dev/null http://127.0.0.1:8000/ 2>/dev/null && _land=true
+  printf '{"ok":true,"sync":%s,"syncd":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
+    "$_sync" "$_sd" "$_guard" "$_pin" "$_strat" \
+    "${_nu:-0}" "${_ne:-0}" "${_nc:-0}" "${_ng:-0}" "${_nr:-0}" \
+    "${_nt:-0}" "$_land" "$LANIP" "$LANIP" "$LANIP" "$LANIP"
+}
+
 # v1.9.0: backup folder inventory for the panel (SMB link + files list, newest first)
 # v1.9.4: UNC contains backslashes - MUST go through json_esc (raw \g breaks rpcd parsing)
 cmd_backups() {
@@ -1059,6 +1082,7 @@ case "$1" in
   leases)     cmd_leases ;;
   log)        cmd_log ;;
   backups)    cmd_backups ;;
+  stack)      cmd_stack ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;
@@ -1095,6 +1119,7 @@ list_methods() {
 	json_add_object "leases";     json_close_object
 	json_add_object "log";        json_close_object
 	json_add_object "backups";    json_close_object
+	json_add_object "stack";      json_close_object
 	json_add_object "sync_lists"; json_close_object
 	json_add_object "google";     json_close_object
 	json_add_object "global";     json_add_string "mode" "string"; json_close_object
@@ -1125,6 +1150,7 @@ call_method() {
 		leases)     "$BACKEND" leases ;;
 		log)        "$BACKEND" log ;;
 		backups)    "$BACKEND" backups ;;
+		stack)      "$BACKEND" stack ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;
@@ -1170,7 +1196,7 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "ai_sub_get", "subs_list", "upd_check", "upd_status" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "ai_sub_get", "subs_list", "upd_check", "upd_status" ],
 				"system": [ "info" ]
 			}
 		},
@@ -1209,6 +1235,7 @@ var callStatus = rpc.declare({ object: 'geo-sync', method: 'status', expect: {} 
 var callLeases = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} });
 var callLog    = rpc.declare({ object: 'geo-sync', method: 'log',    expect: {} });
 var callBackups = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
+var callStack  = rpc.declare({ object: 'geo-sync', method: 'stack', expect: {} });
 var callLists  = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
 var callGoogle = rpc.declare({ object: 'geo-sync', method: 'google',  expect: {} });
 /* params as OBJECT (not array): array form expects positional args and would
@@ -1228,7 +1255,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.9.6';
+var PANEL_VERSION = '1.10.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1377,7 +1404,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack() ]);
 	},
 
 	render: function(all) {
@@ -1387,6 +1414,7 @@ return view.extend({
 		var upd = all[5] || {};
 		var upds = all[6] || {};
 		var bks = all[7] || {};
+		var stk = all[8] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -1533,7 +1561,56 @@ return view.extend({
 		var syncCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Синхронизация и проверка'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 6px' },
-				'Списки «Google+AI to DE» в магитрикле автоматически уходят в mihomo каждые 5 минут. Кнопка ниже применяет изменения сразу, не дожидаясь cron.'),
+				'Событийный сторож применяет изменения списков magitrickle в mihomo за секунды после сохранения ' +
+				'(cron каждые 5 минут остался страховкой). Кнопка ниже — ручной синк "всей силы", если не доверяете автомату.'),
+			(function() {
+				var s = stk.sync || {}, rows = [];
+				var syncTxt;
+				if (stk.ok !== true) { syncTxt = 'нет данных (бэкенд stack не ответит?)'; }
+				else {
+					var last = s.ts ? (s.ts + (s.changed
+						? (' — обновлено: VPN=' + (s.mt || '?') + ', AI=' + (s.ai || '?')
+							+ (s.moved ? (', в AI по маске: ' + s.moved) : '')
+							+ ', mihomo ' + (s.reload ? 'перечитил' : 'НЕ перечитал (!)'))
+						: ' — без изменений')) : 'после загрузки синков ещё не было';
+					syncTxt = (stk.syncd ? 'сторож активен · ' : 'СТОРОЖ НЕ РАБОТАЕТ (только cron) · ') + last;
+				}
+				rows.push(E('div', { 'class': 'gs-row' }, [
+					E('span', { 'class': 'gs-label' }, 'Автосинк списков'),
+					E('span', { 'class': (stk.syncd ? 'gs-val' : 'gs-val gs-badge gs-warn') }, syncTxt)
+				]));
+				if (stk.ok === true) {
+					var L = stk.lists || {}, H = stk.health || {};
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'DPI (zapret)'),
+						E('span', { 'class': 'gs-val gs-mono gs-upd-meta' },
+							(String(stk.strategy || '?') + ' · списки: user=' + (L.user || 0)
+								+ ' excl=' + (L.exclude || 0) + (L.nochange ? ' #nochange✓' : ' #nochange✗')
+								+ ' google=' + (L.google || 0) + ' rkn=' + (L.rkn || 0))
+						)
+					]));
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'Пины/здоровье'),
+						E('span', { 'class': 'gs-val gs-upd-meta' },
+							(stk.pin ? 'рестарты mihomo запрещены пином' : 'пинов нет')
+							+ ' · tg-прокси: ' + (H.tg || 0) + ' · лендинг: ' + (H.landing ? 'ок' : 'НЕ отвечает'))
+					]));
+					var gl = stk.guard || [];
+					rows.push(E('div', { 'class': 'gs-row', 'style': 'align-items:flex-start' }, [
+						E('span', { 'class': 'gs-label' }, 'Страж маршрутизации'),
+						E('span', { 'class': 'gs-val gs-mono gs-upd-meta', 'style': 'white-space:pre-wrap;font-size:11px' },
+							gl.length ? gl.slice(-3).join('\n') : 'тихий (последних событий нет)')
+					]));
+					var K = stk.links || {};
+					var lnk = function(t, u) { return u ? E('a', { 'href': u, 'target': '_blank', 'style': 'color:#58a6ff' }, t) : null; };
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'Панели'),
+						E('span', {}, [ lnk('MagiTrickle', K.magitrickle), ' · ', lnk('Zapret DPI', K.zapret),
+							' · ', lnk('Лендинг', K.landing), ' · ', lnk('LuCI', K.luci) ] || '')
+					]));
+				}
+				return E('div', { 'style': 'margin:0 0 8px' }, rows);
+			})(),
 			E('div', { 'class': 'gs-actions' }, [ btnLists, btnGoogle ]),
 			listsOut
 		]);
@@ -1844,7 +1921,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);
@@ -2503,6 +2580,14 @@ step5_check() {
     bad "sync script missing: /root/sync_mtrickle_mihomo.sh"; _need=1
   fi
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then info "cron */5: present"; else bad "cron entry missing"; _need=1; fi
+  # v1.10.0: event sync watchdog (service enabled + running; graceful if script absent on old installs)
+  if [ -x "$(P /etc/init.d/geomask-syncd)" ]; then
+    if pgrep -f geomask-syncd.sh >/dev/null 2>&1; then info "syncd: running"
+    else warn "syncd: installed but not running"; _need=1; fi
+    ls "$(P /etc/rc.d)" 2>/dev/null | grep -q 'geomask-syncd' && info "syncd: enabled" || { warn "syncd: not enabled"; _need=1; }
+  else
+    bad "syncd: /etc/init.d/geomask-syncd missing"; _need=1
+  fi
   if [ -x "$(P /usr/bin/geomask-guard.sh)" ]; then info "guard: present"; else bad "guard missing: /usr/bin/geomask-guard.sh"; _need=1; fi
   if [ -x "$(P /etc/hotplug.d/iface/99-geomask-guard)" ]; then info "guard hotplug: present"; else bad "guard hotplug missing"; _need=1; fi
   if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then info "guard cron */5: present"; else bad "guard cron missing"; _need=1; fi
@@ -2518,7 +2603,7 @@ step5_apply() {
 # AI detection: whole groups by name + domain patterns (AI domains live inside Geoblock too).
 # Reloads mihomo only on change.
 exec python3 - <<'PYEOF'
-import os, re, json, sys, urllib.request
+import os, re, json, sys, time, urllib.request
 
 SRC = '/etc/magitrickle/state/config.yaml'
 MT  = '/etc/mihomo/ruleset/mtrickle.yaml'
@@ -2681,15 +2766,34 @@ print('mtrickle.yaml: %d rules (%s)' % (n1, 'updated' if c1 else 'up-to-date'))
 print('ai.yaml:       %d rules (%s, + %d moved from non-AI groups by domain pattern)' % (n2, 'updated' if c2 else 'up-to-date', moved))
 
 if c1 or c2:
+    _r_ok = False
     try:
         req = urllib.request.Request(
             'http://127.0.0.1:9090/configs?force=true',
             data=json.dumps({'path': '/etc/mihomo/config.yaml'}).encode(),
             method='PUT', headers={'Content-Type': 'application/json'})
         urllib.request.urlopen(req, timeout=5).read()
+        _r_ok = True
         print('mihomo reloaded')
     except Exception as e:
         print('reload FAILED: %s (restart needed)' % e)
+
+# v1.10.0: machine-readable last-run state for the panel; journal line only on real change
+try:
+    _st = {'ts': time.strftime('%F %T'), 'mt': n1, 'ai': n2, 'moved': moved,
+           'changed': bool(c1 or c2), 'reload': _r_ok if (c1 or c2) else None}
+    with open('/tmp/geomask-sync.state.tmp', 'w') as f:
+        json.dump(_st, f)
+    os.replace('/tmp/geomask-sync.state.tmp', '/tmp/geomask-sync.state')
+except Exception:
+    pass
+if c1 or c2:
+    try:
+        with open('/root/geo-sync.log', 'a') as f:
+            f.write('%s SYNC changed: VPN=%d AI=%d moved-to-AI=%d reload=%s\n' %
+                    (_st['ts'], n1, n2, moved, 'ok' if _r_ok else 'FAILED'))
+    except Exception:
+        pass
 PYEOF
 
 ASSET_EOF
@@ -2978,7 +3082,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.9.6"
+GUARD_VERSION="1.10.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -3173,6 +3277,66 @@ ASSET_EOF
   else
     ( crontab -l 2>/dev/null; echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' ) | crontab - 2>/dev/null && info "cron added: */5 sync" || warn "cannot set crontab"
   fi
+  # v1.10.0: event sync watchdog - magitrickle save -> sync within ~seconds (cron stays as backup)
+  if have apk; then apk add inotifywait >/dev/null 2>&1 || true; fi
+  save_stream /usr/bin/geomask-syncd.sh 755 <<'ASSET_EOF'
+#!/bin/sh
+# geomask-syncd.sh - event watchdog for magitrickle -> mihomo list sync (v1.10.0).
+# Runs the idempotent sync (which reloads mihomo only on real change) a few seconds
+# after magitrickle touches /etc/magitrickle/state, so the panel button and the */5
+# cron become a backup, not the primary path.
+# Prefers inotifywait (package inotifywait); falls back to a 10s mtime poll.
+DIR=/etc/magitrickle/state
+SYNC=/root/sync_mtrickle_mihomo.sh
+DEB=4
+log() { logger -t geomask-syncd "$1" 2>/dev/null; }
+run() {
+  [ -x "$SYNC" ] || return 0
+  _o=$("$SYNC" 2>&1); _r=$?
+  [ $_r -ne 0 ] && log "sync rc=$_r: $(printf '%s' "$_o" | tail -1)"
+}
+log "watchdog started (dir=$DIR, inotify=$(command -v inotifywait >/dev/null 2>&1 && echo yes || echo no))"
+while true; do
+  if ! [ -d "$DIR" ]; then sleep 15; continue; fi
+  if command -v inotifywait >/dev/null 2>&1; then
+    inotifywait -qq -e close_write,moved_to,create,delete "$DIR" 2>/dev/null
+    sleep "$DEB"
+    run
+  else
+    sleep 10
+    _c=$(ls -l "$DIR" 2>/dev/null | md5sum)
+    if [ -n "$_prev" ] && [ "$_c" != "$_prev" ]; then run; fi
+    _prev=$_c
+  fi
+done
+
+ASSET_EOF
+  save_stream /etc/init.d/geomask-syncd 755 <<'ASSET_EOF'
+#!/bin/sh /etc/rc.common
+# geomask-syncd - procd service for the event sync watchdog (geomask v1.10.0+).
+START=98
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	[ -x /usr/bin/geomask-syncd.sh ] || return 0
+	procd_open_instance
+	procd_set_param command /bin/sh /usr/bin/geomask-syncd.sh
+	procd_set_param respawn 3600 5 0
+	procd_set_param term_timeout 5
+	procd_set_param pidfile /var/run/geomask-syncd.pid
+	procd_close_instance
+}
+
+ASSET_EOF
+  initd geomask-syncd enable >/dev/null 2>&1 || true
+  if pgrep -f geomask-syncd.sh >/dev/null 2>&1; then
+    info "syncd: already running"
+  else
+    initd geomask-syncd restart >/dev/null 2>&1 || true
+    sleep 1
+    pgrep -f geomask-syncd.sh >/dev/null 2>&1 && info "syncd: started" || warn "syncd: cannot start (check logread)"
+  fi
   if ! svc_alive magitrickled; then
     info "starting magitrickle..."
     initd magitrickle start >/dev/null 2>&1 || true
@@ -3286,7 +3450,7 @@ step_desc() {
     geo)      printf 'гео-оверлей: панель "Гео-маскировка и AI" в LuCI + бэкенд geo-sync' ;;
     subs)     printf 'подписки: ссылки VPN/AI и группы VPN/AI в mihomo (проверка доступности)' ;;
     aidns)    printf 'AI-DNS: DNS AI-устройств через их же туннель — нет утечки DNS (ставится по умолчанию)' ;;
-    sync)     printf 'sync: списки доменов magitrickle для mihomo + cron каждые 5 минут' ;;
+    sync)     printf 'sync: синк magitrickle→mihomo: watchdog (секунды) + cron-страховка' ;;
     services) printf 'сервисы: mihomo, magitrickle, hev-туннели, dnsmasq, веб-интерфейс' ;;
     verify)   printf 'сквозная проверка: выходы VPN/AI, DNS, группа AI, интернет (ничего не меняет)' ;;
     *)        printf '' ;;
@@ -3430,7 +3594,7 @@ step_desc() {
     env)      printf 'проверка окружения: версия OpenWrt, место на диске, зависимости (только чтение)' ;;
     geo)      printf 'гео-оверлей: панель "Гео-маскировка и AI" в LuCI + бэкенд geo-sync' ;;
     subs)     printf 'подписки: ссылки VPN/AI и группы VPN/AI в mihomo (проверка доступности)' ;;
-    sync)     printf 'sync: списки доменов magitrickle для mihomo + cron каждые 5 минут' ;;
+    sync)     printf 'sync: синк magitrickle→mihomo: watchdog (секунды) + cron-страховка' ;;
     services) printf 'сервисы: mihomo, magitrickle, hev-туннели, dnsmasq, веб-интерфейс' ;;
     verify)   printf 'сквозная проверка: выходы VPN/AI, DNS, группа AI, интернет (ничего не меняет)' ;;
     *)        printf '' ;;
@@ -3495,6 +3659,14 @@ geomask_uninstall() {
   rm -f "$(P /www/luci-static/resources/view/geo-sync/main.js)" 2>/dev/null || true
   rmdir "$(P /www/luci-static/resources/view/geo-sync)" 2>/dev/null || true
   if [ -f "$(P /root/sync_mtrickle_mihomo.sh)" ]; then rm -f "$(P /root/sync_mtrickle_mihomo.sh)"; info "removed: sync script"; fi
+  # v1.10.0: stop+remove the event sync watchdog
+  if [ -x "$(P /etc/init.d/geomask-syncd)" ]; then
+    initd geomask-syncd stop >/dev/null 2>&1 || true
+    initd geomask-syncd disable >/dev/null 2>&1 || true
+    pkill -f geomask-syncd.sh 2>/dev/null || true
+    rm -f "$(P /etc/init.d/geomask-syncd)" "$(P /usr/bin/geomask-syncd.sh)"
+    info "removed: syncd watchdog"
+  fi
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

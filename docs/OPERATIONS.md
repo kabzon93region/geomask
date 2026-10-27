@@ -20,7 +20,10 @@
 2. **geo** — гео-оверлей LuCI.
 3. **subs** — конфиг mihomo (+`mihomo -t`).
 4. **aidns** — AI-DNS без утечки.
-5. **sync** — sync magitrickle → mihomo + cron + hotplug-роутинг.
+5. **sync** — sync magitrickle → mihomo + cron + hotplug-роутинг + событийный watchdog
+   `geomask-syncd` (v1.10.0): сохранение списков в MagiTrickle применяется в mihomo за секунды
+   (inotifywait, graceful-фолбэк на 10-с опрос); cron */5 — страховка; состояние последнего
+   синка видно карточкой «Синхронизация и проверка» (`/tmp/geomask-sync.state`).
 6. **services** — старт только упавших сервисов.
 7. **verify** — E2E-проверки.
 

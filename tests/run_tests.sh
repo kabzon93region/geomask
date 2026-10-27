@@ -74,6 +74,11 @@ echo x > "$R/root/sync_mtrickle_mihomo.sh"; chmod +x "$R/root/sync_mtrickle_miho
 # (shebang required: Git-bash derives +x from shebang for non-exe files)
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-guard.sh"; chmod +x "$R/usr/bin/geomask-guard.sh"
 printf '#!/bin/sh\nexit 0\n' > "$R/etc/hotplug.d/iface/99-geomask-guard"; chmod +x "$R/etc/hotplug.d/iface/99-geomask-guard"
+# event sync watchdog (v1.10.0): healthy fixture has init script + rc.d link + binary
+mkdir -p "$R/etc/rc.d"
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-syncd.sh"; chmod +x "$R/usr/bin/geomask-syncd.sh"
+printf '#!/bin/sh\nexit 0\n' > "$R/etc/init.d/geomask-syncd"; chmod +x "$R/etc/init.d/geomask-syncd"
+: > "$R/etc/rc.d/S98geomask-syncd"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/mtrickle.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ai.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytdirect.yaml"
@@ -128,6 +133,8 @@ printf 'zapret-manager\ngeo-sync\n' > "$HERE/state/ubus_objects"
 echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' > "$HERE/state/crontab"
 echo '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard' >> "$HERE/state/crontab"
 echo '32666: from all iif br-lan ipproto icmp lookup main' > "$HERE/state/ip_rules"
+# pgrep stub state: syncd watchdog considered running in healthy/apply scenarios
+printf 'geomask-syncd.sh\n' > "$HERE/state/pgrep"
 : > "$HERE/state/mihomo_t_ok"
 export GM_PREFIX="$HERE/root_healthy"
 t "S2 check exits zero" 0 sh "$SCRIPT" --check
@@ -322,6 +329,19 @@ if grep -qF 's/^\(ksmbd\.[^=]*\)=share$/\1/p' "$SCRIPT" && grep -qF 'duplicate s
   echo "PASS: S13 section enumeration handles @share[N] + dedupe"; pass=$((pass+1))
 else
   echo "FAIL: S13 section enumeration broken"; failn=$((failn+1))
+fi
+
+# ---------- scenario 14: event sync watchdog + stack state (v1.10.0) ----------
+echo "=== S14: syncd watchdog + stack card ==="
+for _p in 'geomask-syncd.sh' '/etc/init.d/geomask-syncd' 'geomask-sync.state' 'cmd_stack' 'callStack' 'inotifywait'; do
+  if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S14 has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S14 missing: $_p"; failn=$((failn+1)); fi
+done
+# syncd must be removed on uninstall too (no orphans)
+if grep -qF 'removed: syncd watchdog' "$SCRIPT"; then
+  echo "PASS: S14 uninstall cleans syncd"; pass=$((pass+1))
+else
+  echo "FAIL: S14 uninstall leaves syncd"; failn=$((failn+1))
 fi
 # v1.9.4: backslashes must be JSON-escaped (rpcd rejects invalid \g escapes -> Invalid argument)
 if grep -qF '_unc=$(json_esc' "$SCRIPT" && grep -qF '_j=$(printf' "$SCRIPT"; then

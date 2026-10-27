@@ -5,7 +5,7 @@
 # AI detection: whole groups by name + domain patterns (AI domains live inside Geoblock too).
 # Reloads mihomo only on change.
 exec python3 - <<'PYEOF'
-import os, re, json, sys, urllib.request
+import os, re, json, sys, time, urllib.request
 
 SRC = '/etc/magitrickle/state/config.yaml'
 MT  = '/etc/mihomo/ruleset/mtrickle.yaml'
@@ -168,13 +168,32 @@ print('mtrickle.yaml: %d rules (%s)' % (n1, 'updated' if c1 else 'up-to-date'))
 print('ai.yaml:       %d rules (%s, + %d moved from non-AI groups by domain pattern)' % (n2, 'updated' if c2 else 'up-to-date', moved))
 
 if c1 or c2:
+    _r_ok = False
     try:
         req = urllib.request.Request(
             'http://127.0.0.1:9090/configs?force=true',
             data=json.dumps({'path': '/etc/mihomo/config.yaml'}).encode(),
             method='PUT', headers={'Content-Type': 'application/json'})
         urllib.request.urlopen(req, timeout=5).read()
+        _r_ok = True
         print('mihomo reloaded')
     except Exception as e:
         print('reload FAILED: %s (restart needed)' % e)
+
+# v1.10.0: machine-readable last-run state for the panel; journal line only on real change
+try:
+    _st = {'ts': time.strftime('%F %T'), 'mt': n1, 'ai': n2, 'moved': moved,
+           'changed': bool(c1 or c2), 'reload': _r_ok if (c1 or c2) else None}
+    with open('/tmp/geomask-sync.state.tmp', 'w') as f:
+        json.dump(_st, f)
+    os.replace('/tmp/geomask-sync.state.tmp', '/tmp/geomask-sync.state')
+except Exception:
+    pass
+if c1 or c2:
+    try:
+        with open('/root/geo-sync.log', 'a') as f:
+            f.write('%s SYNC changed: VPN=%d AI=%d moved-to-AI=%d reload=%s\n' %
+                    (_st['ts'], n1, n2, moved, 'ok' if _r_ok else 'FAILED'))
+    except Exception:
+        pass
 PYEOF

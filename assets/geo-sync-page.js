@@ -7,6 +7,7 @@ var callStatus = rpc.declare({ object: 'geo-sync', method: 'status', expect: {} 
 var callLeases = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} });
 var callLog    = rpc.declare({ object: 'geo-sync', method: 'log',    expect: {} });
 var callBackups = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
+var callStack  = rpc.declare({ object: 'geo-sync', method: 'stack', expect: {} });
 var callLists  = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
 var callGoogle = rpc.declare({ object: 'geo-sync', method: 'google',  expect: {} });
 /* params as OBJECT (not array): array form expects positional args and would
@@ -175,7 +176,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack() ]);
 	},
 
 	render: function(all) {
@@ -185,6 +186,7 @@ return view.extend({
 		var upd = all[5] || {};
 		var upds = all[6] || {};
 		var bks = all[7] || {};
+		var stk = all[8] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -331,7 +333,56 @@ return view.extend({
 		var syncCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Синхронизация и проверка'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 6px' },
-				'Списки «Google+AI to DE» в магитрикле автоматически уходят в mihomo каждые 5 минут. Кнопка ниже применяет изменения сразу, не дожидаясь cron.'),
+				'Событийный сторож применяет изменения списков magitrickle в mihomo за секунды после сохранения ' +
+				'(cron каждые 5 минут остался страховкой). Кнопка ниже — ручной синк "всей силы", если не доверяете автомату.'),
+			(function() {
+				var s = stk.sync || {}, rows = [];
+				var syncTxt;
+				if (stk.ok !== true) { syncTxt = 'нет данных (бэкенд stack не ответит?)'; }
+				else {
+					var last = s.ts ? (s.ts + (s.changed
+						? (' — обновлено: VPN=' + (s.mt || '?') + ', AI=' + (s.ai || '?')
+							+ (s.moved ? (', в AI по маске: ' + s.moved) : '')
+							+ ', mihomo ' + (s.reload ? 'перечитил' : 'НЕ перечитал (!)'))
+						: ' — без изменений')) : 'после загрузки синков ещё не было';
+					syncTxt = (stk.syncd ? 'сторож активен · ' : 'СТОРОЖ НЕ РАБОТАЕТ (только cron) · ') + last;
+				}
+				rows.push(E('div', { 'class': 'gs-row' }, [
+					E('span', { 'class': 'gs-label' }, 'Автосинк списков'),
+					E('span', { 'class': (stk.syncd ? 'gs-val' : 'gs-val gs-badge gs-warn') }, syncTxt)
+				]));
+				if (stk.ok === true) {
+					var L = stk.lists || {}, H = stk.health || {};
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'DPI (zapret)'),
+						E('span', { 'class': 'gs-val gs-mono gs-upd-meta' },
+							(String(stk.strategy || '?') + ' · списки: user=' + (L.user || 0)
+								+ ' excl=' + (L.exclude || 0) + (L.nochange ? ' #nochange✓' : ' #nochange✗')
+								+ ' google=' + (L.google || 0) + ' rkn=' + (L.rkn || 0))
+						)
+					]));
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'Пины/здоровье'),
+						E('span', { 'class': 'gs-val gs-upd-meta' },
+							(stk.pin ? 'рестарты mihomo запрещены пином' : 'пинов нет')
+							+ ' · tg-прокси: ' + (H.tg || 0) + ' · лендинг: ' + (H.landing ? 'ок' : 'НЕ отвечает'))
+					]));
+					var gl = stk.guard || [];
+					rows.push(E('div', { 'class': 'gs-row', 'style': 'align-items:flex-start' }, [
+						E('span', { 'class': 'gs-label' }, 'Страж маршрутизации'),
+						E('span', { 'class': 'gs-val gs-mono gs-upd-meta', 'style': 'white-space:pre-wrap;font-size:11px' },
+							gl.length ? gl.slice(-3).join('\n') : 'тихий (последних событий нет)')
+					]));
+					var K = stk.links || {};
+					var lnk = function(t, u) { return u ? E('a', { 'href': u, 'target': '_blank', 'style': 'color:#58a6ff' }, t) : null; };
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'Панели'),
+						E('span', {}, [ lnk('MagiTrickle', K.magitrickle), ' · ', lnk('Zapret DPI', K.zapret),
+							' · ', lnk('Лендинг', K.landing), ' · ', lnk('LuCI', K.luci) ] || '')
+					]));
+				}
+				return E('div', { 'style': 'margin:0 0 8px' }, rows);
+			})(),
 			E('div', { 'class': 'gs-actions' }, [ btnLists, btnGoogle ]),
 			listsOut
 		]);
@@ -642,7 +693,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);

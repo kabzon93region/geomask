@@ -1,0 +1,14 @@
+#!/bin/sh
+# stub pgrep: success only for patterns listed in state file (one regex per line)
+[ -f "${GM_STATE}/pgrep" ] || exit 1
+pat=""
+while [ $# -gt 0 ]; do
+  case "$1" in -*) ;; *) pat="$1" ;; esac
+  shift
+done
+[ -n "$pat" ] || exit 1
+if grep -q "$pat" "${GM_STATE}/pgrep" 2>/dev/null; then
+  echo 9999
+  exit 0
+fi
+exit 1

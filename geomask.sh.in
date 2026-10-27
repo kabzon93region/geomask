@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.9.6"
+GM_VERSION="1.10.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -796,6 +796,14 @@ step5_check() {
     bad "sync script missing: /root/sync_mtrickle_mihomo.sh"; _need=1
   fi
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then info "cron */5: present"; else bad "cron entry missing"; _need=1; fi
+  # v1.10.0: event sync watchdog (service enabled + running; graceful if script absent on old installs)
+  if [ -x "$(P /etc/init.d/geomask-syncd)" ]; then
+    if pgrep -f geomask-syncd.sh >/dev/null 2>&1; then info "syncd: running"
+    else warn "syncd: installed but not running"; _need=1; fi
+    ls "$(P /etc/rc.d)" 2>/dev/null | grep -q 'geomask-syncd' && info "syncd: enabled" || { warn "syncd: not enabled"; _need=1; }
+  else
+    bad "syncd: /etc/init.d/geomask-syncd missing"; _need=1
+  fi
   if [ -x "$(P /usr/bin/geomask-guard.sh)" ]; then info "guard: present"; else bad "guard missing: /usr/bin/geomask-guard.sh"; _need=1; fi
   if [ -x "$(P /etc/hotplug.d/iface/99-geomask-guard)" ]; then info "guard hotplug: present"; else bad "guard hotplug missing"; _need=1; fi
   if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then info "guard cron */5: present"; else bad "guard cron missing"; _need=1; fi
@@ -829,6 +837,22 @@ ASSET_EOF
     info "cron already present"
   else
     ( crontab -l 2>/dev/null; echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' ) | crontab - 2>/dev/null && info "cron added: */5 sync" || warn "cannot set crontab"
+  fi
+  # v1.10.0: event sync watchdog - magitrickle save -> sync within ~seconds (cron stays as backup)
+  if have apk; then apk add inotifywait >/dev/null 2>&1 || true; fi
+  save_stream /usr/bin/geomask-syncd.sh 755 <<'ASSET_EOF'
+@@ASSET:geomask-syncd.sh@@
+ASSET_EOF
+  save_stream /etc/init.d/geomask-syncd 755 <<'ASSET_EOF'
+@@ASSET:geomask-syncd.init@@
+ASSET_EOF
+  initd geomask-syncd enable >/dev/null 2>&1 || true
+  if pgrep -f geomask-syncd.sh >/dev/null 2>&1; then
+    info "syncd: already running"
+  else
+    initd geomask-syncd restart >/dev/null 2>&1 || true
+    sleep 1
+    pgrep -f geomask-syncd.sh >/dev/null 2>&1 && info "syncd: started" || warn "syncd: cannot start (check logread)"
   fi
   if ! svc_alive magitrickled; then
     info "starting magitrickle..."
@@ -943,7 +967,7 @@ step_desc() {
     geo)      printf 'гео-оверлей: панель "Гео-маскировка и AI" в LuCI + бэкенд geo-sync' ;;
     subs)     printf 'подписки: ссылки VPN/AI и группы VPN/AI в mihomo (проверка доступности)' ;;
     aidns)    printf 'AI-DNS: DNS AI-устройств через их же туннель — нет утечки DNS (ставится по умолчанию)' ;;
-    sync)     printf 'sync: списки доменов magitrickle для mihomo + cron каждые 5 минут' ;;
+    sync)     printf 'sync: синк magitrickle→mihomo: watchdog (секунды) + cron-страховка' ;;
     services) printf 'сервисы: mihomo, magitrickle, hev-туннели, dnsmasq, веб-интерфейс' ;;
     verify)   printf 'сквозная проверка: выходы VPN/AI, DNS, группа AI, интернет (ничего не меняет)' ;;
     *)        printf '' ;;
@@ -1087,7 +1111,7 @@ step_desc() {
     env)      printf 'проверка окружения: версия OpenWrt, место на диске, зависимости (только чтение)' ;;
     geo)      printf 'гео-оверлей: панель "Гео-маскировка и AI" в LuCI + бэкенд geo-sync' ;;
     subs)     printf 'подписки: ссылки VPN/AI и группы VPN/AI в mihomo (проверка доступности)' ;;
-    sync)     printf 'sync: списки доменов magitrickle для mihomo + cron каждые 5 минут' ;;
+    sync)     printf 'sync: синк magitrickle→mihomo: watchdog (секунды) + cron-страховка' ;;
     services) printf 'сервисы: mihomo, magitrickle, hev-туннели, dnsmasq, веб-интерфейс' ;;
     verify)   printf 'сквозная проверка: выходы VPN/AI, DNS, группа AI, интернет (ничего не меняет)' ;;
     *)        printf '' ;;
@@ -1152,6 +1176,14 @@ geomask_uninstall() {
   rm -f "$(P /www/luci-static/resources/view/geo-sync/main.js)" 2>/dev/null || true
   rmdir "$(P /www/luci-static/resources/view/geo-sync)" 2>/dev/null || true
   if [ -f "$(P /root/sync_mtrickle_mihomo.sh)" ]; then rm -f "$(P /root/sync_mtrickle_mihomo.sh)"; info "removed: sync script"; fi
+  # v1.10.0: stop+remove the event sync watchdog
+  if [ -x "$(P /etc/init.d/geomask-syncd)" ]; then
+    initd geomask-syncd stop >/dev/null 2>&1 || true
+    initd geomask-syncd disable >/dev/null 2>&1 || true
+    pkill -f geomask-syncd.sh 2>/dev/null || true
+    rm -f "$(P /etc/init.d/geomask-syncd)" "$(P /usr/bin/geomask-syncd.sh)"
+    info "removed: syncd watchdog"
+  fi
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

@@ -492,7 +492,7 @@ return view.extend({
 			if (b.user && b.pass) {
 				var nu = 'net use ' + unc + ' /user:' + b.user + ' ' + b.pass + ' /persistent:yes';
 				bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
-					E('span', { 'class': 'gs-label' }, 'Windows: вход по логину (гость блокируется политикой)'),
+					E('span', { 'class': 'gs-label' }, 'Windows: вход backup / backup (или без пароля — гость)'),
 					E('span', { 'class': 'gs-mono gs-upd-meta' }, b.user + ' / ' + b.pass),
 					E('span', {}, E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(nu, this); } }, 'Копировать net use'))
 				]));

@@ -329,9 +329,9 @@ if grep -qF '_unc=$(json_esc' "$SCRIPT" && grep -qF '_j=$(printf' "$SCRIPT"; the
 else
   echo "FAIL: S13 missing json escaping of backslash paths"; failn=$((failn+1))
 fi
-# v1.9.5: force_root for /root paths + auth user (Windows blocks insecure-guest)
-if grep -qF 'force_root=1' "$SCRIPT" && grep -qF '.geomask-smb.pass' "$SCRIPT" && grep -qF 'ksmbd.adduser geomask' "$SCRIPT"; then
-  echo "PASS: S13 force_root + geomask auth user"; pass=$((pass+1))
+# v1.9.6: simple SMB credentials (backup/backup, guest ok) + force_root for /root paths
+if grep -qF 'force_root=1' "$SCRIPT" && grep -qF 'ksmbd.adduser backup -p backup' "$SCRIPT"; then
+  echo "PASS: S13 force_root + backup auth user"; pass=$((pass+1))
 else
   echo "FAIL: S13 SMB auth setup missing"; failn=$((failn+1))
 fi

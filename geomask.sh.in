@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.9.5"
+GM_VERSION="1.9.6"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -515,18 +515,10 @@ ensure_smb_share() {
   # v1.9.5: force user root (share under /root is unreachable for the guest uid)
   _fr=$(uci -q get "$_found.force_root" 2>/dev/null)
   [ "$_fr" = 1 ] || { uci set "$_found.force_root=1"; uci commit ksmbd; _changed=1; }
-  # authenticated user for Windows clients (insecure-guest logons are blocked there):
-  # password generated once, kept in /root/.geomask-smb.pass (0600), reused on re-runs.
-  _pwf=/root/.geomask-smb.pass
-  if [ -s "$_pwf" ]; then
-    _pw=$(cat "$_pwf")
-  else
-    _pw=$(head -c 12 /dev/urandom 2>/dev/null | hexdump -e '12/1 "%02x"')
-    [ -n "$_pw" ] || _pw=geomask-backup
-    printf '%s' "$_pw" > "$_pwf" 2>/dev/null && chmod 600 "$_pwf" 2>/dev/null
-    info "SMB: new user geomask, password written to $_pwf"
-  fi
-  have ksmbd.adduser && ksmbd.adduser geomask -p "$_pw" >/dev/null 2>&1
+  # v1.9.6: simple access per owner request - user `backup` password `backup`; guest (no
+  # password at all) also accepted: the share is read-only either way, LAN-scoped.
+  # (Windows blocks insecure-guest mappings in some setups -> the simple pair is the fallback.)
+  have ksmbd.adduser && ksmbd.adduser backup -p backup >/dev/null 2>&1
   if [ "$_changed" = 1 ]; then
     # restart ONLY the file server (not the network stack); verify right away
     "/etc/init.d/$_init" restart >/dev/null 2>&1 || true

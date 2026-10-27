@@ -830,10 +830,9 @@ cmd_backups() {
     _files="$_files{\"n\":\"$_n\",\"s\":${_sz:-0},\"t\":\"$_t\"},"
   done
   _files=${_files%,}
-  # v1.9.5: SMB auth credentials (Windows blocks insecure-guest mappings)
-  _pw=$(cat /root/.geomask-smb.pass 2>/dev/null)
-  printf '{"ok":true,"dir":"%s","unc":"%s","smb":"%s","user":"geomask","pass":"%s","share_ok":%s,"files":[%s]}\n' \
-    "$DIR" "$_unc" "$_smbu" "$(json_esc "$_pw")" "$_sh" "$_files"
+  # v1.9.6: simple credentials (owner request); guest/no-password also works, share is read-only
+  printf '{"ok":true,"dir":"%s","unc":"%s","smb":"%s","user":"backup","pass":"backup","share_ok":%s,"files":[%s]}\n' \
+    "$DIR" "$_unc" "$_smbu" "$_sh" "$_files"
 }
 
 cmd_upd_status() {
@@ -883,7 +882,7 @@ mv -f "$BK" "$BKF" 2>/dev/null || BKF="$BK"
 echo "file=$BKF md5=$_md" > "$D/backup.info"
 LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
 say backup "backup OK: $BKF ($SZ bytes, md5 $_md)"
-say backup "SMB (retention: freshest one): \\\\$LANIP\\geomask-backups\\${BKF##*/} - Windows: net use with user geomask (pass in /root/.geomask-smb.pass); PC history: fetch_backup.ps1"
+say backup "SMB (retention: freshest one): \\\\$LANIP\\geomask-backups\\${BKF##*/} - Windows: net use /user:backup backup (or no password), read-only; PC history: fetch_backup.ps1"
 say download "downloading geomask $TAG..."
 rm -f "$D/geomask.sh.new"
 if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon93region/geomask@${TAG}/geomask.sh" && \

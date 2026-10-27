@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.9.5"
+GM_VERSION="1.9.6"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -163,7 +163,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.9.5"
+BACKEND_VERSION="1.9.6"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -964,10 +964,9 @@ cmd_backups() {
     _files="$_files{\"n\":\"$_n\",\"s\":${_sz:-0},\"t\":\"$_t\"},"
   done
   _files=${_files%,}
-  # v1.9.5: SMB auth credentials (Windows blocks insecure-guest mappings)
-  _pw=$(cat /root/.geomask-smb.pass 2>/dev/null)
-  printf '{"ok":true,"dir":"%s","unc":"%s","smb":"%s","user":"geomask","pass":"%s","share_ok":%s,"files":[%s]}\n' \
-    "$DIR" "$_unc" "$_smbu" "$(json_esc "$_pw")" "$_sh" "$_files"
+  # v1.9.6: simple credentials (owner request); guest/no-password also works, share is read-only
+  printf '{"ok":true,"dir":"%s","unc":"%s","smb":"%s","user":"backup","pass":"backup","share_ok":%s,"files":[%s]}\n' \
+    "$DIR" "$_unc" "$_smbu" "$_sh" "$_files"
 }
 
 cmd_upd_status() {
@@ -1017,7 +1016,7 @@ mv -f "$BK" "$BKF" 2>/dev/null || BKF="$BK"
 echo "file=$BKF md5=$_md" > "$D/backup.info"
 LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
 say backup "backup OK: $BKF ($SZ bytes, md5 $_md)"
-say backup "SMB (retention: freshest one): \\\\$LANIP\\geomask-backups\\${BKF##*/} - Windows: net use with user geomask (pass in /root/.geomask-smb.pass); PC history: fetch_backup.ps1"
+say backup "SMB (retention: freshest one): \\\\$LANIP\\geomask-backups\\${BKF##*/} - Windows: net use /user:backup backup (or no password), read-only; PC history: fetch_backup.ps1"
 say download "downloading geomask $TAG..."
 rm -f "$D/geomask.sh.new"
 if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon93region/geomask@${TAG}/geomask.sh" && \
@@ -1229,7 +1228,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.9.5';
+var PANEL_VERSION = '1.9.6';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1695,7 +1694,7 @@ return view.extend({
 			if (b.user && b.pass) {
 				var nu = 'net use ' + unc + ' /user:' + b.user + ' ' + b.pass + ' /persistent:yes';
 				bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
-					E('span', { 'class': 'gs-label' }, 'Windows: вход по логину (гость блокируется политикой)'),
+					E('span', { 'class': 'gs-label' }, 'Windows: вход backup / backup (или без пароля — гость)'),
 					E('span', { 'class': 'gs-mono gs-upd-meta' }, b.user + ' / ' + b.pass),
 					E('span', {}, E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(nu, this); } }, 'Копировать net use'))
 				]));
@@ -2223,18 +2222,10 @@ ensure_smb_share() {
   # v1.9.5: force user root (share under /root is unreachable for the guest uid)
   _fr=$(uci -q get "$_found.force_root" 2>/dev/null)
   [ "$_fr" = 1 ] || { uci set "$_found.force_root=1"; uci commit ksmbd; _changed=1; }
-  # authenticated user for Windows clients (insecure-guest logons are blocked there):
-  # password generated once, kept in /root/.geomask-smb.pass (0600), reused on re-runs.
-  _pwf=/root/.geomask-smb.pass
-  if [ -s "$_pwf" ]; then
-    _pw=$(cat "$_pwf")
-  else
-    _pw=$(head -c 12 /dev/urandom 2>/dev/null | hexdump -e '12/1 "%02x"')
-    [ -n "$_pw" ] || _pw=geomask-backup
-    printf '%s' "$_pw" > "$_pwf" 2>/dev/null && chmod 600 "$_pwf" 2>/dev/null
-    info "SMB: new user geomask, password written to $_pwf"
-  fi
-  have ksmbd.adduser && ksmbd.adduser geomask -p "$_pw" >/dev/null 2>&1
+  # v1.9.6: simple access per owner request - user `backup` password `backup`; guest (no
+  # password at all) also accepted: the share is read-only either way, LAN-scoped.
+  # (Windows blocks insecure-guest mappings in some setups -> the simple pair is the fallback.)
+  have ksmbd.adduser && ksmbd.adduser backup -p backup >/dev/null 2>&1
   if [ "$_changed" = 1 ]; then
     # restart ONLY the file server (not the network stack); verify right away
     "/etc/init.d/$_init" restart >/dev/null 2>&1 || true
@@ -2987,7 +2978,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.9.5"
+GUARD_VERSION="1.9.6"
 
 log() { logger -t geomask-guard "$*"; }
 

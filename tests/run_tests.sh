@@ -317,6 +317,12 @@ if grep -qF 'rm -f "$_dir"/router-backup-*.tar.gz 2>/dev/null' "$SCRIPT" && grep
 else
   echo "FAIL: S13 purge order wrong"; failn=$((failn+1))
 fi
+# v1.9.3: section enumeration must accept 'ksmbd.@share[N]' (uci show format) + dedupe
+if grep -qF 's/^\(ksmbd\.[^=]*\)=share$/\1/p' "$SCRIPT" && grep -qF 'duplicate sections removed' "$SCRIPT"; then
+  echo "PASS: S13 section enumeration handles @share[N] + dedupe"; pass=$((pass+1))
+else
+  echo "FAIL: S13 section enumeration broken"; failn=$((failn+1))
+fi
 # backup must be built in /tmp then moved (never let an older /root copy nest into sysupgrade -b)
 if grep -qF 'geomask-bk-$' "$SCRIPT" && grep -qF 'mv -f "$_out" "$_dest"' "$SCRIPT"; then
   echo "PASS: S13 ensure_backup: build in tmp + move (no nesting)"; pass=$((pass+1))

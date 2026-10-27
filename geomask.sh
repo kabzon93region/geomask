@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.9.2"
+GM_VERSION="1.9.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -163,7 +163,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.9.2"
+BACKEND_VERSION="1.9.3"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1224,7 +1224,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.9.2';
+var PANEL_VERSION = '1.9.3';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2156,17 +2156,28 @@ ensure_smb_share() {
   have uci || { warn "no uci - SMB share skipped"; return 0; }
   mkdir -p "$(P $BACKUP_DIR)" 2>/dev/null
   chmod 755 "$(P $BACKUP_DIR)" 2>/dev/null
+  # uci show lists unnamed sections as ksmbd.@share[N] - match any name chars up to '='
+  _secs=$(uci show ksmbd 2>/dev/null | sed -n 's/^\(ksmbd\.[^=]*\)=share$/\1/p')
   # purge leftover share sections without a name (older bug wrote an empty 'config share')
-  for s in $(uci show ksmbd 2>/dev/null | sed -n 's/^\(ksmbd\.[A-Za-z0-9_]*\)=share$/\1/p'); do
+  for s in $_secs; do
     _sn=$(uci -q get "$s.name" 2>/dev/null)
     [ -z "$_sn" ] && uci delete "$s" 2>/dev/null
   done
+  # find our share; drop duplicated sections with the same name (1.9.2 created a dupe)
   _found=""
-  for s in $(uci show ksmbd 2>/dev/null | sed -n 's/^\(ksmbd\.[A-Za-z0-9_]*\)=share$/\1/p'); do
+  _dups=""
+  for s in $(uci show ksmbd 2>/dev/null | sed -n 's/^\(ksmbd\.[^=]*\)=share$/\1/p'); do
     _sn=$(uci -q get "$s.name" 2>/dev/null)
-    [ "$_sn" = "$SMB_SHARE_NAME" ] && _found=$s && break
+    [ "$_sn" = "$SMB_SHARE_NAME" ] || continue
+    if [ -z "$_found" ]; then _found=$s; else _dups="$_dups $s"; fi
   done
   _changed=0
+  if [ -n "$_dups" ]; then
+    for s in $_dups; do uci delete "$s" 2>/dev/null; done
+    uci commit ksmbd
+    _changed=1
+    info "SMB share '$SMB_SHARE_NAME': duplicate sections removed"
+  fi
   if [ -z "$_found" ]; then
     _sec=$(uci add ksmbd share 2>/dev/null)
     [ -n "$_sec" ] || { warn "uci add failed - SMB share skipped"; return 0; }
@@ -2947,7 +2958,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.9.2"
+GUARD_VERSION="1.9.3"
 
 log() { logger -t geomask-guard "$*"; }
 

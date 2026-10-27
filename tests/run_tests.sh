@@ -274,17 +274,37 @@ for _p in 'sysupgrade -b' 'sha256 mismatch' 'reinstall --yes' 'rpcd reload' 'wc 
   if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S12 runner has: $_p"; pass=$((pass+1))
   else echo "FAIL: S12 runner missing: $_p"; failn=$((failn+1)); fi
 done
-# 5) v1.8.1: backups must not live on overlay (sysupgrade -b archives /root -> nesting)
-if grep -qF '/tmp/geomask-backups' "$SCRIPT" && ! grep -qF '_bkdir="$(P /root/geomask-backups)"' "$SCRIPT"; then
-  echo "PASS: S12 ensure_backup uses tmpfs, no overlay dir writes"; pass=$((pass+1))
+# 5) backups: persistent shared folder, but archive MUST be assembled in /tmp and moved -
+#    a pre-existing copy under /root would nest into the next sysupgrade backup (v1.6-1.8 bug)
+if grep -qF 'geomask-bk-' "$SCRIPT" && ! grep -qE 'sysupgrade -b "[^"]*geomask-backups/' "$SCRIPT"; then
+  echo "PASS: S12 ensure_backup: /tmp assembly + move, no direct writes into share"; pass=$((pass+1))
 else
-  echo "FAIL: S12 ensure_backup still writes /root/geomask-backups"; failn=$((failn+1))
+  echo "FAIL: S12 ensure_backup writes backup directly into share dir"; failn=$((failn+1))
 fi
 # 6) busybox find has no -delete on OpenWrt - purge must use rm -f globs
 if grep -q -- '-delete' "$SCRIPT"; then
   echo "FAIL: S12 uses unsupported 'find -delete'"; failn=$((failn+1))
 else
   echo "PASS: S12 no find -delete (busybox-safe)"; pass=$((pass+1))
+fi
+
+# ---------- scenario 13: backup folder over SMB + panel links (v1.9.0) ----------
+echo "=== S13: backups SMB share ==="
+for _p in 'SMB_SHARE_NAME=geomask-backups' 'ensure_smb_share' 'cmd_backups' 'BACKUP_DIR=/root/geomask-backups'; do
+  if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S13 has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S13 missing: $_p"; failn=$((failn+1)); fi
+done
+# panel wires the backups method: rpcd list + acl read + js call + block render
+_c=$(grep -c 'backups' "$SCRIPT")
+if [ "$_c" -ge 8 ]; then echo "PASS: S13 backups wired across layers ($_c refs)"; pass=$((pass+1))
+else echo "FAIL: S13 backups refs=$_c (want >=8)"; failn=$((failn+1)); fi
+if grep -qF '"backups"' "$SCRIPT"; then echo "PASS: S13 acl/rpcd method present"; pass=$((pass+1))
+else echo "FAIL: S13 no \"backups\" method"; failn=$((failn+1)); fi
+# backup must be built in /tmp then moved (never let an older /root copy nest into sysupgrade -b)
+if grep -qF 'geomask-bk-$' "$SCRIPT" && grep -qF 'mv -f "$_out" "$_dest"' "$SCRIPT"; then
+  echo "PASS: S13 ensure_backup: build in tmp + move (no nesting)"; pass=$((pass+1))
+else
+  echo "FAIL: S13 ensure_backup does not build-then-move"; failn=$((failn+1))
 fi
 
 echo ""

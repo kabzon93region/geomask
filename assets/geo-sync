@@ -11,6 +11,7 @@ list_methods() {
 	json_add_object "status";     json_close_object
 	json_add_object "leases";     json_close_object
 	json_add_object "log";        json_close_object
+	json_add_object "backups";    json_close_object
 	json_add_object "sync_lists"; json_close_object
 	json_add_object "google";     json_close_object
 	json_add_object "global";     json_add_string "mode" "string"; json_close_object
@@ -40,6 +41,7 @@ call_method() {
 		status)     "$BACKEND" status ;;
 		leases)     "$BACKEND" leases ;;
 		log)        "$BACKEND" log ;;
+		backups)    "$BACKEND" backups ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;

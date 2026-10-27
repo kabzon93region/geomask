@@ -15,9 +15,9 @@ function Sh([string]$cmd) {
 }
 Write-Host '[1/4] find newest backup on router'
 if (-not $Remote) {
-    $Remote = (Sh 'ls -t /tmp/router-backup-*.tar.gz /tmp/geomask-backups/router-backup-*.tar.gz 2>/dev/null | head -1') | Select-Object -First 1
+    $Remote = (Sh 'ls -t /root/geomask-backups/router-backup-*.tar.gz /tmp/router-backup-*.tar.gz 2>/dev/null | head -1') | Select-Object -First 1
 }
-if (-not $Remote) { Write-Host 'FAIL: no router-backup-*.tar.gz in /tmp on router (tmpfs; reboot wipes it - fetch right after backup/update)'; exit 1 }
+if (-not $Remote) { Write-Host 'FAIL: no router-backup-*.tar.gz on router (panel creates it on update / geomask --backup)'; exit 1 }
 $name = $Remote.Split('/')[-1]
 Write-Host "  remote: $Remote"
 Write-Host '[2/4] scp'

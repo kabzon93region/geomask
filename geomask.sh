@@ -23,14 +23,16 @@
 #
 # SAFETY: never reboots the router; never restarts working services (only starts missing ones);
 #         never touches network/pppoe config; backups before every file write and before ANY
-#         mihomo restart (full settings backup via sysupgrade -b -> /tmp/geomask-backups/,
+#         mihomo restart (full settings backup via sysupgrade -b -> /root/geomask-backups/,
+#         built in /tmp then moved, freshest one kept, published read-only over SMB as
+#         'geomask-backups' with links in the panel - v1.9.0),
 #         mihomo restart = trial-run on shifted ports FIRST, restart only if the trial starts,
 #         and automatic rollback to the previous config if the restarted service does not
 #         answer. Hard pin: /root/.geomask-norestart disables --restart entirely.
 
 set -u
 
-GM_VERSION="1.8.2"
+GM_VERSION="1.9.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -122,6 +124,10 @@ step2_check() {
     if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
   done
   if have ubus && ubus list 2>/dev/null | grep -qx 'geo-sync'; then info "ubus geo-sync: registered"; else bad "ubus geo-sync not registered"; _need=1; fi
+  if [ -e /etc/ksmbd/ksmbd.conf ]; then
+    if grep -qF "[geomask-backups]" /etc/ksmbd/ksmbd.conf; then info "SMB share geomask-backups: present"
+    else bad "SMB share geomask-backups missing"; _need=1; fi
+  fi
   return $_need
 }
 step2_apply() {
@@ -129,7 +135,7 @@ step2_apply() {
 #!/bin/sh
 # geo-backend.sh - backend for LuCI "Гео-маскировка и AI" panel (geo-sync ubus object).
 # Commands:
-#   status | leases | log | sync_lists | google
+#   status | leases | log | sync_lists | google | backups
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
 #     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
@@ -157,7 +163,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.8.2"
+BACKEND_VERSION="1.9.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -939,6 +945,26 @@ _upd_running() {
 
 cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
 
+# v1.9.0: backup folder inventory for the panel (SMB link + files list, newest first)
+cmd_backups() {
+  DIR=/root/geomask-backups
+  LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$LANIP" ] || LANIP=192.168.0.1
+  _sh=false
+  grep -qF '[geomask-backups]' /etc/ksmbd/ksmbd.conf 2>/dev/null && _sh=true
+  _files=''
+  for f in $(ls -t "$DIR"/router-backup-*.tar.gz 2>/dev/null); do
+    [ -f "$f" ] || continue
+    _n=${f##*/}
+    _sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+    _t=$(date -r "$f" '+%F %T' 2>/dev/null)
+    _files="$_files{\"n\":\"$_n\",\"s\":${_sz:-0},\"t\":\"$_t\"},"
+  done
+  _files=${_files%,}
+  printf '{"ok":true,"dir":"%s","unc":"\\\\%s\\geomask-backups","smb":"smb://%s/geomask-backups","share_ok":%s,"files":[%s]}\n' \
+    "$DIR" "$LANIP" "$LANIP" "$_sh" "$_files"
+}
+
 cmd_upd_status() {
   mkdir -p "$UPD_DIR" 2>/dev/null
   if [ -s "$UPD_STATUS" ]; then _b=$(cat "$UPD_STATUS"); else _b='{"phase":"idle"}'; fi
@@ -969,15 +995,23 @@ TAG="$1"
 say queued "update to $TAG started"
 say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
-BK=/tmp/router-backup-$TS.tar.gz
-rm -f /tmp/router-backup-*.tar.gz 2>/dev/null   # tmpfs hygiene: fetch (fetch_backup.ps1) older ones first
+BKD=/root/geomask-backups
+BK=/tmp/geomask-bk-$TS.tar.gz
 if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
   say error "backup failed - update aborted"; exit 1
 fi
+SZ=$(wc -c < "$BK")
 _md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
-echo "file=$BK md5=$_md" > "$D/backup.info"
-say backup "backup OK: $BK ($(wc -c < "$BK") bytes, md5 $_md)"
-say backup "backup saved on router in RAM (/tmp) - copy it to PC now: run fetch_backup.ps1 or scp root@<lan-ip>:$BK; lost after reboot. Restore: LuCI System -> Backup / Flash Firmware -> Restore"
+mkdir -p "$BKD" 2>/dev/null
+rm -f /tmp/router-backup-*.tar.gz 2>/dev/null
+for f in "$BKD"/router-backup-*.tar.gz; do [ -f "$f" ] && rm -f "$f"; done
+BKF="$BKD/router-backup-$TS.tar.gz"
+mv -f "$BK" "$BKF" 2>/dev/null || BKF="$BK"
+[ -s "$BKF" ] || { say error "backup vanished after create - update aborted"; exit 1; }
+echo "file=$BKF md5=$_md" > "$D/backup.info"
+LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+say backup "backup OK: $BKF ($SZ bytes, md5 $_md)"
+say backup "SMB (retention: freshest one): \\\\$LANIP\\geomask-backups\\${BKF##*/} - copy to PC with fetch_backup.ps1. Restore: LuCI System -> Backup / Flash Firmware -> Restore"
 say download "downloading geomask $TAG..."
 rm -f "$D/geomask.sh.new"
 if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon93region/geomask@${TAG}/geomask.sh" && \
@@ -1019,6 +1053,7 @@ case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
   log)        cmd_log ;;
+  backups)    cmd_backups ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;
@@ -1054,6 +1089,7 @@ list_methods() {
 	json_add_object "status";     json_close_object
 	json_add_object "leases";     json_close_object
 	json_add_object "log";        json_close_object
+	json_add_object "backups";    json_close_object
 	json_add_object "sync_lists"; json_close_object
 	json_add_object "google";     json_close_object
 	json_add_object "global";     json_add_string "mode" "string"; json_close_object
@@ -1083,6 +1119,7 @@ call_method() {
 		status)     "$BACKEND" status ;;
 		leases)     "$BACKEND" leases ;;
 		log)        "$BACKEND" log ;;
+		backups)    "$BACKEND" backups ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;
@@ -1128,7 +1165,7 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "ai_sub_get", "subs_list", "upd_check", "upd_status" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "ai_sub_get", "subs_list", "upd_check", "upd_status" ],
 				"system": [ "info" ]
 			}
 		},
@@ -1166,6 +1203,7 @@ ASSET_EOF
 var callStatus = rpc.declare({ object: 'geo-sync', method: 'status', expect: {} });
 var callLeases = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} });
 var callLog    = rpc.declare({ object: 'geo-sync', method: 'log',    expect: {} });
+var callBackups = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
 var callLists  = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
 var callGoogle = rpc.declare({ object: 'geo-sync', method: 'google',  expect: {} });
 /* params as OBJECT (not array): array form expects positional args and would
@@ -1185,7 +1223,32 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.8.2';
+var PANEL_VERSION = '1.9.0';
+
+/* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
+function copyToClipboard(txt, btn) {
+	function flash(ok) {
+		if (!btn) return;
+		var old = btn.textContent;
+		btn.textContent = ok ? 'Скопировано ✓' : 'Не удалось';
+		setTimeout(function () { btn.textContent = old; }, 1600);
+	}
+	function fallback() {
+		var ta = document.createElement('textarea');
+		ta.value = txt;
+		ta.style.position = 'fixed'; ta.style.left = '-1000px';
+		document.body.appendChild(ta); ta.focus(); ta.select();
+		var ok = false;
+		try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+		document.body.removeChild(ta);
+		flash(ok);
+	}
+	if (window.isSecureContext && navigator.clipboard) {
+		navigator.clipboard.writeText(txt).then(function () { flash(true); }, fallback);
+	} else {
+		fallback();
+	}
+}
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -1257,7 +1320,9 @@ var STYLE = [
 	'.gs-console .c-err{color:#f85149}',
 	'.gs-console .c-done{color:#3fb950}',
 	'.gs-console .c-run{color:#d29922}',
-	'.gs-console .c-dim{color:#8b949e}'
+	'.gs-console .c-dim{color:#8b949e}',
+	'.gs-bk{margin-top:10px;border-top:1px solid #30363d;padding-top:6px}',
+	'.gs-bk h4{margin:2px 0 4px;font-size:13px;color:#e6edf3}'
 ].join('\n');
 
 function injectStyle() {
@@ -1307,7 +1372,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups() ]);
 	},
 
 	render: function(all) {
@@ -1316,6 +1381,7 @@ return view.extend({
 		var subs = (all[4] || {}).subs || [];
 		var upd = all[5] || {};
 		var upds = all[6] || {};
+		var bks = all[7] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -1582,6 +1648,46 @@ return view.extend({
 			lines.forEach(function(l) { updLog.appendChild(E('div', { 'class': updLineClass(l) }, l)); });
 			updLog.scrollTop = updLog.scrollHeight;
 		}
+		/* --- backups folder (SMB-shareable, v1.9.0) --- */
+		var bkBox = E('div', { 'class': 'gs-bk' });
+		function fmtSize(b) {
+			b = +b || 0;
+			return (b >= 1048576) ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+		}
+		function renderBk(b) {
+			b = b || {};
+			bkBox.textContent = '';
+			bkBox.appendChild(E('h4', {}, 'Резервные копии (папка на роутере, SMB-шар)'));
+			if (b.share_ok === false)
+				bkBox.appendChild(E('div', { 'class': 'gs-row' }, [ E('span', { 'class': 'gs-badge gs-warn' },
+					'SMB-шар geomask-backups не найден — прогоните шаг geo в geomask') ]));
+			var unc = b.unc || '', smbu = b.smb || '';
+			bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Папка'),
+				E('span', { 'class': 'gs-val gs-mono' }, unc || b.dir || '—'),
+				E('span', {}, [
+					E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(unc, this); } }, 'Копировать (Windows)'),
+					E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(smbu, this); } }, 'Копировать (smb://)')
+				])
+			]));
+			var files = b.files || [];
+			if (!files.length) {
+				bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+					'Свежей копии нет — она создаётся автоматически перед каждым обновлением и при geomask --backup.'));
+			} else {
+				files.forEach(function (f) {
+					bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-val gs-mono' }, String(f.n || '')),
+						E('span', { 'class': 'gs-upd-meta' }, fmtSize(f.s) + ' · ' + String(f.t || '')),
+						E('span', {}, E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(unc + '\\' + String(f.n || ''), this); } }, 'Копировать путь к файлу'))
+					]));
+				});
+			}
+			bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+				'Хранится самая свежая копия (роутер экономит место); полная история — на ПК: geomask\\fetch_backup.ps1. ' +
+				'Провод Windows: Win+R → вставить скопированный путь. Восстановление: LuCI → System → Backup / Flash Firmware → Restore.'));
+		}
+		renderBk(bks);
 		var latest = upd.latest || {}, loc = upd.local || {};
 		var stack = upd.stack || [];
 		var updErr = upd.error || null;
@@ -1612,6 +1718,7 @@ return view.extend({
 						updStatus.appendChild(' ');
 						updStatus.appendChild(E('button', { 'class': 'gs-btn gs-btn-primary',
 							'click': function() { location.reload(); } }, 'Обновить страницу'));
+						callBackups().then(function(b) { renderBk(b || {}); });
 					} else if (ph === 'error') {
 						clearInterval(view._updTimer); view._updTimer = null;
 						updStatus.style.color = '#f85149';
@@ -1631,8 +1738,9 @@ return view.extend({
 				'Обновление geomask: полный бэкап роутера → скачивание релиза с GitHub (sha256) → ' +
 				'установка модулей и панели без перезапуска сервисов → после «Готово» обнови страницу (Ctrl+F5). ' +
 				'Каждый шаг пишется отдельной строкой в консоль ниже и в общий журнал (/root/geo-sync.log). ' +
-				'Бэкап перед обновлением кладется в /tmp роутера (исчезает после перезагрузки) — заберите его на ПК: ' +
-				'geomask\\fetch_backup.ps1 (путь и md5 видны в логе); восстановление — LuCI System → Backup / Flash Firmware → Restore.')
+				'Бэкап перед обновлением хранится в папке «Резервные копии» ниже (SMB-шар на роутере, ' +
+				'самая свежая копия; полная история на ПК — geomask\\fetch_backup.ps1); восстановление — ' +
+				'LuCI System → Backup / Flash Firmware → Restore.')
 		];
 		if (updErr) {
 			updChildren.push(E('div', { 'class': 'gs-row' }, [
@@ -1694,6 +1802,7 @@ return view.extend({
 			if (upd.checked_at) updChildren.push(E('div', { 'class': 'gs-upd-meta' },
 				'Проверено: ' + upd.checked_at + ' · источник: ' + (upd.src || '?') + (upd.need === true && latest.digest ? ' · sha256: ' + String(latest.digest).slice(0, 19) + '…' : '')));
 		}
+		updChildren.push(bkBox);
 		updChildren.push(updStatus);
 		updChildren.push(updLog);
 		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
@@ -1722,7 +1831,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);
@@ -1738,6 +1847,7 @@ ASSET_EOF
   # the second signal -> geo-sync stays unregistered; re-send until it appears.
   ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
   ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
+  ensure_smb_share
   return 0
 }
 step2_verify() { step2_check; }
@@ -1997,31 +2107,91 @@ api_refresh_provider() { # api_refresh_provider <name> <url>
 
 # ============================================================ SAFETY layer
 # full settings backup (restorable via LuCI) - MANDATORY before any router change
-# v1.8.1: written to tmpfs (/tmp/geomask-backups), NOT to overlay /root: sysupgrade -b
-#         archives /root, so /root/geomask-backups was nested into every next backup
-#         (bloat + overlay filled to 66%, found 27.10). Old overlay copies are removed
-#         on first run (policy 22.10: backups live on the PC, fetch with fetch_backup.ps1).
+# v1.9.0: stored persistently in /root/geomask-backups/ (retention: freshest one - replaced by
+#         the next successful backup; full history lives on the PC via fetch_backup.ps1).
+#         Built in /tmp first, then moved: sysupgrade -b archives /root, so an existing copy
+#         must not be present while the new one is created (that nesting bloated archives in
+#         v1.6-1.8). The folder is published read-only over SMB (share 'geomask-backups',
+#         see ensure_smb_share) and linked from the panel.
 ensure_backup() { # -> path on stdout, rc=1 on failure
   _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
-  _bkdir="$(P /tmp/geomask-backups)"
-  mkdir -p "$_bkdir" 2>/dev/null
-  rm -f "$(P /root/geomask-backups)"/router-backup-*.tar.gz 2>/dev/null
-  rm -f "$_bkdir"/router-backup-*.tar.gz 2>/dev/null
-  _out="$_bkdir/router-backup-$_ts.tar.gz"
+  _dir="$(P /root/geomask-backups)"
+  mkdir -p "$_dir" 2>/dev/null
+  _out=""
   if have sysupgrade; then
-    if ! sysupgrade -b "$_out" >/dev/null 2>&1 || [ ! -s "$_out" ]; then _out=""; fi
-  else
-    _out=""
+    _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
+    if sysupgrade -b "$_tmp" >/dev/null 2>&1 && [ -s "$_tmp" ]; then _out="$_tmp"; fi
   fi
-  if [ -z "$_out" ] || [ ! -s "$_out" ]; then
-    _out="$_bkdir/router-backup-$_ts-min.tar.gz"
-    tar czf "$_out" -C "$(P /)" etc 2>/dev/null || { _out=""; }
+  if [ -z "$_out" ]; then
+    _out="$(P /tmp)/geomask-bk-$_ts-min.tar.gz"
+    tar czf "$_out" -C "$(P /)" etc 2>/dev/null || _out=""
   fi
   if [ -z "$_out" ] || [ ! -s "$_out" ]; then
     bad "cannot create backup"
     return 1
   fi
-  printf '%s' "$_out"
+  for f in "$_dir"/router-backup-*.tar.gz; do
+    [ -f "$f" ] && rm -f "$f"
+  done
+  _dest="$_dir/router-backup-$_ts.tar.gz"
+  mv -f "$_out" "$_dest" || { bad "cannot store backup into $_dir"; return 1; }
+  chmod 644 "$_dest" 2>/dev/null
+  printf '%s' "$_dest"
+  return 0
+}
+
+# publish the backup folder over SMB via the existing ksmbd server (guest, read-only for
+# this share only). Safe no-op when ksmbd is absent. Only touch ksmbd when config changes.
+SMB_SHARE_NAME=geomask-backups
+BACKUP_DIR=/root/geomask-backups
+ensure_smb_share() {
+  _init=""
+  for c in ksmbd1 ksmbd; do
+    [ -x "$(P /etc/init.d/$c)" ] && _init=$c && break
+  done
+  [ -n "$_init" ] || { info "ksmbd not installed - SMB share for backups skipped (folder still local)"; return 0; }
+  have uci || { warn "no uci - SMB share skipped"; return 0; }
+  mkdir -p "$(P $BACKUP_DIR)" 2>/dev/null
+  chmod 755 "$(P $BACKUP_DIR)" 2>/dev/null
+  _found=""
+  _i=0
+  while [ $_i -lt 20 ]; do
+    _n=$(uci -q get "ksmbd.@share[$_i].name" 2>/dev/null)
+    [ -z "$_n" ] && break
+    [ "$_n" = "$SMB_SHARE_NAME" ] && _found=$_i && break
+    _i=$((_i+1))
+  done
+  _changed=0
+  if [ -z "$_found" ]; then
+    uci add ksmbd share >/dev/null && _found=last
+    uci set "ksmbd.@share[$_found].name=$SMB_SHARE_NAME"
+    uci set "ksmbd.@share[$_found].path=$BACKUP_DIR"
+    uci set "ksmbd.@share[$_found].read_only='1'"
+    uci set "ksmbd.@share[$_found].guest_ok='1'"
+    uci commit ksmbd
+    _changed=1
+    info "SMB share '$SMB_SHARE_NAME' -> $BACKUP_DIR (guest, read-only): created"
+  else
+    _p=$(uci -q get "ksmbd.@share[$_found].path" 2>/dev/null)
+    [ "$_p" != "$BACKUP_DIR" ] && {
+      uci set "ksmbd.@share[$_found].path=$BACKUP_DIR"
+      uci set "ksmbd.@share[$_found].read_only='1'"
+      uci set "ksmbd.@share[$_found].guest_ok='1'"
+      uci commit ksmbd
+      _changed=1
+      info "SMB share '$SMB_SHARE_NAME': path fixed -> $BACKUP_DIR"
+    }
+  fi
+  if [ "$_changed" = 1 ]; then
+    # restart ONLY the file server (not the network stack); verify right away
+    "/etc/init.d/$_init" restart >/dev/null 2>&1 || true
+    sleep 2
+  fi
+  if grep -qF "[$SMB_SHARE_NAME]" "$(P /etc/ksmbd/ksmbd.conf)" 2>/dev/null; then
+    info "SMB share present in ksmbd.conf: \\\\$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)\\$SMB_SHARE_NAME"
+  else
+    warn "share [$SMB_SHARE_NAME] not found in /etc/ksmbd/ksmbd.conf - check LuCI -> ksmbd"
+  fi
   return 0
 }
 
@@ -2764,7 +2934,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.8.2"
+GUARD_VERSION="1.9.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -3372,7 +3542,7 @@ fi
 
 RC=0
 if [ "$GM_BACKUP" = 1 ]; then
-  _b=$(ensure_backup) && { info "full backup created: $_b"; info "policy: copy it to the PC now (scp / geomask fetch_backup.ps1) - tmpfs: lost after reboot; LuCI Backup/Restore accepts this file"; RC=0; } || RC=1
+  _b=$(ensure_backup) && { info "full backup created: $_b"; info "SMB (freshest one): \\\\$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)\\geomask-backups ; history on PC: geomask\\fetch_backup.ps1"; RC=0; } || RC=1
 elif [ "$GM_REINSTALL" = 1 ]; then
   menu_reinstall || RC=1
 elif [ -n "$GM_STEP" ]; then

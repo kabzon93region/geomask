@@ -23,14 +23,16 @@
 #
 # SAFETY: never reboots the router; never restarts working services (only starts missing ones);
 #         never touches network/pppoe config; backups before every file write and before ANY
-#         mihomo restart (full settings backup via sysupgrade -b -> /tmp/geomask-backups/,
+#         mihomo restart (full settings backup via sysupgrade -b -> /root/geomask-backups/,
+#         built in /tmp then moved, freshest one kept, published read-only over SMB as
+#         'geomask-backups' with links in the panel - v1.9.0),
 #         mihomo restart = trial-run on shifted ports FIRST, restart only if the trial starts,
 #         and automatic rollback to the previous config if the restarted service does not
 #         answer. Hard pin: /root/.geomask-norestart disables --restart entirely.
 
 set -u
 
-GM_VERSION="1.8.2"
+GM_VERSION="1.9.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -122,6 +124,10 @@ step2_check() {
     if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
   done
   if have ubus && ubus list 2>/dev/null | grep -qx 'geo-sync'; then info "ubus geo-sync: registered"; else bad "ubus geo-sync not registered"; _need=1; fi
+  if [ -e /etc/ksmbd/ksmbd.conf ]; then
+    if grep -qF "[geomask-backups]" /etc/ksmbd/ksmbd.conf; then info "SMB share geomask-backups: present"
+    else bad "SMB share geomask-backups missing"; _need=1; fi
+  fi
   return $_need
 }
 step2_apply() {
@@ -147,6 +153,7 @@ ASSET_EOF
   # the second signal -> geo-sync stays unregistered; re-send until it appears.
   ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
   ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
+  ensure_smb_share
   return 0
 }
 step2_verify() { step2_check; }
@@ -406,31 +413,91 @@ api_refresh_provider() { # api_refresh_provider <name> <url>
 
 # ============================================================ SAFETY layer
 # full settings backup (restorable via LuCI) - MANDATORY before any router change
-# v1.8.1: written to tmpfs (/tmp/geomask-backups), NOT to overlay /root: sysupgrade -b
-#         archives /root, so /root/geomask-backups was nested into every next backup
-#         (bloat + overlay filled to 66%, found 27.10). Old overlay copies are removed
-#         on first run (policy 22.10: backups live on the PC, fetch with fetch_backup.ps1).
+# v1.9.0: stored persistently in /root/geomask-backups/ (retention: freshest one - replaced by
+#         the next successful backup; full history lives on the PC via fetch_backup.ps1).
+#         Built in /tmp first, then moved: sysupgrade -b archives /root, so an existing copy
+#         must not be present while the new one is created (that nesting bloated archives in
+#         v1.6-1.8). The folder is published read-only over SMB (share 'geomask-backups',
+#         see ensure_smb_share) and linked from the panel.
 ensure_backup() { # -> path on stdout, rc=1 on failure
   _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
-  _bkdir="$(P /tmp/geomask-backups)"
-  mkdir -p "$_bkdir" 2>/dev/null
-  rm -f "$(P /root/geomask-backups)"/router-backup-*.tar.gz 2>/dev/null
-  rm -f "$_bkdir"/router-backup-*.tar.gz 2>/dev/null
-  _out="$_bkdir/router-backup-$_ts.tar.gz"
+  _dir="$(P /root/geomask-backups)"
+  mkdir -p "$_dir" 2>/dev/null
+  _out=""
   if have sysupgrade; then
-    if ! sysupgrade -b "$_out" >/dev/null 2>&1 || [ ! -s "$_out" ]; then _out=""; fi
-  else
-    _out=""
+    _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
+    if sysupgrade -b "$_tmp" >/dev/null 2>&1 && [ -s "$_tmp" ]; then _out="$_tmp"; fi
   fi
-  if [ -z "$_out" ] || [ ! -s "$_out" ]; then
-    _out="$_bkdir/router-backup-$_ts-min.tar.gz"
-    tar czf "$_out" -C "$(P /)" etc 2>/dev/null || { _out=""; }
+  if [ -z "$_out" ]; then
+    _out="$(P /tmp)/geomask-bk-$_ts-min.tar.gz"
+    tar czf "$_out" -C "$(P /)" etc 2>/dev/null || _out=""
   fi
   if [ -z "$_out" ] || [ ! -s "$_out" ]; then
     bad "cannot create backup"
     return 1
   fi
-  printf '%s' "$_out"
+  for f in "$_dir"/router-backup-*.tar.gz; do
+    [ -f "$f" ] && rm -f "$f"
+  done
+  _dest="$_dir/router-backup-$_ts.tar.gz"
+  mv -f "$_out" "$_dest" || { bad "cannot store backup into $_dir"; return 1; }
+  chmod 644 "$_dest" 2>/dev/null
+  printf '%s' "$_dest"
+  return 0
+}
+
+# publish the backup folder over SMB via the existing ksmbd server (guest, read-only for
+# this share only). Safe no-op when ksmbd is absent. Only touch ksmbd when config changes.
+SMB_SHARE_NAME=geomask-backups
+BACKUP_DIR=/root/geomask-backups
+ensure_smb_share() {
+  _init=""
+  for c in ksmbd1 ksmbd; do
+    [ -x "$(P /etc/init.d/$c)" ] && _init=$c && break
+  done
+  [ -n "$_init" ] || { info "ksmbd not installed - SMB share for backups skipped (folder still local)"; return 0; }
+  have uci || { warn "no uci - SMB share skipped"; return 0; }
+  mkdir -p "$(P $BACKUP_DIR)" 2>/dev/null
+  chmod 755 "$(P $BACKUP_DIR)" 2>/dev/null
+  _found=""
+  _i=0
+  while [ $_i -lt 20 ]; do
+    _n=$(uci -q get "ksmbd.@share[$_i].name" 2>/dev/null)
+    [ -z "$_n" ] && break
+    [ "$_n" = "$SMB_SHARE_NAME" ] && _found=$_i && break
+    _i=$((_i+1))
+  done
+  _changed=0
+  if [ -z "$_found" ]; then
+    uci add ksmbd share >/dev/null && _found=last
+    uci set "ksmbd.@share[$_found].name=$SMB_SHARE_NAME"
+    uci set "ksmbd.@share[$_found].path=$BACKUP_DIR"
+    uci set "ksmbd.@share[$_found].read_only='1'"
+    uci set "ksmbd.@share[$_found].guest_ok='1'"
+    uci commit ksmbd
+    _changed=1
+    info "SMB share '$SMB_SHARE_NAME' -> $BACKUP_DIR (guest, read-only): created"
+  else
+    _p=$(uci -q get "ksmbd.@share[$_found].path" 2>/dev/null)
+    [ "$_p" != "$BACKUP_DIR" ] && {
+      uci set "ksmbd.@share[$_found].path=$BACKUP_DIR"
+      uci set "ksmbd.@share[$_found].read_only='1'"
+      uci set "ksmbd.@share[$_found].guest_ok='1'"
+      uci commit ksmbd
+      _changed=1
+      info "SMB share '$SMB_SHARE_NAME': path fixed -> $BACKUP_DIR"
+    }
+  fi
+  if [ "$_changed" = 1 ]; then
+    # restart ONLY the file server (not the network stack); verify right away
+    "/etc/init.d/$_init" restart >/dev/null 2>&1 || true
+    sleep 2
+  fi
+  if grep -qF "[$SMB_SHARE_NAME]" "$(P /etc/ksmbd/ksmbd.conf)" 2>/dev/null; then
+    info "SMB share present in ksmbd.conf: \\\\$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)\\$SMB_SHARE_NAME"
+  else
+    warn "share [$SMB_SHARE_NAME] not found in /etc/ksmbd/ksmbd.conf - check LuCI -> ksmbd"
+  fi
   return 0
 }
 
@@ -1145,7 +1212,7 @@ fi
 
 RC=0
 if [ "$GM_BACKUP" = 1 ]; then
-  _b=$(ensure_backup) && { info "full backup created: $_b"; info "policy: copy it to the PC now (scp / geomask fetch_backup.ps1) - tmpfs: lost after reboot; LuCI Backup/Restore accepts this file"; RC=0; } || RC=1
+  _b=$(ensure_backup) && { info "full backup created: $_b"; info "SMB (freshest one): \\\\$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)\\geomask-backups ; history on PC: geomask\\fetch_backup.ps1"; RC=0; } || RC=1
 elif [ "$GM_REINSTALL" = 1 ]; then
   menu_reinstall || RC=1
 elif [ -n "$GM_STEP" ]; then

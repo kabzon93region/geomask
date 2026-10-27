@@ -1,7 +1,7 @@
 #!/bin/sh
 # geo-backend.sh - backend for LuCI "Гео-маскировка и AI" panel (geo-sync ubus object).
 # Commands:
-#   status | leases | log | sync_lists | google
+#   status | leases | log | sync_lists | google | backups
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
 #     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
@@ -811,6 +811,26 @@ _upd_running() {
 
 cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
 
+# v1.9.0: backup folder inventory for the panel (SMB link + files list, newest first)
+cmd_backups() {
+  DIR=/root/geomask-backups
+  LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$LANIP" ] || LANIP=192.168.0.1
+  _sh=false
+  grep -qF '[geomask-backups]' /etc/ksmbd/ksmbd.conf 2>/dev/null && _sh=true
+  _files=''
+  for f in $(ls -t "$DIR"/router-backup-*.tar.gz 2>/dev/null); do
+    [ -f "$f" ] || continue
+    _n=${f##*/}
+    _sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+    _t=$(date -r "$f" '+%F %T' 2>/dev/null)
+    _files="$_files{\"n\":\"$_n\",\"s\":${_sz:-0},\"t\":\"$_t\"},"
+  done
+  _files=${_files%,}
+  printf '{"ok":true,"dir":"%s","unc":"\\\\%s\\geomask-backups","smb":"smb://%s/geomask-backups","share_ok":%s,"files":[%s]}\n' \
+    "$DIR" "$LANIP" "$LANIP" "$_sh" "$_files"
+}
+
 cmd_upd_status() {
   mkdir -p "$UPD_DIR" 2>/dev/null
   if [ -s "$UPD_STATUS" ]; then _b=$(cat "$UPD_STATUS"); else _b='{"phase":"idle"}'; fi
@@ -841,15 +861,23 @@ TAG="$1"
 say queued "update to $TAG started"
 say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
-BK=/tmp/router-backup-$TS.tar.gz
-rm -f /tmp/router-backup-*.tar.gz 2>/dev/null   # tmpfs hygiene: fetch (fetch_backup.ps1) older ones first
+BKD=/root/geomask-backups
+BK=/tmp/geomask-bk-$TS.tar.gz
 if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
   say error "backup failed - update aborted"; exit 1
 fi
+SZ=$(wc -c < "$BK")
 _md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
-echo "file=$BK md5=$_md" > "$D/backup.info"
-say backup "backup OK: $BK ($(wc -c < "$BK") bytes, md5 $_md)"
-say backup "backup saved on router in RAM (/tmp) - copy it to PC now: run fetch_backup.ps1 or scp root@<lan-ip>:$BK; lost after reboot. Restore: LuCI System -> Backup / Flash Firmware -> Restore"
+mkdir -p "$BKD" 2>/dev/null
+rm -f /tmp/router-backup-*.tar.gz 2>/dev/null
+for f in "$BKD"/router-backup-*.tar.gz; do [ -f "$f" ] && rm -f "$f"; done
+BKF="$BKD/router-backup-$TS.tar.gz"
+mv -f "$BK" "$BKF" 2>/dev/null || BKF="$BK"
+[ -s "$BKF" ] || { say error "backup vanished after create - update aborted"; exit 1; }
+echo "file=$BKF md5=$_md" > "$D/backup.info"
+LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+say backup "backup OK: $BKF ($SZ bytes, md5 $_md)"
+say backup "SMB (retention: freshest one): \\\\$LANIP\\geomask-backups\\${BKF##*/} - copy to PC with fetch_backup.ps1. Restore: LuCI System -> Backup / Flash Firmware -> Restore"
 say download "downloading geomask $TAG..."
 rm -f "$D/geomask.sh.new"
 if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon93region/geomask@${TAG}/geomask.sh" && \
@@ -891,6 +919,7 @@ case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
   log)        cmd_log ;;
+  backups)    cmd_backups ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;

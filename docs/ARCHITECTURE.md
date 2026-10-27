@@ -55,7 +55,7 @@ geomask ставит на OpenWrt-роутер домашний стек обх�
 | `/etc/init.d/{ai-doh,dnsmasq-ai}` | Второй DoH-воркер и второй dnsmasq для AI-DNS |
 | `/etc/geo-devices.list` | Список устройств: `IP mode name` (`bypass`/`ai`/`realtz`) |
 | `/etc/geomask-aidns.uid` / `-aidns.off` | UID пользователя `dnsai` / флаг отключения AI-DNS |
-| `/tmp/geomask-backups/` | Полные бэкапы (`sysupgrade -b`), tmpfs — забирать на ПК (v1.8.1; `/root/geomask-backups/` приводил к вложению бэкапов в sysupgrade-архивы) |
+| `/root/geomask-backups/` | Полные бэкапы (`sysupgrade -b`): ротация — самая свежая одна; SMB-шар `geomask-backups` (guest, read-only), ссылка в панели (v1.9.0); сборка в /tmp + перенос исключает вложение архивов |
 
 ## Инсталлятор: шаги
 

@@ -6,6 +6,7 @@
 var callStatus = rpc.declare({ object: 'geo-sync', method: 'status', expect: {} });
 var callLeases = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} });
 var callLog    = rpc.declare({ object: 'geo-sync', method: 'log',    expect: {} });
+var callBackups = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
 var callLists  = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
 var callGoogle = rpc.declare({ object: 'geo-sync', method: 'google',  expect: {} });
 /* params as OBJECT (not array): array form expects positional args and would
@@ -26,6 +27,31 @@ var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    p
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
 var PANEL_VERSION = '@@PANEL_VERSION@@';
+
+/* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
+function copyToClipboard(txt, btn) {
+	function flash(ok) {
+		if (!btn) return;
+		var old = btn.textContent;
+		btn.textContent = ok ? 'Скопировано ✓' : 'Не удалось';
+		setTimeout(function () { btn.textContent = old; }, 1600);
+	}
+	function fallback() {
+		var ta = document.createElement('textarea');
+		ta.value = txt;
+		ta.style.position = 'fixed'; ta.style.left = '-1000px';
+		document.body.appendChild(ta); ta.focus(); ta.select();
+		var ok = false;
+		try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+		document.body.removeChild(ta);
+		flash(ok);
+	}
+	if (window.isSecureContext && navigator.clipboard) {
+		navigator.clipboard.writeText(txt).then(function () { flash(true); }, fallback);
+	} else {
+		fallback();
+	}
+}
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -97,7 +123,9 @@ var STYLE = [
 	'.gs-console .c-err{color:#f85149}',
 	'.gs-console .c-done{color:#3fb950}',
 	'.gs-console .c-run{color:#d29922}',
-	'.gs-console .c-dim{color:#8b949e}'
+	'.gs-console .c-dim{color:#8b949e}',
+	'.gs-bk{margin-top:10px;border-top:1px solid #30363d;padding-top:6px}',
+	'.gs-bk h4{margin:2px 0 4px;font-size:13px;color:#e6edf3}'
 ].join('\n');
 
 function injectStyle() {
@@ -147,7 +175,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups() ]);
 	},
 
 	render: function(all) {
@@ -156,6 +184,7 @@ return view.extend({
 		var subs = (all[4] || {}).subs || [];
 		var upd = all[5] || {};
 		var upds = all[6] || {};
+		var bks = all[7] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -422,6 +451,46 @@ return view.extend({
 			lines.forEach(function(l) { updLog.appendChild(E('div', { 'class': updLineClass(l) }, l)); });
 			updLog.scrollTop = updLog.scrollHeight;
 		}
+		/* --- backups folder (SMB-shareable, v1.9.0) --- */
+		var bkBox = E('div', { 'class': 'gs-bk' });
+		function fmtSize(b) {
+			b = +b || 0;
+			return (b >= 1048576) ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+		}
+		function renderBk(b) {
+			b = b || {};
+			bkBox.textContent = '';
+			bkBox.appendChild(E('h4', {}, 'Резервные копии (папка на роутере, SMB-шар)'));
+			if (b.share_ok === false)
+				bkBox.appendChild(E('div', { 'class': 'gs-row' }, [ E('span', { 'class': 'gs-badge gs-warn' },
+					'SMB-шар geomask-backups не найден — прогоните шаг geo в geomask') ]));
+			var unc = b.unc || '', smbu = b.smb || '';
+			bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Папка'),
+				E('span', { 'class': 'gs-val gs-mono' }, unc || b.dir || '—'),
+				E('span', {}, [
+					E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(unc, this); } }, 'Копировать (Windows)'),
+					E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(smbu, this); } }, 'Копировать (smb://)')
+				])
+			]));
+			var files = b.files || [];
+			if (!files.length) {
+				bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+					'Свежей копии нет — она создаётся автоматически перед каждым обновлением и при geomask --backup.'));
+			} else {
+				files.forEach(function (f) {
+					bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-val gs-mono' }, String(f.n || '')),
+						E('span', { 'class': 'gs-upd-meta' }, fmtSize(f.s) + ' · ' + String(f.t || '')),
+						E('span', {}, E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(unc + '\\' + String(f.n || ''), this); } }, 'Копировать путь к файлу'))
+					]));
+				});
+			}
+			bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+				'Хранится самая свежая копия (роутер экономит место); полная история — на ПК: geomask\\fetch_backup.ps1. ' +
+				'Провод Windows: Win+R → вставить скопированный путь. Восстановление: LuCI → System → Backup / Flash Firmware → Restore.'));
+		}
+		renderBk(bks);
 		var latest = upd.latest || {}, loc = upd.local || {};
 		var stack = upd.stack || [];
 		var updErr = upd.error || null;
@@ -452,6 +521,7 @@ return view.extend({
 						updStatus.appendChild(' ');
 						updStatus.appendChild(E('button', { 'class': 'gs-btn gs-btn-primary',
 							'click': function() { location.reload(); } }, 'Обновить страницу'));
+						callBackups().then(function(b) { renderBk(b || {}); });
 					} else if (ph === 'error') {
 						clearInterval(view._updTimer); view._updTimer = null;
 						updStatus.style.color = '#f85149';
@@ -471,8 +541,9 @@ return view.extend({
 				'Обновление geomask: полный бэкап роутера → скачивание релиза с GitHub (sha256) → ' +
 				'установка модулей и панели без перезапуска сервисов → после «Готово» обнови страницу (Ctrl+F5). ' +
 				'Каждый шаг пишется отдельной строкой в консоль ниже и в общий журнал (/root/geo-sync.log). ' +
-				'Бэкап перед обновлением кладется в /tmp роутера (исчезает после перезагрузки) — заберите его на ПК: ' +
-				'geomask\\fetch_backup.ps1 (путь и md5 видны в логе); восстановление — LuCI System → Backup / Flash Firmware → Restore.')
+				'Бэкап перед обновлением хранится в папке «Резервные копии» ниже (SMB-шар на роутере, ' +
+				'самая свежая копия; полная история на ПК — geomask\\fetch_backup.ps1); восстановление — ' +
+				'LuCI System → Backup / Flash Firmware → Restore.')
 		];
 		if (updErr) {
 			updChildren.push(E('div', { 'class': 'gs-row' }, [
@@ -534,6 +605,7 @@ return view.extend({
 			if (upd.checked_at) updChildren.push(E('div', { 'class': 'gs-upd-meta' },
 				'Проверено: ' + upd.checked_at + ' · источник: ' + (upd.src || '?') + (upd.need === true && latest.digest ? ' · sha256: ' + String(latest.digest).slice(0, 19) + '…' : '')));
 		}
+		updChildren.push(bkBox);
 		updChildren.push(updStatus);
 		updChildren.push(updLog);
 		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
@@ -562,7 +634,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);

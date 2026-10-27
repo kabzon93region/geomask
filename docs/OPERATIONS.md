@@ -12,7 +12,7 @@
 | Без вопросов | `+ --yes` | Не спрашивать подтверждений |
 | С рестартом | `+ --restart` | Разрешить перезапуск mihomo (обрыв ~3с). Игнорируется при `/root/.geomask-norestart` |
 | С подписками | `+ --vpn-url URL --ai-url URL` | Задать URL подписок |
-| Бэкап | `sh geomask.sh --backup` | Полный бэкап (`sysupgrade -b`) в `/tmp/geomask-backups/` (tmpfs — забрать на ПК, пропадет после перезагрузки) |
+| Бэкап | `sh geomask.sh --backup` | Полный бэкап (`sysupgrade -b`) в `/root/geomask-backups/` (SMB-шар `geomask-backups`, ротация: самая свежая одна) |
 
 ## Шаги
 
@@ -38,10 +38,10 @@ sha256 = digest релиза → sh new --reinstall --yes (файлы модул
 
 v1.8.0: каждый шаг — отдельная строка в тёмной консоли блока (источник —
 `/tmp/geomask-upd/steps.log`, поле `lines` в `upd_status`) и дубль в `/root/geo-sync.log`
-(`GEOMASK-UPD [...]`). Там же виден **путь, размер и md5 бэкапа**, созданного перед обновлением
-(`/tmp/router-backup-<ts>.tar.gz`, tmpfs — **исчезает после перезагрузки**): забрать на ПК —
-`powershell -File fetch_backup.ps1` (сам находит свежий архив, сверяет md5, кладёт в
-`Y:\openwrt\backup\`, копию на роутере удаляет). После успешного применения кэш `check.json`
+(`GEOMASK-UPD [...]`). В строках фазы backup — путь, размер и md5 архива; с v1.9.0 архив
+лежит в шаре `/root/geomask-backups` (SMB `\\<ip>\geomask-backups`, ротация: свежая одна) и
+виден блоком «Резервные копии» с кнопками копирования пути; забор полной истории на ПК —
+`powershell -File fetch_backup.ps1`. После успешного применения кэш `check.json`
 сбрасывается — версии на странице сразу показываются новые (фикс «после обновления показывает
 старую версию» из кэша 1 ч).
 
@@ -62,11 +62,16 @@ sh /usr/bin/geo-backend.sh upd_check force       # перепроверить в
 
 - Никаких `reboot`, не трогаем `network`/`pppoe`.
 - Перед каждой записью файла — копия `.bak_geomask_<timestamp>`.
-- Полный бэкап: `sh geomask.sh --backup` → `/tmp/geomask-backups/router-backup-<ts>.tar.gz`
-  (tmpfs, LuCI-совместимый архив; **не хранится на overlay** — c v1.8.1 старые копии в
-  `/root/geomask-backups/` автоматически удаляются, до этого они вложенно раздували каждый
-  следующий sysupgrade-архив). Забор на ПК: `fetch_backup.ps1` (md5-сверка + удаление копии
-  на роутере), восстановление — LuCI → Backup / Flash Firmware → Restore.
+- Полный бэкап: `sh geomask.sh --backup` → `/root/geomask-backups/router-backup-<ts>.tar.gz`
+  (LuCI-совместимый архив). С v1.9.0 папка **опубликована по SMB** шаром `geomask-backups`
+  (гостевой, только чтение) и видна блоком **«Резервные копии»** в карточке «Обновления»
+  панели — там же кнопки копирования путей `\\<ip>\geomask-backups` и `smb://<ip>/geomask-backups`.
+  Ротация: на роутере хранится самая свежая копия (предыдущая заменяется после успешной
+  сборки новой; сборка идёт в /tmp и переносится — вложения архивов невозможны). Полная
+  история — на ПК: `geomask/fetch_backup.ps1` (автопоиск, scp, md5, удаление копии на роутере).
+  Восстановление — LuCI → System → Backup / Flash Firmware → Restore (файл с ПК).
+  ⚠ Архив содержит ключи/подписки: гостевой доступ = вся LAN (как и существующий шар
+  `configs`); при ужесточении — `guest_ok=no` + пользователь ksmbd в LuCI.
 - Перед рестартом mihomo (шаг 3 с `--restart`): авто-бэкап → trial-run копии конфига в
   `/tmp/gm-trial-*` на портах 17890/17901/19090 → рестарт → проверка pid + API; при провале —
   **автоматический откат**.

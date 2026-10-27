@@ -12,7 +12,7 @@
 | Без вопросов | `+ --yes` | Не спрашивать подтверждений |
 | С рестартом | `+ --restart` | Разрешить перезапуск mihomo (обрыв ~3с). Игнорируется при `/root/.geomask-norestart` |
 | С подписками | `+ --vpn-url URL --ai-url URL` | Задать URL подписок |
-| Бэкап | `sh geomask.sh --backup` | Полный бэкап (`sysupgrade -b`) в `/root/geomask-backups/` |
+| Бэкап | `sh geomask.sh --backup` | Полный бэкап (`sysupgrade -b`) в `/tmp/geomask-backups/` (tmpfs — забрать на ПК, пропадет после перезагрузки) |
 
 ## Шаги
 
@@ -62,7 +62,11 @@ sh /usr/bin/geo-backend.sh upd_check force       # перепроверить в
 
 - Никаких `reboot`, не трогаем `network`/`pppoe`.
 - Перед каждой записью файла — копия `.bak_geomask_<timestamp>`.
-- Полный бэкап: `sh geomask.sh --backup` (`/root/geomask-backups/`, LuCI-совместимый архив).
+- Полный бэкап: `sh geomask.sh --backup` → `/tmp/geomask-backups/router-backup-<ts>.tar.gz`
+  (tmpfs, LuCI-совместимый архив; **не хранится на overlay** — c v1.8.1 старые копии в
+  `/root/geomask-backups/` автоматически удаляются, до этого они вложенно раздували каждый
+  следующий sysupgrade-архив). Забор на ПК: `fetch_backup.ps1` (md5-сверка + удаление копии
+  на роутере), восстановление — LuCI → Backup / Flash Firmware → Restore.
 - Перед рестартом mihomo (шаг 3 с `--restart`): авто-бэкап → trial-run копии конфига в
   `/tmp/gm-trial-*` на портах 17890/17901/19090 → рестарт → проверка pid + API; при провале —
   **автоматический откат**.

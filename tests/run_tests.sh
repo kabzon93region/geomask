@@ -270,10 +270,16 @@ for _m in upd_check upd_apply upd_status; do
   else echo "FAIL: S12 $_m refs=$_c (want >=3)"; failn=$((failn+1)); fi
 done
 # 4) update runner sanity: backup first, digest check, no-restart install
-for _p in 'sysupgrade -b' 'sha256 mismatch' 'reinstall --yes' 'rpcd reload'; do
+for _p in 'sysupgrade -b' 'sha256 mismatch' 'reinstall --yes' 'rpcd reload' 'wc -c < "$BK"' 'rm -f /tmp/router-backup-'; do
   if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S12 runner has: $_p"; pass=$((pass+1))
   else echo "FAIL: S12 runner missing: $_p"; failn=$((failn+1)); fi
 done
+# 5) v1.8.1: backups must not live on overlay (sysupgrade -b archives /root -> nesting)
+if grep -qF '/tmp/geomask-backups' "$SCRIPT" && ! grep -qF '_bkdir="$(P /root/geomask-backups)"' "$SCRIPT"; then
+  echo "PASS: S12 ensure_backup uses tmpfs, no overlay dir writes"; pass=$((pass+1))
+else
+  echo "FAIL: S12 ensure_backup still writes /root/geomask-backups"; failn=$((failn+1))
+fi
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

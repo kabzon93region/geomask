@@ -23,14 +23,14 @@
 #
 # SAFETY: never reboots the router; never restarts working services (only starts missing ones);
 #         never touches network/pppoe config; backups before every file write and before ANY
-#         mihomo restart (full settings backup via sysupgrade -b -> /root/geomask-backups/);
+#         mihomo restart (full settings backup via sysupgrade -b -> /tmp/geomask-backups/,
 #         mihomo restart = trial-run on shifted ports FIRST, restart only if the trial starts,
 #         and automatic rollback to the previous config if the restarted service does not
 #         answer. Hard pin: /root/.geomask-norestart disables --restart entirely.
 
 set -u
 
-GM_VERSION="1.8.0"
+GM_VERSION="1.8.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -157,7 +157,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.8.0"
+BACKEND_VERSION="1.8.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -970,12 +970,13 @@ say queued "update to $TAG started"
 say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/tmp/router-backup-$TS.tar.gz
+rm -f /tmp/router-backup-*.tar.gz 2>/dev/null   # tmpfs hygiene: fetch (fetch_backup.ps1) older ones first
 if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
   say error "backup failed - update aborted"; exit 1
 fi
 _md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
 echo "file=$BK md5=$_md" > "$D/backup.info"
-say backup "backup OK: $BK ($(stat -c %s "$BK") bytes, md5 $_md)"
+say backup "backup OK: $BK ($(wc -c < "$BK") bytes, md5 $_md)"
 say backup "backup saved on router in RAM (/tmp) - copy it to PC now: run fetch_backup.ps1 or scp root@<lan-ip>:$BK; lost after reboot. Restore: LuCI System -> Backup / Flash Firmware -> Restore"
 say download "downloading geomask $TAG..."
 rm -f "$D/geomask.sh.new"
@@ -983,7 +984,7 @@ if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon
    ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://github.com/kabzon93region/geomask/releases/download/${TAG}/geomask.sh"; then
   say error "download failed (jsdelivr + github)"; exit 1
 fi
-say download "downloaded $(stat -c %s "$D/geomask.sh.new") bytes"
+say download "downloaded $(wc -c < "$D/geomask.sh.new") bytes"
 say validate "checking syntax (sh -n)..."
 if ! sh -n "$D/geomask.sh.new"; then say error "syntax check failed"; exit 1; fi
 NEWV=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$D/geomask.sh.new" | head -1)
@@ -1184,7 +1185,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.8.0';
+var PANEL_VERSION = '1.8.1';
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -1996,10 +1997,16 @@ api_refresh_provider() { # api_refresh_provider <name> <url>
 
 # ============================================================ SAFETY layer
 # full settings backup (restorable via LuCI) - MANDATORY before any router change
+# v1.8.1: written to tmpfs (/tmp/geomask-backups), NOT to overlay /root: sysupgrade -b
+#         archives /root, so /root/geomask-backups was nested into every next backup
+#         (bloat + overlay filled to 66%, found 27.10). Old overlay copies are removed
+#         on first run (policy 22.10: backups live on the PC, fetch with fetch_backup.ps1).
 ensure_backup() { # -> path on stdout, rc=1 on failure
   _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
-  _bkdir="$(P /root/geomask-backups)"
+  _bkdir="$(P /tmp/geomask-backups)"
   mkdir -p "$_bkdir" 2>/dev/null
+  find "$(P /root/geomask-backups)" -maxdepth 1 -name 'router-backup-*.tar.gz' -delete 2>/dev/null
+  find "$_bkdir" -maxdepth 1 -name 'router-backup-*.tar.gz' -delete 2>/dev/null
   _out="$_bkdir/router-backup-$_ts.tar.gz"
   if have sysupgrade; then
     if ! sysupgrade -b "$_out" >/dev/null 2>&1 || [ ! -s "$_out" ]; then _out=""; fi
@@ -2757,7 +2764,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.8.0"
+GUARD_VERSION="1.8.1"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -3365,7 +3372,7 @@ fi
 
 RC=0
 if [ "$GM_BACKUP" = 1 ]; then
-  _b=$(ensure_backup) && { info "full backup created: $_b"; info "policy: copy it to the PC now (scp / geomask fetch_backup.ps1) - do NOT keep backups on the router (overlay space); LuCI Backup/Restore accepts this file"; RC=0; } || RC=1
+  _b=$(ensure_backup) && { info "full backup created: $_b"; info "policy: copy it to the PC now (scp / geomask fetch_backup.ps1) - tmpfs: lost after reboot; LuCI Backup/Restore accepts this file"; RC=0; } || RC=1
 elif [ "$GM_REINSTALL" = 1 ]; then
   menu_reinstall || RC=1
 elif [ -n "$GM_STEP" ]; then

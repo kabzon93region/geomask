@@ -842,12 +842,13 @@ say queued "update to $TAG started"
 say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/tmp/router-backup-$TS.tar.gz
+rm -f /tmp/router-backup-*.tar.gz 2>/dev/null   # tmpfs hygiene: fetch (fetch_backup.ps1) older ones first
 if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
   say error "backup failed - update aborted"; exit 1
 fi
 _md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
 echo "file=$BK md5=$_md" > "$D/backup.info"
-say backup "backup OK: $BK ($(stat -c %s "$BK") bytes, md5 $_md)"
+say backup "backup OK: $BK ($(wc -c < "$BK") bytes, md5 $_md)"
 say backup "backup saved on router in RAM (/tmp) - copy it to PC now: run fetch_backup.ps1 or scp root@<lan-ip>:$BK; lost after reboot. Restore: LuCI System -> Backup / Flash Firmware -> Restore"
 say download "downloading geomask $TAG..."
 rm -f "$D/geomask.sh.new"
@@ -855,7 +856,7 @@ if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon
    ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://github.com/kabzon93region/geomask/releases/download/${TAG}/geomask.sh"; then
   say error "download failed (jsdelivr + github)"; exit 1
 fi
-say download "downloaded $(stat -c %s "$D/geomask.sh.new") bytes"
+say download "downloaded $(wc -c < "$D/geomask.sh.new") bytes"
 say validate "checking syntax (sh -n)..."
 if ! sh -n "$D/geomask.sh.new"; then say error "syntax check failed"; exit 1; fi
 NEWV=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$D/geomask.sh.new" | head -1)

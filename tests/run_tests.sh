@@ -329,6 +329,12 @@ if grep -qF '_unc=$(json_esc' "$SCRIPT" && grep -qF '_j=$(printf' "$SCRIPT"; the
 else
   echo "FAIL: S13 missing json escaping of backslash paths"; failn=$((failn+1))
 fi
+# v1.9.5: force_root for /root paths + auth user (Windows blocks insecure-guest)
+if grep -qF 'force_root=1' "$SCRIPT" && grep -qF '.geomask-smb.pass' "$SCRIPT" && grep -qF 'ksmbd.adduser geomask' "$SCRIPT"; then
+  echo "PASS: S13 force_root + geomask auth user"; pass=$((pass+1))
+else
+  echo "FAIL: S13 SMB auth setup missing"; failn=$((failn+1))
+fi
 # backup must be built in /tmp then moved (never let an older /root copy nest into sysupgrade -b)
 if grep -qF 'geomask-bk-$' "$SCRIPT" && grep -qF 'mv -f "$_out" "$_dest"' "$SCRIPT"; then
   echo "PASS: S13 ensure_backup: build in tmp + move (no nesting)"; pass=$((pass+1))

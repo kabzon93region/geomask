@@ -489,6 +489,14 @@ return view.extend({
 			bkBox.appendChild(E('div', { 'class': 'gs-hint' },
 				'Хранится самая свежая копия (роутер экономит место); полная история — на ПК: geomask\\fetch_backup.ps1. ' +
 				'Провод Windows: Win+R → вставить скопированный путь. Восстановление: LuCI → System → Backup / Flash Firmware → Restore.'));
+			if (b.user && b.pass) {
+				var nu = 'net use ' + unc + ' /user:' + b.user + ' ' + b.pass + ' /persistent:yes';
+				bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
+					E('span', { 'class': 'gs-label' }, 'Windows: вход по логину (гость блокируется политикой)'),
+					E('span', { 'class': 'gs-mono gs-upd-meta' }, b.user + ' / ' + b.pass),
+					E('span', {}, E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(nu, this); } }, 'Копировать net use'))
+				]));
+			}
 		}
 		renderBk(bks);
 		var latest = upd.latest || {}, loc = upd.local || {};

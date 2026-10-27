@@ -323,6 +323,12 @@ if grep -qF 's/^\(ksmbd\.[^=]*\)=share$/\1/p' "$SCRIPT" && grep -qF 'duplicate s
 else
   echo "FAIL: S13 section enumeration broken"; failn=$((failn+1))
 fi
+# v1.9.4: backslashes must be JSON-escaped (rpcd rejects invalid \g escapes -> Invalid argument)
+if grep -qF '_unc=$(json_esc' "$SCRIPT" && grep -qF '_j=$(printf' "$SCRIPT"; then
+  echo "PASS: S13 UNC/say JSON escaping present"; pass=$((pass+1))
+else
+  echo "FAIL: S13 missing json escaping of backslash paths"; failn=$((failn+1))
+fi
 # backup must be built in /tmp then moved (never let an older /root copy nest into sysupgrade -b)
 if grep -qF 'geomask-bk-$' "$SCRIPT" && grep -qF 'mv -f "$_out" "$_dest"' "$SCRIPT"; then
   echo "PASS: S13 ensure_backup: build in tmp + move (no nesting)"; pass=$((pass+1))

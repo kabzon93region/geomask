@@ -812,23 +812,26 @@ _upd_running() {
 cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
 
 # v1.9.0: backup folder inventory for the panel (SMB link + files list, newest first)
+# v1.9.4: UNC contains backslashes - MUST go through json_esc (raw \g breaks rpcd parsing)
 cmd_backups() {
   DIR=/root/geomask-backups
   LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
   [ -n "$LANIP" ] || LANIP=192.168.0.1
   _sh=false
   grep -qF '[geomask-backups]' /etc/ksmbd/ksmbd.conf 2>/dev/null && _sh=true
+  _unc=$(json_esc "$(printf '\\\\%s\\geomask-backups' "$LANIP")")
+  _smbu=$(json_esc "$(printf 'smb://%s/geomask-backups' "$LANIP")")
   _files=''
   for f in $(ls -t "$DIR"/router-backup-*.tar.gz 2>/dev/null); do
     [ -f "$f" ] || continue
-    _n=${f##*/}
+    _n=$(basename "$f")
     _sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
     _t=$(date -r "$f" '+%F %T' 2>/dev/null)
     _files="$_files{\"n\":\"$_n\",\"s\":${_sz:-0},\"t\":\"$_t\"},"
   done
   _files=${_files%,}
-  printf '{"ok":true,"dir":"%s","unc":"\\\\%s\\geomask-backups","smb":"smb://%s/geomask-backups","share_ok":%s,"files":[%s]}\n' \
-    "$DIR" "$LANIP" "$LANIP" "$_sh" "$_files"
+  printf '{"ok":true,"dir":"%s","unc":"%s","smb":"%s","share_ok":%s,"files":[%s]}\n' \
+    "$DIR" "$_unc" "$_smbu" "$_sh" "$_files"
 }
 
 cmd_upd_status() {
@@ -855,7 +858,7 @@ D=/tmp/geomask-upd
 ST=$D/status.json
 SL=$D/steps.log
 LOGF=/root/geo-sync.log
-say() { _t=$(date '+%F %T'); printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$2" "$_t" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; printf '%s [%s] %s\n' "$_t" "$1" "$2" >> "$SL"; printf '%s GEOMASK-UPD [%s] %s\n' "$_t" "$1" "$2" >> "$LOGF"; }
+say() { _t=$(date '+%F %T'); _j=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g'); printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$_j" "$_t" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; printf '%s [%s] %s\n' "$_t" "$1" "$2" >> "$SL"; printf '%s GEOMASK-UPD [%s] %s\n' "$_t" "$1" "$2" >> "$LOGF"; }
 trap 'rm -f "$D/pid"' EXIT
 TAG="$1"
 say queued "update to $TAG started"

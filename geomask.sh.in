@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.9.3"
+GM_VERSION="1.9.4"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0

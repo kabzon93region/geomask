@@ -300,6 +300,12 @@ if [ "$_c" -ge 8 ]; then echo "PASS: S13 backups wired across layers ($_c refs)"
 else echo "FAIL: S13 backups refs=$_c (want >=8)"; failn=$((failn+1)); fi
 if grep -qF '"backups"' "$SCRIPT"; then echo "PASS: S13 acl/rpcd method present"; pass=$((pass+1))
 else echo "FAIL: S13 no \"backups\" method"; failn=$((failn+1)); fi
+# v1.9.1: uci section must be captured from 'uci add' output (no @share[last] syntax support)
+if grep -qF '_sec=$(uci add ksmbd share' "$SCRIPT" && ! grep -qF '@share[last]' "$SCRIPT"; then
+  echo "PASS: S13 uci section id captured correctly"; pass=$((pass+1))
+else
+  echo "FAIL: S13 bad uci section handling"; failn=$((failn+1))
+fi
 # backup must be built in /tmp then moved (never let an older /root copy nest into sysupgrade -b)
 if grep -qF 'geomask-bk-$' "$SCRIPT" && grep -qF 'mv -f "$_out" "$_dest"' "$SCRIPT"; then
   echo "PASS: S13 ensure_backup: build in tmp + move (no nesting)"; pass=$((pass+1))

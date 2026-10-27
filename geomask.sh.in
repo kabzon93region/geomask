@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.9.0"
+GM_VERSION="1.9.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -459,34 +459,37 @@ ensure_smb_share() {
   have uci || { warn "no uci - SMB share skipped"; return 0; }
   mkdir -p "$(P $BACKUP_DIR)" 2>/dev/null
   chmod 755 "$(P $BACKUP_DIR)" 2>/dev/null
+  # purge leftover share sections without a name (older bug wrote an empty 'config share')
+  for s in $(uci show ksmbd 2>/dev/null | sed -n 's/^\(ksmbd\.[A-Za-z0-9_]*\)=share$/\1/p'); do
+    _sn=$(uci -q get "$s.name" 2>/dev/null)
+    [ -z "$_sn" ] && uci delete "$s" 2>/dev/null
+  done
   _found=""
-  _i=0
-  while [ $_i -lt 20 ]; do
-    _n=$(uci -q get "ksmbd.@share[$_i].name" 2>/dev/null)
-    [ -z "$_n" ] && break
-    [ "$_n" = "$SMB_SHARE_NAME" ] && _found=$_i && break
-    _i=$((_i+1))
+  for s in $(uci show ksmbd 2>/dev/null | sed -n 's/^\(ksmbd\.[A-Za-z0-9_]*\)=share$/\1/p'); do
+    _sn=$(uci -q get "$s.name" 2>/dev/null)
+    [ "$_sn" = "$SMB_SHARE_NAME" ] && _found=$s && break
   done
   _changed=0
   if [ -z "$_found" ]; then
-    uci add ksmbd share >/dev/null && _found=last
-    uci set "ksmbd.@share[$_found].name=$SMB_SHARE_NAME"
-    uci set "ksmbd.@share[$_found].path=$BACKUP_DIR"
-    uci set "ksmbd.@share[$_found].read_only='1'"
-    uci set "ksmbd.@share[$_found].guest_ok='1'"
+    _sec=$(uci add ksmbd share 2>/dev/null)
+    [ -n "$_sec" ] || { warn "uci add failed - SMB share skipped"; return 0; }
+    uci set "ksmbd.$_sec.name=$SMB_SHARE_NAME"
+    uci set "ksmbd.$_sec.path=$BACKUP_DIR"
+    uci set "ksmbd.$_sec.read_only='1'"
+    uci set "ksmbd.$_sec.guest_ok='1'"
     uci commit ksmbd
     _changed=1
-    info "SMB share '$SMB_SHARE_NAME' -> $BACKUP_DIR (guest, read-only): created"
+    info "SMB share '$SMB_SHARE_NAME' -> $BACKUP_DIR (guest, read-only): created (section $_sec)"
   else
-    _p=$(uci -q get "ksmbd.@share[$_found].path" 2>/dev/null)
-    [ "$_p" != "$BACKUP_DIR" ] && {
-      uci set "ksmbd.@share[$_found].path=$BACKUP_DIR"
-      uci set "ksmbd.@share[$_found].read_only='1'"
-      uci set "ksmbd.@share[$_found].guest_ok='1'"
+    _p=$(uci -q get "$_found.path" 2>/dev/null)
+    if [ "$_p" != "$BACKUP_DIR" ]; then
+      uci set "$_found.path=$BACKUP_DIR"
+      uci set "$_found.read_only='1'"
+      uci set "$_found.guest_ok='1'"
       uci commit ksmbd
       _changed=1
       info "SMB share '$SMB_SHARE_NAME': path fixed -> $BACKUP_DIR"
-    }
+    fi
   fi
   if [ "$_changed" = 1 ]; then
     # restart ONLY the file server (not the network stack); verify right away

@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.8.1"
+GM_VERSION="1.8.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -414,8 +414,8 @@ ensure_backup() { # -> path on stdout, rc=1 on failure
   _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
   _bkdir="$(P /tmp/geomask-backups)"
   mkdir -p "$_bkdir" 2>/dev/null
-  find "$(P /root/geomask-backups)" -maxdepth 1 -name 'router-backup-*.tar.gz' -delete 2>/dev/null
-  find "$_bkdir" -maxdepth 1 -name 'router-backup-*.tar.gz' -delete 2>/dev/null
+  rm -f "$(P /root/geomask-backups)"/router-backup-*.tar.gz 2>/dev/null
+  rm -f "$_bkdir"/router-backup-*.tar.gz 2>/dev/null
   _out="$_bkdir/router-backup-$_ts.tar.gz"
   if have sysupgrade; then
     if ! sysupgrade -b "$_out" >/dev/null 2>&1 || [ ! -s "$_out" ]; then _out=""; fi

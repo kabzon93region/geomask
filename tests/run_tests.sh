@@ -280,6 +280,12 @@ if grep -qF '/tmp/geomask-backups' "$SCRIPT" && ! grep -qF '_bkdir="$(P /root/ge
 else
   echo "FAIL: S12 ensure_backup still writes /root/geomask-backups"; failn=$((failn+1))
 fi
+# 6) busybox find has no -delete on OpenWrt - purge must use rm -f globs
+if grep -q -- '-delete' "$SCRIPT"; then
+  echo "FAIL: S12 uses unsupported 'find -delete'"; failn=$((failn+1))
+else
+  echo "PASS: S12 no find -delete (busybox-safe)"; pass=$((pass+1))
+fi
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

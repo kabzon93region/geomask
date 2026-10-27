@@ -30,7 +30,7 @@
 
 set -u
 
-GM_VERSION="1.8.1"
+GM_VERSION="1.8.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -157,7 +157,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.8.1"
+BACKEND_VERSION="1.8.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1185,7 +1185,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.8.1';
+var PANEL_VERSION = '1.8.2';
 
 var CCNAME = {
 	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
@@ -2005,8 +2005,8 @@ ensure_backup() { # -> path on stdout, rc=1 on failure
   _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
   _bkdir="$(P /tmp/geomask-backups)"
   mkdir -p "$_bkdir" 2>/dev/null
-  find "$(P /root/geomask-backups)" -maxdepth 1 -name 'router-backup-*.tar.gz' -delete 2>/dev/null
-  find "$_bkdir" -maxdepth 1 -name 'router-backup-*.tar.gz' -delete 2>/dev/null
+  rm -f "$(P /root/geomask-backups)"/router-backup-*.tar.gz 2>/dev/null
+  rm -f "$_bkdir"/router-backup-*.tar.gz 2>/dev/null
   _out="$_bkdir/router-backup-$_ts.tar.gz"
   if have sysupgrade; then
     if ! sysupgrade -b "$_out" >/dev/null 2>&1 || [ ! -s "$_out" ]; then _out=""; fi
@@ -2764,7 +2764,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.8.1"
+GUARD_VERSION="1.8.2"
 
 log() { logger -t geomask-guard "$*"; }
 

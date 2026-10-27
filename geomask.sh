@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.10.0"
+GM_VERSION="1.10.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -163,7 +163,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.10.0"
+BACKEND_VERSION="1.10.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -952,9 +952,9 @@ cmd_stack() {
   _sync=$(cat /tmp/geomask-sync.state 2>/dev/null)
   case "$_sync" in '{'*'}'*) : ;; *) _sync='{"ts":"","changed":false,"reload":null,"mt":0,"ai":0,"moved":0}' ;; esac
   _sd=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _sd=true
-  _guard=$(logread 2>/dev/null | grep geomask-guard | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  _guard=$(logread 2>/dev/null | grep geomask-guard | grep -v crond | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
   _pin=false; [ -e /root/.geomask-norestart ] && _pin=true
-  _strat=$(sed -n "/option NFQWS_OPT '/,+1p" /etc/config/zapret 2>/dev/null | tail -1 | tr -d " \t'" | json_esc)
+  _strat=$(json_esc "$(sed -n "/option NFQWS_OPT '/,+1p" /etc/config/zapret 2>/dev/null | tail -1 | tr -d " \t'")")
   _nu=$(grep -c . /opt/zapret/ipset/zapret-hosts-user.txt 2>/dev/null)
   _ne=$(grep -c . /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)
   _nc=$(grep -cE '#[[:space:]]*nochange' /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)
@@ -1255,7 +1255,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.10.0';
+var PANEL_VERSION = '1.10.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -3082,7 +3082,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.10.0"
+GUARD_VERSION="1.10.1"
 
 log() { logger -t geomask-guard "$*"; }
 

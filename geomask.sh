@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.10.2"
+GM_VERSION="1.11.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -163,7 +163,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.10.2"
+BACKEND_VERSION="1.11.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -952,6 +952,8 @@ cmd_stack() {
   _sync=$(cat /tmp/geomask-sync.state 2>/dev/null)
   case "$_sync" in '{'*'}'*) : ;; *) _sync='{"ts":"","changed":false,"reload":null,"mt":0,"ai":0,"moved":0}' ;; esac
   _sd=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _sd=true
+  _ns=$(cat /tmp/geomask-nodescan.state 2>/dev/null)
+  case "$_ns" in '{'*'}'*) : ;; *) _ns='null' ;; esac
   _guard=$(logread 2>/dev/null | grep geomask-guard | grep -v crond | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
   _pin=false; [ -e /root/.geomask-norestart ] && _pin=true
   _strat=$(json_esc "$(sed -n "/option NFQWS_OPT '/,+1p" /etc/config/zapret 2>/dev/null | tail -1 | tr -d " \t'")")
@@ -962,8 +964,8 @@ cmd_stack() {
   _nr=$(grep -c . /opt/zapret/ipset/zapret-hosts-rkn.txt 2>/dev/null)
   _nt=$(pgrep -c -f tg-ws-proxy 2>/dev/null)
   _land=false; wget -q -T 3 -O /dev/null http://127.0.0.1:8000/ 2>/dev/null && _land=true
-  printf '{"ok":true,"sync":%s,"syncd":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
-    "$_sync" "$_sd" "$_guard" "$_pin" "$_strat" \
+  printf '{"ok":true,"sync":%s,"syncd":%s,"nodescan":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
+    "$_sync" "$_sd" "$_ns" "$_guard" "$_pin" "$_strat" \
     "${_nu:-0}" "${_ne:-0}" "${_nc:-0}" "${_ng:-0}" "${_nr:-0}" \
     "${_nt:-0}" "$_land" "$LANIP" "$LANIP" "$LANIP" "$LANIP"
 }
@@ -1083,6 +1085,9 @@ case "$1" in
   log)        cmd_log ;;
   backups)    cmd_backups ;;
   stack)      cmd_stack ;;
+  nodescan)   # kick the node audit in background (returns immediately; panel re-reads stack)
+    ( /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 & )
+    printf '{"ok":true,"started":true}\n' ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;
@@ -1120,6 +1125,7 @@ list_methods() {
 	json_add_object "log";        json_close_object
 	json_add_object "backups";    json_close_object
 	json_add_object "stack";      json_close_object
+	json_add_object "nodescan";   json_close_object
 	json_add_object "sync_lists"; json_close_object
 	json_add_object "google";     json_close_object
 	json_add_object "global";     json_add_string "mode" "string"; json_close_object
@@ -1151,6 +1157,7 @@ call_method() {
 		log)        "$BACKEND" log ;;
 		backups)    "$BACKEND" backups ;;
 		stack)      "$BACKEND" stack ;;
+		nodescan)   "$BACKEND" nodescan ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;
@@ -1202,7 +1209,7 @@ ASSET_EOF
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply" ]
+				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan" ]
 			}
 		}
 	}
@@ -1236,6 +1243,7 @@ var callLeases = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} 
 var callLog    = rpc.declare({ object: 'geo-sync', method: 'log',    expect: {} });
 var callBackups = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
 var callStack  = rpc.declare({ object: 'geo-sync', method: 'stack', expect: {} });
+var callNodescan = rpc.declare({ object: 'geo-sync', method: 'nodescan', expect: {} });
 var callLists  = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
 var callGoogle = rpc.declare({ object: 'geo-sync', method: 'google',  expect: {} });
 /* params as OBJECT (not array): array form expects positional args and would
@@ -1255,7 +1263,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.10.2';
+var PANEL_VERSION = '1.11.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1558,6 +1566,19 @@ return view.extend({
 				});
 			} }, 'Что видит Google?');
 
+		var btnScan = E('button', { 'class': 'gs-btn',
+			'click': function() {
+				btnScan.disabled = true; btnScan.textContent = 'Проверка…';
+				callNodescan().then(function() {
+					btnScan.textContent = 'Проверить узлы сейчас';
+					ui.addNotification(null, E('p', {}, 'Аудит узлов запущен в фоне (до ~1 минуты); итог появится в этой карточке после обновления.'), 'info');
+					setTimeout(function() { view.reload(); }, 45000);
+				}).catch(function(e) {
+					btnScan.disabled = false; btnScan.textContent = 'Проверить узлы сейчас';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Проверить узлы сейчас');
+
 		var syncCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Синхронизация и проверка'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 6px' },
@@ -1580,6 +1601,14 @@ return view.extend({
 					E('span', { 'class': (stk.syncd ? 'gs-val' : 'gs-val gs-badge gs-warn') }, syncTxt)
 				]));
 				if (stk.ok === true) {
+					var ns = stk.nodescan;
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'Узлы подписки (аудит)'),
+						E('span', { 'class': 'gs-val gs-upd-meta' },
+							ns ? (ns.ts + ' · узлов ' + ns.total + ', с РФ-меткой ' + ns.blocked
+								+ (ns.changed ? ' (фильтр обновлён)' : '') + (ns.errors ? ' · сбоевlookup: ' + ns.errors : ''))
+								: 'ночной скан ещё не запускался (03:30)')
+					]));
 					var L = stk.lists || {}, H = stk.health || {};
 					rows.push(E('div', { 'class': 'gs-row' }, [
 						E('span', { 'class': 'gs-label' }, 'DPI (zapret)'),
@@ -1611,7 +1640,7 @@ return view.extend({
 				}
 				return E('div', { 'style': 'margin:0 0 8px' }, rows);
 			})(),
-			E('div', { 'class': 'gs-actions' }, [ btnLists, btnGoogle ]),
+			E('div', { 'class': 'gs-actions' }, [ btnLists, btnGoogle, btnScan ]),
 			listsOut
 		]);
 		wrap.appendChild(syncCard);
@@ -2591,6 +2620,10 @@ step5_check() {
   if [ -x "$(P /usr/bin/geomask-guard.sh)" ]; then info "guard: present"; else bad "guard missing: /usr/bin/geomask-guard.sh"; _need=1; fi
   if [ -x "$(P /etc/hotplug.d/iface/99-geomask-guard)" ]; then info "guard hotplug: present"; else bad "guard hotplug missing"; _need=1; fi
   if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then info "guard cron */5: present"; else bad "guard cron missing"; _need=1; fi
+  # v1.11.0: node audit plumbing
+  if [ -x "$(P /usr/bin/geomask-node-scan.sh)" ] && [ -s "$(P /etc/geomask-nodes.conf)" ]; then info "node-scan: installed"
+  else bad "node-scan missing (script/conf)"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then info "nodescan cron 03:30: present"; else bad "nodescan cron missing"; _need=1; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -3082,7 +3115,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.10.2"
+GUARD_VERSION="1.11.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -3276,6 +3309,201 @@ ASSET_EOF
     info "cron already present"
   else
     ( crontab -l 2>/dev/null; echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' ) | crontab - 2>/dev/null && info "cron added: */5 sync" || warn "cannot set crontab"
+  fi
+  # v1.11.0: nightly node audit (registry check of every subscription server)
+  save_stream /usr/bin/geomask-node-scan.sh 755 <<'ASSET_EOF'
+#!/bin/sh
+# geomask-node-scan.sh - nightly subscription node audit (geomask v1.11.0+).
+# Downloads the VPN subscription, resolves every node SERVER through a geo db
+# (country + ASN), blocks nodes matching bad_countries/bad_asns by adding their
+# exact names to the VPN group exclude-filter, unblocks clean ones, validates
+# (mihomo -t) and hot-reloads ONLY when the filter changed. Never selects nodes,
+# never touches traffic. Config: /etc/geomask-nodes.conf.
+exec python3 - <<'PYEOF'
+import re, sys, json, time, urllib.request, urllib.parse, subprocess, os
+
+CONF='/etc/geomask-nodes.conf'
+CFG='/etc/mihomo/config.yaml'
+BLOCKF='/etc/geomask-node-block.txt'
+STATE='/tmp/geomask-nodescan.state'
+LOG='/root/geo-sync.log'
+
+def log(msg):
+    line='%s NODESCAN %s\n' % (time.strftime('%F %T'), msg)
+    try:
+        with open(LOG,'a') as f: f.write(line)
+    except Exception: pass
+
+cfgd={}
+try:
+    for ln in open(CONF, encoding='utf-8'):
+        ln=ln.strip()
+        if ln and not ln.startswith('#') and '=' in ln:
+            k,_,v=ln.partition('='); cfgd[k.strip()]=v.strip()
+except Exception as e:
+    log('conf read failed: %s' % e); sys.exit(1)
+
+bad_countries={c.strip().upper() for c in cfgd.get('bad_countries','RU,BY').split(',') if c.strip()}
+bad_asns={('AS'+a.replace('AS','').strip().upper()) for a in cfgd.get('bad_asns','').split(',') if a.strip()}
+base_filter=cfgd.get('base_filter','Россия')
+provider=cfgd.get('sub_provider','sub')
+
+text=open(CFG, encoding='utf-8').read()
+# provider url (+ optional header x-hwid lines)
+m=re.search(r'%s:\s*\n(?:[^\n]*\n)*?\s*url:\s*"?([^"\n]+)"?' % re.escape(provider), text)
+if not m:
+    log('provider %s url not found' % provider); sys.exit(1)
+url=m.group(1).strip()
+hdrs={}
+hm=re.search(r'%s:\s*\n((?:[^\n]*\n)*?)\s*url:' % re.escape(provider), text)
+if hm and 'x-hwid' in hm.group(1):
+    hv=re.search(r'-\s*"?([^"\n]+)"?', hm.group(1)[hm.group(1).find('x-hwid'):])
+    if hv: hdrs['x-hwid']=hv.group(1).strip()
+
+try:
+    req=urllib.request.Request(url, headers=hdrs)
+    raw=urllib.request.urlopen(req, timeout=25).read().decode('utf-8','replace')
+except Exception as e:
+    log('subscription download failed: %s' % e); sys.exit(1)
+sub_text=raw
+if not re.search(r'(?m)^(vless|ss|trojan|vmess|anytls|hysteria2?)://', raw):
+    try:
+        import base64
+        sub_text=base64.b64decode(raw.strip()+'===').decode('utf-8','replace')
+    except Exception:
+        pass
+
+nodes=[]
+for ln in sub_text.splitlines():
+    ln=ln.strip()
+    mm=re.match(r'^(vless|ss|trojan|vmess|anytls|hysteria2?)://\S+', ln, re.I)
+    if not mm: continue
+    frag=''
+    if '#' in ln:
+        frag=ln.split('#',1)[1]
+        frag=urllib.parse.unquote(frag.split('|')[0]).strip()
+    srv=None
+    sm=re.search(r'@([A-Za-z0-9.\-]+):(\d+)', ln)
+    if sm: srv=sm.group(1)
+    if frag and srv and frag.lower()!='ip':
+        nodes.append((frag, srv))
+# yaml-style provider cache fallback
+if not nodes:
+    for nm,sv in re.findall(r'-\s*name:\s*"?([^"\n]+)"?\s*\n\s*server:\s*"?([^"\n]+)"?', sub_text):
+        nodes.append((nm.strip(), sv.strip()))
+
+if not nodes:
+    log('no nodes parsed from subscription'); sys.exit(1)
+
+# geodb per unique server (cached)
+cache={}
+def lookup(host):
+    if host in cache: return cache[host]
+    r=('', '')
+    try:
+        j=json.load(urllib.request.urlopen('http://ip-api.com/json/%s?fields=status,countryCode,as' % host, timeout=10))
+        if j.get('status')=='success':
+            r=(j.get('countryCode',''), (j.get('as','').split(' ')[0]).upper())
+    except Exception:
+        r=None
+    cache[host]=r
+    return r
+
+blocked=set(); total=0; errs=0
+for name, srv in nodes:
+    total+=1
+    res=lookup(srv)
+    if res is None:
+        errs+=1
+        continue  # lookup failed: keep node as-is (do not block on doubt)
+    cc, asn = res
+    bad = (cc in bad_countries) or (asn in bad_asns)
+    if bad:
+        blocked.add(name)
+
+# compose exclude-filter: base + exact blocked names (regex-escaped)
+parts=[base_filter.strip()] if base_filter.strip() else []
+for nm in sorted(blocked):
+    parts.append(re.escape(nm))
+new_filter='|'.join(parts)
+
+def apply_filter(cfgtext, filt):
+    # escape for double-quoted YAML scalar
+    esc=filt.replace('\\','\\\\').replace('"','\\"')
+    old=re.search(r'(exclude-filter: )"([^"]*)"|exclude-filter: ([^\n]*)', cfgtext)
+    if not old: return cfgtext, False
+    m=re.search(r'^( )*exclude-filter:.*$', cfgtext, re.M)
+    indent=m.group(1) if m else '    '
+    new_line='%sexclude-filter: "%s"' % (indent, esc)
+    out=cfgtext[:m.start()]+new_line+cfgtext[m.end():]
+    return out, out!=cfgtext
+
+out, changed = apply_filter(text, new_filter)
+if changed:
+    open(CFG+'.bak_nodescan','w',encoding='utf-8').write(text)
+    open(CFG+'.tmp','w',encoding='utf-8').write(out)
+    try:
+        rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',CFG+'.tmp','-t'], capture_output=True, timeout=30).returncode
+    except Exception:
+        rc=1
+    if rc==0:
+        os.replace(CFG+'.tmp', CFG)
+        try:
+            r=urllib.request.Request('http://127.0.0.1:9090/configs?force=true',
+                data=json.dumps({'path':CFG}).encode(), method='PUT',
+                headers={'Content-Type':'application/json'})
+            urllib.request.urlopen(r, timeout=8).read()
+        except Exception as e:
+            log('reload failed: %s' % e)
+        log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs))
+    else:
+        try: os.remove(CFG+'.tmp')
+        except Exception: pass
+        log('VALIDATION FAILED - config untouched (test rc=%d)' % rc)
+else:
+    log('no change (blocked=%d of %d, errors=%d)' % (len(blocked), total, errs))
+
+# remember list + state for the panel
+try:
+    with open(BLOCKF,'w',encoding='utf-8') as f:
+        f.write('\n'.join(sorted(blocked))+'\n')
+except Exception: pass
+st={'ts':time.strftime('%F %T'),'total':total,'blocked':len(blocked),'errors':errs,'changed':bool(changed)}
+try:
+    with open(STATE+'.tmp','w') as f: json.dump(st,f)
+    os.replace(STATE+'.tmp', STATE)
+except Exception: pass
+print('nodes=%d blocked=%d errors=%d changed=%s' % (total, len(blocked), errs, bool(changed)))
+PYEOF
+
+ASSET_EOF
+  if [ ! -s "$(P /etc/geomask-nodes.conf)" ]; then
+    save_stream /etc/geomask-nodes.conf 644 <<'ASSET_EOF'
+# geomask node-scan configuration (v1.11.0+)
+# Nightly subscription scan: a node is blocked by NAME in the VPN group
+# exclude-filter when its SERVER matches these criteria. Edit freely; the scan
+# re-reads this file every run; re-installing geomask keeps the file (keep-as-is).
+
+# ISO country codes of the node SERVER considered leaking (comma separated)
+bad_countries=RU,BY,KZ,IR
+
+# ASN numbers of known fake-geo / RF-affiliated networks (comma separated, "AS" prefix optional)
+bad_asns=AS210976,AS215540
+
+# Base name filter always kept in exclude-filter (static part)
+base_filter=Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания|Финляндия
+
+# provider name in mihomo config to scan
+sub_provider=sub
+
+ASSET_EOF
+  else
+    info "nodes conf: keeping existing /etc/geomask-nodes.conf"
+  fi
+  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
+    info "nodescan cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
   fi
   # v1.10.0: event sync watchdog - magitrickle save -> sync within ~seconds (cron stays as backup)
   if have apk; then apk add inotifywait >/dev/null 2>&1 || true; fi
@@ -3667,6 +3895,12 @@ geomask_uninstall() {
     rm -f "$(P /etc/init.d/geomask-syncd)" "$(P /usr/bin/geomask-syncd.sh)"
     info "removed: syncd watchdog"
   fi
+  # v1.11.0: node audit removal
+  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-node-scan' | crontab - 2>/dev/null || true
+  fi
+  rm -f "$(P /usr/bin/geomask-node-scan.sh)"
+  info "removed: node-scan (conf /etc/geomask-nodes.conf left for reference)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

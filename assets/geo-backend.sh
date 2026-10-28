@@ -818,6 +818,8 @@ cmd_stack() {
   _sync=$(cat /tmp/geomask-sync.state 2>/dev/null)
   case "$_sync" in '{'*'}'*) : ;; *) _sync='{"ts":"","changed":false,"reload":null,"mt":0,"ai":0,"moved":0}' ;; esac
   _sd=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _sd=true
+  _ns=$(cat /tmp/geomask-nodescan.state 2>/dev/null)
+  case "$_ns" in '{'*'}'*) : ;; *) _ns='null' ;; esac
   _guard=$(logread 2>/dev/null | grep geomask-guard | grep -v crond | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
   _pin=false; [ -e /root/.geomask-norestart ] && _pin=true
   _strat=$(json_esc "$(sed -n "/option NFQWS_OPT '/,+1p" /etc/config/zapret 2>/dev/null | tail -1 | tr -d " \t'")")
@@ -828,8 +830,8 @@ cmd_stack() {
   _nr=$(grep -c . /opt/zapret/ipset/zapret-hosts-rkn.txt 2>/dev/null)
   _nt=$(pgrep -c -f tg-ws-proxy 2>/dev/null)
   _land=false; wget -q -T 3 -O /dev/null http://127.0.0.1:8000/ 2>/dev/null && _land=true
-  printf '{"ok":true,"sync":%s,"syncd":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
-    "$_sync" "$_sd" "$_guard" "$_pin" "$_strat" \
+  printf '{"ok":true,"sync":%s,"syncd":%s,"nodescan":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
+    "$_sync" "$_sd" "$_ns" "$_guard" "$_pin" "$_strat" \
     "${_nu:-0}" "${_ne:-0}" "${_nc:-0}" "${_ng:-0}" "${_nr:-0}" \
     "${_nt:-0}" "$_land" "$LANIP" "$LANIP" "$LANIP" "$LANIP"
 }
@@ -949,6 +951,9 @@ case "$1" in
   log)        cmd_log ;;
   backups)    cmd_backups ;;
   stack)      cmd_stack ;;
+  nodescan)   # kick the node audit in background (returns immediately; panel re-reads stack)
+    ( /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 & )
+    printf '{"ok":true,"started":true}\n' ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;

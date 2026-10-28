@@ -8,6 +8,7 @@ var callLeases = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} 
 var callLog    = rpc.declare({ object: 'geo-sync', method: 'log',    expect: {} });
 var callBackups = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
 var callStack  = rpc.declare({ object: 'geo-sync', method: 'stack', expect: {} });
+var callNodescan = rpc.declare({ object: 'geo-sync', method: 'nodescan', expect: {} });
 var callLists  = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
 var callGoogle = rpc.declare({ object: 'geo-sync', method: 'google',  expect: {} });
 /* params as OBJECT (not array): array form expects positional args and would
@@ -330,6 +331,19 @@ return view.extend({
 				});
 			} }, 'Что видит Google?');
 
+		var btnScan = E('button', { 'class': 'gs-btn',
+			'click': function() {
+				btnScan.disabled = true; btnScan.textContent = 'Проверка…';
+				callNodescan().then(function() {
+					btnScan.textContent = 'Проверить узлы сейчас';
+					ui.addNotification(null, E('p', {}, 'Аудит узлов запущен в фоне (до ~1 минуты); итог появится в этой карточке после обновления.'), 'info');
+					setTimeout(function() { view.reload(); }, 45000);
+				}).catch(function(e) {
+					btnScan.disabled = false; btnScan.textContent = 'Проверить узлы сейчас';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Проверить узлы сейчас');
+
 		var syncCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Синхронизация и проверка'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 6px' },
@@ -352,6 +366,14 @@ return view.extend({
 					E('span', { 'class': (stk.syncd ? 'gs-val' : 'gs-val gs-badge gs-warn') }, syncTxt)
 				]));
 				if (stk.ok === true) {
+					var ns = stk.nodescan;
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'Узлы подписки (аудит)'),
+						E('span', { 'class': 'gs-val gs-upd-meta' },
+							ns ? (ns.ts + ' · узлов ' + ns.total + ', с РФ-меткой ' + ns.blocked
+								+ (ns.changed ? ' (фильтр обновлён)' : '') + (ns.errors ? ' · сбоевlookup: ' + ns.errors : ''))
+								: 'ночной скан ещё не запускался (03:30)')
+					]));
 					var L = stk.lists || {}, H = stk.health || {};
 					rows.push(E('div', { 'class': 'gs-row' }, [
 						E('span', { 'class': 'gs-label' }, 'DPI (zapret)'),
@@ -383,7 +405,7 @@ return view.extend({
 				}
 				return E('div', { 'style': 'margin:0 0 8px' }, rows);
 			})(),
-			E('div', { 'class': 'gs-actions' }, [ btnLists, btnGoogle ]),
+			E('div', { 'class': 'gs-actions' }, [ btnLists, btnGoogle, btnScan ]),
 			listsOut
 		]);
 		wrap.appendChild(syncCard);

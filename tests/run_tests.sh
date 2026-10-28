@@ -79,6 +79,9 @@ mkdir -p "$R/etc/rc.d"
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-syncd.sh"; chmod +x "$R/usr/bin/geomask-syncd.sh"
 printf '#!/bin/sh\nexit 0\n' > "$R/etc/init.d/geomask-syncd"; chmod +x "$R/etc/init.d/geomask-syncd"
 : > "$R/etc/rc.d/S98geomask-syncd"
+# node audit (v1.11.0): script + conf fixtures
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-node-scan.sh"; chmod +x "$R/usr/bin/geomask-node-scan.sh"
+echo 'bad_asns=AS210976' > "$R/etc/geomask-nodes.conf"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/mtrickle.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ai.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytdirect.yaml"
@@ -132,6 +135,7 @@ printf 'dnsmasq\nmagitrickled\nmihomo\nhev-socks5-tunnel\nrpcd\n' > "$HERE/state
 printf 'zapret-manager\ngeo-sync\n' > "$HERE/state/ubus_objects"
 echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' > "$HERE/state/crontab"
 echo '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard' >> "$HERE/state/crontab"
+echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' >> "$HERE/state/crontab"
 echo '32666: from all iif br-lan ipproto icmp lookup main' > "$HERE/state/ip_rules"
 # pgrep stub state: syncd watchdog considered running in healthy/apply scenarios
 printf 'geomask-syncd.sh\n' > "$HERE/state/pgrep"
@@ -355,6 +359,12 @@ if grep -qF 'Нидерланды-(5|13|16|18)' "$SCRIPT" && grep -qF 'Герм�
 else
   echo "FAIL: S13 RF node filter missing"; failn=$((failn+1))
 fi
+
+# v1.11.0: nightly node audit (registry scan + panel + cron)
+for _p in 'geomask-node-scan.sh' 'geomask-nodes.conf' 'geomask-nodescan.state' 'nodescan cron' 'callNodescan' 'bad_asns'; do
+  if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S15 nodescan has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S15 nodescan missing: $_p"; failn=$((failn+1)); fi
+done
 # v1.9.6: simple SMB credentials (backup/backup, guest ok) + force_root for /root paths
 if grep -qF 'force_root=1' "$SCRIPT" && grep -qF 'ksmbd.adduser backup -p backup' "$SCRIPT"; then
   echo "PASS: S13 force_root + backup auth user"; pass=$((pass+1))

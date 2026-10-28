@@ -20,6 +20,8 @@ MAP = {
     "geomask-guard.sh":      "geomask-guard.sh",
     "geomask-syncd.sh":      "geomask-syncd.sh",
     "geomask-syncd.init":    "geomask-syncd.init",
+    "geomask-node-scan.sh":  "geomask-node-scan.sh",
+    "geomask-nodes.conf":    "geomask-nodes.conf",
 }
 
 # menu.json asset file on disk (same acl download name collision): we saved menu as second luci-app-geo-sync.json

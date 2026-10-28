@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.10.2"
+GM_VERSION="1.11.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -807,6 +807,10 @@ step5_check() {
   if [ -x "$(P /usr/bin/geomask-guard.sh)" ]; then info "guard: present"; else bad "guard missing: /usr/bin/geomask-guard.sh"; _need=1; fi
   if [ -x "$(P /etc/hotplug.d/iface/99-geomask-guard)" ]; then info "guard hotplug: present"; else bad "guard hotplug missing"; _need=1; fi
   if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then info "guard cron */5: present"; else bad "guard cron missing"; _need=1; fi
+  # v1.11.0: node audit plumbing
+  if [ -x "$(P /usr/bin/geomask-node-scan.sh)" ] && [ -s "$(P /etc/geomask-nodes.conf)" ]; then info "node-scan: installed"
+  else bad "node-scan missing (script/conf)"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then info "nodescan cron 03:30: present"; else bad "nodescan cron missing"; _need=1; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -837,6 +841,22 @@ ASSET_EOF
     info "cron already present"
   else
     ( crontab -l 2>/dev/null; echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' ) | crontab - 2>/dev/null && info "cron added: */5 sync" || warn "cannot set crontab"
+  fi
+  # v1.11.0: nightly node audit (registry check of every subscription server)
+  save_stream /usr/bin/geomask-node-scan.sh 755 <<'ASSET_EOF'
+@@ASSET:geomask-node-scan.sh@@
+ASSET_EOF
+  if [ ! -s "$(P /etc/geomask-nodes.conf)" ]; then
+    save_stream /etc/geomask-nodes.conf 644 <<'ASSET_EOF'
+@@ASSET:geomask-nodes.conf@@
+ASSET_EOF
+  else
+    info "nodes conf: keeping existing /etc/geomask-nodes.conf"
+  fi
+  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
+    info "nodescan cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
   fi
   # v1.10.0: event sync watchdog - magitrickle save -> sync within ~seconds (cron stays as backup)
   if have apk; then apk add inotifywait >/dev/null 2>&1 || true; fi
@@ -1184,6 +1204,12 @@ geomask_uninstall() {
     rm -f "$(P /etc/init.d/geomask-syncd)" "$(P /usr/bin/geomask-syncd.sh)"
     info "removed: syncd watchdog"
   fi
+  # v1.11.0: node audit removal
+  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-node-scan' | crontab - 2>/dev/null || true
+  fi
+  rm -f "$(P /usr/bin/geomask-node-scan.sh)"
+  info "removed: node-scan (conf /etc/geomask-nodes.conf left for reference)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

@@ -14,6 +14,11 @@ list_methods() {
 	json_add_object "backups";    json_close_object
 	json_add_object "stack";      json_close_object
 	json_add_object "nodescan";   json_close_object
+	json_add_object "nodes_get";  json_close_object
+	json_add_object "nodes_set";  json_add_string "enabled" "string"; json_add_string "schedule" "string"; json_add_string "countries" "string"; json_add_string "asns" "string"; json_add_string "base" "string"; json_add_string "provider" "string"; json_close_object
+	json_add_object "sync_set";   json_add_string "interval" "string"; json_close_object
+	json_add_object "syncd_set";  json_add_string "state" "string"; json_close_object
+	json_add_object "pin_set";    json_add_string "state" "string"; json_close_object
 	json_add_object "sync_lists"; json_close_object
 	json_add_object "google";     json_close_object
 	json_add_object "global";     json_add_string "mode" "string"; json_close_object
@@ -46,6 +51,11 @@ call_method() {
 		backups)    "$BACKEND" backups ;;
 		stack)      "$BACKEND" stack ;;
 		nodescan)   "$BACKEND" nodescan ;;
+		nodes_get)  "$BACKEND" nodes_get ;;
+		nodes_set)  json_get_var enabled enabled; json_get_var schedule schedule; json_get_var countries countries; json_get_var asns asns; json_get_var base base; json_get_var provider provider; "$BACKEND" nodes_set "$enabled" "$schedule" "$countries" "$asns" "$base" "$provider" ;;
+		sync_set)   json_get_var interval interval; "$BACKEND" sync_set "$interval" ;;
+		syncd_set)  json_get_var state state; "$BACKEND" syncd_set "$state" ;;
+		pin_set)    json_get_var state state; "$BACKEND" pin_set "$state" ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;

@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.11.2"
+GM_VERSION="1.12.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -135,7 +135,9 @@ step2_apply() {
 #!/bin/sh
 # geo-backend.sh - backend for LuCI "Гео-маскировка и AI" panel (geo-sync ubus object).
 # Commands:
-#   status | leases | log | sync_lists | google | backups | stack
+#   status | leases | log | sync_lists | google | backups | stack | nodescan
+#   nodes_get | nodes_set <0|1> <HH:MM> <countries> <asns> <base> <provider>
+#   sync_set <N> | syncd_set <on|off> | pin_set <on|off>   (v1.12.0 automation controls)
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
 #     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
@@ -163,7 +165,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.11.2"
+BACKEND_VERSION="1.12.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -952,8 +954,12 @@ cmd_stack() {
   _sync=$(cat /tmp/geomask-sync.state 2>/dev/null)
   case "$_sync" in '{'*'}'*) : ;; *) _sync='{"ts":"","changed":false,"reload":null,"mt":0,"ai":0,"moved":0}' ;; esac
   _sd=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _sd=true
+  _sde=false; ls /etc/rc.d/ 2>/dev/null | grep -q geomask-syncd && _sde=true
+  _sci=$(crontab -l 2>/dev/null | grep 'sync_mtrickle_mihomo.sh' | head -1 | awk '{print $1}')
+  [ -n "$_sci" ] || _sci='*/5'
+  _ne=false; crontab -l 2>/dev/null | grep -qF '# geomask-nodescan' && _ne=true
   _ns=$(cat /tmp/geomask-nodescan.state 2>/dev/null)
-  case "$_ns" in '{'*'}'*) : ;; *) _ns='null' ;; esac
+  case "$_ns" in '{'*'}'*) : ;; *) _ns=null ;; esac
   _guard=$(logread 2>/dev/null | grep geomask-guard | grep -v crond | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
   _pin=false; [ -e /root/.geomask-norestart ] && _pin=true
   _strat=$(json_esc "$(sed -n "/option NFQWS_OPT '/,+1p" /etc/config/zapret 2>/dev/null | tail -1 | tr -d " \t'")")
@@ -964,8 +970,8 @@ cmd_stack() {
   _nr=$(grep -c . /opt/zapret/ipset/zapret-hosts-rkn.txt 2>/dev/null)
   _nt=$(pgrep -f tg-ws-proxy 2>/dev/null | wc -l)
   _land=false; wget -q -T 3 -O /dev/null http://127.0.0.1:8000/ 2>/dev/null && _land=true
-  printf '{"ok":true,"sync":%s,"syncd":%s,"nodescan":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
-    "$_sync" "$_sd" "$_ns" "$_guard" "$_pin" "$_strat" \
+  printf '{"ok":true,"sync":%s,"syncd":%s,"syncd_enabled":%s,"sync_interval":"%s","nodescan_enabled":%s,"nodescan":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
+    "$_sync" "$_sd" "$_sde" "$_sci" "$_ne" "$_ns" "$_guard" "$_pin" "$_strat" \
     "${_nu:-0}" "${_ne:-0}" "${_nc:-0}" "${_ng:-0}" "${_nr:-0}" \
     "${_nt:-0}" "$_land" "$LANIP" "$LANIP" "$LANIP" "$LANIP"
 }
@@ -1079,6 +1085,105 @@ RUNEOF
   printf '{"ok":true,"to":"%s"}\n' "$_tag"
 }
 
+# ---------- v1.12.0: node audit control + automation settings ----------
+NODESCONF=/etc/geomask-nodes.conf
+NODESBLOCK=/etc/geomask-node-block.txt
+NODESCAN_TAG='# geomask-nodescan'
+SYNC_TAG='# geomask-sync'
+
+# read key from nodes conf
+_nconf() { sed -n "s/^$1=//p" "$NODESCONF" 2>/dev/null | head -1; }
+
+cmd_nodes_get() {
+  _en=false
+  crontab -l 2>/dev/null | grep -qF "$NODESCAN_TAG" && _en=true
+  _line=$(crontab -l 2>/dev/null | grep -F "$NODESCAN_TAG" | head -1)
+  _min=$(printf '%s' "$_line" | awk '{print $1}')
+  _hr=$(printf '%s' "$_line" | awk '{print $2}')
+  [ -n "$_hr" ] || { _hr=3; _min=30; }
+  _sched=$(printf '%02d:%02d' "${_hr:-3}" "${_min:-30}" 2>/dev/null || echo '03:30')
+  _st=$(cat /tmp/geomask-nodescan.state 2>/dev/null)
+  case "$_st" in '{'*'}'*) : ;; *) _st=null ;; esac
+  _blk=$(while IFS= read -r _l; do [ -n "$_l" ] && printf '"%s",' "$(json_esc "$_l")"; done < "$NODESBLOCK" 2>/dev/null | sed 's/,$//')
+  _lastlog=$(grep NODESCAN "$LOG" 2>/dev/null | tail -3 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  printf '{"ok":true,"enabled":%s,"schedule":"%s","state":%s,"conf":{"bad_countries":"%s","bad_asns":"%s","base_filter":"%s","sub_provider":"%s"},"blocked":[%s],"log":[%s]}\n' \
+    "$_en" "$_sched" "$_st" \
+    "$(_nconf bad_countries)" "$(_nconf bad_asns)" "$(_nconf base_filter)" "$(_nconf sub_provider)" \
+    "$_blk" "$_lastlog"
+}
+
+# args: enabled(0|1) HH:MM countries asns base provider
+cmd_nodes_set() {
+  _en=$1; _sched=$2; _cc=$3; _as=$4; _base=$5; _prov=$6
+  case "$_en" in 0|1) : ;; *) printf '{"ok":false,"error":"bad enabled"}\n'; return 1;; esac
+  printf '%s' "$_sched" | grep -qE '^([01][0-9]|2[0-3]):[0-5][0-9]$' || { printf '{"ok":false,"error":"bad schedule (HH:MM)"}\n'; return 1; }
+  [ -z "$_cc" ] || printf '%s' "$_cc" | grep -qE '^([A-Z][A-Z],)*[A-Z][A-Z]$' || { printf '{"ok":false,"error":"bad countries (AA,BB)"}\n'; return 1; }
+  [ -z "$_as" ] || printf '%s' "$_as" | grep -qE '^(AS?[0-9]+,)*AS?[0-9]+$' || { printf '{"ok":false,"error":"bad asns"}\n'; return 1; }
+  printf '%s' "$_base" | grep -qE '["'"'"'\\]' && { printf '{"ok":false,"error":"base filter: no quotes/backslashes"}\n'; return 1; }
+  [ -z "$_prov" ] && _prov=sub
+  printf '%s' "$_prov" | grep -qE '^[a-z0-9_-]+$' || { printf '{"ok":false,"error":"bad provider name"}\n'; return 1; }
+  # write conf (full template; keep-as-is logic preserved, user values)
+  cat > "$NODESCONF" <<EOF
+# geomask node-scan configuration (edited via panel $(date '+%F %T'))
+bad_countries=$_cc
+bad_asns=$_as
+base_filter=$_base
+sub_provider=$_prov
+EOF
+  _hr=${_sched%:*}; _min=${_sched#*:}
+  # cron line (hour/min: cron wants numbers; strip leading zeros to be safe)
+  _hrn=$(printf '%s' "$_hr" | sed 's/^0//'); _minn=$(printf '%s' "$_min" | sed 's/^0//')
+  [ -n "$_hrn" ] || _hrn=0
+  _tmp=/tmp/gm-cron.$$
+  crontab -l 2>/dev/null | grep -vF "$NODESCAN_TAG" > "$_tmp" || true
+  if [ "$_en" = 1 ]; then
+    printf '%s %s * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 %s\n' "$_minn" "$_hrn" "$NODESCAN_TAG" >> "$_tmp"
+  fi
+  crontab "$_tmp" && rm -f "$_tmp" || { printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
+  printf '%s NODESCAN config saved via panel (enabled=%s sched=%s)\n' "$(date '+%F %T')" "$_en" "$_sched" >> "$LOG"
+  printf '{"ok":true,"enabled":%s,"schedule":"%s"}\n' "$_en" "$_sched"
+}
+
+# sync insurance cron interval: */N minutes (N: 1,2,3,5,10,15,30)
+cmd_sync_set() {
+  case "$1" in 1|2|3|5|10|15|30) : ;; *) printf '{"ok":false,"error":"bad interval"}\n'; return 1;; esac
+  _tmp=/tmp/gm-cron.$$
+  crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo.sh' > "$_tmp" || true
+  printf '*/%s * * * * %s # %s\n' "$1" "$SYNCLISTS" "$SYNC_TAG" >> "$_tmp"
+  crontab "$_tmp" && rm -f "$_tmp" || { printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
+  printf '%s SYNC cron set to */%s\n' "$(date '+%F %T')" "$1" >> "$LOG"
+  printf '{"ok":true,"interval":"*/%s"}\n' "$1"
+}
+
+# event watchdog on/off
+cmd_syncd_set() {
+  case "$1" in on|off) : ;; *) printf '{"ok":false,"error":"bad arg"}\n'; return 1;; esac
+  if [ "$1" = off ]; then
+    /etc/init.d/geomask-syncd stop >/dev/null 2>&1; /etc/init.d/geomask-syncd disable >/dev/null 2>&1
+  else
+    /etc/init.d/geomask-syncd enable >/dev/null 2>&1; /etc/init.d/geomask-syncd restart >/dev/null 2>&1
+  fi
+  sleep 1
+  _run=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _run=true
+  [ "$1" = on ] && [ "$_run" = true ] || [ "$1" = off ] && [ "$_run" = false ] || { printf '{"ok":false,"running":%s}\n' "$_run"; return 1; }
+  printf '{"ok":true,"running":%s}\n' "$_run"
+}
+
+# mihomo restart pin on/off
+cmd_pin_set() {
+  case "$1" in on|off) : ;; *) printf '{"ok":false,"error":"bad arg"}\n'; return 1;; esac
+  if [ "$1" = on ]; then
+    printf 'restarts forbidden by owner - VPN must stay up\n' > /root/.geomask-norestart
+    printf '%s PIN set (mihomo --restart disabled)\n' "$(date '+%F %T')" >> "$LOG"
+  else
+    rm -f /root/.geomask-norestart
+    printf '%s PIN removed (restarts allowed; be careful)\n' "$(date '+%F %T')" >> "$LOG"
+  fi
+  _p=false; [ -e /root/.geomask-norestart ] && _p=true
+  printf '{"ok":true,"pin":%s}\n' "$_p"
+}
+
+
 case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
@@ -1088,6 +1193,11 @@ case "$1" in
   nodescan)   # kick the node audit in background (returns immediately; panel re-reads stack)
     ( /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 & )
     printf '{"ok":true,"started":true}\n' ;;
+  nodes_get)  cmd_nodes_get ;;
+  nodes_set)  cmd_nodes_set "$2" "$3" "$4" "$5" "$6" "$7" ;;
+  sync_set)   cmd_sync_set "$2" ;;
+  syncd_set)  cmd_syncd_set "$2" ;;
+  pin_set)    cmd_pin_set "$2" ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;
@@ -1126,6 +1236,11 @@ list_methods() {
 	json_add_object "backups";    json_close_object
 	json_add_object "stack";      json_close_object
 	json_add_object "nodescan";   json_close_object
+	json_add_object "nodes_get";  json_close_object
+	json_add_object "nodes_set";  json_add_string "enabled" "string"; json_add_string "schedule" "string"; json_add_string "countries" "string"; json_add_string "asns" "string"; json_add_string "base" "string"; json_add_string "provider" "string"; json_close_object
+	json_add_object "sync_set";   json_add_string "interval" "string"; json_close_object
+	json_add_object "syncd_set";  json_add_string "state" "string"; json_close_object
+	json_add_object "pin_set";    json_add_string "state" "string"; json_close_object
 	json_add_object "sync_lists"; json_close_object
 	json_add_object "google";     json_close_object
 	json_add_object "global";     json_add_string "mode" "string"; json_close_object
@@ -1158,6 +1273,11 @@ call_method() {
 		backups)    "$BACKEND" backups ;;
 		stack)      "$BACKEND" stack ;;
 		nodescan)   "$BACKEND" nodescan ;;
+		nodes_get)  "$BACKEND" nodes_get ;;
+		nodes_set)  json_get_var enabled enabled; json_get_var schedule schedule; json_get_var countries countries; json_get_var asns asns; json_get_var base base; json_get_var provider provider; "$BACKEND" nodes_set "$enabled" "$schedule" "$countries" "$asns" "$base" "$provider" ;;
+		sync_set)   json_get_var interval interval; "$BACKEND" sync_set "$interval" ;;
+		syncd_set)  json_get_var state state; "$BACKEND" syncd_set "$state" ;;
+		pin_set)    json_get_var state state; "$BACKEND" pin_set "$state" ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;
@@ -1203,13 +1323,13 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "ai_sub_get", "subs_list", "upd_check", "upd_status" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "ai_sub_get", "subs_list", "upd_check", "upd_status" ],
 				"system": [ "info" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan" ]
+				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set" ]
 			}
 		}
 	}
@@ -1263,7 +1383,12 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.11.2';
+var callNodesGet   = rpc.declare({ object: 'geo-sync', method: 'nodes_get',   expect: {} });
+var callNodesSet   = rpc.declare({ object: 'geo-sync', method: 'nodes_set',   params: { enabled: null, schedule: null, countries: null, asns: null, base: null, provider: null }, expect: {} });
+var callSyncSet    = rpc.declare({ object: 'geo-sync', method: 'sync_set',    params: { interval: null }, expect: {} });
+var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   params: { state: null }, expect: {} });
+var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
+var PANEL_VERSION = '1.12.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1362,7 +1487,16 @@ var STYLE = [
 	'.gs-console .c-run{color:#d29922}',
 	'.gs-console .c-dim{color:#8b949e}',
 	'.gs-bk{margin-top:10px;border-top:1px solid #30363d;padding-top:6px}',
-	'.gs-bk h4{margin:2px 0 4px;font-size:13px;color:#e6edf3}'
+	'.gs-bk h4{margin:2px 0 4px;font-size:13px;color:#e6edf3}',
+	'.gs-tabs{display:flex;gap:6px;flex-wrap:wrap;border-bottom:2px solid #1f6feb44;padding-bottom:0}',
+	'.gs-tab{padding:7px 16px;border:1px solid #30363d;border-bottom:none;border-radius:9px 9px 0 0;background:#161b22;color:#8b949e;cursor:pointer;font-size:13px;font-weight:600}',
+	'.gs-tab:hover{background:#1c2129}',
+	'.gs-tab.gs-tab-active{background:#0d419d33;color:#58a6ff;border-color:#1f6feb88}',
+	'.gs-panels{display:flex;flex-direction:column;gap:14px;padding-top:14px}',
+	'.gs-panel{display:flex;flex-direction:column;gap:14px}',
+	'.gs-check{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:13px}',
+	'.gs-text{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;font-size:13px;font-family:monospace}',
+	'.gs-blocklist{background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:8px 11px;font-family:monospace;font-size:12px;color:#8b949e;max-height:180px;overflow:auto;white-space:pre-wrap;margin-top:6px}'
 ].join('\n');
 
 function injectStyle() {
@@ -1412,7 +1546,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet() ]);
 	},
 
 	render: function(all) {
@@ -1423,9 +1557,39 @@ return view.extend({
 		var upds = all[6] || {};
 		var bks = all[7] || {};
 		var stk = all[8] || {};
+		var nd = all[9] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
+
+		/* ===================== TABS shell (v1.12.0) ===================== */
+		var TABS = [
+			['obzor', 'Обзор'], ['dev', 'Устройства'], ['subs', 'Подписки'],
+			['lists', 'Списки и синк'], ['nodes', 'Узлы подписки'],
+			['bk', 'Бэкапы'], ['upd', 'Обновление'], ['set', 'Настройки']
+		];
+		var curTab = 'obzor';
+		try { curTab = localStorage.getItem('gs-tab') || 'obzor'; } catch (e) {}
+		var panels = {}, tabBtns = [];
+		var tabbar = E('div', { 'class': 'gs-tabs' });
+		var panelBox = E('div', { 'class': 'gs-panels' });
+		TABS.forEach(function(t) {
+			var btn = E('button', { 'class': 'gs-tab', 'click': function() { showTab(t[0]); } }, t[1]);
+			tabBtns.push([t[0], btn]);
+			tabbar.appendChild(btn);
+			var p = E('div', { 'class': 'gs-panel' });
+			panels[t[0]] = p;
+			panelBox.appendChild(p);
+		});
+		function showTab(id) {
+			curTab = id;
+			try { localStorage.setItem('gs-tab', id); } catch (e) {}
+			tabBtns.forEach(function(tb) { tb[1].classList.toggle('gs-tab-active', tb[0] === id); });
+			TABS.forEach(function(t) { panels[t[0]].style.display = (t[0] === id) ? '' : 'none'; });
+		}
+		wrap.appendChild(tabbar);
+		wrap.appendChild(panelBox);
+		showTab(panels[curTab] ? curTab : 'obzor');
 
 		/* ===================== HERO: dual subscription ===================== */
 		var aiCc = st.ai_cc || '', vpnCc = st.vpn_cc || '';
@@ -1459,7 +1623,7 @@ return view.extend({
 			E('div', { 'class': 'gs-duo' }, [ aiSub, vpnSub ]),
 			counters
 		]);
-		wrap.appendChild(hero);
+		panels.obzor.appendChild(hero);
 
 		/* ===================== Subscriptions registry ===================== */
 		function maskUrl(u) {
@@ -1532,7 +1696,7 @@ return view.extend({
 			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ]),
 			E('div', { 'class': 'gs-row' }, [ btnSubSeed ])
 		]);
-		wrap.appendChild(subsCard);
+		panels.subs.appendChild(subsCard);
 
 		/* ===================== ACTIONS: sync / google check ===================== */
 		var listsOut = E('div', {});
@@ -1643,7 +1807,7 @@ return view.extend({
 			E('div', { 'class': 'gs-actions' }, [ btnLists, btnGoogle, btnScan ]),
 			listsOut
 		]);
-		wrap.appendChild(syncCard);
+		panels.lists.appendChild(syncCard);
 
 		/* ===================== Routing ===================== */
 		var globalSeg = E('div', { 'class': 'gs-seg' }, [
@@ -1658,7 +1822,7 @@ return view.extend({
 				globalSeg ]),
 			E('div', { 'class': 'gs-hint' }, 'DIRECT — мимо списков напрямую (локальные сервисы свободны). VPN — весь остаток через общую подписку.')
 		]);
-		wrap.appendChild(routeCard);
+		panels.obzor.appendChild(routeCard);
 
 		/* ===================== IPv6 ===================== */
 		var v6Card = E('div', { 'class': 'gs-card' }, [
@@ -1672,7 +1836,7 @@ return view.extend({
 			]),
 			E('div', { 'class': 'gs-hint' }, 'Отключение снимает глобальные IPv6-адреса с роутера и LAN-устройств, утечка закрывается полностью.')
 		]);
-		wrap.appendChild(v6Card);
+		panels.obzor.appendChild(v6Card);
 
 		/* ===================== Per-device geo policy ===================== */
 		var MODEINFO = {
@@ -1728,14 +1892,14 @@ return view.extend({
 				} }, 'Добавить')
 			])
 		]);
-		wrap.appendChild(devCard);
+		panels.dev.appendChild(devCard);
 
 		/* ===================== Log ===================== */
 		var logCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Журнал'),
 			E('pre', { 'class': 'gs-log' }, lg || '(пусто)')
 		]);
-		wrap.appendChild(logCard);
+		panels.obzor.appendChild(logCard);
 
 		/* ===================== Updates (bottom - rarely used block) ===================== */
 		var updStatus = E('div', { 'class': 'gs-upd-status' });
@@ -1921,17 +2085,157 @@ return view.extend({
 			if (upd.checked_at) updChildren.push(E('div', { 'class': 'gs-upd-meta' },
 				'Проверено: ' + upd.checked_at + ' · источник: ' + (upd.src || '?') + (upd.need === true && latest.digest ? ' · sha256: ' + String(latest.digest).slice(0, 19) + '…' : '')));
 		}
-		updChildren.push(bkBox);
 		updChildren.push(updStatus);
 		updChildren.push(updLog);
 		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
-		wrap.appendChild(updCard);
+		panels.upd.appendChild(updCard);
 		updRenderLines((upds || {}).lines);
 		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) {
 			updStatus.style.color = '#d29922';
 			updStatus.textContent = 'Идет обновление… подробности в консоли ниже.';
 			updPoll();
 		}
+
+		/* ===================== Backups as own tab card (v1.12.0) ===================== */
+		panels.bk.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Резервные копии'),
+			bkBox
+		]));
+
+		/* ===================== Automation (lists tab) ===================== */
+		var selInt = E('select', { 'class': 'gs-input' });
+		['1', '2', '3', '5', '10', '15', '30'].forEach(function(v) {
+			var op = E('option', { value: v }, 'каждые ' + v + ' мин');
+			if (stk.sync_interval && String(stk.sync_interval).replace('*/', '') === v) op.selected = true;
+			selInt.appendChild(op);
+		});
+		var btnInt = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnInt.disabled = true;
+			callSyncSet({ interval: selInt.value }).then(function(res) {
+				btnInt.disabled = false;
+				if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+				ui.addNotification(null, E('p', {}, 'Cron-страховка синка: каждые ' + selInt.value + ' мин'), 'info');
+				return view.reload();
+			}).catch(function(e) { btnInt.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Применить');
+		var btnSyncd = stk.syncd_enabled
+			? E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+				btnSyncd.disabled = true;
+				callSyncdSet({ state: 'off' }).then(function() { view.reload(); }).catch(function() { btnSyncd.disabled = false; });
+			} }, 'Выключить сторож')
+			: E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+				btnSyncd.disabled = true;
+				callSyncdSet({ state: 'on' }).then(function() { view.reload(); }).catch(function() { btnSyncd.disabled = false; });
+			} }, 'Включить сторож');
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Автоматизация применения списков'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Событийный сторож (применяет за секунды)'),
+				E('span', { 'class': 'gs-badge ' + (stk.syncd ? 'gs-ok' : 'gs-off') }, stk.syncd ? 'работает' : 'не запущен'),
+				btnSyncd
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Cron-страховка (полный прогон)'),
+				E('span', { 'class': 'gs-val gs-mono' }, String(stk.sync_interval || '*/5')),
+				E('span', {}, [selInt, btnInt])
+			]),
+			E('div', { 'class': 'gs-hint' }, 'Сторож реагирует на сохранение списков в MagiTrickle; cron — гарантия на случай сбоя события.')
+		]));
+
+		/* ===================== Node audit (nodes tab, v1.12.0) ===================== */
+		var conf = nd.conf || {};
+		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
+		var inSched = E('input', { 'class': 'gs-text', type: 'text', value: nd.schedule || '03:30', size: 6 });
+		var inCC = E('input', { 'class': 'gs-text', type: 'text', value: conf.bad_countries || '', size: 14 });
+		var inAS = E('input', { 'class': 'gs-text', type: 'text', value: conf.bad_asns || '', size: 24 });
+		var inBase = E('input', { 'class': 'gs-text', type: 'text', value: conf.base_filter || '', size: 40 });
+		var inProv = E('input', { 'class': 'gs-text', type: 'text', value: conf.sub_provider || 'sub', size: 8 });
+		var btnSave = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+			btnSave.disabled = true; btnSave.textContent = 'Сохранение…';
+			callNodesSet({
+				enabled: chkEn.checked ? '1' : '0',
+				schedule: inSched.value.trim(), countries: inCC.value.trim(), asns: inAS.value.trim(),
+				base: inBase.value.trim(), provider: inProv.value.trim()
+			}).then(function(res) {
+				btnSave.disabled = false; btnSave.textContent = 'Сохранить';
+				if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+				ui.addNotification(null, E('p', {}, 'Настройки аудита сохранены'), 'info');
+				return view.reload();
+			}).catch(function(e) { btnSave.disabled = false; btnSave.textContent = 'Сохранить'; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Сохранить');
+		var btnRun = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnRun.disabled = true; btnRun.textContent = 'Запущен…';
+			callNodescan().then(function() {
+				ui.addNotification(null, E('p', {}, 'Аудит запущен (до ~1 минуты), затем фильтр применится сам'), 'info');
+				setTimeout(function() { view.reload(); }, 45000);
+			}).catch(function(e) { btnRun.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Проверить сейчас');
+		var nst = nd.state || {};
+		var blocked = nd.blocked || [];
+		panels.nodes.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Ночной аудит узлов подписки'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Сканер скачивает подписку, проверяет адрес каждого сервера по гео-реестрам (страна и владелец сети), ' +
+				'и собирает exclude-filter группы VPN: узлы с «плохой» сетью блокируются точным именем, чистые — разблокируются. ' +
+				'Трафик при этом не переключается; конфиг применяется только после успешной проверки mihomo -t.'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Последний прогон'),
+				E('span', { 'class': 'gs-val' }, nst.ts ? (nst.ts + ' · узлов ' + nst.total + ' · заблокировано ' + nst.blocked
+					+ (nst.errors ? ' · сбоев проверки ' + nst.errors : '') + (nst.changed ? ' · фильтр обновлён' : ''))
+					: 'ещё не запускался')
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('label', { 'class': 'gs-check' }, [chkEn, E('span', {}, 'Аудит по расписанию (ночью)')]),
+				E('span', { 'class': 'gs-label' }, 'Время (ЧЧ:ММ)'), inSched, btnRun
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Плохие страны'), inCC,
+				E('span', { 'class': 'gs-label' }, 'Плохие сети (ASN)'), inAS,
+				E('span', { 'class': 'gs-label' }, 'Провайдер'), inProv
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Базовый фильтр имён'), inBase, btnSave
+			]),
+			E('div', { 'class': 'gs-hint' }, 'Страны: AA,BB (ISO-2). ASN: AS123456,AS234. Без кавычек и обратных слэшей.'),
+			E('div', { 'class': 'gs-blocklist' }, blocked.length ? blocked.join('\n') : 'заблокированных узлов нет'),
+			E('div', { 'class': 'gs-upd-meta' }, (nd.log || []).join('\n'))
+		]));
+
+		/* ===================== Settings tab ===================== */
+		var btnPin = stk.pin
+			? E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+				if (!confirm('Снять запрет рестарта mihomo? Панельные операции с --restart снова станут возможны.')) return;
+				btnPin.disabled = true;
+				callPinSet({ state: 'off' }).then(function() { view.reload(); }).catch(function() { btnPin.disabled = false; });
+			} }, 'Снять пин')
+			: E('button', { 'class': 'gs-btn', 'click': function() {
+				btnPin.disabled = true;
+				callPinSet({ state: 'on' }).then(function() { view.reload(); }).catch(function() { btnPin.disabled = false; });
+			} }, 'Запретить рестарты');
+		var K = stk.links || {};
+		function linkRow(label, url) {
+			return E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, label),
+				url ? E('a', { 'href': url, 'target': '_blank', 'class': 'gs-mono' }, url) : E('span', {}, '—')
+			]);
+		}
+		panels.set.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Прочее'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Пин «не рестартить mihomo»'),
+				E('span', { 'class': 'gs-badge ' + (stk.pin ? 'gs-on' : 'gs-off') }, stk.pin ? 'установлен' : 'снят'),
+				btnPin
+			]),
+			E('div', { 'class': 'gs-hint' }, 'С пином безопасные операции панели не трогают живой VPN-трафик рестартами. Снимайте только осознанно.'),
+			linkRow('MagiTrickle (группы доменов)', K.magitrickle),
+			linkRow('Zapret DPI (стратегии)', K.zapret),
+			linkRow('Лендинг портов', K.landing),
+			linkRow('LuCI', K.luci),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Версия панели'),
+				E('span', { 'class': 'gs-val gs-mono' }, PANEL_VERSION)
+			])
+		]));
 
 		return wrap;
 	},
@@ -1950,7 +2254,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);
@@ -3115,7 +3419,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.11.2"
+GUARD_VERSION="1.12.0"
 
 log() { logger -t geomask-guard "$*"; }
 

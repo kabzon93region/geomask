@@ -28,6 +28,11 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
+var callNodesGet   = rpc.declare({ object: 'geo-sync', method: 'nodes_get',   expect: {} });
+var callNodesSet   = rpc.declare({ object: 'geo-sync', method: 'nodes_set',   params: { enabled: null, schedule: null, countries: null, asns: null, base: null, provider: null }, expect: {} });
+var callSyncSet    = rpc.declare({ object: 'geo-sync', method: 'sync_set',    params: { interval: null }, expect: {} });
+var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   params: { state: null }, expect: {} });
+var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
 var PANEL_VERSION = '@@PANEL_VERSION@@';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
@@ -127,7 +132,16 @@ var STYLE = [
 	'.gs-console .c-run{color:#d29922}',
 	'.gs-console .c-dim{color:#8b949e}',
 	'.gs-bk{margin-top:10px;border-top:1px solid #30363d;padding-top:6px}',
-	'.gs-bk h4{margin:2px 0 4px;font-size:13px;color:#e6edf3}'
+	'.gs-bk h4{margin:2px 0 4px;font-size:13px;color:#e6edf3}',
+	'.gs-tabs{display:flex;gap:6px;flex-wrap:wrap;border-bottom:2px solid #1f6feb44;padding-bottom:0}',
+	'.gs-tab{padding:7px 16px;border:1px solid #30363d;border-bottom:none;border-radius:9px 9px 0 0;background:#161b22;color:#8b949e;cursor:pointer;font-size:13px;font-weight:600}',
+	'.gs-tab:hover{background:#1c2129}',
+	'.gs-tab.gs-tab-active{background:#0d419d33;color:#58a6ff;border-color:#1f6feb88}',
+	'.gs-panels{display:flex;flex-direction:column;gap:14px;padding-top:14px}',
+	'.gs-panel{display:flex;flex-direction:column;gap:14px}',
+	'.gs-check{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:13px}',
+	'.gs-text{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;font-size:13px;font-family:monospace}',
+	'.gs-blocklist{background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:8px 11px;font-family:monospace;font-size:12px;color:#8b949e;max-height:180px;overflow:auto;white-space:pre-wrap;margin-top:6px}'
 ].join('\n');
 
 function injectStyle() {
@@ -177,7 +191,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet() ]);
 	},
 
 	render: function(all) {
@@ -188,9 +202,39 @@ return view.extend({
 		var upds = all[6] || {};
 		var bks = all[7] || {};
 		var stk = all[8] || {};
+		var nd = all[9] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
+
+		/* ===================== TABS shell (v1.12.0) ===================== */
+		var TABS = [
+			['obzor', 'Обзор'], ['dev', 'Устройства'], ['subs', 'Подписки'],
+			['lists', 'Списки и синк'], ['nodes', 'Узлы подписки'],
+			['bk', 'Бэкапы'], ['upd', 'Обновление'], ['set', 'Настройки']
+		];
+		var curTab = 'obzor';
+		try { curTab = localStorage.getItem('gs-tab') || 'obzor'; } catch (e) {}
+		var panels = {}, tabBtns = [];
+		var tabbar = E('div', { 'class': 'gs-tabs' });
+		var panelBox = E('div', { 'class': 'gs-panels' });
+		TABS.forEach(function(t) {
+			var btn = E('button', { 'class': 'gs-tab', 'click': function() { showTab(t[0]); } }, t[1]);
+			tabBtns.push([t[0], btn]);
+			tabbar.appendChild(btn);
+			var p = E('div', { 'class': 'gs-panel' });
+			panels[t[0]] = p;
+			panelBox.appendChild(p);
+		});
+		function showTab(id) {
+			curTab = id;
+			try { localStorage.setItem('gs-tab', id); } catch (e) {}
+			tabBtns.forEach(function(tb) { tb[1].classList.toggle('gs-tab-active', tb[0] === id); });
+			TABS.forEach(function(t) { panels[t[0]].style.display = (t[0] === id) ? '' : 'none'; });
+		}
+		wrap.appendChild(tabbar);
+		wrap.appendChild(panelBox);
+		showTab(panels[curTab] ? curTab : 'obzor');
 
 		/* ===================== HERO: dual subscription ===================== */
 		var aiCc = st.ai_cc || '', vpnCc = st.vpn_cc || '';
@@ -224,7 +268,7 @@ return view.extend({
 			E('div', { 'class': 'gs-duo' }, [ aiSub, vpnSub ]),
 			counters
 		]);
-		wrap.appendChild(hero);
+		panels.obzor.appendChild(hero);
 
 		/* ===================== Subscriptions registry ===================== */
 		function maskUrl(u) {
@@ -297,7 +341,7 @@ return view.extend({
 			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ]),
 			E('div', { 'class': 'gs-row' }, [ btnSubSeed ])
 		]);
-		wrap.appendChild(subsCard);
+		panels.subs.appendChild(subsCard);
 
 		/* ===================== ACTIONS: sync / google check ===================== */
 		var listsOut = E('div', {});
@@ -408,7 +452,7 @@ return view.extend({
 			E('div', { 'class': 'gs-actions' }, [ btnLists, btnGoogle, btnScan ]),
 			listsOut
 		]);
-		wrap.appendChild(syncCard);
+		panels.lists.appendChild(syncCard);
 
 		/* ===================== Routing ===================== */
 		var globalSeg = E('div', { 'class': 'gs-seg' }, [
@@ -423,7 +467,7 @@ return view.extend({
 				globalSeg ]),
 			E('div', { 'class': 'gs-hint' }, 'DIRECT — мимо списков напрямую (локальные сервисы свободны). VPN — весь остаток через общую подписку.')
 		]);
-		wrap.appendChild(routeCard);
+		panels.obzor.appendChild(routeCard);
 
 		/* ===================== IPv6 ===================== */
 		var v6Card = E('div', { 'class': 'gs-card' }, [
@@ -437,7 +481,7 @@ return view.extend({
 			]),
 			E('div', { 'class': 'gs-hint' }, 'Отключение снимает глобальные IPv6-адреса с роутера и LAN-устройств, утечка закрывается полностью.')
 		]);
-		wrap.appendChild(v6Card);
+		panels.obzor.appendChild(v6Card);
 
 		/* ===================== Per-device geo policy ===================== */
 		var MODEINFO = {
@@ -493,14 +537,14 @@ return view.extend({
 				} }, 'Добавить')
 			])
 		]);
-		wrap.appendChild(devCard);
+		panels.dev.appendChild(devCard);
 
 		/* ===================== Log ===================== */
 		var logCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Журнал'),
 			E('pre', { 'class': 'gs-log' }, lg || '(пусто)')
 		]);
-		wrap.appendChild(logCard);
+		panels.obzor.appendChild(logCard);
 
 		/* ===================== Updates (bottom - rarely used block) ===================== */
 		var updStatus = E('div', { 'class': 'gs-upd-status' });
@@ -686,17 +730,157 @@ return view.extend({
 			if (upd.checked_at) updChildren.push(E('div', { 'class': 'gs-upd-meta' },
 				'Проверено: ' + upd.checked_at + ' · источник: ' + (upd.src || '?') + (upd.need === true && latest.digest ? ' · sha256: ' + String(latest.digest).slice(0, 19) + '…' : '')));
 		}
-		updChildren.push(bkBox);
 		updChildren.push(updStatus);
 		updChildren.push(updLog);
 		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
-		wrap.appendChild(updCard);
+		panels.upd.appendChild(updCard);
 		updRenderLines((upds || {}).lines);
 		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) {
 			updStatus.style.color = '#d29922';
 			updStatus.textContent = 'Идет обновление… подробности в консоли ниже.';
 			updPoll();
 		}
+
+		/* ===================== Backups as own tab card (v1.12.0) ===================== */
+		panels.bk.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Резервные копии'),
+			bkBox
+		]));
+
+		/* ===================== Automation (lists tab) ===================== */
+		var selInt = E('select', { 'class': 'gs-input' });
+		['1', '2', '3', '5', '10', '15', '30'].forEach(function(v) {
+			var op = E('option', { value: v }, 'каждые ' + v + ' мин');
+			if (stk.sync_interval && String(stk.sync_interval).replace('*/', '') === v) op.selected = true;
+			selInt.appendChild(op);
+		});
+		var btnInt = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnInt.disabled = true;
+			callSyncSet({ interval: selInt.value }).then(function(res) {
+				btnInt.disabled = false;
+				if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+				ui.addNotification(null, E('p', {}, 'Cron-страховка синка: каждые ' + selInt.value + ' мин'), 'info');
+				return view.reload();
+			}).catch(function(e) { btnInt.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Применить');
+		var btnSyncd = stk.syncd_enabled
+			? E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+				btnSyncd.disabled = true;
+				callSyncdSet({ state: 'off' }).then(function() { view.reload(); }).catch(function() { btnSyncd.disabled = false; });
+			} }, 'Выключить сторож')
+			: E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+				btnSyncd.disabled = true;
+				callSyncdSet({ state: 'on' }).then(function() { view.reload(); }).catch(function() { btnSyncd.disabled = false; });
+			} }, 'Включить сторож');
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Автоматизация применения списков'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Событийный сторож (применяет за секунды)'),
+				E('span', { 'class': 'gs-badge ' + (stk.syncd ? 'gs-ok' : 'gs-off') }, stk.syncd ? 'работает' : 'не запущен'),
+				btnSyncd
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Cron-страховка (полный прогон)'),
+				E('span', { 'class': 'gs-val gs-mono' }, String(stk.sync_interval || '*/5')),
+				E('span', {}, [selInt, btnInt])
+			]),
+			E('div', { 'class': 'gs-hint' }, 'Сторож реагирует на сохранение списков в MagiTrickle; cron — гарантия на случай сбоя события.')
+		]));
+
+		/* ===================== Node audit (nodes tab, v1.12.0) ===================== */
+		var conf = nd.conf || {};
+		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
+		var inSched = E('input', { 'class': 'gs-text', type: 'text', value: nd.schedule || '03:30', size: 6 });
+		var inCC = E('input', { 'class': 'gs-text', type: 'text', value: conf.bad_countries || '', size: 14 });
+		var inAS = E('input', { 'class': 'gs-text', type: 'text', value: conf.bad_asns || '', size: 24 });
+		var inBase = E('input', { 'class': 'gs-text', type: 'text', value: conf.base_filter || '', size: 40 });
+		var inProv = E('input', { 'class': 'gs-text', type: 'text', value: conf.sub_provider || 'sub', size: 8 });
+		var btnSave = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+			btnSave.disabled = true; btnSave.textContent = 'Сохранение…';
+			callNodesSet({
+				enabled: chkEn.checked ? '1' : '0',
+				schedule: inSched.value.trim(), countries: inCC.value.trim(), asns: inAS.value.trim(),
+				base: inBase.value.trim(), provider: inProv.value.trim()
+			}).then(function(res) {
+				btnSave.disabled = false; btnSave.textContent = 'Сохранить';
+				if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+				ui.addNotification(null, E('p', {}, 'Настройки аудита сохранены'), 'info');
+				return view.reload();
+			}).catch(function(e) { btnSave.disabled = false; btnSave.textContent = 'Сохранить'; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Сохранить');
+		var btnRun = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnRun.disabled = true; btnRun.textContent = 'Запущен…';
+			callNodescan().then(function() {
+				ui.addNotification(null, E('p', {}, 'Аудит запущен (до ~1 минуты), затем фильтр применится сам'), 'info');
+				setTimeout(function() { view.reload(); }, 45000);
+			}).catch(function(e) { btnRun.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Проверить сейчас');
+		var nst = nd.state || {};
+		var blocked = nd.blocked || [];
+		panels.nodes.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Ночной аудит узлов подписки'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Сканер скачивает подписку, проверяет адрес каждого сервера по гео-реестрам (страна и владелец сети), ' +
+				'и собирает exclude-filter группы VPN: узлы с «плохой» сетью блокируются точным именем, чистые — разблокируются. ' +
+				'Трафик при этом не переключается; конфиг применяется только после успешной проверки mihomo -t.'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Последний прогон'),
+				E('span', { 'class': 'gs-val' }, nst.ts ? (nst.ts + ' · узлов ' + nst.total + ' · заблокировано ' + nst.blocked
+					+ (nst.errors ? ' · сбоев проверки ' + nst.errors : '') + (nst.changed ? ' · фильтр обновлён' : ''))
+					: 'ещё не запускался')
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('label', { 'class': 'gs-check' }, [chkEn, E('span', {}, 'Аудит по расписанию (ночью)')]),
+				E('span', { 'class': 'gs-label' }, 'Время (ЧЧ:ММ)'), inSched, btnRun
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Плохие страны'), inCC,
+				E('span', { 'class': 'gs-label' }, 'Плохие сети (ASN)'), inAS,
+				E('span', { 'class': 'gs-label' }, 'Провайдер'), inProv
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Базовый фильтр имён'), inBase, btnSave
+			]),
+			E('div', { 'class': 'gs-hint' }, 'Страны: AA,BB (ISO-2). ASN: AS123456,AS234. Без кавычек и обратных слэшей.'),
+			E('div', { 'class': 'gs-blocklist' }, blocked.length ? blocked.join('\n') : 'заблокированных узлов нет'),
+			E('div', { 'class': 'gs-upd-meta' }, (nd.log || []).join('\n'))
+		]));
+
+		/* ===================== Settings tab ===================== */
+		var btnPin = stk.pin
+			? E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+				if (!confirm('Снять запрет рестарта mihomo? Панельные операции с --restart снова станут возможны.')) return;
+				btnPin.disabled = true;
+				callPinSet({ state: 'off' }).then(function() { view.reload(); }).catch(function() { btnPin.disabled = false; });
+			} }, 'Снять пин')
+			: E('button', { 'class': 'gs-btn', 'click': function() {
+				btnPin.disabled = true;
+				callPinSet({ state: 'on' }).then(function() { view.reload(); }).catch(function() { btnPin.disabled = false; });
+			} }, 'Запретить рестарты');
+		var K = stk.links || {};
+		function linkRow(label, url) {
+			return E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, label),
+				url ? E('a', { 'href': url, 'target': '_blank', 'class': 'gs-mono' }, url) : E('span', {}, '—')
+			]);
+		}
+		panels.set.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Прочее'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Пин «не рестартить mihomo»'),
+				E('span', { 'class': 'gs-badge ' + (stk.pin ? 'gs-on' : 'gs-off') }, stk.pin ? 'установлен' : 'снят'),
+				btnPin
+			]),
+			E('div', { 'class': 'gs-hint' }, 'С пином безопасные операции панели не трогают живой VPN-трафик рестартами. Снимайте только осознанно.'),
+			linkRow('MagiTrickle (группы доменов)', K.magitrickle),
+			linkRow('Zapret DPI (стратегии)', K.zapret),
+			linkRow('Лендинг портов', K.landing),
+			linkRow('LuCI', K.luci),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Версия панели'),
+				E('span', { 'class': 'gs-val gs-mono' }, PANEL_VERSION)
+			])
+		]));
 
 		return wrap;
 	},
@@ -715,7 +899,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);

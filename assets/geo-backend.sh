@@ -1,7 +1,9 @@
 #!/bin/sh
 # geo-backend.sh - backend for LuCI "Гео-маскировка и AI" panel (geo-sync ubus object).
 # Commands:
-#   status | leases | log | sync_lists | google | backups | stack
+#   status | leases | log | sync_lists | google | backups | stack | nodescan
+#   nodes_get | nodes_set <0|1> <HH:MM> <countries> <asns> <base> <provider>
+#   sync_set <N> | syncd_set <on|off> | pin_set <on|off>   (v1.12.0 automation controls)
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
 #     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
@@ -818,8 +820,12 @@ cmd_stack() {
   _sync=$(cat /tmp/geomask-sync.state 2>/dev/null)
   case "$_sync" in '{'*'}'*) : ;; *) _sync='{"ts":"","changed":false,"reload":null,"mt":0,"ai":0,"moved":0}' ;; esac
   _sd=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _sd=true
+  _sde=false; ls /etc/rc.d/ 2>/dev/null | grep -q geomask-syncd && _sde=true
+  _sci=$(crontab -l 2>/dev/null | grep 'sync_mtrickle_mihomo.sh' | head -1 | awk '{print $1}')
+  [ -n "$_sci" ] || _sci='*/5'
+  _ne=false; crontab -l 2>/dev/null | grep -qF '# geomask-nodescan' && _ne=true
   _ns=$(cat /tmp/geomask-nodescan.state 2>/dev/null)
-  case "$_ns" in '{'*'}'*) : ;; *) _ns='null' ;; esac
+  case "$_ns" in '{'*'}'*) : ;; *) _ns=null ;; esac
   _guard=$(logread 2>/dev/null | grep geomask-guard | grep -v crond | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
   _pin=false; [ -e /root/.geomask-norestart ] && _pin=true
   _strat=$(json_esc "$(sed -n "/option NFQWS_OPT '/,+1p" /etc/config/zapret 2>/dev/null | tail -1 | tr -d " \t'")")
@@ -830,8 +836,8 @@ cmd_stack() {
   _nr=$(grep -c . /opt/zapret/ipset/zapret-hosts-rkn.txt 2>/dev/null)
   _nt=$(pgrep -f tg-ws-proxy 2>/dev/null | wc -l)
   _land=false; wget -q -T 3 -O /dev/null http://127.0.0.1:8000/ 2>/dev/null && _land=true
-  printf '{"ok":true,"sync":%s,"syncd":%s,"nodescan":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
-    "$_sync" "$_sd" "$_ns" "$_guard" "$_pin" "$_strat" \
+  printf '{"ok":true,"sync":%s,"syncd":%s,"syncd_enabled":%s,"sync_interval":"%s","nodescan_enabled":%s,"nodescan":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
+    "$_sync" "$_sd" "$_sde" "$_sci" "$_ne" "$_ns" "$_guard" "$_pin" "$_strat" \
     "${_nu:-0}" "${_ne:-0}" "${_nc:-0}" "${_ng:-0}" "${_nr:-0}" \
     "${_nt:-0}" "$_land" "$LANIP" "$LANIP" "$LANIP" "$LANIP"
 }
@@ -945,6 +951,105 @@ RUNEOF
   printf '{"ok":true,"to":"%s"}\n' "$_tag"
 }
 
+# ---------- v1.12.0: node audit control + automation settings ----------
+NODESCONF=/etc/geomask-nodes.conf
+NODESBLOCK=/etc/geomask-node-block.txt
+NODESCAN_TAG='# geomask-nodescan'
+SYNC_TAG='# geomask-sync'
+
+# read key from nodes conf
+_nconf() { sed -n "s/^$1=//p" "$NODESCONF" 2>/dev/null | head -1; }
+
+cmd_nodes_get() {
+  _en=false
+  crontab -l 2>/dev/null | grep -qF "$NODESCAN_TAG" && _en=true
+  _line=$(crontab -l 2>/dev/null | grep -F "$NODESCAN_TAG" | head -1)
+  _min=$(printf '%s' "$_line" | awk '{print $1}')
+  _hr=$(printf '%s' "$_line" | awk '{print $2}')
+  [ -n "$_hr" ] || { _hr=3; _min=30; }
+  _sched=$(printf '%02d:%02d' "${_hr:-3}" "${_min:-30}" 2>/dev/null || echo '03:30')
+  _st=$(cat /tmp/geomask-nodescan.state 2>/dev/null)
+  case "$_st" in '{'*'}'*) : ;; *) _st=null ;; esac
+  _blk=$(while IFS= read -r _l; do [ -n "$_l" ] && printf '"%s",' "$(json_esc "$_l")"; done < "$NODESBLOCK" 2>/dev/null | sed 's/,$//')
+  _lastlog=$(grep NODESCAN "$LOG" 2>/dev/null | tail -3 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  printf '{"ok":true,"enabled":%s,"schedule":"%s","state":%s,"conf":{"bad_countries":"%s","bad_asns":"%s","base_filter":"%s","sub_provider":"%s"},"blocked":[%s],"log":[%s]}\n' \
+    "$_en" "$_sched" "$_st" \
+    "$(_nconf bad_countries)" "$(_nconf bad_asns)" "$(_nconf base_filter)" "$(_nconf sub_provider)" \
+    "$_blk" "$_lastlog"
+}
+
+# args: enabled(0|1) HH:MM countries asns base provider
+cmd_nodes_set() {
+  _en=$1; _sched=$2; _cc=$3; _as=$4; _base=$5; _prov=$6
+  case "$_en" in 0|1) : ;; *) printf '{"ok":false,"error":"bad enabled"}\n'; return 1;; esac
+  printf '%s' "$_sched" | grep -qE '^([01][0-9]|2[0-3]):[0-5][0-9]$' || { printf '{"ok":false,"error":"bad schedule (HH:MM)"}\n'; return 1; }
+  [ -z "$_cc" ] || printf '%s' "$_cc" | grep -qE '^([A-Z][A-Z],)*[A-Z][A-Z]$' || { printf '{"ok":false,"error":"bad countries (AA,BB)"}\n'; return 1; }
+  [ -z "$_as" ] || printf '%s' "$_as" | grep -qE '^(AS?[0-9]+,)*AS?[0-9]+$' || { printf '{"ok":false,"error":"bad asns"}\n'; return 1; }
+  printf '%s' "$_base" | grep -qE '["'"'"'\\]' && { printf '{"ok":false,"error":"base filter: no quotes/backslashes"}\n'; return 1; }
+  [ -z "$_prov" ] && _prov=sub
+  printf '%s' "$_prov" | grep -qE '^[a-z0-9_-]+$' || { printf '{"ok":false,"error":"bad provider name"}\n'; return 1; }
+  # write conf (full template; keep-as-is logic preserved, user values)
+  cat > "$NODESCONF" <<EOF
+# geomask node-scan configuration (edited via panel $(date '+%F %T'))
+bad_countries=$_cc
+bad_asns=$_as
+base_filter=$_base
+sub_provider=$_prov
+EOF
+  _hr=${_sched%:*}; _min=${_sched#*:}
+  # cron line (hour/min: cron wants numbers; strip leading zeros to be safe)
+  _hrn=$(printf '%s' "$_hr" | sed 's/^0//'); _minn=$(printf '%s' "$_min" | sed 's/^0//')
+  [ -n "$_hrn" ] || _hrn=0
+  _tmp=/tmp/gm-cron.$$
+  crontab -l 2>/dev/null | grep -vF "$NODESCAN_TAG" > "$_tmp" || true
+  if [ "$_en" = 1 ]; then
+    printf '%s %s * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 %s\n' "$_minn" "$_hrn" "$NODESCAN_TAG" >> "$_tmp"
+  fi
+  crontab "$_tmp" && rm -f "$_tmp" || { printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
+  printf '%s NODESCAN config saved via panel (enabled=%s sched=%s)\n' "$(date '+%F %T')" "$_en" "$_sched" >> "$LOG"
+  printf '{"ok":true,"enabled":%s,"schedule":"%s"}\n' "$_en" "$_sched"
+}
+
+# sync insurance cron interval: */N minutes (N: 1,2,3,5,10,15,30)
+cmd_sync_set() {
+  case "$1" in 1|2|3|5|10|15|30) : ;; *) printf '{"ok":false,"error":"bad interval"}\n'; return 1;; esac
+  _tmp=/tmp/gm-cron.$$
+  crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo.sh' > "$_tmp" || true
+  printf '*/%s * * * * %s # %s\n' "$1" "$SYNCLISTS" "$SYNC_TAG" >> "$_tmp"
+  crontab "$_tmp" && rm -f "$_tmp" || { printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
+  printf '%s SYNC cron set to */%s\n' "$(date '+%F %T')" "$1" >> "$LOG"
+  printf '{"ok":true,"interval":"*/%s"}\n' "$1"
+}
+
+# event watchdog on/off
+cmd_syncd_set() {
+  case "$1" in on|off) : ;; *) printf '{"ok":false,"error":"bad arg"}\n'; return 1;; esac
+  if [ "$1" = off ]; then
+    /etc/init.d/geomask-syncd stop >/dev/null 2>&1; /etc/init.d/geomask-syncd disable >/dev/null 2>&1
+  else
+    /etc/init.d/geomask-syncd enable >/dev/null 2>&1; /etc/init.d/geomask-syncd restart >/dev/null 2>&1
+  fi
+  sleep 1
+  _run=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _run=true
+  [ "$1" = on ] && [ "$_run" = true ] || [ "$1" = off ] && [ "$_run" = false ] || { printf '{"ok":false,"running":%s}\n' "$_run"; return 1; }
+  printf '{"ok":true,"running":%s}\n' "$_run"
+}
+
+# mihomo restart pin on/off
+cmd_pin_set() {
+  case "$1" in on|off) : ;; *) printf '{"ok":false,"error":"bad arg"}\n'; return 1;; esac
+  if [ "$1" = on ]; then
+    printf 'restarts forbidden by owner - VPN must stay up\n' > /root/.geomask-norestart
+    printf '%s PIN set (mihomo --restart disabled)\n' "$(date '+%F %T')" >> "$LOG"
+  else
+    rm -f /root/.geomask-norestart
+    printf '%s PIN removed (restarts allowed; be careful)\n' "$(date '+%F %T')" >> "$LOG"
+  fi
+  _p=false; [ -e /root/.geomask-norestart ] && _p=true
+  printf '{"ok":true,"pin":%s}\n' "$_p"
+}
+
+
 case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
@@ -954,6 +1059,11 @@ case "$1" in
   nodescan)   # kick the node audit in background (returns immediately; panel re-reads stack)
     ( /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 & )
     printf '{"ok":true,"started":true}\n' ;;
+  nodes_get)  cmd_nodes_get ;;
+  nodes_set)  cmd_nodes_set "$2" "$3" "$4" "$5" "$6" "$7" ;;
+  sync_set)   cmd_sync_set "$2" ;;
+  syncd_set)  cmd_syncd_set "$2" ;;
+  pin_set)    cmd_pin_set "$2" ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;

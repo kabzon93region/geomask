@@ -335,7 +335,12 @@ else
   echo "FAIL: S13 section enumeration broken"; failn=$((failn+1))
 fi
 
-# ---------- scenario 14: event sync watchdog + stack state (v1.10.0) ----------
+# v1.12.0: tabbed panel + full node-audit automation control
+for _p in 'gs-tabs' 'callNodesGet' 'cmd_nodes_set' 'cmd_sync_set' 'cmd_syncd_set' 'cmd_pin_set' 'geomask-nodescan.state'; do
+  if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S16 v1.12: $_p"; pass=$((pass+1))
+  else echo "FAIL: S16 v1.12 missing: $_p"; failn=$((failn+1)); fi
+done
+
 echo "=== S14: syncd watchdog + stack card ==="
 for _p in 'geomask-syncd.sh' '/etc/init.d/geomask-syncd' 'geomask-sync.state' 'cmd_stack' 'callStack' 'inotifywait'; do
   if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S14 has: $_p"; pass=$((pass+1))

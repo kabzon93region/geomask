@@ -1,7 +1,7 @@
 # geomask
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v1.11.2-blue)](https://github.com/kabzon93region/geomask/releases/tag/v1.11.2)
+[![Release](https://img.shields.io/badge/release-v1.12.0-blue)](https://github.com/kabzon93region/geomask/releases/tag/v1.12.0)
 [![Language: Shell](https://img.shields.io/badge/language-POSIX%20sh-informational)](geomask.sh)
 [![Platform: OpenWrt](https://img.shields.io/badge/platform-OpenWrt%2024.10%2B-00b5e2)](https://openwrt.org)
 [![LuCI](https://img.shields.io/badge/UI-LuCI-ff6d00)](https://github.com/openwrt/luci)
@@ -51,7 +51,7 @@ sh <(wget -qO - 'https://raw.githubusercontent.com/kabzon93region/geomask/master
 Из релиза (пин на конкретную версию):
 
 ```sh
-opkg install https://github.com/kabzon93region/geomask/releases/download/v1.11.2/geomask.sh
+opkg install https://github.com/kabzon93region/geomask/releases/download/v1.12.0/geomask.sh
 ```
 
 ## Быстрый старт

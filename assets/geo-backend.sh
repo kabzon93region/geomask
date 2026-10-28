@@ -828,7 +828,7 @@ cmd_stack() {
   _nc=$(grep -cE '#[[:space:]]*nochange' /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)
   _ng=$(grep -c . /opt/zapret/ipset/zapret-hosts-google.txt 2>/dev/null)
   _nr=$(grep -c . /opt/zapret/ipset/zapret-hosts-rkn.txt 2>/dev/null)
-  _nt=$(pgrep -c -f tg-ws-proxy 2>/dev/null)
+  _nt=$(pgrep -f tg-ws-proxy 2>/dev/null | wc -l)
   _land=false; wget -q -T 3 -O /dev/null http://127.0.0.1:8000/ 2>/dev/null && _land=true
   printf '{"ok":true,"sync":%s,"syncd":%s,"nodescan":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
     "$_sync" "$_sd" "$_ns" "$_guard" "$_pin" "$_strat" \

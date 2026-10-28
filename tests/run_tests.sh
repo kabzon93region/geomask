@@ -340,6 +340,12 @@ for _p in 'gs-tabs' 'callNodesGet' 'cmd_nodes_set' 'cmd_sync_set' 'cmd_syncd_set
   if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S16 v1.12: $_p"; pass=$((pass+1))
   else echo "FAIL: S16 v1.12 missing: $_p"; failn=$((failn+1)); fi
 done
+# v1.12.2: generic LuCI footer must be suppressed (own save buttons only)
+if grep -qF 'handleSaveApply: null' "$SCRIPT"; then
+  echo "PASS: S16 v1.12.2 footer suppressed"; pass=$((pass+1))
+else
+  echo "FAIL: S16 v1.12.2 footer not suppressed"; failn=$((failn+1))
+fi
 
 echo "=== S14: syncd watchdog + stack card ==="
 for _p in 'geomask-syncd.sh' '/etc/init.d/geomask-syncd' 'geomask-sync.state' 'cmd_stack' 'callStack' 'inotifywait'; do

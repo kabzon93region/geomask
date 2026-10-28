@@ -188,6 +188,13 @@ var E = (function(raw) {
 })(window.E);
 
 return view.extend({
+	/* v1.12.2: this panel saves via its own per-card buttons (rpc -> backend), no
+	   UCI form here - hide the generic LuCI apply/save/reset footer so it cannot
+	   be mistaken for the way to commit our fields. */
+	handleSaveApply: null,
+	handleSave: null,
+	handleReset: null,
+
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),

@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.12.1"
+GM_VERSION="1.12.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -165,7 +165,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.12.1"
+BACKEND_VERSION="1.12.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1392,7 +1392,7 @@ var callNodesSet   = rpc.declare({ object: 'geo-sync', method: 'nodes_set',   pa
 var callSyncSet    = rpc.declare({ object: 'geo-sync', method: 'sync_set',    params: { interval: null }, expect: {} });
 var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   params: { state: null }, expect: {} });
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
-var PANEL_VERSION = '1.12.1';
+var PANEL_VERSION = '1.12.2';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1547,6 +1547,13 @@ var E = (function(raw) {
 })(window.E);
 
 return view.extend({
+	/* v1.12.2: this panel saves via its own per-card buttons (rpc -> backend), no
+	   UCI form here - hide the generic LuCI apply/save/reset footer so it cannot
+	   be mistaken for the way to commit our fields. */
+	handleSaveApply: null,
+	handleSave: null,
+	handleReset: null,
+
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
@@ -3423,7 +3430,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.12.1"
+GUARD_VERSION="1.12.2"
 
 log() { logger -t geomask-guard "$*"; }
 

@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.11.0"
+GM_VERSION="1.11.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -163,7 +163,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.11.0"
+BACKEND_VERSION="1.11.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1263,7 +1263,7 @@ var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  p
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var PANEL_VERSION = '1.11.0';
+var PANEL_VERSION = '1.11.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -3115,7 +3115,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.11.0"
+GUARD_VERSION="1.11.1"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -3428,17 +3428,20 @@ for nm in sorted(blocked):
 new_filter='|'.join(parts)
 
 def apply_filter(cfgtext, filt):
-    # escape for double-quoted YAML scalar
-    esc=filt.replace('\\','\\\\').replace('"','\\"')
-    old=re.search(r'(exclude-filter: )"([^"]*)"|exclude-filter: ([^\n]*)', cfgtext)
-    if not old: return cfgtext, False
-    m=re.search(r'^( )*exclude-filter:.*$', cfgtext, re.M)
-    indent=m.group(1) if m else '    '
-    new_line='%sexclude-filter: "%s"' % (indent, esc)
+    # YAML single-quoted scalar: backslashes are literal (Go regex needs them);
+    # embedded single quotes would be doubled (names never contain them, kept safe anyway)
+    esc=filt.replace("'", "''")
+    m=re.search(r'^ *exclude-filter:.*$', cfgtext, re.M)
+    if not m: return cfgtext, False, False
+    indent=re.match(r'^ *', m.group(0)).group(0)
+    new_line='%sexclude-filter: '"'"'%s'"'"'' % (indent, esc)
     out=cfgtext[:m.start()]+new_line+cfgtext[m.end():]
-    return out, out!=cfgtext
+    return out, out!=cfgtext, True
 
-out, changed = apply_filter(text, new_filter)
+out, changed, found = apply_filter(text, new_filter)
+if not found:
+    log('exclude-filter line not found in config - nothing done'); sys.exit(1)
+applied=False
 if changed:
     open(CFG+'.bak_nodescan','w',encoding='utf-8').write(text)
     open(CFG+'.tmp','w',encoding='utf-8').write(out)
@@ -3456,6 +3459,7 @@ if changed:
         except Exception as e:
             log('reload failed: %s' % e)
         log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs))
+        applied=True
     else:
         try: os.remove(CFG+'.tmp')
         except Exception: pass
@@ -3468,12 +3472,12 @@ try:
     with open(BLOCKF,'w',encoding='utf-8') as f:
         f.write('\n'.join(sorted(blocked))+'\n')
 except Exception: pass
-st={'ts':time.strftime('%F %T'),'total':total,'blocked':len(blocked),'errors':errs,'changed':bool(changed)}
+st={'ts':time.strftime('%F %T'),'total':total,'blocked':len(blocked),'errors':errs,'changed':applied}
 try:
     with open(STATE+'.tmp','w') as f: json.dump(st,f)
     os.replace(STATE+'.tmp', STATE)
 except Exception: pass
-print('nodes=%d blocked=%d errors=%d changed=%s' % (total, len(blocked), errs, bool(changed)))
+print('nodes=%d blocked=%d errors=%d applied=%s' % (total, len(blocked), errs, applied))
 PYEOF
 
 ASSET_EOF

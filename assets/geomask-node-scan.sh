@@ -114,17 +114,20 @@ for nm in sorted(blocked):
 new_filter='|'.join(parts)
 
 def apply_filter(cfgtext, filt):
-    # escape for double-quoted YAML scalar
-    esc=filt.replace('\\','\\\\').replace('"','\\"')
-    old=re.search(r'(exclude-filter: )"([^"]*)"|exclude-filter: ([^\n]*)', cfgtext)
-    if not old: return cfgtext, False
-    m=re.search(r'^( )*exclude-filter:.*$', cfgtext, re.M)
-    indent=m.group(1) if m else '    '
-    new_line='%sexclude-filter: "%s"' % (indent, esc)
+    # YAML single-quoted scalar: backslashes are literal (Go regex needs them);
+    # embedded single quotes would be doubled (names never contain them, kept safe anyway)
+    esc=filt.replace("'", "''")
+    m=re.search(r'^ *exclude-filter:.*$', cfgtext, re.M)
+    if not m: return cfgtext, False, False
+    indent=re.match(r'^ *', m.group(0)).group(0)
+    new_line='%sexclude-filter: '"'"'%s'"'"'' % (indent, esc)
     out=cfgtext[:m.start()]+new_line+cfgtext[m.end():]
-    return out, out!=cfgtext
+    return out, out!=cfgtext, True
 
-out, changed = apply_filter(text, new_filter)
+out, changed, found = apply_filter(text, new_filter)
+if not found:
+    log('exclude-filter line not found in config - nothing done'); sys.exit(1)
+applied=False
 if changed:
     open(CFG+'.bak_nodescan','w',encoding='utf-8').write(text)
     open(CFG+'.tmp','w',encoding='utf-8').write(out)
@@ -142,6 +145,7 @@ if changed:
         except Exception as e:
             log('reload failed: %s' % e)
         log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs))
+        applied=True
     else:
         try: os.remove(CFG+'.tmp')
         except Exception: pass
@@ -154,10 +158,10 @@ try:
     with open(BLOCKF,'w',encoding='utf-8') as f:
         f.write('\n'.join(sorted(blocked))+'\n')
 except Exception: pass
-st={'ts':time.strftime('%F %T'),'total':total,'blocked':len(blocked),'errors':errs,'changed':bool(changed)}
+st={'ts':time.strftime('%F %T'),'total':total,'blocked':len(blocked),'errors':errs,'changed':applied}
 try:
     with open(STATE+'.tmp','w') as f: json.dump(st,f)
     os.replace(STATE+'.tmp', STATE)
 except Exception: pass
-print('nodes=%d blocked=%d errors=%d changed=%s' % (total, len(blocked), errs, bool(changed)))
+print('nodes=%d blocked=%d errors=%d applied=%s' % (total, len(blocked), errs, applied))
 PYEOF

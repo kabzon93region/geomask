@@ -131,6 +131,10 @@ var STYLE = [
 	'.gs-console .c-done{color:#3fb950}',
 	'.gs-console .c-run{color:#d29922}',
 	'.gs-console .c-dim{color:#8b949e}',
+	'.gs-log .c-err{color:#f85149}',
+	'.gs-log .c-done{color:#3fb950}',
+	'.gs-log .c-run{color:#d29922}',
+	'.gs-log .c-dim{color:#8b949e}',
 	'.gs-bk{margin-top:10px;border-top:1px solid #30363d;padding-top:6px}',
 	'.gs-bk h4{margin:2px 0 4px;font-size:13px;color:#e6edf3}',
 	'.gs-tabs{display:flex;gap:6px;flex-wrap:wrap;border-bottom:2px solid #1f6feb44;padding-bottom:0}',
@@ -549,7 +553,18 @@ return view.extend({
 		/* ===================== Log ===================== */
 		var logCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Журнал'),
-			E('pre', { 'class': 'gs-log' }, lg || '(пусто)')
+			(function() {
+				/* v1.12.3: same semantic colors as the update console */
+				var box = E('pre', { 'class': 'gs-log' });
+				String(lg || '(пусто)').split('\n').forEach(function(l) {
+					var cls = 'c-dim';
+					if (/\[error\]|FAILED|FAIL\b|abort/i.test(l)) cls = 'c-err';
+					else if (/\bwarn/i.test(l)) cls = 'c-run';
+					else if (/\[done\]|updated to|SYNC changed|no change/i.test(l)) cls = 'c-done';
+					box.appendChild(E('div', { 'class': cls }, l));
+				});
+				return box;
+			})()
 		]);
 		panels.obzor.appendChild(logCard);
 
@@ -559,9 +574,11 @@ return view.extend({
 		updLog.style.display = 'none';
 		var lastLogKey = null;
 		function updLineClass(l) {
-			if (l.indexOf('[error]') >= 0) return 'c-err';
-			if (l.indexOf('[done]') >= 0) return 'c-done';
-			if (/\[(queued|backup|download|validate|apply)\]/.test(l)) return 'c-run';
+			/* colors carry meaning: red=error, yellow=real warning, green=finished,
+			   dim=normal process step (was yellow before v1.12.3 - read as false warnings) */
+			if (/\[error\]|FAILED|fail\b/i.test(l)) return 'c-err';
+			if (/\bwarn(ing)?\b/i.test(l)) return 'c-run';
+			if (l.indexOf('[done]') >= 0 || /updated to|filter updated|no change/.test(l)) return 'c-done';
 			return 'c-dim';
 		}
 		function updRenderLines(lines) {

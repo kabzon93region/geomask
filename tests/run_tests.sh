@@ -349,6 +349,12 @@ if grep -qF '_unc=$(json_esc' "$SCRIPT" && grep -qF '_j=$(printf' "$SCRIPT"; the
 else
   echo "FAIL: S13 missing json escaping of backslash paths"; failn=$((failn+1))
 fi
+# v1.10.2: subscription exclude-filter must carry RF-marked node blocklist
+if grep -qF 'Нидерланды-(5|13|16|18)' "$SCRIPT" && grep -qF 'Германия-[234]' "$SCRIPT"; then
+  echo "PASS: S13 RF node filter in exclude-filter"; pass=$((pass+1))
+else
+  echo "FAIL: S13 RF node filter missing"; failn=$((failn+1))
+fi
 # v1.9.6: simple SMB credentials (backup/backup, guest ok) + force_root for /root paths
 if grep -qF 'force_root=1' "$SCRIPT" && grep -qF 'ksmbd.adduser backup -p backup' "$SCRIPT"; then
   echo "PASS: S13 force_root + backup auth user"; pass=$((pass+1))

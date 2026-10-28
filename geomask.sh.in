@@ -32,7 +32,7 @@
 
 set -u
 
-GM_VERSION="1.10.1"
+GM_VERSION="1.10.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -319,7 +319,7 @@ write_mihomo_config() {
     printf '%s\n' '    type: url-test'
     printf '%s\n' '    use:'
     printf '%s\n' '      - sub'
-    printf '%s\n' '    exclude-filter: "Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания"'
+    printf '%s\n' '    exclude-filter: "Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания|Финляндия|Нидерланды-(5|13|16|18)($|[^0-9])|Германия-[234]($|[^0-9])|США-1($|[^0-9])|Турция"'
     printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
     printf '%s\n' '    interval: 180'
     printf '%s\n' '    tolerance: 50'

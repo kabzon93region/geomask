@@ -823,7 +823,7 @@ cmd_stack() {
   _sde=false; ls /etc/rc.d/ 2>/dev/null | grep -q geomask-syncd && _sde=true
   _sci=$(crontab -l 2>/dev/null | grep 'sync_mtrickle_mihomo.sh' | head -1 | awk '{print $1}')
   [ -n "$_sci" ] || _sci='*/5'
-  _ne=false; crontab -l 2>/dev/null | grep -qF '# geomask-nodescan' && _ne=true
+  _nse=false; crontab -l 2>/dev/null | grep -q 'geomask-nodescan$' && _nse=true
   _ns=$(cat /tmp/geomask-nodescan.state 2>/dev/null)
   case "$_ns" in '{'*'}'*) : ;; *) _ns=null ;; esac
   _guard=$(logread 2>/dev/null | grep geomask-guard | grep -v crond | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
@@ -837,7 +837,7 @@ cmd_stack() {
   _nt=$(pgrep -f tg-ws-proxy 2>/dev/null | wc -l)
   _land=false; wget -q -T 3 -O /dev/null http://127.0.0.1:8000/ 2>/dev/null && _land=true
   printf '{"ok":true,"sync":%s,"syncd":%s,"syncd_enabled":%s,"sync_interval":"%s","nodescan_enabled":%s,"nodescan":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
-    "$_sync" "$_sd" "$_sde" "$_sci" "$_ne" "$_ns" "$_guard" "$_pin" "$_strat" \
+    "$_sync" "$_sd" "$_sde" "$_sci" "$_nse" "$_ns" "$_guard" "$_pin" "$_strat" \
     "${_nu:-0}" "${_ne:-0}" "${_nc:-0}" "${_ng:-0}" "${_nr:-0}" \
     "${_nt:-0}" "$_land" "$LANIP" "$LANIP" "$LANIP" "$LANIP"
 }
@@ -955,14 +955,14 @@ RUNEOF
 NODESCONF=/etc/geomask-nodes.conf
 NODESBLOCK=/etc/geomask-node-block.txt
 NODESCAN_TAG='# geomask-nodescan'
-SYNC_TAG='# geomask-sync'
+SYNC_TAG='geomask-sync'
 
 # read key from nodes conf
 _nconf() { sed -n "s/^$1=//p" "$NODESCONF" 2>/dev/null | head -1; }
 
 cmd_nodes_get() {
   _en=false
-  crontab -l 2>/dev/null | grep -qF "$NODESCAN_TAG" && _en=true
+  crontab -l 2>/dev/null | grep -q 'geomask-nodescan$' && _en=true
   _line=$(crontab -l 2>/dev/null | grep -F "$NODESCAN_TAG" | head -1)
   _min=$(printf '%s' "$_line" | awk '{print $1}')
   _hr=$(printf '%s' "$_line" | awk '{print $2}')
@@ -1003,18 +1003,18 @@ EOF
   _tmp=/tmp/gm-cron.$$
   crontab -l 2>/dev/null | grep -vF "$NODESCAN_TAG" > "$_tmp" || true
   if [ "$_en" = 1 ]; then
-    printf '%s %s * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 %s\n' "$_minn" "$_hrn" "$NODESCAN_TAG" >> "$_tmp"
+    printf '%s %s * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 %s\n' "$_minn" "$_hrn" "$NODESCAN_TAG" >> "$_tmp" 2>/dev/null
   fi
   crontab "$_tmp" && rm -f "$_tmp" || { printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
-  printf '%s NODESCAN config saved via panel (enabled=%s sched=%s)\n' "$(date '+%F %T')" "$_en" "$_sched" >> "$LOG"
-  printf '{"ok":true,"enabled":%s,"schedule":"%s"}\n' "$_en" "$_sched"
+  printf '%s NODESCAN cfg saved via panel (enabled=%s sched=%s)\n' "$(date '+%F %T')" "$_en" "$_sched" >> "$LOG"
+  printf '{"ok":true,"enabled":"%s","schedule":"%s"}\n' "$_en" "$_sched"
 }
 
 # sync insurance cron interval: */N minutes (N: 1,2,3,5,10,15,30)
 cmd_sync_set() {
   case "$1" in 1|2|3|5|10|15|30) : ;; *) printf '{"ok":false,"error":"bad interval"}\n'; return 1;; esac
   _tmp=/tmp/gm-cron.$$
-  crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo.sh' > "$_tmp" || true
+  crontab -l 2>/dev/null | grep -vF "/root/sync_mtrickle_mihomo.sh" > "$_tmp" || true
   printf '*/%s * * * * %s # %s\n' "$1" "$SYNCLISTS" "$SYNC_TAG" >> "$_tmp"
   crontab "$_tmp" && rm -f "$_tmp" || { printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
   printf '%s SYNC cron set to */%s\n' "$(date '+%F %T')" "$1" >> "$LOG"
@@ -1031,7 +1031,11 @@ cmd_syncd_set() {
   fi
   sleep 1
   _run=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _run=true
-  [ "$1" = on ] && [ "$_run" = true ] || [ "$1" = off ] && [ "$_run" = false ] || { printf '{"ok":false,"running":%s}\n' "$_run"; return 1; }
+  if [ "$1" = on ]; then
+    [ "$_run" = true ] || { printf '{"ok":false,"running":%s}\n' "$_run"; return 1; }
+  else
+    [ "$_run" = false ] || { printf '{"ok":false,"running":%s}\n' "$_run"; return 1; }
+  fi
   printf '{"ok":true,"running":%s}\n' "$_run"
 }
 

@@ -1281,7 +1281,10 @@ list_methods() {
 	json_add_object "sync_set";   json_add_string "interval" "string"; json_close_object
 	json_add_object "syncd_set";  json_add_string "state" "string"; json_close_object
 	json_add_object "pin_set";    json_add_string "state" "string"; json_close_object
+	json_add_object "lists_get";  json_close_object
+	json_add_object "lists_seed"; json_close_object
 	json_add_object "sync_lists"; json_close_object
+	json_add_object "aidns";      json_close_object
 	json_add_object "google";     json_close_object
 	json_add_object "global";     json_add_string "mode" "string"; json_close_object
 	json_add_object "ipv6";       json_add_string "state" "string"; json_close_object
@@ -1318,6 +1321,8 @@ call_method() {
 		sync_set)   json_get_var interval interval; "$BACKEND" sync_set "$interval" ;;
 		syncd_set)  json_get_var state state; "$BACKEND" syncd_set "$state" ;;
 		pin_set)    json_get_var state state; "$BACKEND" pin_set "$state" ;;
+		lists_get)  "$BACKEND" lists_get ;;
+		lists_seed) "$BACKEND" lists_seed ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;

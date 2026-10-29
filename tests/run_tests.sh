@@ -452,21 +452,28 @@ if [ -n "$_yt" ] && [ -n "$_yd" ] && [ "$_yt" -lt "$_yd" ]; then
 else echo "FAIL: S18 ytvpn/ytdirect order wrong (ytvpn=$_yt ytdirect=$_yd)"; failn=$((failn+1)); fi
 
 # ---------- scenario 19: every backend dispatch method is present in rpcd ACL (v1.13.3) ----------
-echo "=== S19: geo-sync methods must be ACL-granted ==="
+echo "=== S19: geo-sync methods must be ACL-granted AND registered in the rpcd wrapper ==="
 # collect methods from the backend case-block (lines like:   foo)  cmd_foo ...) and check each
 # appears in acl-geo-sync.json read[] or write[]. Missing -> rpcd -32002 Access denied at runtime.
-_miss=0
+_miss=0; _nowrap=0
 for _m in $(grep -oE '^  [a-z_]+\) ' "$HERE/../assets/geo-backend.sh" | tr -d ' )' | sort -u); do
   if ! grep -qF "\"$_m\"" "$HERE/../assets/acl-geo-sync.json"; then
     echo "  MISSING in ACL: $_m"; _miss=$((_miss+1))
   fi
+  # v1.13.3 lesson: the ubus method must ALSO be registered in the rpcd plugin wrapper
+  if ! grep -qE "(json_add_object \"$_m\"|^\t\t$_m\))" "$HERE/../assets/geo-sync"; then
+    echo "  MISSING in rpcd wrapper: $_m"; _nowrap=$((_nowrap+1))
+  fi
 done
 if [ "$_miss" = 0 ]; then echo "PASS: S19 all backend methods granted in ACL"; pass=$((pass+1))
 else echo "FAIL: S19 $_miss backend method(s) missing from ACL"; failn=$((failn+1)); fi
+if [ "$_nowrap" = 0 ]; then echo "PASS: S19 all backend methods registered in rpcd wrapper"; pass=$((pass+1))
+else echo "FAIL: S19 $_nowrap backend method(s) missing from rpcd wrapper"; failn=$((failn+1)); fi
 # explicit: lists_get/lists_seed must be present (the v1.13.0 regression)
-if grep -qF '"lists_get"' "$HERE/../assets/acl-geo-sync.json" && grep -qF '"lists_seed"' "$HERE/../assets/acl-geo-sync.json"; then
-  echo "PASS: S19 lists_get/lists_seed in ACL"; pass=$((pass+1))
-else echo "FAIL: S19 lists_* not in ACL"; failn=$((failn+1)); fi
+if grep -qF '"lists_get"' "$HERE/../assets/acl-geo-sync.json" && grep -qF '"lists_seed"' "$HERE/../assets/acl-geo-sync.json" \
+   && grep -qF '"lists_get"' "$HERE/../assets/geo-sync" && grep -qF '"lists_seed"' "$HERE/../assets/geo-sync"; then
+  echo "PASS: S19 lists_get/lists_seed in ACL + wrapper"; pass=$((pass+1))
+else echo "FAIL: S19 lists_* not in ACL/wrapper"; failn=$((failn+1)); fi
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

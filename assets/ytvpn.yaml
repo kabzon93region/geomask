@@ -1,10 +1,5 @@
-# IP-blocked googlevideo edge hosts -> route via VPN (DPI/zapret cannot fix IP-level blocks).
-# Curated from DPI strategy tests. Add newly-blocked rr*.googlevideo.com hosts here
-# (one "  - DOMAIN,<host>" per line); geomask installs this only if missing/empty, so local edits survive.
+# Bootstrap for googlevideo -> VPN. SOURCE OF TRUTH is the MagiTrickle group "GoogleVideo VPN"
+# (:8080); /root/sync_mtrickle_mihomo.sh regenerates this file from that group on every sync.
+# This seed only matters before the first sync so mihomo -t has a valid ruleset. Edit in MagiTrickle.
 payload:
-  - DOMAIN,rr4---sn-4g5e6nze.googlevideo.com
-  - DOMAIN,rr4---sn-q4flrnsl.googlevideo.com
-  - DOMAIN,rr2---sn-q4fl6ndl.googlevideo.com
-  - DOMAIN,rr1---sn-q4fl6n6y.googlevideo.com
-  - DOMAIN,rr16---sn-axq7sn76.googlevideo.com
-  - DOMAIN,rr1---sn-xguxaxjvh-gufl.googlevideo.com
+  - DOMAIN-SUFFIX,googlevideo.com

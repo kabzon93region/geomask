@@ -424,14 +424,23 @@ if grep -qF 'svc_alive' "$HERE/../assets/geo-backend.sh"; then
   echo "FAIL: S17 geo-backend.sh calls svc_alive (undefined in backend context)"; failn=$((failn+1))
 else echo "PASS: S17 geo-backend.sh uses pgrep, not svc_alive"; pass=$((pass+1)); fi
 
-# ---------- scenario 18: ytvpn (IP-blocked googlevideo edges -> VPN) (v1.13.2) ----------
-echo "=== S18: ytvpn -> VPN (v1.13.2) ==="
-# asset shipped with the 6 curated hosts
-if [ -s "$HERE/../assets/ytvpn.yaml" ] && grep -q 'rr4---sn-4g5e6nze.googlevideo.com' "$HERE/../assets/ytvpn.yaml"; then
-  echo "PASS: S18 ytvpn asset present with hosts"; pass=$((pass+1))
-else echo "FAIL: S18 ytvpn asset missing/incomplete"; failn=$((failn+1)); fi
-# built script wires provider + rule + keep-existing + check
-for _p in 'path: /etc/mihomo/ruleset/ytvpn.yaml' 'RULE-SET,ytvpn,VPN' 'keeping existing /etc/mihomo/ruleset/ytvpn.yaml' 'ytvpn->VPN rule: present'; do
+# ---------- scenario 18: ytvpn (googlevideo edges -> VPN via MagiTrickle group) (v1.13.2/3) ----------
+echo "=== S18: ytvpn -> VPN (v1.13.3) ==="
+# seed asset present and points googlevideo at the suffix (source of truth is the MT group)
+if [ -s "$HERE/../assets/ytvpn.yaml" ] && grep -q 'DOMAIN-SUFFIX,googlevideo.com' "$HERE/../assets/ytvpn.yaml"; then
+  echo "PASS: S18 ytvpn seed has googlevideo suffix"; pass=$((pass+1))
+else echo "FAIL: S18 ytvpn seed missing/incomplete"; failn=$((failn+1)); fi
+# sync must generate ytvpn.yaml from the GoogleVideo VPN group
+for _p in 'GOOGLEVIDEO_GROUP' 'ytvpn_payload' 'write_if_changed(YTVPN'; do
+  if grep -qF -- "$_p" "$HERE/../assets/sync_mtrickle_mihomo.sh"; then echo "PASS: S18 sync has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S18 sync missing: $_p"; failn=$((failn+1)); fi
+done
+# ytdirect must NOT carry googlevideo (would win over VPN by ordering)
+if grep -qE 'googlevideo\.com$' "$HERE/../assets/ytdirect.yaml"; then
+  echo "FAIL: S18 ytdirect still contains googlevideo suffix"; failn=$((failn+1))
+else echo "PASS: S18 ytdirect free of googlevideo"; pass=$((pass+1)); fi
+# built script wires provider + rule + check
+for _p in 'path: /etc/mihomo/ruleset/ytvpn.yaml' 'RULE-SET,ytvpn,VPN' 'ytvpn->VPN rule: present'; do
   if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S18 has: $_p"; pass=$((pass+1))
   else echo "FAIL: S18 missing: $_p"; failn=$((failn+1)); fi
 done
@@ -441,6 +450,23 @@ _yd=$(grep -nF 'RULE-SET,ytdirect,DIRECT' "$HERE/../geomask.sh.in" | head -1 | c
 if [ -n "$_yt" ] && [ -n "$_yd" ] && [ "$_yt" -lt "$_yd" ]; then
   echo "PASS: S18 ytvpn rule precedes ytdirect (line $_yt < $_yd)"; pass=$((pass+1))
 else echo "FAIL: S18 ytvpn/ytdirect order wrong (ytvpn=$_yt ytdirect=$_yd)"; failn=$((failn+1)); fi
+
+# ---------- scenario 19: every backend dispatch method is present in rpcd ACL (v1.13.3) ----------
+echo "=== S19: geo-sync methods must be ACL-granted ==="
+# collect methods from the backend case-block (lines like:   foo)  cmd_foo ...) and check each
+# appears in acl-geo-sync.json read[] or write[]. Missing -> rpcd -32002 Access denied at runtime.
+_miss=0
+for _m in $(grep -oE '^  [a-z_]+\) ' "$HERE/../assets/geo-backend.sh" | tr -d ' )' | sort -u); do
+  if ! grep -qF "\"$_m\"" "$HERE/../assets/acl-geo-sync.json"; then
+    echo "  MISSING in ACL: $_m"; _miss=$((_miss+1))
+  fi
+done
+if [ "$_miss" = 0 ]; then echo "PASS: S19 all backend methods granted in ACL"; pass=$((pass+1))
+else echo "FAIL: S19 $_miss backend method(s) missing from ACL"; failn=$((failn+1)); fi
+# explicit: lists_get/lists_seed must be present (the v1.13.0 regression)
+if grep -qF '"lists_get"' "$HERE/../assets/acl-geo-sync.json" && grep -qF '"lists_seed"' "$HERE/../assets/acl-geo-sync.json"; then
+  echo "PASS: S19 lists_get/lists_seed in ACL"; pass=$((pass+1))
+else echo "FAIL: S19 lists_* not in ACL"; failn=$((failn+1)); fi
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

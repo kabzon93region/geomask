@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.13.2"
+GM_VERSION="1.13.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -870,14 +870,15 @@ ASSET_EOF
   save_stream /etc/mihomo/ruleset/ytdirect.yaml 644 <<'ASSET_EOF'
 @@ASSET:ytdirect.yaml@@
 ASSET_EOF
-  # v1.13.2: IP-blocked googlevideo edges -> VPN. Install curated list only if missing/empty
-  # so the owner can append hosts to /etc/mihomo/ruleset/ytvpn.yaml and edits survive updates.
-  if [ ! -s "$(P /etc/mihomo/ruleset/ytvpn.yaml)" ] || grep -q '^payload: \[\]$' "$(P /etc/mihomo/ruleset/ytvpn.yaml)" 2>/dev/null; then
+  # v1.13.3: googlevideo -> VPN. Source of truth is the MagiTrickle group "GoogleVideo VPN";
+  # sync regenerates ytvpn.yaml from it. Seed the file only if missing so mihomo -t passes before
+  # first sync; never clobber an existing one here.
+  if [ ! -s "$(P /etc/mihomo/ruleset/ytvpn.yaml)" ]; then
     save_stream /etc/mihomo/ruleset/ytvpn.yaml 644 <<'ASSET_EOF'
 @@ASSET:ytvpn.yaml@@
 ASSET_EOF
   else
-    info "ytvpn list: keeping existing /etc/mihomo/ruleset/ytvpn.yaml"
+    info "ytvpn list: keeping existing /etc/mihomo/ruleset/ytvpn.yaml (sync-managed)"
   fi
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 @@ASSET:99-default-vpn-route@@

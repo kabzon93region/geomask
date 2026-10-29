@@ -1,12 +1,12 @@
-# AUTO-GENERATED from magitrickle Youtube group - YouTube DIRECT ruleset - DO NOT EDIT
+# YouTube DIRECT ruleset (non-video assets) - DO NOT EDIT manually.
+# v1.13.3: googlevideo.com / manifest.googlevideo.com REMOVED here -> routed to VPN via the
+# "GoogleVideo VPN" MagiTrickle group (sync writes ytvpn.yaml; rule precedes this one).
 payload:
   - DOMAIN-SUFFIX,cdn.youtube.com
-  - DOMAIN-SUFFIX,googlevideo.com
   - DOMAIN-SUFFIX,i.ytimg.com
   - DOMAIN-SUFFIX,i9.ytimg.com
   - DOMAIN-SUFFIX,kids.youtube.com
   - DOMAIN-SUFFIX,m.youtube.com
-  - DOMAIN-SUFFIX,manifest.googlevideo.com
   - DOMAIN-SUFFIX,music.youtube.com
   - DOMAIN-SUFFIX,nhacmp3youtube.com
   - DOMAIN-SUFFIX,returnyoutubedislikeapi.com

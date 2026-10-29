@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.13.2"
+GM_VERSION="1.13.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -168,7 +168,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.13.2"
+BACKEND_VERSION="1.13.3"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1363,13 +1363,13 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "ai_sub_get", "subs_list", "upd_check", "upd_status" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "ai_sub_get", "subs_list", "upd_check", "upd_status", "lists_get" ],
 				"system": [ "info" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set" ]
+				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed" ]
 			}
 		}
 	}
@@ -1430,7 +1430,7 @@ var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   pa
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
 var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
 var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
-var PANEL_VERSION = '1.13.2';
+var PANEL_VERSION = '1.13.3';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -19851,6 +19851,10 @@ import os, re, json, sys, time, urllib.request
 SRC = '/etc/magitrickle/state/config.yaml'
 MT  = '/etc/mihomo/ruleset/mtrickle.yaml'
 AI  = '/etc/mihomo/ruleset/ai.yaml'
+# v1.13.3: googlevideo edges -> VPN. Generated from the dedicated MagiTrickle group so the
+# user edits ONE place (:8080); no hand-maintained ruleset file. Rule precedes ytdirect->DIRECT.
+YTVPN = '/etc/mihomo/ruleset/ytvpn.yaml'
+GOOGLEVIDEO_GROUP = 'GoogleVideo VPN'
 
 # Whole groups routed to the German AI subscription.
 AI_GROUPS = {'Google+AI to DE'}
@@ -19954,17 +19958,24 @@ def is_ai_domain(e):
     return bool(m and AI_DOMAIN_RE.match(m.group(1)))
 
 mt_payload, ai_payload = [], []
-seen_mt, seen_ai = set(), set()
+ytvpn_payload = []
+seen_mt, seen_ai, seen_yt = set(), set(), set()
 moved = 0
 for g in GRPS:
     if g.get('interface') != 'Mihomo' or str(g.get('enable')).lower() != 'true':
         continue
     is_ai = g.get('name') in AI_GROUPS
+    is_ytvpn = g.get('name') == GOOGLEVIDEO_GROUP
     for r in g['rules']:
         if str(r.get('enable')).lower() != 'true':
             continue
         e = emit(r)
         if not e:
+            continue
+        if is_ytvpn:
+            if e not in seen_yt:
+                seen_yt.add(e)
+                ytvpn_payload.append(e)
             continue
         if is_ai:
             if e not in seen_ai:
@@ -20005,10 +20016,16 @@ def write_if_changed(path, payload):
 
 c1, n1 = write_if_changed(MT, mt_payload)
 c2, n2 = write_if_changed(AI, ai_payload)
+# v1.13.3: only rewrite ytvpn.yaml when the GoogleVideo group produced something; never blank it
+# to empty on a transient parse miss (keeps googlevideo->VPN stable). Absent group -> leave file as-is.
+c3 = False; n3 = len(ytvpn_payload)
+if ytvpn_payload:
+    c3, n3 = write_if_changed(YTVPN, ytvpn_payload)
 print('mtrickle.yaml: %d rules (%s)' % (n1, 'updated' if c1 else 'up-to-date'))
 print('ai.yaml:       %d rules (%s, + %d moved from non-AI groups by domain pattern)' % (n2, 'updated' if c2 else 'up-to-date', moved))
+print('ytvpn.yaml:    %d rules (%s)' % (n3, 'updated' if c3 else 'up-to-date'))
 
-if c1 or c2:
+if c1 or c2 or c3:
     _r_ok = False
     try:
         req = urllib.request.Request(
@@ -20041,15 +20058,15 @@ PYEOF
 
 ASSET_EOF
   save_stream /etc/mihomo/ruleset/ytdirect.yaml 644 <<'ASSET_EOF'
-# AUTO-GENERATED from magitrickle Youtube group - YouTube DIRECT ruleset - DO NOT EDIT
+# YouTube DIRECT ruleset (non-video assets) - DO NOT EDIT manually.
+# v1.13.3: googlevideo.com / manifest.googlevideo.com REMOVED here -> routed to VPN via the
+# "GoogleVideo VPN" MagiTrickle group (sync writes ytvpn.yaml; rule precedes this one).
 payload:
   - DOMAIN-SUFFIX,cdn.youtube.com
-  - DOMAIN-SUFFIX,googlevideo.com
   - DOMAIN-SUFFIX,i.ytimg.com
   - DOMAIN-SUFFIX,i9.ytimg.com
   - DOMAIN-SUFFIX,kids.youtube.com
   - DOMAIN-SUFFIX,m.youtube.com
-  - DOMAIN-SUFFIX,manifest.googlevideo.com
   - DOMAIN-SUFFIX,music.youtube.com
   - DOMAIN-SUFFIX,nhacmp3youtube.com
   - DOMAIN-SUFFIX,returnyoutubedislikeapi.com
@@ -20236,24 +20253,20 @@ payload:
   - DOMAIN-SUFFIX,ytimg.l.google.com
 
 ASSET_EOF
-  # v1.13.2: IP-blocked googlevideo edges -> VPN. Install curated list only if missing/empty
-  # so the owner can append hosts to /etc/mihomo/ruleset/ytvpn.yaml and edits survive updates.
-  if [ ! -s "$(P /etc/mihomo/ruleset/ytvpn.yaml)" ] || grep -q '^payload: \[\]$' "$(P /etc/mihomo/ruleset/ytvpn.yaml)" 2>/dev/null; then
+  # v1.13.3: googlevideo -> VPN. Source of truth is the MagiTrickle group "GoogleVideo VPN";
+  # sync regenerates ytvpn.yaml from it. Seed the file only if missing so mihomo -t passes before
+  # first sync; never clobber an existing one here.
+  if [ ! -s "$(P /etc/mihomo/ruleset/ytvpn.yaml)" ]; then
     save_stream /etc/mihomo/ruleset/ytvpn.yaml 644 <<'ASSET_EOF'
-# IP-blocked googlevideo edge hosts -> route via VPN (DPI/zapret cannot fix IP-level blocks).
-# Curated from DPI strategy tests. Add newly-blocked rr*.googlevideo.com hosts here
-# (one "  - DOMAIN,<host>" per line); geomask installs this only if missing/empty, so local edits survive.
+# Bootstrap for googlevideo -> VPN. SOURCE OF TRUTH is the MagiTrickle group "GoogleVideo VPN"
+# (:8080); /root/sync_mtrickle_mihomo.sh regenerates this file from that group on every sync.
+# This seed only matters before the first sync so mihomo -t has a valid ruleset. Edit in MagiTrickle.
 payload:
-  - DOMAIN,rr4---sn-4g5e6nze.googlevideo.com
-  - DOMAIN,rr4---sn-q4flrnsl.googlevideo.com
-  - DOMAIN,rr2---sn-q4fl6ndl.googlevideo.com
-  - DOMAIN,rr1---sn-q4fl6n6y.googlevideo.com
-  - DOMAIN,rr16---sn-axq7sn76.googlevideo.com
-  - DOMAIN,rr1---sn-xguxaxjvh-gufl.googlevideo.com
+  - DOMAIN-SUFFIX,googlevideo.com
 
 ASSET_EOF
   else
-    info "ytvpn list: keeping existing /etc/mihomo/ruleset/ytvpn.yaml"
+    info "ytvpn list: keeping existing /etc/mihomo/ruleset/ytvpn.yaml (sync-managed)"
   fi
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 #!/bin/sh
@@ -20344,7 +20357,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.13.2"
+GUARD_VERSION="1.13.3"
 
 log() { logger -t geomask-guard "$*"; }
 

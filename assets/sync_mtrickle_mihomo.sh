@@ -10,6 +10,10 @@ import os, re, json, sys, time, urllib.request
 SRC = '/etc/magitrickle/state/config.yaml'
 MT  = '/etc/mihomo/ruleset/mtrickle.yaml'
 AI  = '/etc/mihomo/ruleset/ai.yaml'
+# v1.13.3: googlevideo edges -> VPN. Generated from the dedicated MagiTrickle group so the
+# user edits ONE place (:8080); no hand-maintained ruleset file. Rule precedes ytdirect->DIRECT.
+YTVPN = '/etc/mihomo/ruleset/ytvpn.yaml'
+GOOGLEVIDEO_GROUP = 'GoogleVideo VPN'
 
 # Whole groups routed to the German AI subscription.
 AI_GROUPS = {'Google+AI to DE'}
@@ -113,17 +117,24 @@ def is_ai_domain(e):
     return bool(m and AI_DOMAIN_RE.match(m.group(1)))
 
 mt_payload, ai_payload = [], []
-seen_mt, seen_ai = set(), set()
+ytvpn_payload = []
+seen_mt, seen_ai, seen_yt = set(), set(), set()
 moved = 0
 for g in GRPS:
     if g.get('interface') != 'Mihomo' or str(g.get('enable')).lower() != 'true':
         continue
     is_ai = g.get('name') in AI_GROUPS
+    is_ytvpn = g.get('name') == GOOGLEVIDEO_GROUP
     for r in g['rules']:
         if str(r.get('enable')).lower() != 'true':
             continue
         e = emit(r)
         if not e:
+            continue
+        if is_ytvpn:
+            if e not in seen_yt:
+                seen_yt.add(e)
+                ytvpn_payload.append(e)
             continue
         if is_ai:
             if e not in seen_ai:
@@ -164,10 +175,16 @@ def write_if_changed(path, payload):
 
 c1, n1 = write_if_changed(MT, mt_payload)
 c2, n2 = write_if_changed(AI, ai_payload)
+# v1.13.3: only rewrite ytvpn.yaml when the GoogleVideo group produced something; never blank it
+# to empty on a transient parse miss (keeps googlevideo->VPN stable). Absent group -> leave file as-is.
+c3 = False; n3 = len(ytvpn_payload)
+if ytvpn_payload:
+    c3, n3 = write_if_changed(YTVPN, ytvpn_payload)
 print('mtrickle.yaml: %d rules (%s)' % (n1, 'updated' if c1 else 'up-to-date'))
 print('ai.yaml:       %d rules (%s, + %d moved from non-AI groups by domain pattern)' % (n2, 'updated' if c2 else 'up-to-date', moved))
+print('ytvpn.yaml:    %d rules (%s)' % (n3, 'updated' if c3 else 'up-to-date'))
 
-if c1 or c2:
+if c1 or c2 or c3:
     _r_ok = False
     try:
         req = urllib.request.Request(

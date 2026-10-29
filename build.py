@@ -16,6 +16,7 @@ MAP = {
     "geo-main.js":           "geo-sync-page.js",
     "sync_mtrickle_mihomo.sh": "sync_mtrickle_mihomo.sh",
     "ytdirect.yaml":         "ytdirect.yaml",
+    "ytvpn.yaml":            "ytvpn.yaml",
     "99-default-vpn-route":  "99-default-vpn-route",
     "geomask-guard.sh":      "geomask-guard.sh",
     "geomask-syncd.sh":      "geomask-syncd.sh",

@@ -424,6 +424,24 @@ if grep -qF 'svc_alive' "$HERE/../assets/geo-backend.sh"; then
   echo "FAIL: S17 geo-backend.sh calls svc_alive (undefined in backend context)"; failn=$((failn+1))
 else echo "PASS: S17 geo-backend.sh uses pgrep, not svc_alive"; pass=$((pass+1)); fi
 
+# ---------- scenario 18: ytvpn (IP-blocked googlevideo edges -> VPN) (v1.13.2) ----------
+echo "=== S18: ytvpn -> VPN (v1.13.2) ==="
+# asset shipped with the 6 curated hosts
+if [ -s "$HERE/../assets/ytvpn.yaml" ] && grep -q 'rr4---sn-4g5e6nze.googlevideo.com' "$HERE/../assets/ytvpn.yaml"; then
+  echo "PASS: S18 ytvpn asset present with hosts"; pass=$((pass+1))
+else echo "FAIL: S18 ytvpn asset missing/incomplete"; failn=$((failn+1)); fi
+# built script wires provider + rule + keep-existing + check
+for _p in 'path: /etc/mihomo/ruleset/ytvpn.yaml' 'RULE-SET,ytvpn,VPN' 'keeping existing /etc/mihomo/ruleset/ytvpn.yaml' 'ytvpn->VPN rule: present'; do
+  if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S18 has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S18 missing: $_p"; failn=$((failn+1)); fi
+done
+# ORDERING: ytvpn rule must precede ytdirect DIRECT rule (else ytdirect suffix wins -> still DIRECT)
+_yt=$(grep -nF 'RULE-SET,ytvpn,VPN' "$HERE/../geomask.sh.in" | head -1 | cut -d: -f1)
+_yd=$(grep -nF 'RULE-SET,ytdirect,DIRECT' "$HERE/../geomask.sh.in" | head -1 | cut -d: -f1)
+if [ -n "$_yt" ] && [ -n "$_yd" ] && [ "$_yt" -lt "$_yd" ]; then
+  echo "PASS: S18 ytvpn rule precedes ytdirect (line $_yt < $_yd)"; pass=$((pass+1))
+else echo "FAIL: S18 ytvpn/ytdirect order wrong (ytvpn=$_yt ytdirect=$_yd)"; failn=$((failn+1)); fi
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.13.1"
+GM_VERSION="1.13.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -168,7 +168,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.13.1"
+BACKEND_VERSION="1.13.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1430,7 +1430,7 @@ var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   pa
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
 var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
 var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
-var PANEL_VERSION = '1.13.1';
+var PANEL_VERSION = '1.13.2';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2390,7 +2390,8 @@ step3_check() {
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
-  for rf in /etc/mihomo/ruleset/mtrickle.yaml /etc/mihomo/ruleset/ai.yaml /etc/mihomo/ruleset/ytdirect.yaml; do
+  grep -q 'RULE-SET,ytvpn,VPN' "$_c" 2>/dev/null && info "ytvpn->VPN rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to VPN)"
+  for rf in /etc/mihomo/ruleset/mtrickle.yaml /etc/mihomo/ruleset/ai.yaml /etc/mihomo/ruleset/ytdirect.yaml /etc/mihomo/ruleset/ytvpn.yaml; do
     if [ -s "$(P "$rf")" ]; then info "ruleset: $rf ($(grep -c 'DOMAIN-SUFFIX' "$(P "$rf")" 2>/dev/null || echo '?') suffixes)"; else warn "ruleset empty/missing: $rf (sync step will create)"; fi
   done
   if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then info "mihomo -t: PASS"; else bad "mihomo -t: FAIL"; _need=1; fi
@@ -2559,6 +2560,10 @@ write_mihomo_config() {
     printf '%s\n' '    type: file'
     printf '%s\n' '    behavior: classical'
     printf '%s\n' '    path: /etc/mihomo/ruleset/ytdirect.yaml'
+    printf '%s\n' '  ytvpn:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/ytvpn.yaml'
     printf '\n'
     printf '%s\n' 'rules:'
     printf '%s\n' '  # AUTO-SYNC from magitrickle: /root/sync_mtrickle_mihomo.sh - DO NOT EDIT MANUALLY'
@@ -2578,6 +2583,7 @@ write_mihomo_config() {
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT'
+    printf '%s\n' '  - RULE-SET,ytvpn,VPN'
     printf '%s\n' '  - RULE-SET,ytdirect,DIRECT'
     printf '%s\n' '  - DOMAIN-SUFFIX,cloudflare-ech.com,AI'
     printf '%s\n' '  - RULE-SET,ai,AI'
@@ -2601,7 +2607,7 @@ write_mihomo_config() {
   } > "$_tmpconf" || { bad "cannot write $_tmpconf"; return 1; }
   # ruleset files must exist before mihomo -t
   mkdir -p "$(P /etc/mihomo/ruleset)"
-  for rf in mtrickle ai ytdirect; do
+  for rf in mtrickle ai ytdirect ytvpn; do
     [ -s "$(P /etc/mihomo/ruleset/$rf.yaml)" ] || printf 'payload: []\n' > "$(P /etc/mihomo/ruleset/$rf.yaml)"
   done
   if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
@@ -20230,6 +20236,25 @@ payload:
   - DOMAIN-SUFFIX,ytimg.l.google.com
 
 ASSET_EOF
+  # v1.13.2: IP-blocked googlevideo edges -> VPN. Install curated list only if missing/empty
+  # so the owner can append hosts to /etc/mihomo/ruleset/ytvpn.yaml and edits survive updates.
+  if [ ! -s "$(P /etc/mihomo/ruleset/ytvpn.yaml)" ] || grep -q '^payload: \[\]$' "$(P /etc/mihomo/ruleset/ytvpn.yaml)" 2>/dev/null; then
+    save_stream /etc/mihomo/ruleset/ytvpn.yaml 644 <<'ASSET_EOF'
+# IP-blocked googlevideo edge hosts -> route via VPN (DPI/zapret cannot fix IP-level blocks).
+# Curated from DPI strategy tests. Add newly-blocked rr*.googlevideo.com hosts here
+# (one "  - DOMAIN,<host>" per line); geomask installs this only if missing/empty, so local edits survive.
+payload:
+  - DOMAIN,rr4---sn-4g5e6nze.googlevideo.com
+  - DOMAIN,rr4---sn-q4flrnsl.googlevideo.com
+  - DOMAIN,rr2---sn-q4fl6ndl.googlevideo.com
+  - DOMAIN,rr1---sn-q4fl6n6y.googlevideo.com
+  - DOMAIN,rr16---sn-axq7sn76.googlevideo.com
+  - DOMAIN,rr1---sn-xguxaxjvh-gufl.googlevideo.com
+
+ASSET_EOF
+  else
+    info "ytvpn list: keeping existing /etc/mihomo/ruleset/ytvpn.yaml"
+  fi
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 #!/bin/sh
 # Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
@@ -20319,7 +20344,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.13.1"
+GUARD_VERSION="1.13.2"
 
 log() { logger -t geomask-guard "$*"; }
 

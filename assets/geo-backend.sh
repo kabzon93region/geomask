@@ -4,6 +4,7 @@
 #   status | leases | log | sync_lists | google | backups | stack | nodescan
 #   nodes_get | nodes_set <0|1> <HH:MM> <countries> <asns> <base> <provider>
 #   sync_set <N> | syncd_set <on|off> | pin_set <on|off>   (v1.12.0 automation controls)
+#   lists_get | lists_seed   (v1.13.0 bundled MagiTrickle lists template: status + restore)
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
 #     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
@@ -1054,6 +1055,37 @@ cmd_pin_set() {
 }
 
 
+# v1.13.0: lists template status (bundled MagiTrickle groups snapshot vs current config)
+cmd_lists_get() {
+  _tpl=/etc/geomask/lists/magitrickle-groups.yaml
+  _cfg=/etc/magitrickle/state/config.yaml
+  _tp=false; [ -s "$_tpl" ] && _tp=true
+  _tg=$(grep -c '^- id:' "$_tpl" 2>/dev/null); [ -n "$_tg" ] || _tg=0
+  _tr=$(grep -c '^  - id:' "$_tpl" 2>/dev/null); [ -n "$_tr" ] || _tr=0
+  _cg=$(grep -c '^- id:' "$_cfg" 2>/dev/null); [ -n "$_cg" ] || _cg=0
+  _cr=$(grep -c '^  - id:' "$_cfg" 2>/dev/null); [ -n "$_cr" ] || _cr=0
+  _run=false; svc_alive magitrickled && _run=true
+  printf '{"ok":true,"template_present":%s,"template_version":"%s","template_groups":%s,"template_rules":%s,"current_groups":%s,"current_rules":%s,"magitrickle_running":%s}\n' \
+    "$_tp" "$BACKEND_VERSION" "$_tg" "$_tr" "$_cg" "$_cr" "$_run"
+}
+
+# v1.13.0: restore MagiTrickle groups from the template (backup config.yaml, splice, restart+sync)
+cmd_lists_seed() {
+  _tpl=/etc/geomask/lists/magitrickle-groups.yaml
+  _py=/usr/bin/geomask-seed-lists.py
+  [ -s "$_tpl" ] || { printf '{"ok":false,"error":"template missing"}\n'; return 1; }
+  [ -f "$_py" ] || { printf '{"ok":false,"error":"seeder missing"}\n'; return 1; }
+  /etc/init.d/magitrickle stop >/dev/null 2>&1 || true
+  _out=$(python3 "$_py" 2>&1); _rc=$?
+  /etc/init.d/magitrickle start >/dev/null 2>&1 || true
+  sleep 2
+  sh /root/sync_mtrickle_mihomo.sh >/dev/null 2>&1 || true
+  curl -s -X PUT http://127.0.0.1:9090/configs -H 'Content-Type: application/json' \
+    -d '{"path":"/etc/mihomo/config.yaml"}' >/dev/null 2>&1 || true
+  _ok=false; printf '%s' "$_out" | grep -q '^CHANGED' && _ok=true
+  printf '{"ok":%s,"rc":%s,"result":"%s"}\n' "$_ok" "$_rc" "$(json_esc "$_out")"
+}
+
 case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
@@ -1068,6 +1100,8 @@ case "$1" in
   sync_set)   cmd_sync_set "$2" ;;
   syncd_set)  cmd_syncd_set "$2" ;;
   pin_set)    cmd_pin_set "$2" ;;
+  lists_get)  cmd_lists_get ;;
+  lists_seed) cmd_lists_seed ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;

@@ -12,6 +12,7 @@
 #   sh geomask.sh --yes        never ask (with --auto/--step/--reinstall)
 #   sh geomask.sh --restart    allow mihomo/magitrickle restarts where needed (drops VPN ~3s)
 #   sh geomask.sh --vpn-url U --ai-url U    set subscription URLs (kept secret in config only)
+#   sh geomask.sh --seed-lists  restore MagiTrickle domain lists from the bundled template (all groups)
 #   sh geomask.sh --help
 #
 # Install (jsDelivr CDN - fast, shows download progress):
@@ -32,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.12.3"
+GM_VERSION="1.13.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -40,6 +41,7 @@ GM_CHECK_ONLY=0
 GM_RESTART=0
 GM_BACKUP=0
 GM_REINSTALL=0
+GM_SEED_LISTS=0
 GM_STEP=""
 GM_VPN_URL=""
 GM_AI_URL=""
@@ -786,6 +788,47 @@ ASSET_EOF
 step4_verify() { step4_check; }
 
 # ============================================================ STEP 5: magitrickle -> mihomo sync
+# v1.13.0: write the bundled lists template + seeder to the router (idempotent; asset injected once).
+write_lists_assets() {
+  mkdir -p "$(P /etc/geomask/lists)" 2>/dev/null || true
+  save_stream /etc/geomask/lists/magitrickle-groups.yaml 644 <<'ASSET_EOF'
+@@ASSET:MagiTrickleGroups@@
+ASSET_EOF
+  save_stream /usr/bin/geomask-seed-lists.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-seed-lists.py@@
+ASSET_EOF
+}
+
+# v1.13.0: restore MagiTrickle domain lists from the bundled template.
+#   seed_lists ""    -> auto: seed only if MagiTrickle has no groups (fresh install)
+#   seed_lists force -> overwrite current groups with the template (backup first)
+# magitrickled owns config.yaml, so it is stopped around the write, then restarted + synced.
+seed_lists() {
+  _force="${1:-}"
+  _tpl="$(P /etc/geomask/lists/magitrickle-groups.yaml)"
+  _cfg="$(P /etc/magitrickle/state/config.yaml)"
+  _py="$(P /usr/bin/geomask-seed-lists.py)"
+  [ -s "$_tpl" ] || { warn "lists template missing ($_tpl) - skip seed"; return 0; }
+  [ -f "$_py" ]  || { warn "seed script missing ($_py) - skip seed"; return 0; }
+  if [ "$_force" != force ]; then
+    [ -f "$_cfg" ] || { info "lists: MagiTrickle config not created yet - auto-seed deferred (it seeds once magitrickle initializes)"; return 0; }
+    python3 "$_py" --check-empty --config="$_cfg" --template="$_tpl" || { info "lists: MagiTrickle already configured - auto-seed skipped (use --seed-lists to restore)"; return 0; }
+  fi
+  info "lists: seeding MagiTrickle groups from template (mode=${_force:-ifempty})..."
+  initd magitrickle stop >/dev/null 2>&1 || true
+  _out=$(python3 "$_py" --config="$_cfg" --template="$_tpl" 2>&1); _rc=$?
+  initd magitrickle start >/dev/null 2>&1 || true
+  sleep 2
+  svc_alive magitrickled || warn "magitrickle did not come back after seed"
+  # regenerate mihomo rulesets + hot-reload mihomo (no mihomo restart)
+  sh "$(P /root/sync_mtrickle_mihomo.sh)" >/dev/null 2>&1 || true
+  curl -s -X PUT "http://127.0.0.1:9090/configs" -H 'Content-Type: application/json' \
+    -d '{"path":"/etc/mihomo/config.yaml"}' >/dev/null 2>&1 || true
+  printf '%s\n' "$_out" | sed 's/^/  | /'
+  if [ "$_rc" -eq 0 ]; then info "lists: seed applied"; else bad "lists: seed failed rc=$_rc"; fi
+  return "$_rc"
+}
+
 step5_check() {
   _need=0
   _s="$(P /root/sync_mtrickle_mihomo.sh)"
@@ -884,6 +927,9 @@ ASSET_EOF
   else
     warn "sync not run (it may restart mihomo). Run later: sh /root/sync_mtrickle_mihomo.sh  or use --restart"
   fi
+  # v1.13.0: ship the lists template + seeder, and auto-seed MagiTrickle if it is empty (fresh install).
+  write_lists_assets
+  seed_lists ""
   return 0
 }
 step5_verify() { step5_check; }
@@ -1287,6 +1333,7 @@ while [ $# -gt 0 ]; do
     --step) shift; GM_STEP="${1:-}" ;;
     --vpn-url) shift; GM_VPN_URL="${1:-}" ;;
     --ai-url) shift; GM_AI_URL="${1:-}" ;;
+    --seed-lists) GM_SEED_LISTS=1 ;;
     --help|-h) usage; exit 0 ;;
     *) printf 'unknown option: %s (see --help)\n' "$1"; exit 2 ;;
   esac
@@ -1304,6 +1351,8 @@ if [ "$GM_BACKUP" = 1 ]; then
   _b=$(ensure_backup) && { info "full backup created: $_b"; info "SMB (freshest one): \\\\$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)\\geomask-backups ; history on PC: geomask\\fetch_backup.ps1"; RC=0; } || RC=1
 elif [ "$GM_REINSTALL" = 1 ]; then
   menu_reinstall || RC=1
+elif [ "$GM_SEED_LISTS" = 1 ]; then
+  write_lists_assets && seed_lists force || RC=1
 elif [ -n "$GM_STEP" ]; then
   run_step "$GM_STEP" || RC=1
 elif [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then

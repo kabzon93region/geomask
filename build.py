@@ -22,6 +22,8 @@ MAP = {
     "geomask-syncd.init":    "geomask-syncd.init",
     "geomask-node-scan.sh":  "geomask-node-scan.sh",
     "geomask-nodes.conf":    "geomask-nodes.conf",
+    "MagiTrickleGroups":     "magitrickle-groups.yaml",
+    "geomask-seed-lists.py": "geomask-seed-lists.py",
 }
 
 # menu.json asset file on disk (same acl download name collision): we saved menu as second luci-app-geo-sync.json

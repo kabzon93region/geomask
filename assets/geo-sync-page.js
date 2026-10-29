@@ -33,6 +33,8 @@ var callNodesSet   = rpc.declare({ object: 'geo-sync', method: 'nodes_set',   pa
 var callSyncSet    = rpc.declare({ object: 'geo-sync', method: 'sync_set',    params: { interval: null }, expect: {} });
 var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   params: { state: null }, expect: {} });
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
+var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
+var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
 var PANEL_VERSION = '@@PANEL_VERSION@@';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
@@ -202,7 +204,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet() ]);
 	},
 
 	render: function(all) {
@@ -214,6 +216,7 @@ return view.extend({
 		var bks = all[7] || {};
 		var stk = all[8] || {};
 		var nd = all[9] || {};
+		var lt = all[10] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -811,6 +814,35 @@ return view.extend({
 			E('div', { 'class': 'gs-hint' }, 'Сторож реагирует на сохранение списков в MagiTrickle; cron — гарантия на случай сбоя события.')
 		]));
 
+		/* ===================== Lists template (lists tab, v1.13.0) ===================== */
+		var btnSeed = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+			if (!confirm('Восстановить списки MagiTrickle из шаблона geomask? Текущие группы будут перезаписаны (config.yaml сохранится в бэкап), MagiTrickle перезапустится на несколько секунд.')) return;
+			btnSeed.disabled = true; btnSeed.textContent = 'Восстановление…';
+			callListsSeed().then(function(res) {
+				btnSeed.disabled = false; btnSeed.textContent = 'Восстановить из шаблона';
+				if (res && res.ok) ui.addNotification(null, E('p', {}, 'Списки восстановлены из шаблона'), 'info');
+				else ui.addNotification(null, E('p', {}, 'Ошибка восстановления: ' + ((res && res.result) || 'см. журнал')), 'error');
+				return view.reload();
+			}).catch(function(e) { btnSeed.disabled = false; btnSeed.textContent = 'Восстановить из шаблона'; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Восстановить из шаблона');
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Шаблоны списков (резерв восстановления)'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'geomask хранит снимок всех групп MagiTrickle (To VPN / To Not VPN / Google+AI / Geoblock / Youtube и др.) — без секретов. ' +
+				'После переустановки или сброса (инцидент B-018) кнопка ниже вернет списки к этому снимку. Тонкая правка доменов — в панели MagiTrickle (:8080).'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Шаблон'),
+				E('span', { 'class': 'gs-badge ' + (lt.template_present ? 'gs-ok' : 'gs-off') }, lt.template_present ? ('v' + (lt.template_version || '?')) : 'отсутствует'),
+				E('span', { 'class': 'gs-val gs-mono' }, 'групп ' + (lt.template_groups || 0) + ' · правил ' + (lt.template_rules || 0))
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Сейчас в MagiTrickle'),
+				E('span', { 'class': 'gs-val gs-mono' }, 'групп ' + (lt.current_groups || 0) + ' · правил ' + (lt.current_rules || 0)),
+				E('span', { 'class': 'gs-badge ' + (lt.magitrickle_running ? 'gs-ok' : 'gs-off') }, lt.magitrickle_running ? 'работает' : 'остановлен')
+			]),
+			E('div', { 'class': 'gs-row' }, [ btnSeed ])
+		]));
+
 		/* ===================== Node audit (nodes tab, v1.12.0) ===================== */
 		var conf = nd.conf || {};
 		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
@@ -923,7 +955,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);

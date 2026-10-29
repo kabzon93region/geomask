@@ -389,6 +389,37 @@ else
   echo "FAIL: S13 ensure_backup does not build-then-move"; failn=$((failn+1))
 fi
 
+# ---------- scenario 17: MagiTrickle lists template + seeder (v1.13.0) ----------
+echo "=== S17: lists template (v1.13.0) ==="
+for _p in '--seed-lists' 'write_lists_assets' 'seed_lists' 'geomask-seed-lists.py' 'magitrickle-groups.yaml' 'cmd_lists_get' 'cmd_lists_seed' 'callListsGet' 'callListsSeed' 'lists_get' 'lists_seed'; do
+  if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S17 has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S17 missing: $_p"; failn=$((failn+1)); fi
+done
+# template + meta shipped in repo
+if [ -s "$HERE/../assets/magitrickle-groups.yaml" ] && [ -s "$HERE/../templates/lists.meta.json" ]; then
+  echo "PASS: S17 template + meta present"; pass=$((pass+1))
+else echo "FAIL: S17 template/meta missing"; failn=$((failn+1)); fi
+# template must carry the real groups (To VPN + Google+AI + Youtube)
+if grep -qF 'name: To VPN' "$HERE/../assets/magitrickle-groups.yaml" \
+   && grep -qF 'name: Google+AI to DE' "$HERE/../assets/magitrickle-groups.yaml" \
+   && grep -qF 'name: To Not VPN' "$HERE/../assets/magitrickle-groups.yaml"; then
+  echo "PASS: S17 template has routing groups"; pass=$((pass+1))
+else echo "FAIL: S17 template missing expected groups"; failn=$((failn+1)); fi
+# SECRET SCAN: lists template must not contain URLs or hwid (domain lists only)
+if grep -qiE 'http://|https://|x-hwid|hwid:' "$HERE/../assets/magitrickle-groups.yaml"; then
+  echo "FAIL: S17 lists template contains URL/hwid"; grep -inE 'http|hwid' "$HERE/../assets/magitrickle-groups.yaml" | head -3 | sed 's/^/    | /'; failn=$((failn+1))
+else echo "PASS: S17 lists template has no URLs/hwid"; pass=$((pass+1)); fi
+# SECRET SCAN: no 32-hex credential literal in installer source or template
+if grep -qE '\b[0-9a-f]{32}\b' "$HERE/../geomask.sh.in" "$HERE/../assets/magitrickle-groups.yaml"; then
+  echo "FAIL: S17 possible 32-hex secret literal committed"; failn=$((failn+1))
+else echo "PASS: S17 no 32-hex secret literal"; pass=$((pass+1)); fi
+# seeder is prefix-aware (takes --config/--template) and idempotent-safe (check-empty)
+if grep -qF -- '--check-empty' "$HERE/../assets/geomask-seed-lists.py" \
+   && grep -qF -- '--config=' "$HERE/../assets/geomask-seed-lists.py" \
+   && grep -qF 'bak_geomask_' "$HERE/../assets/geomask-seed-lists.py"; then
+  echo "PASS: S17 seeder: check-empty + prefix paths + backup"; pass=$((pass+1))
+else echo "FAIL: S17 seeder contract broken"; failn=$((failn+1)); fi
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

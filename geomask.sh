@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.13.0"
+GM_VERSION="1.13.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -168,7 +168,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.13.0"
+BACKEND_VERSION="1.13.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1200,7 +1200,7 @@ cmd_lists_get() {
   _tr=$(grep -c '^  - id:' "$_tpl" 2>/dev/null); [ -n "$_tr" ] || _tr=0
   _cg=$(grep -c '^- id:' "$_cfg" 2>/dev/null); [ -n "$_cg" ] || _cg=0
   _cr=$(grep -c '^  - id:' "$_cfg" 2>/dev/null); [ -n "$_cr" ] || _cr=0
-  _run=false; svc_alive magitrickled && _run=true
+  _run=false; pgrep -f magitrickled >/dev/null 2>&1 && _run=true
   printf '{"ok":true,"template_present":%s,"template_version":"%s","template_groups":%s,"template_rules":%s,"current_groups":%s,"current_rules":%s,"magitrickle_running":%s}\n' \
     "$_tp" "$BACKEND_VERSION" "$_tg" "$_tr" "$_cg" "$_cr" "$_run"
 }
@@ -1430,7 +1430,7 @@ var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   pa
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
 var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
 var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
-var PANEL_VERSION = '1.13.0';
+var PANEL_VERSION = '1.13.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -20319,7 +20319,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.13.0"
+GUARD_VERSION="1.13.1"
 
 log() { logger -t geomask-guard "$*"; }
 

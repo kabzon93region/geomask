@@ -419,6 +419,10 @@ if grep -qF -- '--check-empty' "$HERE/../assets/geomask-seed-lists.py" \
    && grep -qF 'bak_geomask_' "$HERE/../assets/geomask-seed-lists.py"; then
   echo "PASS: S17 seeder: check-empty + prefix paths + backup"; pass=$((pass+1))
 else echo "FAIL: S17 seeder contract broken"; failn=$((failn+1)); fi
+# backend runs OUTSIDE geomask.sh: svc_alive is undefined there -> must use pgrep (v1.13.0 bug guard)
+if grep -qF 'svc_alive' "$HERE/../assets/geo-backend.sh"; then
+  echo "FAIL: S17 geo-backend.sh calls svc_alive (undefined in backend context)"; failn=$((failn+1))
+else echo "PASS: S17 geo-backend.sh uses pgrep, not svc_alive"; pass=$((pass+1)); fi
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

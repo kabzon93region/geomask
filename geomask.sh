@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.13.8"
+GM_VERSION="1.14.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.13.8"
+BACKEND_VERSION="1.14.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1314,6 +1314,32 @@ cmd_lists_seed() {
   printf '{"ok":%s,"rc":%s,"result":"%s"}\n' "$_ok" "$_rc" "$(json_esc "$_out")"
 }
 
+# v1.14.0: youtube edge watchdog - status / mode switch / manual release
+YT_WATCH=/usr/bin/geomask-ytwatch.sh
+YT_CONF=/etc/geomask-ytwatch.conf
+
+cmd_yt_get() {
+  [ -x "$YT_WATCH" ] || { printf '{"ok":false,"error":"ytwatch not installed"}\n'; return 1; }
+  _j=$(sh "$YT_WATCH" --status 2>/dev/null)
+  case "$_j" in '{'*'}'*) : ;; *) _j='{"error":"no status"}' ;; esac
+  _mode=$(sed -n 's/^mode=//p' "$YT_CONF" 2>/dev/null | head -1)
+  printf '%s\n' "$_j" | sed "s#\"mode\":[^,]*#\"mode\":\"${_mode:-auto}\",\"ok\":true#"
+}
+
+cmd_yt_mode() {
+  case "$1" in auto|blanket) : ;; *) printf '{"ok":false,"error":"bad mode"}\n'; return 1 ;; esac
+  [ -x "$YT_WATCH" ] || { printf '{"ok":false,"error":"ytwatch not installed"}\n'; return 1; }
+  _out=$(sh "$YT_WATCH" --mode "$1" 2>&1); _rc=$?
+  printf '%s\n' "$_out" | tail -1
+  return $_rc
+}
+
+cmd_yt_reset() {
+  [ -x "$YT_WATCH" ] || { printf '{"ok":false,"error":"ytwatch not installed"}\n'; return 1; }
+  sh "$YT_WATCH" --reset >/dev/null 2>&1
+  printf '{"ok":true}\n'
+}
+
 case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
@@ -1330,6 +1356,9 @@ case "$1" in
   pin_set)    cmd_pin_set "$2" ;;
   lists_get)  cmd_lists_get ;;
   lists_seed) cmd_lists_seed ;;
+  yt_get)     cmd_yt_get ;;
+  yt_mode)    cmd_yt_mode "$2" ;;
+  yt_reset)   cmd_yt_reset ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;
@@ -1375,6 +1404,9 @@ list_methods() {
 	json_add_object "pin_set";    json_add_string "state" "string"; json_close_object
 	json_add_object "lists_get";  json_close_object
 	json_add_object "lists_seed"; json_close_object
+	json_add_object "yt_get";     json_close_object
+	json_add_object "yt_mode";    json_add_string "mode" "string"; json_close_object
+	json_add_object "yt_reset";   json_close_object
 	json_add_object "sync_lists"; json_close_object
 	json_add_object "aidns";      json_close_object
 	json_add_object "google";     json_close_object
@@ -1415,6 +1447,9 @@ call_method() {
 		pin_set)    json_get_var state state; "$BACKEND" pin_set "$state" ;;
 		lists_get)  "$BACKEND" lists_get ;;
 		lists_seed) "$BACKEND" lists_seed ;;
+		yt_get)     "$BACKEND" yt_get ;;
+		yt_mode)    json_get_var mode mode; "$BACKEND" yt_mode "$mode" ;;
+		yt_reset)   "$BACKEND" yt_reset ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;
@@ -1460,13 +1495,13 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "ai_sub_get", "subs_list", "upd_check", "upd_status", "lists_get" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "ai_sub_get", "subs_list", "upd_check", "upd_status", "lists_get", "yt_get" ],
 				"system": [ "info" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed" ]
+				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset" ]
 			}
 		}
 	}
@@ -1527,7 +1562,10 @@ var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   pa
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
 var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
 var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
-var PANEL_VERSION = '1.13.8';
+var callYtGet      = rpc.declare({ object: 'geo-sync', method: 'yt_get',      expect: {} });
+var callYtMode     = rpc.declare({ object: 'geo-sync', method: 'yt_mode',     params: { mode: null }, expect: {} });
+var callYtReset    = rpc.declare({ object: 'geo-sync', method: 'yt_reset',    expect: {} });
+var PANEL_VERSION = '1.14.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1696,7 +1734,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet() ]);
 	},
 
 	render: function(all) {
@@ -1709,6 +1747,7 @@ return view.extend({
 		var stk = all[8] || {};
 		var nd = all[9] || {};
 		var lt = all[10] || {};
+		var yt = all[11] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -2335,6 +2374,46 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [ btnSeed ])
 		]));
 
+		/* ===================== YouTube edges watchdog (lists tab, v1.14.0) ===================== */
+		var ytAuto = (yt.mode || 'auto') === 'auto';
+		var setMode = function(m, btn) {
+			btn.disabled = true;
+			callYtMode({ mode: m }).then(function(res) {
+				btn.disabled = false;
+				if (res && res.ok) ui.addNotification(null, E('p', {}, m === 'auto' ? 'Режим авто: битые рёбра уходят в VPN, остальные через запрет (DPI)' : 'Режим blanket: весь googlevideo в VPN'), 'info');
+				else ui.addNotification(null, E('p', {}, 'Не удалось переключить режим'), 'error');
+				return view.reload();
+			}).catch(function(e) { btn.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		};
+		var btnYtAuto = E('button', { 'class': 'gs-btn' + (ytAuto ? '' : ' gs-btn-primary'), 'click': function() { setMode('auto', btnYtAuto); } }, 'Авто (битые — в VPN)');
+		var btnYtAll = E('button', { 'class': 'gs-btn' + (ytAuto ? '' : ' gs-btn-primary'), 'click': function() { setMode('blanket', btnYtAll); } }, 'Весь googlevideo в VPN');
+		var btnYtRel = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+			if (!confirm('Отпустить все автотопинги? Рёбра вернутся на прямой путь через запрет (DPI).')) return;
+			btnYtRel.disabled = true;
+			callYtReset().then(function() { view.reload(); }).catch(function(e) { btnYtRel.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Отпустить пины сейчас');
+		var ytPins = yt.pinned_hosts || [];
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'YouTube: рёбра googlevideo'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Google раздаёт адреса рёбер динамически и часть из них блокируется по IP, поэтому статический список всегда отстаёт. ' +
+				'В режиме «Авто» рёбра идут напрямую через запрет (DPI), а watchdog каждые 5 минут читает ошибки соединений mihomo и ' +
+				'кладёт реально падающие хосты в группу «GoogleVideo VPN» (видно в MagiTrickle :8080). Ночью пины отпускаются. ' +
+				'Картинки (ytimg/ggpht) и сам youtube.com — всегда напрямую через запрет.'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Режим'),
+				E('span', { 'class': 'gs-badge ' + (ytAuto ? 'gs-ok' : 'gs-off') }, ytAuto ? 'авто' : 'весь в VPN'),
+				btnYtAuto, btnYtAll
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Сейчас в VPN'),
+				E('span', { 'class': 'gs-val gs-mono' }, ytPins.length ? (ytPins.length + ' ребра') : '—'),
+				E('span', { 'class': 'gs-hint' }, 'порог ' + (yt.threshold || 2) + ' ошибок за ' + (yt.window_min || 30) + ' мин, максимум ' + (yt.max_pins || 40))
+			]),
+			ytPins.length ? E('div', { 'class': 'gs-blocklist' }, ytPins.join('\n')) : null,
+			E('div', { 'class': 'gs-row' }, [ btnYtRel ])
+		]));
+
 		/* ===================== Node audit (nodes tab, v1.12.0) ===================== */
 		var conf = nd.conf || {};
 		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
@@ -2447,7 +2526,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);
@@ -19927,6 +20006,11 @@ step5_check() {
   if [ -x "$(P /usr/bin/geomask-node-scan.sh)" ] && [ -s "$(P /etc/geomask-nodes.conf)" ]; then info "node-scan: installed"
   else bad "node-scan missing (script/conf)"; _need=1; fi
   if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then info "nodescan cron 03:30: present"; else bad "nodescan cron missing"; _need=1; fi
+  # v1.14.0: youtube edge watchdog
+  if [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ] && [ -s "$(P /etc/geomask-ytwatch.conf)" ]; then info "ytwatch: installed"
+  else bad "ytwatch missing (script/conf)"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch$'; then info "ytwatch cron */5: present"; else bad "ytwatch cron missing"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch-reset$'; then info "ytwatch reset cron: present"; else bad "ytwatch reset cron missing"; _need=1; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -20479,7 +20563,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.13.8"
+GUARD_VERSION="1.14.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -20939,6 +21023,280 @@ ASSET_EOF
   else
     ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
   fi
+  # v1.14.0: YouTube edge watchdog - failing *.googlevideo.com edges get pinned to VPN,
+  # released back to zapret nightly. Source of truth stays in MagiTrickle (group feeds ytvpn.yaml).
+  save_stream /usr/bin/geomask-ytwatch.sh 755 <<'ASSET_EOF'
+#!/bin/sh
+# geomask-ytwatch.sh - YouTube edge auto-pin watchdog (geomask v1.14.0+).
+#
+# Why: googlevideo.com edges are IP-blocked per hostname and Google rotates those names,
+# so any static list lags. Default path is DIRECT (DPI/zapret). This watcher reads mihomo's
+# OWN dial errors and pins only the hosts that actually fail into the MagiTrickle group
+# "GoogleVideo VPN" (which sync turns into ytvpn.yaml, matched BEFORE ytdirect). A nightly
+# --reset drops the automatic pins so healthy edges return to zapret.
+#
+#   geomask-ytwatch.sh            scan + pin (cron */5)
+#   geomask-ytwatch.sh --reset    remove automatic pins (cron, nightly)
+#   geomask-ytwatch.sh --status   JSON for the panel
+#   geomask-ytwatch.sh --mode auto|blanket   switch mode (also called by the panel)
+#
+# Config: /etc/geomask-ytwatch.conf. Nothing here selects proxies or touches traffic directly.
+exec python3 - "$@" <<'PYEOF'
+import json, os, re, socket, subprocess, sys, time, urllib.request, http.client
+
+CONF='/etc/geomask-ytwatch.conf'
+STATE='/tmp/geomask-ytwatch.state'
+JOURNAL='/root/geo-sync.log'
+SOCKPATH='/var/run/magitrickle.sock'
+BLANKET='googlevideo.com'
+
+def log(msg):
+    try:
+        with open(JOURNAL,'a',encoding='utf-8') as f:
+            f.write('%s YTWATCH %s\n' % (time.strftime('%F %T'), msg))
+    except Exception:
+        pass
+
+cfgd={}
+try:
+    for ln in open(CONF, encoding='utf-8'):
+        ln=ln.strip()
+        if ln and not ln.startswith('#') and '=' in ln:
+            k,_,v=ln.partition('='); cfgd[k.strip()]=v.strip()
+except Exception as e:
+    log('conf read failed: %s' % e)
+
+mode=cfgd.get('mode','auto')
+threshold=max(1,int(cfgd.get('fail_threshold','2')))
+window=max(5,int(cfgd.get('window_min','30')))
+cap=max(1,int(cfgd.get('max_pins','40')))
+group_name=cfgd.get('group_name','GoogleVideo VPN')
+
+# ---------- MagiTrickle API over unix socket (handles chunked responses) ----------
+class U(http.client.HTTPConnection):
+    def connect(self):
+        s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(8); s.connect(SOCKPATH); self.sock=s
+
+def api(method, path, body=None):
+    try:
+        c=U('localhost')
+        c.request(method, path, body=(json.dumps(body) if body is not None else None),
+                  headers=({'Content-Type':'application/json'} if body is not None else {}))
+        r=c.getresponse(); raw=r.read().decode('utf-8','replace'); c.close()
+        try: return r.status, json.loads(raw)
+        except Exception: return r.status, {'raw': raw[:200]}
+    except Exception as e:
+        return 0, {'error': str(e)}
+
+def group_id(name):
+    st,gs=api('GET','/api/v1/groups')
+    if st!=200: return None
+    for g in (gs.get('groups',[]) if isinstance(gs,dict) else []):
+        if g.get('name')==name: return g.get('id')
+    return None
+
+def group_rules(gid):
+    st,r=api('GET','/api/v1/groups/%s/rules'%gid)
+    return (r.get('rules',[]) if isinstance(r,dict) else [])
+
+def rule_state(gid):
+    rs=group_rules(gid)
+    blanket=[x for x in rs if str(x.get('rule','')).lower()==BLANKET]
+    edges={str(x.get('rule','')).lower(): x.get('id') for x in rs
+           if str(x.get('rule','')).endswith('googlevideo.com') and x not in blanket}
+    return blanket, edges
+
+# ---------- failure scan from mihomo's own log ----------
+FAIL_RE=re.compile(r'msg="\[(?:TCP|UDP)\] dial \S+ \(match [^)]*\) \S+ --> ([a-z0-9.\-]+\.googlevideo\.com):\d+ error: ')
+TIME_RE=re.compile(r'time="(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
+
+def recent_failures():
+    counts={}
+    try:
+        out=subprocess.run(['logread'], capture_output=True, timeout=20).stdout.decode('utf-8','replace')
+    except Exception as e:
+        log('logread failed: %s' % e); return counts
+    cutoff=time.time()-window*60
+    for ln in out.splitlines():
+        m=FAIL_RE.search(ln)
+        if not m: continue
+        tm=TIME_RE.search(ln)
+        if tm:
+            try:
+                ts=time.mktime(time.strptime(tm.group(1).split('.')[0].replace('T',' '), '%Y-%m-%d %H:%M:%S'))
+                if ts < cutoff: continue
+            except Exception:
+                pass
+        host=m.group(1).lower()
+        counts[host]=counts.get(host,0)+1
+    return counts
+
+# ---------- state (which pins are automatic) ----------
+def load_state():
+    try:
+        with open(STATE,encoding='utf-8') as f: return json.load(f)
+    except Exception: return {'pins': [], 'last': None, 'failures': {}}
+
+def save_state(st):
+    st['last']=time.strftime('%F %T')
+    try:
+        with open(STATE+'.tmp','w',encoding='utf-8') as f: json.dump(st,f)
+        os.replace(STATE+'.tmp', STATE)
+    except Exception as e:
+        log('state write failed: %s' % e)
+
+# ---------- actions ----------
+def sync_now():
+    try:
+        subprocess.run(['sh','/root/sync_mtrickle_mihomo.sh'], capture_output=True, timeout=60)
+    except Exception as e:
+        log('sync failed: %s' % e)
+
+def do_status():
+    gid=group_id(group_name)
+    out={'mode': mode, 'group': group_name, 'group_found': bool(gid),
+         'threshold': threshold, 'window_min': window, 'max_pins': cap}
+    st=load_state()
+    out['auto_pins']=sorted(st.get('pins',[]))
+    if gid:
+        blanket, edges = rule_state(gid)
+        out['blanket_present']=bool(blanket)
+        out['pinned_hosts']=sorted(edges.keys())
+        out['pinned_count']=len(edges)
+    return out
+
+def set_mode(new_mode):
+    global mode
+    if new_mode not in ('auto','blanket'):
+        log('bad mode %r' % new_mode); return False
+    gid=group_id(group_name)
+    if not gid:
+        log('group %s not found' % group_name); return False
+    blanket, edges = rule_state(gid)
+    if new_mode=='blanket':
+        if not blanket:
+            api('POST','/api/v1/groups/%s/rules?save=true'%gid,
+                {'type':'namespace','rule':BLANKET,'name':'','enable':True})
+            log('mode=blanket: added blanket rule')
+    else:
+        for x in blanket:
+            api('DELETE','/api/v1/groups/%s/rules/%s?save=true'%(gid,x['id']))
+            log('mode=auto: removed blanket rule')
+    # persist the choice
+    try:
+        t=open(CONF,encoding='utf-8').read()
+        t=re.sub(r'(?m)^mode=.*$','mode=%s'%new_mode, t)
+        open(CONF,'w',encoding='utf-8',newline='\n').write(t)
+    except Exception as e:
+        log('mode persist failed: %s' % e)
+    mode=new_mode
+    sync_now()
+    return True
+
+def do_reset():
+    gid=group_id(group_name)
+    if not gid:
+        log('reset: group %s not found' % group_name); return 0
+    st=load_state()
+    blanket, edges = rule_state(gid)
+    removed=0
+    for host in st.get('pins',[]):
+        rid=edges.get(host.lower())
+        if rid:
+            api('DELETE','/api/v1/groups/%s/rules/%s?save=true'%(gid,rid)); removed+=1
+    st['pins']=[]
+    save_state(st)
+    if removed:
+        log('reset: released %d auto-pins back to zapret' % removed)
+        sync_now()
+    return removed
+
+def do_scan():
+    gid=group_id(group_name)
+    if not gid:
+        log('group %s not found - nothing to do' % group_name); return
+    st=load_state()
+    if mode!='auto':
+        # in blanket mode everything is already on VPN; just keep the record fresh
+        st['failures']=recent_failures(); save_state(st); return
+    blanket, edges = rule_state(gid)
+    if blanket:
+        log('mode=auto but blanket rule present - removing it')
+        for x in blanket:
+            api('DELETE','/api/v1/groups/%s/rules/%s?save=true'%(gid,x['id']))
+        sync_now()
+        blanket, edges = rule_state(gid)
+    counts=recent_failures()
+    st['failures']=counts
+    added=[]
+    for host,n in sorted(counts.items()):
+        if n < threshold: continue
+        if host in edges: continue
+        if len(edges)+len(added) >= cap:
+            log('max_pins=%d reached, %d candidate(s) not pinned' % (cap, len(counts)))
+            break
+        r=api('POST','/api/v1/groups/%s/rules?save=true'%gid,
+              {'type':'domain','rule':host,'name':'ytwatch','enable':True})
+        if r[0]==200:
+            added.append(host); edges[host]=True
+    if added:
+        st['pins']=sorted(set(st.get('pins',[])) | set(added))
+        save_state(st)
+        log('pinned %d edge(s): %s' % (len(added), ', '.join(added[:6]) + ('…' if len(added)>6 else '')))
+        sync_now()
+    else:
+        save_state(st)
+
+args=[a for a in sys.argv[1:]]
+if '--status' in args:
+    print(json.dumps(do_status(), ensure_ascii=False)); sys.exit(0)
+if '--reset' in args:
+    do_reset(); sys.exit(0)
+if '--mode' in args:
+    i=args.index('--mode')
+    ok=set_mode(args[i+1] if i+1 < len(args) else '')
+    print(json.dumps({'ok': ok, 'mode': mode})); sys.exit(0 if ok else 1)
+do_scan()
+PYEOF
+
+ASSET_EOF
+  if [ ! -s "$(P /etc/geomask-ytwatch.conf)" ]; then
+    save_stream /etc/geomask-ytwatch.conf 644 <<'ASSET_EOF'
+# geomask youtube-edge watcher configuration (v1.14.0+)
+# Decides how googlevideo.com (YouTube video edges) is routed. The edges are IP-blocked
+# per-host by RKN, and Google rotates the hostnames, so a static list always lags behind.
+
+# Routing mode:
+#   auto    - edges go DIRECT (zapret/DPI); only hosts that actually fail get pinned to VPN
+#   blanket - every *.googlevideo.com goes to VPN (the v1.13.x behaviour)
+mode=auto
+
+# Pin a host after this many failed dials inside the window (avoid pinning on one blip)
+fail_threshold=2
+
+# Consider failures from the last N minutes when scanning the log
+window_min=30
+
+# Hard cap on automatically pinned hosts; when reached the watcher stops pinning and logs
+max_pins=40
+
+# MagiTrickle group that feeds ytvpn.yaml (created by geomask, editable at :8080)
+group_name=GoogleVideo VPN
+
+ASSET_EOF
+  else
+    info "ytwatch conf: keeping existing /etc/geomask-ytwatch.conf"
+  fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch$'; then
+    info "ytwatch cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '*/5 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch' ) | crontab - 2>/dev/null && info "cron added: */5 ytwatch" || warn "cannot set crontab"
+  fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch-reset$'; then
+    info "ytwatch reset cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset' ) | crontab - 2>/dev/null && info "cron added: 04:20 ytwatch reset" || warn "cannot set crontab"
+  fi
   # v1.10.0: event sync watchdog - magitrickle save -> sync within ~seconds (cron stays as backup)
   if have apk; then apk add inotifywait >/dev/null 2>&1 || true; fi
   save_stream /usr/bin/geomask-syncd.sh 755 <<'ASSET_EOF'
@@ -21341,6 +21699,13 @@ geomask_uninstall() {
   fi
   rm -f "$(P /usr/bin/geomask-node-scan.sh)"
   info "removed: node-scan (conf /etc/geomask-nodes.conf left for reference)"
+  # v1.14.0: youtube edge watchdog removal (release any auto-pins first so edges return to zapret)
+  [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ] && "$(P /usr/bin/geomask-ytwatch.sh)" --reset >/dev/null 2>&1
+  if crontab -l 2>/dev/null | grep -q 'geomask-ytwatch'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-ytwatch' | crontab - 2>/dev/null || true
+  fi
+  rm -f "$(P /usr/bin/geomask-ytwatch.sh)" "$(P /tmp/geomask-ytwatch.state)"
+  info "removed: ytwatch (conf /etc/geomask-ytwatch.conf left for reference)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

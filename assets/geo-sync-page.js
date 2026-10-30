@@ -35,6 +35,9 @@ var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   pa
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
 var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
 var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
+var callYtGet      = rpc.declare({ object: 'geo-sync', method: 'yt_get',      expect: {} });
+var callYtMode     = rpc.declare({ object: 'geo-sync', method: 'yt_mode',     params: { mode: null }, expect: {} });
+var callYtReset    = rpc.declare({ object: 'geo-sync', method: 'yt_reset',    expect: {} });
 var PANEL_VERSION = '@@PANEL_VERSION@@';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
@@ -204,7 +207,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet() ]);
 	},
 
 	render: function(all) {
@@ -217,6 +220,7 @@ return view.extend({
 		var stk = all[8] || {};
 		var nd = all[9] || {};
 		var lt = all[10] || {};
+		var yt = all[11] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -843,6 +847,46 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [ btnSeed ])
 		]));
 
+		/* ===================== YouTube edges watchdog (lists tab, v1.14.0) ===================== */
+		var ytAuto = (yt.mode || 'auto') === 'auto';
+		var setMode = function(m, btn) {
+			btn.disabled = true;
+			callYtMode({ mode: m }).then(function(res) {
+				btn.disabled = false;
+				if (res && res.ok) ui.addNotification(null, E('p', {}, m === 'auto' ? 'Режим авто: битые рёбра уходят в VPN, остальные через запрет (DPI)' : 'Режим blanket: весь googlevideo в VPN'), 'info');
+				else ui.addNotification(null, E('p', {}, 'Не удалось переключить режим'), 'error');
+				return view.reload();
+			}).catch(function(e) { btn.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		};
+		var btnYtAuto = E('button', { 'class': 'gs-btn' + (ytAuto ? '' : ' gs-btn-primary'), 'click': function() { setMode('auto', btnYtAuto); } }, 'Авто (битые — в VPN)');
+		var btnYtAll = E('button', { 'class': 'gs-btn' + (ytAuto ? '' : ' gs-btn-primary'), 'click': function() { setMode('blanket', btnYtAll); } }, 'Весь googlevideo в VPN');
+		var btnYtRel = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+			if (!confirm('Отпустить все автотопинги? Рёбра вернутся на прямой путь через запрет (DPI).')) return;
+			btnYtRel.disabled = true;
+			callYtReset().then(function() { view.reload(); }).catch(function(e) { btnYtRel.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Отпустить пины сейчас');
+		var ytPins = yt.pinned_hosts || [];
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'YouTube: рёбра googlevideo'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Google раздаёт адреса рёбер динамически и часть из них блокируется по IP, поэтому статический список всегда отстаёт. ' +
+				'В режиме «Авто» рёбра идут напрямую через запрет (DPI), а watchdog каждые 5 минут читает ошибки соединений mihomo и ' +
+				'кладёт реально падающие хосты в группу «GoogleVideo VPN» (видно в MagiTrickle :8080). Ночью пины отпускаются. ' +
+				'Картинки (ytimg/ggpht) и сам youtube.com — всегда напрямую через запрет.'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Режим'),
+				E('span', { 'class': 'gs-badge ' + (ytAuto ? 'gs-ok' : 'gs-off') }, ytAuto ? 'авто' : 'весь в VPN'),
+				btnYtAuto, btnYtAll
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Сейчас в VPN'),
+				E('span', { 'class': 'gs-val gs-mono' }, ytPins.length ? (ytPins.length + ' ребра') : '—'),
+				E('span', { 'class': 'gs-hint' }, 'порог ' + (yt.threshold || 2) + ' ошибок за ' + (yt.window_min || 30) + ' мин, максимум ' + (yt.max_pins || 40))
+			]),
+			ytPins.length ? E('div', { 'class': 'gs-blocklist' }, ytPins.join('\n')) : null,
+			E('div', { 'class': 'gs-row' }, [ btnYtRel ])
+		]));
+
 		/* ===================== Node audit (nodes tab, v1.12.0) ===================== */
 		var conf = nd.conf || {};
 		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
@@ -955,7 +999,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);

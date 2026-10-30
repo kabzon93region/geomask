@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.13.8"
+GM_VERSION="1.14.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -906,6 +906,11 @@ step5_check() {
   if [ -x "$(P /usr/bin/geomask-node-scan.sh)" ] && [ -s "$(P /etc/geomask-nodes.conf)" ]; then info "node-scan: installed"
   else bad "node-scan missing (script/conf)"; _need=1; fi
   if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then info "nodescan cron 03:30: present"; else bad "nodescan cron missing"; _need=1; fi
+  # v1.14.0: youtube edge watchdog
+  if [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ] && [ -s "$(P /etc/geomask-ytwatch.conf)" ]; then info "ytwatch: installed"
+  else bad "ytwatch missing (script/conf)"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch$'; then info "ytwatch cron */5: present"; else bad "ytwatch cron missing"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch-reset$'; then info "ytwatch reset cron: present"; else bad "ytwatch reset cron missing"; _need=1; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -962,6 +967,28 @@ ASSET_EOF
     info "nodescan cron already present"
   else
     ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
+  fi
+  # v1.14.0: YouTube edge watchdog - failing *.googlevideo.com edges get pinned to VPN,
+  # released back to zapret nightly. Source of truth stays in MagiTrickle (group feeds ytvpn.yaml).
+  save_stream /usr/bin/geomask-ytwatch.sh 755 <<'ASSET_EOF'
+@@ASSET:geomask-ytwatch.sh@@
+ASSET_EOF
+  if [ ! -s "$(P /etc/geomask-ytwatch.conf)" ]; then
+    save_stream /etc/geomask-ytwatch.conf 644 <<'ASSET_EOF'
+@@ASSET:geomask-ytwatch.conf@@
+ASSET_EOF
+  else
+    info "ytwatch conf: keeping existing /etc/geomask-ytwatch.conf"
+  fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch$'; then
+    info "ytwatch cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '*/5 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch' ) | crontab - 2>/dev/null && info "cron added: */5 ytwatch" || warn "cannot set crontab"
+  fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch-reset$'; then
+    info "ytwatch reset cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset' ) | crontab - 2>/dev/null && info "cron added: 04:20 ytwatch reset" || warn "cannot set crontab"
   fi
   # v1.10.0: event sync watchdog - magitrickle save -> sync within ~seconds (cron stays as backup)
   if have apk; then apk add inotifywait >/dev/null 2>&1 || true; fi
@@ -1321,6 +1348,13 @@ geomask_uninstall() {
   fi
   rm -f "$(P /usr/bin/geomask-node-scan.sh)"
   info "removed: node-scan (conf /etc/geomask-nodes.conf left for reference)"
+  # v1.14.0: youtube edge watchdog removal (release any auto-pins first so edges return to zapret)
+  [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ] && "$(P /usr/bin/geomask-ytwatch.sh)" --reset >/dev/null 2>&1
+  if crontab -l 2>/dev/null | grep -q 'geomask-ytwatch'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-ytwatch' | crontab - 2>/dev/null || true
+  fi
+  rm -f "$(P /usr/bin/geomask-ytwatch.sh)" "$(P /tmp/geomask-ytwatch.state)"
+  info "removed: ytwatch (conf /etc/geomask-ytwatch.conf left for reference)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

@@ -11,6 +11,7 @@
 | [AIDNS.md](AIDNS.md) | AI-DNS без утечки: DNAT → второй dnsmasq/DoH → метка → `dev AI` |
 | [SYNC.md](SYNC.md) | Синхронизация magitrickle → mihomo (`rule-providers`) |
 | [LISTS.md](LISTS.md) | Шаблоны списков MagiTrickle: снимок групп, сид/восстановление (v1.13.0) |
+| [YOUTUBE.md](YOUTUBE.md) | YouTube: страница/картинки через запрет, сбойные рёбра googlevideo — в VPN (v1.14.0) |
 | [OPERATIONS.md](OPERATIONS.md) | Режимы запуска, шаги, бэкапы, безопасность |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Диагностика типовых проблем |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Сборка, песочница, тесты |

@@ -1132,6 +1132,32 @@ cmd_lists_seed() {
   printf '{"ok":%s,"rc":%s,"result":"%s"}\n' "$_ok" "$_rc" "$(json_esc "$_out")"
 }
 
+# v1.14.0: youtube edge watchdog - status / mode switch / manual release
+YT_WATCH=/usr/bin/geomask-ytwatch.sh
+YT_CONF=/etc/geomask-ytwatch.conf
+
+cmd_yt_get() {
+  [ -x "$YT_WATCH" ] || { printf '{"ok":false,"error":"ytwatch not installed"}\n'; return 1; }
+  _j=$(sh "$YT_WATCH" --status 2>/dev/null)
+  case "$_j" in '{'*'}'*) : ;; *) _j='{"error":"no status"}' ;; esac
+  _mode=$(sed -n 's/^mode=//p' "$YT_CONF" 2>/dev/null | head -1)
+  printf '%s\n' "$_j" | sed "s#\"mode\":[^,]*#\"mode\":\"${_mode:-auto}\",\"ok\":true#"
+}
+
+cmd_yt_mode() {
+  case "$1" in auto|blanket) : ;; *) printf '{"ok":false,"error":"bad mode"}\n'; return 1 ;; esac
+  [ -x "$YT_WATCH" ] || { printf '{"ok":false,"error":"ytwatch not installed"}\n'; return 1; }
+  _out=$(sh "$YT_WATCH" --mode "$1" 2>&1); _rc=$?
+  printf '%s\n' "$_out" | tail -1
+  return $_rc
+}
+
+cmd_yt_reset() {
+  [ -x "$YT_WATCH" ] || { printf '{"ok":false,"error":"ytwatch not installed"}\n'; return 1; }
+  sh "$YT_WATCH" --reset >/dev/null 2>&1
+  printf '{"ok":true}\n'
+}
+
 case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
@@ -1148,6 +1174,9 @@ case "$1" in
   pin_set)    cmd_pin_set "$2" ;;
   lists_get)  cmd_lists_get ;;
   lists_seed) cmd_lists_seed ;;
+  yt_get)     cmd_yt_get ;;
+  yt_mode)    cmd_yt_mode "$2" ;;
+  yt_reset)   cmd_yt_reset ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;

@@ -82,6 +82,10 @@ printf '#!/bin/sh\nexit 0\n' > "$R/etc/init.d/geomask-syncd"; chmod +x "$R/etc/i
 # node audit (v1.11.0): script + conf fixtures
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-node-scan.sh"; chmod +x "$R/usr/bin/geomask-node-scan.sh"
 echo 'bad_asns=AS210976' > "$R/etc/geomask-nodes.conf"
+# youtube edge watchdog (v1.14.0): script + conf fixtures
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-ytwatch.sh"; chmod +x "$R/usr/bin/geomask-ytwatch.sh"
+echo 'mode=auto' > "$R/etc/geomask-ytwatch.conf"
+printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytvpn.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/mtrickle.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ai.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytdirect.yaml"
@@ -136,6 +140,8 @@ printf 'zapret-manager\ngeo-sync\n' > "$HERE/state/ubus_objects"
 echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' > "$HERE/state/crontab"
 echo '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard' >> "$HERE/state/crontab"
 echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' >> "$HERE/state/crontab"
+echo '*/5 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch' >> "$HERE/state/crontab"
+echo '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset' >> "$HERE/state/crontab"
 echo '32666: from all iif br-lan ipproto icmp lookup main' > "$HERE/state/ip_rules"
 # pgrep stub state: syncd watchdog considered running in healthy/apply scenarios
 printf 'geomask-syncd.sh\n' > "$HERE/state/pgrep"
@@ -474,6 +480,27 @@ if grep -qF '"lists_get"' "$HERE/../assets/acl-geo-sync.json" && grep -qF '"list
    && grep -qF '"lists_get"' "$HERE/../assets/geo-sync" && grep -qF '"lists_seed"' "$HERE/../assets/geo-sync"; then
   echo "PASS: S19 lists_get/lists_seed in ACL + wrapper"; pass=$((pass+1))
 else echo "FAIL: S19 lists_* not in ACL/wrapper"; failn=$((failn+1)); fi
+
+# ---------- scenario 20: youtube edges watchdog (v1.14.0) ----------
+echo "=== S20: ytwatch (googlevideo auto-pin) ==="
+if [ -s "$HERE/../assets/geomask-ytwatch.sh" ] && [ -s "$HERE/../assets/geomask-ytwatch.conf" ]; then
+  echo "PASS: S20 ytwatch script + conf present"; pass=$((pass+1))
+else echo "FAIL: S20 ytwatch assets missing"; failn=$((failn+1)); fi
+for _p in '/usr/bin/geomask-ytwatch.sh' '/etc/geomask-ytwatch.conf' '# geomask-ytwatch' '# geomask-ytwatch-reset'; do
+  if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S20 installer has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S20 installer missing: $_p"; failn=$((failn+1)); fi
+done
+grep -qF 'ytwatch: installed' "$SCRIPT" && { echo "PASS: S20 step5_check verifies ytwatch"; pass=$((pass+1)); } || { echo "FAIL: S20 no ytwatch check"; failn=$((failn+1)); }
+grep -qF 'removed: ytwatch' "$SCRIPT" && { echo "PASS: S20 uninstall cleans ytwatch"; pass=$((pass+1)); } || { echo "FAIL: S20 uninstall leaves ytwatch"; failn=$((failn+1)); }
+# watchdog semantics: reads mihomo dial errors, pins into the MT group, nightly release, cap, modes
+for _p in 'googlevideo' '--reset' '--mode' 'max_pins' 'fail_threshold'; do
+  if grep -qF -- "$_p" "$HERE/../assets/geomask-ytwatch.sh"; then echo "PASS: S20 ytwatch has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S20 ytwatch missing: $_p"; failn=$((failn+1)); fi
+done
+for _p in 'callYtGet' 'callYtMode' 'callYtReset' 'yt_get' 'yt_mode' 'yt_reset'; do
+  if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S20 panel/backend has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S20 panel/backend missing: $_p"; failn=$((failn+1)); fi
+done
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

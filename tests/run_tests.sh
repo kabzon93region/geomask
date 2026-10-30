@@ -502,6 +502,17 @@ for _p in 'callYtGet' 'callYtMode' 'callYtReset' 'yt_get' 'yt_mode' 'yt_reset'; 
   else echo "FAIL: S20 panel/backend missing: $_p"; failn=$((failn+1)); fi
 done
 
+# ---------- scenario 21: update card must not show stale installed versions (v1.14.2) ----------
+echo "=== S21: live installed-version block in update check ==="
+if grep -qF '_upd_local_block' "$HERE/../assets/geo-backend.sh" \
+   && grep -qF 'cached GitHub answer, but installed versions are always recomputed live' "$HERE/../assets/geo-backend.sh"; then
+  echo "PASS: S21 cached check recomputes installed versions"; pass=$((pass+1))
+else echo "FAIL: S21 update card still serves cached installed versions"; failn=$((failn+1)); fi
+# the helper must be used by BOTH branches (cache hit and fresh fetch) - no duplicated logic left
+if [ "$(grep -c '_upd_local_block' "$HERE/../assets/geo-backend.sh")" -ge 3 ]; then
+  echo "PASS: S21 helper defined and used in both paths"; pass=$((pass+1))
+else echo "FAIL: S21 helper not used in both paths"; failn=$((failn+1)); fi
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

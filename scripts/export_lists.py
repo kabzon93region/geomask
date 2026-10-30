@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OUT_GROUPS = os.path.join(ROOT, "assets", "magitrickle-groups.yaml")
 OUT_META = os.path.join(ROOT, "templates", "lists.meta.json")
-TEMPLATE_VERSION = "1.13.6"
+TEMPLATE_VERSION = "1.14.2"
 
 def log(m): print("[export]", m, flush=True)
 

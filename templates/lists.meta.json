@@ -1,8 +1,8 @@
 {
-  "template_version": "1.13.0",
+  "template_version": "1.14.2",
   "exported_at": "2026-10-30",
   "groups": 26,
-  "rules": 3299,
-  "sha256": "5f0788c0c62ebd26b27bd6013021092b1588220357b90e01b809e14a7712acb4",
+  "rules": 3285,
+  "sha256": "86ee7f40bb00dd743f48940488fc659f928021537e267bf467cf63360e2087cf",
   "source": "router /etc/magitrickle/state/config.yaml"
 }

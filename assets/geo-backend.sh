@@ -809,10 +809,34 @@ _upd_stack_json() { # display-only versions of the managed stack
   printf '[%s]' "$_o"
 }
 
+# Live "installed versions" block + need flag for a given latest version. Sets _LBLK and _LNEED.
+# v1.14.2: the update card used to serve these straight from the TTL cache, so after a deploy the
+# panel kept showing the OLD installed versions for up to an hour (looked like "not updated").
+_upd_local_block() { # $1 = latest version (no leading v)
+  _core=$(_upd_core_ver)
+  _panel=$(_upd_mark "$DEPLOY_JS" PANEL_VERSION); [ -n "$_panel" ] || _panel=none
+  _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION); [ -n "$_guard" ] || _guard=none
+  _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION); [ -n "$_backend" ] || _backend=none
+  _LNEED=false
+  if [ "$_core" = "none" ]; then _LNEED=true
+  elif _upd_newer "$1" "$_core"; then _LNEED=true
+  elif [ "$_core" = "$1" ] && { [ "$_panel" != "$1" ] || [ "$_guard" != "$1" ] || [ "$_backend" != "$1" ]; }; then
+    _LNEED=true   # partial/misaligned deploy of the same release -> repair
+  fi
+  _LBLK=$(printf '{"core":"%s","panel":"%s","guard":"%s","backend":"%s"}' "$_core" "$_panel" "$_guard" "$_backend")
+}
+
 _upd_check_now() { # $1 = "force" bypasses the TTL cache
   mkdir -p "$UPD_DIR" 2>/dev/null
   _age=$(( $(date +%s) - $(date -r "$UPD_CHECK" +%s 2>/dev/null || echo 0) ))
   if [ "$1" != "force" ] && [ -s "$UPD_CHECK" ] && [ "$_age" -lt "$UPD_TTL" ]; then
+    # cached GitHub answer, but installed versions are always recomputed live
+    _lv=$(sed -n 's/.*"latest":{[^}]*"version":"\([^"]*\)".*/\1/p' "$UPD_CHECK" | head -1)
+    if [ -n "$_lv" ]; then
+      _upd_local_block "$_lv"
+      sed -e 's#"local":{[^}]*}#"local":'"$_LBLK"'#' -e 's#"need":[a-z]*#"need":'"$_LNEED"'#' "$UPD_CHECK"
+      return 0
+    fi
     cat "$UPD_CHECK"; return 0
   fi
   _j=$(curl -fsS -m 10 -H 'Accept: application/vnd.github+json' \
@@ -831,22 +855,11 @@ _upd_check_now() { # $1 = "force" bypasses the TTL cache
     _tag="v$_rv"; _src=raw; _dig=""; _pub=""
   fi
   _ver=$(printf '%s' "$_tag" | sed 's/^v//')
-  _core=$(_upd_core_ver)
-  _panel=$(_upd_mark "$DEPLOY_JS" PANEL_VERSION)
-  _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION)
-  _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION)
-  [ -n "$_panel" ] || _panel=none
-  [ -n "$_guard" ] || _guard=none
-  [ -n "$_backend" ] || _backend=none
-  _need=false
-  if [ "$_core" = "none" ]; then _need=true
-  elif _upd_newer "$_ver" "$_core"; then _need=true
-  elif [ "$_core" = "$_ver" ] && { [ "$_panel" != "$_ver" ] || [ "$_guard" != "$_ver" ] || [ "$_backend" != "$_ver" ]; }; then
-    _need=true   # partial/misaligned deploy of the same release -> repair
-  fi
+  _upd_local_block "$_ver"
+  _need=$_LNEED
   _now=$(date '+%F %T')
-  printf '{"ok":true,"checked_at":"%s","src":"%s","local":{"core":"%s","panel":"%s","guard":"%s","backend":"%s"},"latest":{"tag":"%s","version":"%s","digest":"%s","published":"%s"},"need":%s,"stack":%s}\n' \
-    "$_now" "$_src" "$_core" "$_panel" "$_guard" "$_backend" \
+  printf '{"ok":true,"checked_at":"%s","src":"%s","local":%s,"latest":{"tag":"%s","version":"%s","digest":"%s","published":"%s"},"need":%s,"stack":%s}\n' \
+    "$_now" "$_src" "$_LBLK" \
     "$_tag" "$_ver" "$_dig" "$_pub" "$_need" "$(_upd_stack_json)" > "$UPD_CHECK.tmp" \
     && mv -f "$UPD_CHECK.tmp" "$UPD_CHECK"
   cat "$UPD_CHECK"

@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.14.1"
+GM_VERSION="1.14.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.14.1"
+BACKEND_VERSION="1.14.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -991,10 +991,34 @@ _upd_stack_json() { # display-only versions of the managed stack
   printf '[%s]' "$_o"
 }
 
+# Live "installed versions" block + need flag for a given latest version. Sets _LBLK and _LNEED.
+# v1.14.2: the update card used to serve these straight from the TTL cache, so after a deploy the
+# panel kept showing the OLD installed versions for up to an hour (looked like "not updated").
+_upd_local_block() { # $1 = latest version (no leading v)
+  _core=$(_upd_core_ver)
+  _panel=$(_upd_mark "$DEPLOY_JS" PANEL_VERSION); [ -n "$_panel" ] || _panel=none
+  _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION); [ -n "$_guard" ] || _guard=none
+  _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION); [ -n "$_backend" ] || _backend=none
+  _LNEED=false
+  if [ "$_core" = "none" ]; then _LNEED=true
+  elif _upd_newer "$1" "$_core"; then _LNEED=true
+  elif [ "$_core" = "$1" ] && { [ "$_panel" != "$1" ] || [ "$_guard" != "$1" ] || [ "$_backend" != "$1" ]; }; then
+    _LNEED=true   # partial/misaligned deploy of the same release -> repair
+  fi
+  _LBLK=$(printf '{"core":"%s","panel":"%s","guard":"%s","backend":"%s"}' "$_core" "$_panel" "$_guard" "$_backend")
+}
+
 _upd_check_now() { # $1 = "force" bypasses the TTL cache
   mkdir -p "$UPD_DIR" 2>/dev/null
   _age=$(( $(date +%s) - $(date -r "$UPD_CHECK" +%s 2>/dev/null || echo 0) ))
   if [ "$1" != "force" ] && [ -s "$UPD_CHECK" ] && [ "$_age" -lt "$UPD_TTL" ]; then
+    # cached GitHub answer, but installed versions are always recomputed live
+    _lv=$(sed -n 's/.*"latest":{[^}]*"version":"\([^"]*\)".*/\1/p' "$UPD_CHECK" | head -1)
+    if [ -n "$_lv" ]; then
+      _upd_local_block "$_lv"
+      sed -e 's#"local":{[^}]*}#"local":'"$_LBLK"'#' -e 's#"need":[a-z]*#"need":'"$_LNEED"'#' "$UPD_CHECK"
+      return 0
+    fi
     cat "$UPD_CHECK"; return 0
   fi
   _j=$(curl -fsS -m 10 -H 'Accept: application/vnd.github+json' \
@@ -1013,22 +1037,11 @@ _upd_check_now() { # $1 = "force" bypasses the TTL cache
     _tag="v$_rv"; _src=raw; _dig=""; _pub=""
   fi
   _ver=$(printf '%s' "$_tag" | sed 's/^v//')
-  _core=$(_upd_core_ver)
-  _panel=$(_upd_mark "$DEPLOY_JS" PANEL_VERSION)
-  _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION)
-  _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION)
-  [ -n "$_panel" ] || _panel=none
-  [ -n "$_guard" ] || _guard=none
-  [ -n "$_backend" ] || _backend=none
-  _need=false
-  if [ "$_core" = "none" ]; then _need=true
-  elif _upd_newer "$_ver" "$_core"; then _need=true
-  elif [ "$_core" = "$_ver" ] && { [ "$_panel" != "$_ver" ] || [ "$_guard" != "$_ver" ] || [ "$_backend" != "$_ver" ]; }; then
-    _need=true   # partial/misaligned deploy of the same release -> repair
-  fi
+  _upd_local_block "$_ver"
+  _need=$_LNEED
   _now=$(date '+%F %T')
-  printf '{"ok":true,"checked_at":"%s","src":"%s","local":{"core":"%s","panel":"%s","guard":"%s","backend":"%s"},"latest":{"tag":"%s","version":"%s","digest":"%s","published":"%s"},"need":%s,"stack":%s}\n' \
-    "$_now" "$_src" "$_core" "$_panel" "$_guard" "$_backend" \
+  printf '{"ok":true,"checked_at":"%s","src":"%s","local":%s,"latest":{"tag":"%s","version":"%s","digest":"%s","published":"%s"},"need":%s,"stack":%s}\n' \
+    "$_now" "$_src" "$_LBLK" \
     "$_tag" "$_ver" "$_dig" "$_pub" "$_need" "$(_upd_stack_json)" > "$UPD_CHECK.tmp" \
     && mv -f "$UPD_CHECK.tmp" "$UPD_CHECK"
   cat "$UPD_CHECK"
@@ -1565,7 +1578,7 @@ var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  ex
 var callYtGet      = rpc.declare({ object: 'geo-sync', method: 'yt_get',      expect: {} });
 var callYtMode     = rpc.declare({ object: 'geo-sync', method: 'yt_mode',     params: { mode: null }, expect: {} });
 var callYtReset    = rpc.declare({ object: 'geo-sync', method: 'yt_reset',    expect: {} });
-var PANEL_VERSION = '1.14.1';
+var PANEL_VERSION = '1.14.2';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -9256,11 +9269,6 @@ groups:
     type: namespace
     rule: discord-activities.com
     enable: true
-  - id: 7c2b8f81
-    name: ""
-    type: domain
-    rule: discord-attachments-uploads-prd.storage.googleapis.com
-    enable: true
   - id: e03f08de
     name: ""
     type: namespace
@@ -9346,11 +9354,6 @@ groups:
     type: namespace
     rule: discordsays.com
     enable: true
-  - id: 6763b30e
-    name: ""
-    type: namespace
-    rule: discord-attachments-uploads-prd.storage.googleapis.com
-    enable: true
 - id: 9a2c6777
   name: Geoblock
   color: '#5b54f2'
@@ -9397,20 +9400,10 @@ groups:
     type: namespace
     rule: adobe.com
     enable: true
-  - id: b8fd03af
-    name: ""
-    type: namespace
-    rule: adobe.io
-    enable: true
   - id: dcff74fe
     name: ""
     type: namespace
     rule: adobe.net
-    enable: true
-  - id: 8be27e2c
-    name: ""
-    type: namespace
-    rule: affinity.studio
     enable: true
   - id: d744b50a
     name: ""
@@ -9717,11 +9710,6 @@ groups:
     type: domain
     rule: code.gist.build
     enable: true
-  - id: 94cba272
-    name: ""
-    type: namespace
-    rule: codeium.com
-    enable: true
   - id: 527efc7e
     name: ""
     type: namespace
@@ -9791,11 +9779,6 @@ groups:
     name: ""
     type: domain
     rule: data.cline.bot
-    enable: true
-  - id: 1e587597
-    name: ""
-    type: namespace
-    rule: deepl.com
     enable: true
   - id: 273a31c4
     name: ""
@@ -10217,11 +10200,6 @@ groups:
     type: namespace
     rule: httptoolkit.com
     enable: true
-  - id: 65677fed
-    name: ""
-    type: namespace
-    rule: hume.ai
-    enable: true
   - id: a0c3f26e
     name: ""
     type: namespace
@@ -10322,11 +10300,6 @@ groups:
     type: namespace
     rule: joesandbox.com
     enable: true
-  - id: 660a0e57
-    name: ""
-    type: namespace
-    rule: kaleido.ai
-    enable: true
   - id: 02a90adb
     name: ""
     type: namespace
@@ -10411,11 +10384,6 @@ groups:
     name: ""
     type: namespace
     rule: mailinator.com
-    enable: true
-  - id: "36444478"
-    name: ""
-    type: namespace
-    rule: manus.im
     enable: true
   - id: 1dd0bf30
     name: ""
@@ -10947,11 +10915,6 @@ groups:
     type: namespace
     rule: research.net
     enable: true
-  - id: 65eef0e9
-    name: ""
-    type: namespace
-    rule: reve.art
-    enable: true
   - id: 3b1ba77d
     name: ""
     type: namespace
@@ -11297,11 +11260,6 @@ groups:
     type: namespace
     rule: torrenteditor.com
     enable: true
-  - id: 06ea6366
-    name: ""
-    type: namespace
-    rule: trae.ai
-    enable: true
   - id: cdd20624
     name: ""
     type: namespace
@@ -11316,11 +11274,6 @@ groups:
     name: ""
     type: namespace
     rule: transferwise.com
-    enable: true
-  - id: b50ddc37
-    name: ""
-    type: namespace
-    rule: tria.ge
     enable: true
   - id: ddb4aae6
     name: ""
@@ -11461,11 +11414,6 @@ groups:
     name: ""
     type: namespace
     rule: wikidot.com
-    enable: true
-  - id: 3c274344
-    name: ""
-    type: namespace
-    rule: windsurf.com
     enable: true
   - id: b81e0415
     name: ""
@@ -18783,12 +18731,7 @@ groups:
   color: '#0e7490'
   interface: Mihomo
   enable: true
-  rules:
-  - id: 1fc97a5b
-    name: ""
-    type: namespace
-    rule: googlevideo.com
-    enable: true
+  rules: []
 - id: 145328f2
   name: Youtube
   color: '#54f296'
@@ -20568,7 +20511,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.14.1"
+GUARD_VERSION="1.14.2"
 
 log() { logger -t geomask-guard "$*"; }
 

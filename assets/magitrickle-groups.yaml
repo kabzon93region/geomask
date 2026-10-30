@@ -6069,11 +6069,6 @@ groups:
     type: namespace
     rule: discord-activities.com
     enable: true
-  - id: 7c2b8f81
-    name: ""
-    type: domain
-    rule: discord-attachments-uploads-prd.storage.googleapis.com
-    enable: true
   - id: e03f08de
     name: ""
     type: namespace
@@ -6159,11 +6154,6 @@ groups:
     type: namespace
     rule: discordsays.com
     enable: true
-  - id: 6763b30e
-    name: ""
-    type: namespace
-    rule: discord-attachments-uploads-prd.storage.googleapis.com
-    enable: true
 - id: 9a2c6777
   name: Geoblock
   color: '#5b54f2'
@@ -6210,20 +6200,10 @@ groups:
     type: namespace
     rule: adobe.com
     enable: true
-  - id: b8fd03af
-    name: ""
-    type: namespace
-    rule: adobe.io
-    enable: true
   - id: dcff74fe
     name: ""
     type: namespace
     rule: adobe.net
-    enable: true
-  - id: 8be27e2c
-    name: ""
-    type: namespace
-    rule: affinity.studio
     enable: true
   - id: d744b50a
     name: ""
@@ -6530,11 +6510,6 @@ groups:
     type: domain
     rule: code.gist.build
     enable: true
-  - id: 94cba272
-    name: ""
-    type: namespace
-    rule: codeium.com
-    enable: true
   - id: 527efc7e
     name: ""
     type: namespace
@@ -6604,11 +6579,6 @@ groups:
     name: ""
     type: domain
     rule: data.cline.bot
-    enable: true
-  - id: 1e587597
-    name: ""
-    type: namespace
-    rule: deepl.com
     enable: true
   - id: 273a31c4
     name: ""
@@ -7030,11 +7000,6 @@ groups:
     type: namespace
     rule: httptoolkit.com
     enable: true
-  - id: 65677fed
-    name: ""
-    type: namespace
-    rule: hume.ai
-    enable: true
   - id: a0c3f26e
     name: ""
     type: namespace
@@ -7135,11 +7100,6 @@ groups:
     type: namespace
     rule: joesandbox.com
     enable: true
-  - id: 660a0e57
-    name: ""
-    type: namespace
-    rule: kaleido.ai
-    enable: true
   - id: 02a90adb
     name: ""
     type: namespace
@@ -7224,11 +7184,6 @@ groups:
     name: ""
     type: namespace
     rule: mailinator.com
-    enable: true
-  - id: "36444478"
-    name: ""
-    type: namespace
-    rule: manus.im
     enable: true
   - id: 1dd0bf30
     name: ""
@@ -7760,11 +7715,6 @@ groups:
     type: namespace
     rule: research.net
     enable: true
-  - id: 65eef0e9
-    name: ""
-    type: namespace
-    rule: reve.art
-    enable: true
   - id: 3b1ba77d
     name: ""
     type: namespace
@@ -8110,11 +8060,6 @@ groups:
     type: namespace
     rule: torrenteditor.com
     enable: true
-  - id: 06ea6366
-    name: ""
-    type: namespace
-    rule: trae.ai
-    enable: true
   - id: cdd20624
     name: ""
     type: namespace
@@ -8129,11 +8074,6 @@ groups:
     name: ""
     type: namespace
     rule: transferwise.com
-    enable: true
-  - id: b50ddc37
-    name: ""
-    type: namespace
-    rule: tria.ge
     enable: true
   - id: ddb4aae6
     name: ""
@@ -8274,11 +8214,6 @@ groups:
     name: ""
     type: namespace
     rule: wikidot.com
-    enable: true
-  - id: 3c274344
-    name: ""
-    type: namespace
-    rule: windsurf.com
     enable: true
   - id: b81e0415
     name: ""
@@ -15596,12 +15531,7 @@ groups:
   color: '#0e7490'
   interface: Mihomo
   enable: true
-  rules:
-  - id: 1fc97a5b
-    name: ""
-    type: namespace
-    rule: googlevideo.com
-    enable: true
+  rules: []
 - id: 145328f2
   name: Youtube
   color: '#54f296'

@@ -115,8 +115,10 @@ def build_ruleset():
     return len(hosts), len(ips), True
 
 # ---------- listener toggle ----------
+# No fixed policy: the rule chain decides, so AI domains sent through the listener still
+# match RULE-SET,ai and go to AI (a forced "proxy: DIRECT" would leak them).
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
-                '    listen: 192.168.0.1','    proxy: DIRECT']
+                '    listen: 192.168.0.1']
 
 def listener_present():
     return 'torrent-direct' in read(CFG)

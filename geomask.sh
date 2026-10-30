@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.15.0"
+GM_VERSION="1.15.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.15.0"
+BACKEND_VERSION="1.15.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1624,7 +1624,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.15.0';
+var PANEL_VERSION = '1.15.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2685,7 +2685,12 @@ step3_check() {
   grep -q 'RULE-SET,ai,AI' "$_c" 2>/dev/null && info "rule ai->AI: present" || { bad "rule ai->AI missing"; _need=1; }
   grep -q 'RULE-SET,mtrickle,VPN' "$_c" 2>/dev/null && info "rule mtrickle->VPN: present" || { bad "rule mtrickle->VPN missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
-  grep -q 'torrent-direct' "$_c" 2>/dev/null && info "listener (torrent-direct:7894): present" || warn "torrent-direct listener missing (torrent clients cannot be pinned to DIRECT via proxy)"
+  if grep -q 'torrent-direct' "$_c" 2>/dev/null; then
+    if awk '/name: torrent-direct/{f=1;next} f&&/^[^ ]/{exit} f&&/proxy:/{print}' "$_c" | grep -q .; then
+      bad "torrent-direct listener forces a policy - AI domains sent through it would leak to DIRECT"
+      _need=1
+    else info "listener (torrent-direct:7894, rule-based): present"; fi
+  else warn "torrent-direct listener missing (torrent clients cannot be pinned to DIRECT via proxy)"; fi
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
@@ -2771,7 +2776,7 @@ write_mihomo_config() {
     if ! grep -q 'ai-devices' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
       awk 'BEGIN{d=0}
-        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: 192.168.0.1";print "    proxy: DIRECT";print "";d=1}
+        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: 192.168.0.1";print "";d=1}
         {print}' "$_c" > "$_c.zmnew" || return 1
       if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
         mv -f "$_c.zmnew" "$_c"; info "listeners block added to existing config (custom rules preserved)"
@@ -2784,7 +2789,7 @@ write_mihomo_config() {
         cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
         awk 'BEGIN{d=0} {print} (!d && $0 ~ /^    proxy: AI$/) {
               print "  - name: torrent-direct"; print "    type: mixed"; print "    port: 7894";
-              print "    listen: 192.168.0.1"; print "    proxy: DIRECT"; d=1 }' "$_c" > "$_c.tdnew" || return 1
+              print "    listen: 192.168.0.1"; d=1 }' "$_c" > "$_c.tdnew" || return 1
         if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
           mv -f "$_c.tdnew" "$_c"; info "torrent-direct listener added (listeners already present)"
         else
@@ -2820,12 +2825,12 @@ write_mihomo_config() {
     printf '%s\n' '    port: 7891'
     printf '%s\n' '    listen: 127.0.0.1'
     printf '%s\n' '    proxy: AI'
-    printf '%s\n' '  # torrent clients point here (SOCKS5/HTTP); everything it dials leaves DIRECT'
+    printf '%s\n' '  # torrent clients point here (SOCKS5/HTTP). No fixed policy on purpose: the rule'
+    printf '%s\n' '  # chain decides, so AI domains sent through it still go to AI (never leaked)'
     printf '%s\n' '  - name: torrent-direct'
     printf '%s\n' '    type: mixed'
     printf '%s\n' '    port: 7894'
     printf '%s\n' '    listen: 192.168.0.1'
-    printf '%s\n' '    proxy: DIRECT'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
     printf '%s\n' '  sub:'
@@ -20805,8 +20810,10 @@ def build_ruleset():
     return len(hosts), len(ips), True
 
 # ---------- listener toggle ----------
+# No fixed policy: the rule chain decides, so AI domains sent through the listener still
+# match RULE-SET,ai and go to AI (a forced "proxy: DIRECT" would leak them).
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
-                '    listen: 192.168.0.1','    proxy: DIRECT']
+                '    listen: 192.168.0.1']
 
 def listener_present():
     return 'torrent-direct' in read(CFG)
@@ -20991,7 +20998,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.15.0"
+GUARD_VERSION="1.15.1"
 
 log() { logger -t geomask-guard "$*"; }
 

@@ -593,6 +593,14 @@ for _p in 'callTorGet' 'callTorRefresh' 'callTorListener' 'callTorExtra' 'Тор
 done
 # the panel must read the 13th promise slot
 grep -qF 'all[12]' "$HERE/../assets/geo-sync-page.js" && { echo "PASS: S24 panel consumes the new RPC slot"; pass=$((pass+1)); } || { echo "FAIL: S24 new RPC result not consumed"; failn=$((failn+1)); }
+# v1.15.1: the listener must NOT force a policy, otherwise AI domains through it leak to DIRECT
+if grep -qF "'    proxy: DIRECT'" "$HERE/../assets/geomask-torrent.sh"; then
+  echo "FAIL: S24 torrent script still forces proxy: DIRECT (AI leak vector)"; failn=$((failn+1))
+else echo "PASS: S24 listener is rule-based in the admin script"; pass=$((pass+1)); fi
+if awk "/name: torrent-direct/{f=1;next} f&&/^ *printf .*'  - name:/{exit} f" "$HERE/../geomask.sh.in" | grep -qF "proxy: DIRECT"; then
+  echo "FAIL: S24 template listener block forces a policy"; failn=$((failn+1))
+else echo "PASS: S24 template listener block has no forced policy"; pass=$((pass+1)); fi
+grep -qF 'forces a policy' "$HERE/../geomask.sh.in" && { echo "PASS: S24 --check detects a forced policy"; pass=$((pass+1)); } || { echo "FAIL: S24 --check cannot detect a forced policy"; failn=$((failn+1)); }
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

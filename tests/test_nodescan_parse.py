@@ -71,6 +71,27 @@ proxies:
         self.assertIn('MIN_NODES', SRC)
         self.assertRegex(SRC, r'refusing to rewrite filter')
 
+    def test_subscription_client_identified(self):
+        # v1.13.7: the panel serves a 1-node stub to unknown User-Agents -> scan must
+        # send a known app UA (configurable) and retry.
+        self.assertRegex(SRC, r"sub_user_agent','clash-meta'")
+        self.assertRegex(SRC, r"h\['User-Agent'\]=sub_ua")
+        self.assertRegex(SRC, r'for _try in range\(3\)')
+        conf = (ROOT / 'assets' / 'geomask-nodes.conf').read_text(encoding='utf-8')
+        self.assertIn('sub_user_agent=clash-meta', conf)
+
+    def test_controller_reload_is_authenticated(self):
+        # v1.13.5 fixed auth in installer/backend/sync; the scan had the same 401 bug
+        self.assertRegex(SRC, r"add_header\('Authorization', 'Bearer ")
+
+    def test_geo_policy_covers_found_leaks(self):
+        conf = (ROOT / 'assets' / 'geomask-nodes.conf').read_text(encoding='utf-8')
+        self.assertIn('TR', conf.split('bad_countries=')[1].split('\n')[0])
+        self.assertIn('AS207847', conf.split('bad_asns=')[1].split('\n')[0])
+        base = conf.split('base_filter=')[1].split('\n')[0]
+        for needle in ('Turkey', 'United Kingdom', '\U0001F1F7\U0001F1FA'):
+            self.assertIn(needle, base)
+
 
 if __name__ == '__main__':
     unittest.main()

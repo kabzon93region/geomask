@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.13.6"
+GM_VERSION="1.13.7"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.13.6"
+BACKEND_VERSION="1.13.7"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1527,7 +1527,7 @@ var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   pa
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
 var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
 var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
-var PANEL_VERSION = '1.13.6';
+var PANEL_VERSION = '1.13.7';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -20479,7 +20479,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.13.6"
+GUARD_VERSION="1.13.7"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -20711,6 +20711,9 @@ bad_countries={c.strip().upper() for c in cfgd.get('bad_countries','RU,BY').spli
 bad_asns={('AS'+a.replace('AS','').strip().upper()) for a in cfgd.get('bad_asns','').split(',') if a.strip()}
 base_filter=cfgd.get('base_filter','Россия')
 provider=cfgd.get('sub_provider','sub')
+# v1.13.7: the panel (Remnawave) serves a 1-node stub ("Приложение не поддерживается") to
+# unknown clients, so the scan must identify itself. clash-meta -> YAML, v2rayNG -> links.
+sub_ua=cfgd.get('sub_user_agent','clash-meta')
 
 text=open(CFG, encoding='utf-8').read()
 # provider url (+ optional header x-hwid lines)
@@ -20724,11 +20727,18 @@ if hm and 'x-hwid' in hm.group(1):
     hv=re.search(r'-\s*"?([^"\n]+)"?', hm.group(1)[hm.group(1).find('x-hwid'):])
     if hv: hdrs['x-hwid']=hv.group(1).strip()
 
-try:
-    req=urllib.request.Request(url, headers=hdrs)
-    raw=urllib.request.urlopen(req, timeout=25).read().decode('utf-8','replace')
-except Exception as e:
-    log('subscription download failed: %s' % e); sys.exit(1)
+raw=''
+for _try in range(3):
+    try:
+        h=dict(hdrs); h['User-Agent']=sub_ua
+        raw=urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=25).read().decode('utf-8','replace')
+        if raw.strip():
+            break
+    except Exception as e:
+        log('subscription download failed (try %d/3): %s' % (_try+1, e))
+    time.sleep(2)
+if not raw.strip():
+    log('subscription download failed: empty response'); sys.exit(1)
 sub_text=raw
 if not re.search(r'(?m)^(vless|ss|trojan|vmess|anytls|hysteria2?)://', raw):
     try:
@@ -20849,9 +20859,13 @@ if changed:
     if rc==0:
         os.replace(CFG+'.tmp', CFG)
         try:
+            # v1.13.7: controller is protected by a secret; without Bearer the reload 401s
+            sm=re.search(r'^secret:\s*(\S+)', text, re.M)
+            sec=sm.group(1).strip().strip('"\'') if sm else ''
             r=urllib.request.Request('http://127.0.0.1:9090/configs?force=true',
                 data=json.dumps({'path':CFG}).encode(), method='PUT',
                 headers={'Content-Type':'application/json'})
+            if sec: r.add_header('Authorization', 'Bearer '+sec)
             urllib.request.urlopen(r, timeout=8).read()
         except Exception as e:
             log('reload failed: %s' % e)
@@ -20886,16 +20900,25 @@ ASSET_EOF
 # re-reads this file every run; re-installing geomask keeps the file (keep-as-is).
 
 # ISO country codes of the node SERVER considered leaking (comma separated)
-bad_countries=RU,BY,KZ,IR
+# TR added 30.10: Turkish nodes returned to the pool after a format change went unnoticed
+bad_countries=RU,BY,KZ,IR,TR
 
 # ASN numbers of known fake-geo / RF-affiliated networks (comma separated, "AS" prefix optional)
-bad_asns=AS210976,AS215540
+# AS207847 CloudBlast (AE) - nodes labelled "United Kingdom" that actually exit in the UAE
+bad_asns=AS210976,AS215540,AS207847
 
-# Base name filter always kept in exclude-filter (static part)
-base_filter=Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания|Финляндия
+# Base name filter always kept in exclude-filter (static part).
+# NOTE: emoji flags are NOT matched by country words - a node named only "🇷🇺 <something>"
+# needs the flag itself in this list (added 30.10 after an RU node slipped through).
+base_filter=Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания|Финляндия|Albania|Croatia|Lithuania|Latvia|Denmark|Finland|Turkey|United Kingdom|🇷🇺|без рекламы
 
 # provider name in mihomo config to scan
 sub_provider=sub
+
+# User-Agent for fetching the subscription. The panel (Remnawave) answers a 1-node
+# stub "Приложение не поддерживается" to unknown clients, so this MUST be a known app.
+# clash-meta -> YAML config; v2rayNG/NekoBox/kitsunebi -> base64 share links.
+sub_user_agent=clash-meta
 
 ASSET_EOF
   else

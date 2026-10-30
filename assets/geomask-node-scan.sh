@@ -33,6 +33,9 @@ bad_countries={c.strip().upper() for c in cfgd.get('bad_countries','RU,BY').spli
 bad_asns={('AS'+a.replace('AS','').strip().upper()) for a in cfgd.get('bad_asns','').split(',') if a.strip()}
 base_filter=cfgd.get('base_filter','Россия')
 provider=cfgd.get('sub_provider','sub')
+# v1.13.7: the panel (Remnawave) serves a 1-node stub ("Приложение не поддерживается") to
+# unknown clients, so the scan must identify itself. clash-meta -> YAML, v2rayNG -> links.
+sub_ua=cfgd.get('sub_user_agent','clash-meta')
 
 text=open(CFG, encoding='utf-8').read()
 # provider url (+ optional header x-hwid lines)
@@ -46,11 +49,18 @@ if hm and 'x-hwid' in hm.group(1):
     hv=re.search(r'-\s*"?([^"\n]+)"?', hm.group(1)[hm.group(1).find('x-hwid'):])
     if hv: hdrs['x-hwid']=hv.group(1).strip()
 
-try:
-    req=urllib.request.Request(url, headers=hdrs)
-    raw=urllib.request.urlopen(req, timeout=25).read().decode('utf-8','replace')
-except Exception as e:
-    log('subscription download failed: %s' % e); sys.exit(1)
+raw=''
+for _try in range(3):
+    try:
+        h=dict(hdrs); h['User-Agent']=sub_ua
+        raw=urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=25).read().decode('utf-8','replace')
+        if raw.strip():
+            break
+    except Exception as e:
+        log('subscription download failed (try %d/3): %s' % (_try+1, e))
+    time.sleep(2)
+if not raw.strip():
+    log('subscription download failed: empty response'); sys.exit(1)
 sub_text=raw
 if not re.search(r'(?m)^(vless|ss|trojan|vmess|anytls|hysteria2?)://', raw):
     try:
@@ -171,9 +181,13 @@ if changed:
     if rc==0:
         os.replace(CFG+'.tmp', CFG)
         try:
+            # v1.13.7: controller is protected by a secret; without Bearer the reload 401s
+            sm=re.search(r'^secret:\s*(\S+)', text, re.M)
+            sec=sm.group(1).strip().strip('"\'') if sm else ''
             r=urllib.request.Request('http://127.0.0.1:9090/configs?force=true',
                 data=json.dumps({'path':CFG}).encode(), method='PUT',
                 headers={'Content-Type':'application/json'})
+            if sec: r.add_header('Authorization', 'Bearer '+sec)
             urllib.request.urlopen(r, timeout=8).read()
         except Exception as e:
             log('reload failed: %s' % e)

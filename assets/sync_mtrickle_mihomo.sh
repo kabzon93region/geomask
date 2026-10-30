@@ -7,6 +7,34 @@
 exec python3 - <<'PYEOF'
 import os, re, json, sys, time, urllib.request
 
+def controller_headers(path):
+    with open(path, encoding='utf-8') as config:
+        for line in config:
+            match = re.match(r'^secret:\s*(.*)$', line.rstrip('\r\n'))
+            if not match:
+                continue
+            value = match.group(1).strip()
+            if value.startswith('"'):
+                value, end = json.JSONDecoder().raw_decode(value)
+                tail = match.group(1).strip()[end:].strip()
+                if tail and not tail.startswith('#'):
+                    raise ValueError('Invalid controller secret')
+            elif value.startswith("'"):
+                quoted = re.fullmatch(r"'((?:[^']|'')*)'\s*(?:#.*)?", value)
+                if not quoted:
+                    raise ValueError('Invalid controller secret')
+                value = quoted.group(1).replace("''", "'")
+            else:
+                value = re.split(r'\s+#', value, maxsplit=1)[0].strip()
+                if value.startswith('#'):
+                    value = ''
+                if value.startswith(('|', '>', '[', '{', '&', '*', '!')):
+                    raise ValueError('Unsupported controller secret')
+            if not isinstance(value, str) or any(ord(c) < 32 or ord(c) == 127 for c in value):
+                raise ValueError('Invalid controller secret')
+            return {'Authorization': 'Bearer ' + value} if value else {}
+    return {}
+
 SRC = '/etc/magitrickle/state/config.yaml'
 MT  = '/etc/mihomo/ruleset/mtrickle.yaml'
 AI  = '/etc/mihomo/ruleset/ai.yaml'
@@ -190,12 +218,13 @@ if c1 or c2 or c3:
         req = urllib.request.Request(
             'http://127.0.0.1:9090/configs?force=true',
             data=json.dumps({'path': '/etc/mihomo/config.yaml'}).encode(),
-            method='PUT', headers={'Content-Type': 'application/json'})
+            method='PUT', headers={'Content-Type': 'application/json',
+                                   **controller_headers('/etc/mihomo/config.yaml')})
         urllib.request.urlopen(req, timeout=5).read()
         _r_ok = True
         print('mihomo reloaded')
     except Exception as e:
-        print('reload FAILED: %s (restart needed)' % e)
+        print('reload FAILED (configuration or controller error; restart needed)')
 
 # v1.10.0: machine-readable last-run state for the panel; journal line only on real change
 try:

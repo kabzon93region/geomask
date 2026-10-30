@@ -1,4 +1,12 @@
 #!/bin/sh
+# Windows Python cannot execute the shell curl stub directly via subprocess.
+# Keep this compatibility bridge test-only; Linux uses the normal interpreter.
+if [ "${1:-}" = '-' ] && command -v cygpath >/dev/null 2>&1; then
+  GM_TEST_SHELL=$(cygpath -w "$(command -v sh)")
+  export GM_TEST_SHELL
+  shift
+  exec python "$(dirname "$0")/../python_stdin.py" "$@"
+fi
 # stub python3 -> delegate to real python if found, else exit 0
 if command -v python >/dev/null 2>&1; then exec python "$@"; fi
 exit 0

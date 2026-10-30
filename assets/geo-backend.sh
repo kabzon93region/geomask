@@ -44,6 +44,52 @@ DEPLOY_JS=/www/luci-static/resources/view/geo-sync/main.js
 DEPLOY_GUARD=/usr/bin/geomask-guard.sh
 DEPLOY_BACKEND=/usr/bin/geo-backend.sh
 
+# Keep authentication out of curl argv and diagnostics; read the active config on each call.
+controller_curl() {
+  python3 - "$MIHOMO_CONF" "$@" <<'GM_CONTROLLER_PY'
+import json, re, subprocess, sys
+
+def controller_headers(path):
+    with open(path, encoding='utf-8') as config:
+        for line in config:
+            match = re.match(r'^secret:\s*(.*)$', line.rstrip('\r\n'))
+            if not match:
+                continue
+            value = match.group(1).strip()
+            if value.startswith('"'):
+                value, end = json.JSONDecoder().raw_decode(value)
+                tail = match.group(1).strip()[end:].strip()
+                if tail and not tail.startswith('#'):
+                    raise ValueError('Invalid controller secret')
+            elif value.startswith("'"):
+                quoted = re.fullmatch(r"'((?:[^']|'')*)'\s*(?:#.*)?", value)
+                if not quoted:
+                    raise ValueError('Invalid controller secret')
+                value = quoted.group(1).replace("''", "'")
+            else:
+                value = re.split(r'\s+#', value, maxsplit=1)[0].strip()
+                if value.startswith('#'):
+                    value = ''
+                if value.startswith(('|', '>', '[', '{', '&', '*', '!')):
+                    raise ValueError('Unsupported controller secret')
+            if not isinstance(value, str) or any(ord(c) < 32 or ord(c) == 127 for c in value):
+                raise ValueError('Invalid controller secret')
+            return {'Authorization': 'Bearer ' + value} if value else {}
+    return {}
+
+try:
+    headers = controller_headers(sys.argv[1])
+    options = ''.join('header = ' + json.dumps(k + ': ' + v, ensure_ascii=False) + '\n'
+                      for k, v in headers.items())
+    result = subprocess.run(['curl', '--config', '-', *sys.argv[2:]],
+                            input=options.encode('utf-8'))
+    sys.exit(result.returncode)
+except Exception:
+    print('Controller request failed (configuration or transport error)', file=sys.stderr)
+    sys.exit(1)
+GM_CONTROLLER_PY
+}
+
 # escape a string for JSON: backslash, quote, tab; CR stripped; newline -> \n
 json_esc() {
   printf '%s' "$1" | awk '
@@ -61,7 +107,7 @@ json_esc() {
 
 # current node of a mihomo group (VPN or AI)
 _grp_node() {
-  curl -s -m3 "$MIHOMO_API/proxies/$1" | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//; s/"$//'
+  controller_curl -s -m3 "$MIHOMO_API/proxies/$1" | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//; s/"$//'
 }
 
 # count rules in a rule-provider yaml (payload lines starting with "  - ")
@@ -84,7 +130,7 @@ cmd_status() {
   _migrate
   VPN_NODE=$(_grp_node VPN)
   AI_NODE=$(_grp_node AI)
-  GLOBAL=$(curl -s -m3 "$MIHOMO_API/proxies/GLOBAL" | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//; s/"$//')
+  GLOBAL=$(controller_curl -s -m3 "$MIHOMO_API/proxies/GLOBAL" | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//; s/"$//')
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then LCRON=1; else LCRON=0; fi
   if [ -f /etc/sysctl.d/99-disable-ipv6.conf ]; then V6=0;
     elif [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then V6=0; else V6=1; fi
@@ -202,7 +248,7 @@ cmd_global() {
     vpn)    NAME=VPN ;;
     *) printf '{"error":"bad arg"}'; return 1 ;;
   esac
-  curl -s -m5 -X PUT "$MIHOMO_API/proxies/GLOBAL" -H 'Content-Type: application/json' \
+  controller_curl -s -m5 -X PUT "$MIHOMO_API/proxies/GLOBAL" -H 'Content-Type: application/json' \
     -d "{\"name\":\"$NAME\"}" >/dev/null
   cmd_status
 }
@@ -583,7 +629,7 @@ _mihomo_set_provider() {
   # apply to the RUNNING mihomo without restart:
   # PUT /configs with config path forces re-read of the config file,
   # which re-fetches the provider subscription (old node list replaced)
-  if curl -s -m15 -f -X PUT "$MIHOMO_API/configs" \
+  if controller_curl -s -m15 -f -X PUT "$MIHOMO_API/configs" \
       -H 'Content-Type: application/json' \
       -d "{\"path\":\"$MIHOMO_CONF\"}" >/dev/null 2>&1; then
     WARN=''
@@ -592,7 +638,7 @@ _mihomo_set_provider() {
   fi
   # verify the running provider actually serves nodes after reload
   sleep 2
-  _n=$(curl -s -m6 "$MIHOMO_API/providers/proxies/$PN" 2>/dev/null \
+  _n=$(controller_curl -s -m6 "$MIHOMO_API/providers/proxies/$PN" 2>/dev/null \
        | tr ',' '\n' | grep -c "\"provider-name\":\"$PN\"")
   case "${_n:-0}" in ''|*[!0-9]*) _n=0 ;; esac
   if [ "$_n" -eq 0 ]; then
@@ -1080,7 +1126,7 @@ cmd_lists_seed() {
   /etc/init.d/magitrickle start >/dev/null 2>&1 || true
   sleep 2
   sh /root/sync_mtrickle_mihomo.sh >/dev/null 2>&1 || true
-  curl -s -X PUT http://127.0.0.1:9090/configs -H 'Content-Type: application/json' \
+  controller_curl -s -X PUT http://127.0.0.1:9090/configs -H 'Content-Type: application/json' \
     -d '{"path":"/etc/mihomo/config.yaml"}' >/dev/null 2>&1 || true
   _ok=false; printf '%s' "$_out" | grep -q '^CHANGED' && _ok=true
   printf '{"ok":%s,"rc":%s,"result":"%s"}\n' "$_ok" "$_rc" "$(json_esc "$_out")"

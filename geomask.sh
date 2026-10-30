@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.14.3"
+GM_VERSION="1.14.4"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.14.3"
+BACKEND_VERSION="1.14.4"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1585,7 +1585,7 @@ var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  ex
 var callYtGet      = rpc.declare({ object: 'geo-sync', method: 'yt_get',      expect: {} });
 var callYtMode     = rpc.declare({ object: 'geo-sync', method: 'yt_mode',     params: { mode: null }, expect: {} });
 var callYtReset    = rpc.declare({ object: 'geo-sync', method: 'yt_reset',    expect: {} });
-var PANEL_VERSION = '1.14.3';
+var PANEL_VERSION = '1.14.4';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2583,11 +2583,17 @@ step3_check() {
   grep -q 'RULE-SET,ai,AI' "$_c" 2>/dev/null && info "rule ai->AI: present" || { bad "rule ai->AI missing"; _need=1; }
   grep -q 'RULE-SET,mtrickle,VPN' "$_c" 2>/dev/null && info "rule mtrickle->VPN: present" || { bad "rule mtrickle->VPN missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
+  grep -q 'torrent-direct' "$_c" 2>/dev/null && info "listener (torrent-direct:7894): present" || warn "torrent-direct listener missing (torrent clients cannot be pinned to DIRECT via proxy)"
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
   grep -q 'RULE-SET,ytvpn,VPN' "$_c" 2>/dev/null && info "ytvpn->VPN rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to VPN)"
-  for rf in /etc/mihomo/ruleset/mtrickle.yaml /etc/mihomo/ruleset/ai.yaml /etc/mihomo/ruleset/ytdirect.yaml /etc/mihomo/ruleset/ytvpn.yaml; do
+  # v1.14.4: torrents must never be swallowed by the VPN lists (owner policy 30.10)
+  grep -q 'RULE-SET,torrentdirect,DIRECT' "$_c" 2>/dev/null && info "torrentdirect->DIRECT rule: present" || warn "torrentdirect rule missing (tracker domains can still go to VPN)"
+  if grep -qE '^  - DST-PORT,6969,DIRECT' "$_c" 2>/dev/null; then info "P2P/tracker ports -> DIRECT: present"
+  elif grep -qE '^  - DST-PORT,6969,VPN' "$_c" 2>/dev/null; then bad "DST-PORT,6969 still sends tracker announces to VPN (legacy rule)"
+  else warn "no DST-PORT,6969 rule at all"; fi
+  for rf in /etc/mihomo/ruleset/mtrickle.yaml /etc/mihomo/ruleset/ai.yaml /etc/mihomo/ruleset/ytdirect.yaml /etc/mihomo/ruleset/ytvpn.yaml /etc/mihomo/ruleset/torrentdirect.yaml; do
     if [ -s "$(P "$rf")" ]; then info "ruleset: $rf ($(grep -c 'DOMAIN-SUFFIX' "$(P "$rf")" 2>/dev/null || echo '?') suffixes)"; else warn "ruleset empty/missing: $rf (sync step will create)"; fi
   done
   if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then info "mihomo -t: PASS"; else bad "mihomo -t: FAIL"; _need=1; fi
@@ -2660,7 +2666,7 @@ write_mihomo_config() {
     if ! grep -q 'ai-devices' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
       awk 'BEGIN{d=0}
-        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "";d=1}
+        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: 192.168.0.1";print "    proxy: DIRECT";print "";d=1}
         {print}' "$_c" > "$_c.zmnew" || return 1
       if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
         mv -f "$_c.zmnew" "$_c"; info "listeners block added to existing config (custom rules preserved)"
@@ -2668,7 +2674,20 @@ write_mihomo_config() {
         rm -f "$_c.zmnew"; bad "mihomo -t failed after adding listeners - config kept"; return 1
       fi
     else
-      info "existing 2-subscription config kept as-is (ai-devices already present)"
+      # v1.14.4: config already had listeners - make sure the torrent DIRECT one exists
+      if ! grep -q 'torrent-direct' "$_c"; then
+        cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+        awk 'BEGIN{d=0} {print} (!d && $0 ~ /^    proxy: AI$/) {
+              print "  - name: torrent-direct"; print "    type: mixed"; print "    port: 7894";
+              print "    listen: 192.168.0.1"; print "    proxy: DIRECT"; d=1 }' "$_c" > "$_c.tdnew" || return 1
+        if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+          mv -f "$_c.tdnew" "$_c"; info "torrent-direct listener added (listeners already present)"
+        else
+          rm -f "$_c.tdnew"; bad "mihomo -t failed after adding torrent-direct - config kept"; return 1
+        fi
+      else
+        info "existing 2-subscription config kept as-is (ai-devices + torrent-direct present)"
+      fi
     fi
     return 0
   fi
@@ -2696,6 +2715,12 @@ write_mihomo_config() {
     printf '%s\n' '    port: 7891'
     printf '%s\n' '    listen: 127.0.0.1'
     printf '%s\n' '    proxy: AI'
+    printf '%s\n' '  # torrent clients point here (SOCKS5/HTTP); everything it dials leaves DIRECT'
+    printf '%s\n' '  - name: torrent-direct'
+    printf '%s\n' '    type: mixed'
+    printf '%s\n' '    port: 7894'
+    printf '%s\n' '    listen: 192.168.0.1'
+    printf '%s\n' '    proxy: DIRECT'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
     printf '%s\n' '  sub:'
@@ -2760,15 +2785,20 @@ write_mihomo_config() {
     printf '%s\n' '    type: file'
     printf '%s\n' '    behavior: classical'
     printf '%s\n' '    path: /etc/mihomo/ruleset/ytvpn.yaml'
+    printf '%s\n' '  torrentdirect:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/torrentdirect.yaml'
     printf '\n'
     printf '%s\n' 'rules:'
     printf '%s\n' '  # AUTO-SYNC from magitrickle: /root/sync_mtrickle_mihomo.sh - DO NOT EDIT MANUALLY'
-    printf '%s\n' '  - DST-PORT,1337,VPN'
-    printf '%s\n' '  - DST-PORT,6969,VPN'
-    printf '%s\n' '  - DST-PORT,451,VPN'
-    printf '%s\n' '  - DST-PORT,5944,VPN'
-    printf '%s\n' '  - DST-PORT,2710,VPN'
-    printf '%s\n' '  - DST-PORT,8081,VPN'
+    printf '%s\n' '  # P2P/tracker ports: never via VPN (owner policy 30.10 - torrents must not touch mihomo)'
+    printf '%s\n' '  - DST-PORT,1337,DIRECT'
+    printf '%s\n' '  - DST-PORT,6969,DIRECT'
+    printf '%s\n' '  - DST-PORT,451,DIRECT'
+    printf '%s\n' '  - DST-PORT,5944,DIRECT'
+    printf '%s\n' '  - DST-PORT,2710,DIRECT'
+    printf '%s\n' '  - DST-PORT,8081,DIRECT'
     printf '%s\n' '  # direct fallback: these SNIs are filtered at VPN exit (verified: all 19 nodes fail, direct works)'
     printf '%s\n' '  - DOMAIN-SUFFIX,thepiratebay.org,DIRECT'
     printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.org,DIRECT'
@@ -2783,6 +2813,8 @@ write_mihomo_config() {
     printf '%s\n' '  - RULE-SET,ytdirect,DIRECT'
     printf '%s\n' '  - DOMAIN-SUFFIX,cloudflare-ech.com,AI'
     printf '%s\n' '  - RULE-SET,ai,AI'
+    printf '%s\n' '  # torrent tracker endpoints (public lists) - DIRECT, after ai so the AI policy always wins'
+    printf '%s\n' '  - RULE-SET,torrentdirect,DIRECT'
     printf '%s\n' '  - RULE-SET,mtrickle,VPN'
     printf '%s\n' '  # STUN via VPN: stop WebRTC leaking the real (RU) IP, keep calls working'
     printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN'
@@ -20429,6 +20461,126 @@ ASSET_EOF
   else
     info "ytvpn list: keeping existing /etc/mihomo/ruleset/ytvpn.yaml (sync-managed)"
   fi
+  # v1.14.4: torrent tracker allow-list -> DIRECT. Static asset built from the public tracker lists
+  # (ngosang/trackerslist, XIU2/TrackersListCollection). Existing file is kept: owners edit it.
+  if [ ! -s "$(P /etc/mihomo/ruleset/torrentdirect.yaml)" ]; then
+    save_stream /etc/mihomo/ruleset/torrentdirect.yaml 644 <<'ASSET_EOF'
+# AUTO-GENERATED from public tracker lists (ngosang/trackerslist, XIU2/TrackersListCollection)
+# Policy: trackers must never be swallowed by the VPN lists. Do not edit by hand.
+payload:
+  - DOMAIN-SUFFIX,004430.xyz
+  - DOMAIN-SUFFIX,1.tracker.eu.org
+  - DOMAIN-SUFFIX,1337.abcvg.info
+  - DOMAIN-SUFFIX,admin.52ywp.com
+  - DOMAIN-SUFFIX,anime-tracker.aruku.kro.kr
+  - DOMAIN-SUFFIX,bittorrent-tracker.e-n-c-r-y-p-t.net
+  - DOMAIN-SUFFIX,bt-tracker.de
+  - DOMAIN-SUFFIX,bt1.archive.org
+  - DOMAIN-SUFFIX,bt2.archive.org
+  - DOMAIN-SUFFIX,edgev.duckdns.org
+  - DOMAIN-SUFFIX,evan.im
+  - DOMAIN-SUFFIX,exodus.desync.com
+  - DOMAIN-SUFFIX,explodie.org
+  - DOMAIN-SUFFIX,gargoyleperch.de
+  - DOMAIN-SUFFIX,ht.therarbg.to
+  - DOMAIN-SUFFIX,ipv4announce.sktorrent.eu
+  - DOMAIN-SUFFIX,ipv6.govt.hu
+  - DOMAIN-SUFFIX,kolankoalastree.newtrackon.co.nz
+  - DOMAIN-SUFFIX,mail.segso.net
+  - DOMAIN-SUFFIX,martin-gebhardt.eu
+  - DOMAIN-SUFFIX,ns575949.ip-51-222-82.net
+  - DOMAIN-SUFFIX,nyaa.tracker.wf
+  - DOMAIN-SUFFIX,open.demonii.com
+  - DOMAIN-SUFFIX,open.ftorrent.com
+  - DOMAIN-SUFFIX,open.stealth.si
+  - DOMAIN-SUFFIX,open.tracker.cl
+  - DOMAIN-SUFFIX,open.tracker.ink
+  - DOMAIN-SUFFIX,opentor.org
+  - DOMAIN-SUFFIX,opentracker.lain.moscow
+  - DOMAIN-SUFFIX,opentracker2.lain.moscow
+  - DOMAIN-SUFFIX,p4p.arenabg.com
+  - DOMAIN-SUFFIX,retracker.hotplug.ru
+  - DOMAIN-SUFFIX,retracker01-msk-virt.corbina.net
+  - DOMAIN-SUFFIX,seedpeer.net
+  - DOMAIN-SUFFIX,t.213891.xyz
+  - DOMAIN-SUFFIX,t.overflow.biz
+  - DOMAIN-SUFFIX,torrent.tracker.durukanbal.com
+  - DOMAIN-SUFFIX,torrentsmd.com
+  - DOMAIN-SUFFIX,tr.abiir.top
+  - DOMAIN-SUFFIX,tr.burnabyhighstar.com
+  - DOMAIN-SUFFIX,tr.highstar.shop
+  - DOMAIN-SUFFIX,tr.nyacat.pw
+  - DOMAIN-SUFFIX,tr3.ysagin.top
+  - DOMAIN-SUFFIX,tr4ck3r.duckdns.org
+  - DOMAIN-SUFFIX,tracker-udp.gbitt.info
+  - DOMAIN-SUFFIX,tracker.7471.top
+  - DOMAIN-SUFFIX,tracker.aruku.ovh
+  - DOMAIN-SUFFIX,tracker.breizh.pm
+  - DOMAIN-SUFFIX,tracker.cn.nyaa.net
+  - DOMAIN-SUFFIX,tracker.corpscorp.online
+  - DOMAIN-SUFFIX,tracker.ddunlimited.net
+  - DOMAIN-SUFFIX,tracker.dhitechnical.com
+  - DOMAIN-SUFFIX,tracker.dler.com
+  - DOMAIN-SUFFIX,tracker.dler.org
+  - DOMAIN-SUFFIX,tracker.ducks.party
+  - DOMAIN-SUFFIX,tracker.evergarden.uk
+  - DOMAIN-SUFFIX,tracker.farted.net
+  - DOMAIN-SUFFIX,tracker.filemail.com
+  - DOMAIN-SUFFIX,tracker.fnix.net
+  - DOMAIN-SUFFIX,tracker.foreverpirates.co
+  - DOMAIN-SUFFIX,tracker.gmi.gd
+  - DOMAIN-SUFFIX,tracker.ilibr.org
+  - DOMAIN-SUFFIX,tracker.internetwarriors.net
+  - DOMAIN-SUFFIX,tracker.k.vu
+  - DOMAIN-SUFFIX,tracker.kuroy.me
+  - DOMAIN-SUFFIX,tracker.midnightprogrammer.net
+  - DOMAIN-SUFFIX,tracker.mywaifu.best
+  - DOMAIN-SUFFIX,tracker.nekomi.cn
+  - DOMAIN-SUFFIX,tracker.nyaa.net
+  - DOMAIN-SUFFIX,tracker.nyaa.vc
+  - DOMAIN-SUFFIX,tracker.okade.pro
+  - DOMAIN-SUFFIX,tracker.opentrackr.com
+  - DOMAIN-SUFFIX,tracker.opentrackr.org
+  - DOMAIN-SUFFIX,tracker.peerfect.org
+  - DOMAIN-SUFFIX,tracker.playground.ru
+  - DOMAIN-SUFFIX,tracker.pmman.tech
+  - DOMAIN-SUFFIX,tracker.qingwapt.org
+  - DOMAIN-SUFFIX,tracker.qu.ax
+  - DOMAIN-SUFFIX,tracker.renfei.net
+  - DOMAIN-SUFFIX,tracker.sela.st
+  - DOMAIN-SUFFIX,tracker.skynetcloud.site
+  - DOMAIN-SUFFIX,tracker.skyts.net
+  - DOMAIN-SUFFIX,tracker.theoks.net
+  - DOMAIN-SUFFIX,tracker.torrent.eu.org
+  - DOMAIN-SUFFIX,tracker.torrents.observer
+  - DOMAIN-SUFFIX,tracker.tryhackx.org
+  - DOMAIN-SUFFIX,tracker.waaa.moe
+  - DOMAIN-SUFFIX,tracker.wildkat.net
+  - DOMAIN-SUFFIX,tracker.willy.pro
+  - DOMAIN-SUFFIX,tracker.xn--djrq4gl4hvoi.top
+  - DOMAIN-SUFFIX,tracker.yume-hatsuyuki.moe
+  - DOMAIN-SUFFIX,tracker.zhuqiy.com
+  - DOMAIN-SUFFIX,tracker.zhuqiy.dgj055.icu
+  - DOMAIN-SUFFIX,tracker1.520.jp
+  - DOMAIN-SUFFIX,tracker1.itzmx.com
+  - DOMAIN-SUFFIX,tracker2.dler.org
+  - DOMAIN-SUFFIX,tracker2.itzmx.com
+  - DOMAIN-SUFFIX,tracker3.itzmx.com
+  - DOMAIN-SUFFIX,tracker4.itzmx.com
+  - DOMAIN-SUFFIX,v2.iperson.xyz
+  - DOMAIN-SUFFIX,whybother.torrentonline.cc
+  - DOMAIN-SUFFIX,www.wareztorrent.com
+  - DOMAIN-SUFFIX,yuptracker-eu.gaijinent.com
+  - IP-CIDR,52.58.128.163/32,no-resolve
+  - IP-CIDR,93.158.213.92/32,no-resolve
+  - IP-CIDR,107.189.2.131/32,no-resolve
+  - IP-CIDR,207.241.226.111/32,no-resolve
+  - IP-CIDR,207.241.231.226/32,no-resolve
+
+ASSET_EOF
+  else
+    info "torrentdirect list: keeping existing /etc/mihomo/ruleset/torrentdirect.yaml"
+  fi
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 #!/bin/sh
 # Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
@@ -20518,7 +20670,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.14.3"
+GUARD_VERSION="1.14.4"
 
 log() { logger -t geomask-guard "$*"; }
 

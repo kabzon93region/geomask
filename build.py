@@ -27,6 +27,7 @@ MAP = {
     "geomask-seed-lists.py": "geomask-seed-lists.py",
     "geomask-ytwatch.sh":    "geomask-ytwatch.sh",
     "geomask-ytwatch.conf":  "geomask-ytwatch.conf",
+    "torrentdirect.yaml":    "torrentdirect.yaml",
 }
 
 # menu.json asset file on disk (same acl download name collision): we saved menu as second luci-app-geo-sync.json

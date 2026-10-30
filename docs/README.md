@@ -12,6 +12,7 @@
 | [SYNC.md](SYNC.md) | Синхронизация magitrickle → mihomo (`rule-providers`) |
 | [LISTS.md](LISTS.md) | Шаблоны списков MagiTrickle: снимок групп, сид/восстановление (v1.13.0) |
 | [YOUTUBE.md](YOUTUBE.md) | YouTube: страница/картинки через запрет, сбойные рёбра googlevideo — в VPN (v1.14.0) |
+| [TORRENTS.md](TORRENTS.md) | Торренты/P2P: слушатель `torrent-direct`, порты и списки трекеров — всегда мимо VPN (v1.14.4) |
 | [OPERATIONS.md](OPERATIONS.md) | Режимы запуска, шаги, бэкапы, безопасность |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Диагностика типовых проблем |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Сборка, песочница, тесты |

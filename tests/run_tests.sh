@@ -86,6 +86,7 @@ echo 'bad_asns=AS210976' > "$R/etc/geomask-nodes.conf"
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-ytwatch.sh"; chmod +x "$R/usr/bin/geomask-ytwatch.sh"
 echo 'mode=auto' > "$R/etc/geomask-ytwatch.conf"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytvpn.yaml"
+printf 'payload:\n  - DOMAIN-SUFFIX,tracker.example.org\n' > "$R/etc/mihomo/ruleset/torrentdirect.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/mtrickle.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ai.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytdirect.yaml"
@@ -108,12 +109,16 @@ rule-providers:
     type: file
   ytdirect:
     type: file
+  torrentdirect:
+    type: file
 rules:
+  - DST-PORT,6969,DIRECT
   - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT
   - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT
   - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT
   - RULE-SET,ytdirect,DIRECT
   - RULE-SET,ai,AI
+  - RULE-SET,torrentdirect,DIRECT
   - RULE-SET,mtrickle,VPN
   - MATCH,GLOBAL
 listeners:
@@ -523,6 +528,40 @@ else echo "FAIL: S22 need-flag still driven by the volatile /tmp core marker"; f
 if grep -qE 'if \[ "\$_core" = "none" \]; then _LNEED=true$' "$HERE/../assets/geo-backend.sh"; then
   echo "FAIL: S22 bare core=none -> need=true rule still present"; failn=$((failn+1))
 else echo "PASS: S22 no bare core=none -> need=true rule"; pass=$((pass+1)); fi
+
+# ---------- scenario 23: torrent trackers must never reach the VPN lists (v1.14.4) ----------
+echo "=== S23: torrentdirect (trackers -> DIRECT) ==="
+if [ -s "$HERE/../assets/torrentdirect.yaml" ] && grep -q '^payload:' "$HERE/../assets/torrentdirect.yaml" \
+   && grep -q 'DOMAIN-SUFFIX,' "$HERE/../assets/torrentdirect.yaml"; then
+  echo "PASS: S23 tracker ruleset asset present with entries"; pass=$((pass+1))
+else echo "FAIL: S23 tracker ruleset asset missing/empty"; failn=$((failn+1)); fi
+if grep -qE 'x-hwid|token|password|secret|/sub' "$HERE/../assets/torrentdirect.yaml"; then
+  echo "FAIL: S23 ruleset asset contains a secret-looking string"; failn=$((failn+1))
+else echo "PASS: S23 ruleset asset has no secrets"; pass=$((pass+1)); fi
+grep -qF '"torrentdirect.yaml"' "$HERE/../build.py" && { echo "PASS: S23 wired into build MAP"; pass=$((pass+1)); } || { echo "FAIL: S23 not in build MAP"; failn=$((failn+1)); }
+for _p in '/etc/mihomo/ruleset/torrentdirect.yaml' 'RULE-SET,torrentdirect,DIRECT' 'torrentdirect->DIRECT rule' 'P2P/tracker ports -> DIRECT'; do
+  if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S23 installer has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S23 installer missing: $_p"; failn=$((failn+1)); fi
+done
+# the legacy rule that sent tracker ports to VPN must be gone FROM THE TEMPLATE.
+# Scope to the generated rules block: the same strings appear in step3_check as detectors.
+_tmpl=$(awk "/^ *printf .*'rules:'/{f=1} f{print} /'  - MATCH,GLOBAL'/{if(f)exit}" "$HERE/../geomask.sh.in")
+if printf '%s' "$_tmpl" | grep -qE "DST-PORT,(6969|1337|2710|8081),VPN"; then
+  echo "FAIL: S23 template still redirects P2P ports to VPN"; failn=$((failn+1))
+else echo "PASS: S23 no P2P port -> VPN in the template"; pass=$((pass+1)); fi
+if ! printf '%s' "$_tmpl" | grep -qF 'RULE-SET,torrentdirect,DIRECT'; then
+  echo "FAIL: S23 template lacks the torrentdirect rule"; failn=$((failn+1))
+else echo "PASS: S23 template emits the torrentdirect rule"; pass=$((pass+1)); fi
+# ordering INSIDE the template: ai first, then torrentdirect, then mtrickle
+_la=$(printf '%s\n' "$_tmpl" | grep -nF "RULE-SET,ai,AI" | head -1 | cut -d: -f1)
+_lt=$(printf '%s\n' "$_tmpl" | grep -nF "RULE-SET,torrentdirect,DIRECT" | head -1 | cut -d: -f1)
+_lm=$(printf '%s\n' "$_tmpl" | grep -nF "RULE-SET,mtrickle,VPN" | head -1 | cut -d: -f1)
+if [ -n "$_la" ] && [ -n "$_lt" ] && [ -n "$_lm" ] && [ "$_la" -lt "$_lt" ] && [ "$_lt" -lt "$_lm" ]; then
+  echo "PASS: S23 template rule order ai < torrentdirect < mtrickle"; pass=$((pass+1))
+else echo "FAIL: S23 template rule order wrong (ai=$_la td=$_lt mt=$_lm)"; failn=$((failn+1)); fi
+# the DIRECT listener for torrent clients is documented in the template too
+grep -qF 'torrent-direct' "$HERE/../geomask.sh.in" || grep -qF 'torrent-direct' "$HERE/../docs/YOUTUBE.md" || grep -qF 'torrent-direct' "$HERE/../docs/ARCHITECTURE.md" \
+  && { echo "PASS: S23 DIRECT listener documented"; pass=$((pass+1)); } || { echo "FAIL: S23 torrent-direct listener not documented"; failn=$((failn+1)); }
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

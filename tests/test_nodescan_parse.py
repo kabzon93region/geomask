@@ -80,6 +80,19 @@ proxies:
         conf = (ROOT / 'assets' / 'geomask-nodes.conf').read_text(encoding='utf-8')
         self.assertIn('sub_user_agent=clash-meta', conf)
 
+    def test_base64_only_for_real_base64(self):
+        # v1.13.8: b64decode(validate=False) silently eats ':' and spaces, so decoding a
+        # YAML body produced mojibake and the scan saw ~no nodes -> bans got wiped.
+        self.assertIn("re.fullmatch(r'[A-Za-z0-9+/=]+', _s)", SRC)
+
+    def test_stub_answer_is_retried(self):
+        # v1.13.8: the panel answers a ~1.4 KB stub when it does not recognise the client
+        # or is rate-limiting; the real payload is 12-15 KB. Retry with backoff instead of
+        # parsing the stub (the MIN_NODES guard is the last line of defence).
+        self.assertRegex(SRC, r'looks like a stub')
+        self.assertRegex(SRC, r'len\(raw\) > 2000')
+        self.assertRegex(SRC, r'time\.sleep\(5\*\(_try\+1\)\)')
+
     def test_controller_reload_is_authenticated(self):
         # v1.13.5 fixed auth in installer/backend/sync; the scan had the same 401 bug
         self.assertRegex(SRC, r"add_header\('Authorization', 'Bearer ")

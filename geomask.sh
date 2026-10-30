@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.13.7"
+GM_VERSION="1.13.8"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.13.7"
+BACKEND_VERSION="1.13.8"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1527,7 +1527,7 @@ var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   pa
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
 var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
 var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
-var PANEL_VERSION = '1.13.7';
+var PANEL_VERSION = '1.13.8';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -20479,7 +20479,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.13.7"
+GUARD_VERSION="1.13.8"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -20732,18 +20732,28 @@ for _try in range(3):
     try:
         h=dict(hdrs); h['User-Agent']=sub_ua
         raw=urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=25).read().decode('utf-8','replace')
-        if raw.strip():
+        # The panel answers a tiny stub ("Приложение не поддерживается", ~1.4 KB) when it does
+        # not recognise the client or is rate-limiting; the real payload is 12-15 KB.
+        if len(raw) > 2000:
             break
+        log('subscription looks like a stub (%d bytes), retrying' % len(raw))
     except Exception as e:
         log('subscription download failed (try %d/3): %s' % (_try+1, e))
-    time.sleep(2)
+    time.sleep(5*(_try+1))
 if not raw.strip():
     log('subscription download failed: empty response'); sys.exit(1)
 sub_text=raw
-if not re.search(r'(?m)^(vless|ss|trojan|vmess|anytls|hysteria2?)://', raw):
+# v1.13.8: only base64-decode when the body really is base64. b64decode(validate=False)
+# silently discards ':' and spaces, so feeding it a YAML config produced mojibake and the
+# parser then saw ~no nodes at all (that is how the filter lost its exact-name bans).
+_s=re.sub(r'\s', '', raw)
+if _s and re.fullmatch(r'[A-Za-z0-9+/=]+', _s) \
+   and not re.search(r'(?m)^(vless|ss|trojan|vmess|anytls|hysteria2?)://', raw):
     try:
         import base64
-        sub_text=base64.b64decode(raw.strip()+'===').decode('utf-8','replace')
+        _dec=base64.b64decode(_s+'===').decode('utf-8','replace')
+        if _dec.strip():
+            sub_text=_dec
     except Exception:
         pass
 

@@ -54,18 +54,28 @@ for _try in range(3):
     try:
         h=dict(hdrs); h['User-Agent']=sub_ua
         raw=urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=25).read().decode('utf-8','replace')
-        if raw.strip():
+        # The panel answers a tiny stub ("Приложение не поддерживается", ~1.4 KB) when it does
+        # not recognise the client or is rate-limiting; the real payload is 12-15 KB.
+        if len(raw) > 2000:
             break
+        log('subscription looks like a stub (%d bytes), retrying' % len(raw))
     except Exception as e:
         log('subscription download failed (try %d/3): %s' % (_try+1, e))
-    time.sleep(2)
+    time.sleep(5*(_try+1))
 if not raw.strip():
     log('subscription download failed: empty response'); sys.exit(1)
 sub_text=raw
-if not re.search(r'(?m)^(vless|ss|trojan|vmess|anytls|hysteria2?)://', raw):
+# v1.13.8: only base64-decode when the body really is base64. b64decode(validate=False)
+# silently discards ':' and spaces, so feeding it a YAML config produced mojibake and the
+# parser then saw ~no nodes at all (that is how the filter lost its exact-name bans).
+_s=re.sub(r'\s', '', raw)
+if _s and re.fullmatch(r'[A-Za-z0-9+/=]+', _s) \
+   and not re.search(r'(?m)^(vless|ss|trojan|vmess|anytls|hysteria2?)://', raw):
     try:
         import base64
-        sub_text=base64.b64decode(raw.strip()+'===').decode('utf-8','replace')
+        _dec=base64.b64decode(_s+'===').decode('utf-8','replace')
+        if _dec.strip():
+            sub_text=_dec
     except Exception:
         pass
 

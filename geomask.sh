@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.13.5"
+GM_VERSION="1.13.6"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.13.5"
+BACKEND_VERSION="1.13.6"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1527,7 +1527,7 @@ var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   pa
 var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
 var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
 var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
-var PANEL_VERSION = '1.13.5';
+var PANEL_VERSION = '1.13.6';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -3117,6 +3117,11 @@ groups:
   interface: Mihomo
   enable: true
   rules:
+  - id: f9ed4e6e
+    name: ""
+    type: namespace
+    rule: ipleak.net
+    enable: true
   - id: de368371
     name: ""
     type: namespace
@@ -3773,7 +3778,7 @@ groups:
     name: ""
     type: namespace
     rule: ipleak.net
-    enable: true
+    enable: false
   - id: e1358f75
     name: ""
     type: namespace
@@ -12726,11 +12731,6 @@ groups:
     type: namespace
     rule: ocbase.com
     enable: true
-  - id: 184b3dd8
-    name: ""
-    type: namespace
-    rule: opencode.ai
-    enable: true
   - id: 16263c56
     name: ""
     type: namespace
@@ -12795,11 +12795,6 @@ groups:
     name: ""
     type: domain
     rule: pinia-colada.esm.dev
-    enable: true
-  - id: 4ca73b1f
-    name: ""
-    type: namespace
-    rule: pinterest.com
     enable: true
   - id: 13a66ad0
     name: ""
@@ -18254,8 +18249,8 @@ groups:
 - id: 2f9be9d6
   name: Telegram
   color: '#9cf254'
-  interface: pppoe-wan
-  enable: false
+  interface: Mihomo
+  enable: true
   rules:
   - id: 915a7f0e
     name: ""
@@ -18704,6 +18699,17 @@ groups:
     type: namespace
     rule: x.com
     enable: true
+- id: 4e8ce948
+  name: GoogleVideo VPN
+  color: '#0e7490'
+  interface: Mihomo
+  enable: true
+  rules:
+  - id: 1fc97a5b
+    name: ""
+    type: namespace
+    rule: googlevideo.com
+    enable: true
 - id: 145328f2
   name: Youtube
   color: '#54f296'
@@ -18714,11 +18720,6 @@ groups:
     name: ""
     type: namespace
     rule: cdn.youtube.com
-    enable: true
-  - id: be02bf07
-    name: ""
-    type: namespace
-    rule: googlevideo.com
     enable: true
   - id: dc01379a
     name: ""
@@ -18739,11 +18740,6 @@ groups:
     name: ""
     type: namespace
     rule: m.youtube.com
-    enable: true
-  - id: 7973c2b1
-    name: ""
-    type: namespace
-    rule: manifest.googlevideo.com
     enable: true
   - id: 40ab07d5
     name: ""
@@ -20483,7 +20479,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.13.5"
+GUARD_VERSION="1.13.6"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -20755,10 +20751,43 @@ for ln in sub_text.splitlines():
     if sm: srv=sm.group(1)
     if frag and srv and frag.lower()!='ip':
         nodes.append((frag, srv))
-# yaml-style provider cache fallback
+
+# yaml-style subscription: a proxy item may put server:/port: several lines AFTER its name:
+# (v1.13.6 fix - the old regex required server on the very next line and silently matched
+# almost nothing once the provider switched to a full YAML config with "type:" in between).
+def parse_yaml_items(t):
+    out=[]; name=None; srv=None
+    def close():
+        if name and srv: out.append((name, srv))
+    for ln in t.splitlines():
+        raw=ln.strip()
+        # flow style:  - {name: X, server: y, port: 443}
+        if raw.startswith('- {') or raw.startswith('{'):
+            body=raw.lstrip('- ').strip('{}')
+            kv=dict(re.findall(r'(\w+)\s*:\s*"?([^",}]+)"?', body))
+            if kv.get('name') and kv.get('server'):
+                out.append((kv['name'].strip().strip('"\''), kv['server'].strip().strip('"\'')))
+            continue
+        mn=re.match(r'^-\s*name:\s*(.+?)\s*$', raw)
+        if mn:
+            close()
+            name=mn.group(1).strip().strip('"').strip("'"); srv=None
+            continue
+        ms=re.match(r'^server:\s*(.+?)\s*$', raw)
+        if ms and name and not srv:
+            srv=ms.group(1).strip().strip('"').strip("'")
+    close()
+    return out
+
 if not nodes:
-    for nm,sv in re.findall(r'-\s*name:\s*"?([^"\n]+)"?\s*\n\s*server:\s*"?([^"\n]+)"?', sub_text):
-        nodes.append((nm.strip(), sv.strip()))
+    nodes=parse_yaml_items(sub_text)
+
+# safety net: a parse regression must not silently wipe the exact-name bans
+MIN_NODES=3
+if len(nodes) < MIN_NODES:
+    log('suspiciously few nodes parsed (%d < %d) - subscription format changed? refusing to rewrite filter'
+        % (len(nodes), MIN_NODES))
+    sys.exit(1)
 
 if not nodes:
     log('no nodes parsed from subscription'); sys.exit(1)

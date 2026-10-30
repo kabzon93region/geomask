@@ -9,6 +9,11 @@ groups:
   interface: Mihomo
   enable: true
   rules:
+  - id: f9ed4e6e
+    name: ""
+    type: namespace
+    rule: ipleak.net
+    enable: true
   - id: de368371
     name: ""
     type: namespace
@@ -665,7 +670,7 @@ groups:
     name: ""
     type: namespace
     rule: ipleak.net
-    enable: true
+    enable: false
   - id: e1358f75
     name: ""
     type: namespace
@@ -9618,11 +9623,6 @@ groups:
     type: namespace
     rule: ocbase.com
     enable: true
-  - id: 184b3dd8
-    name: ""
-    type: namespace
-    rule: opencode.ai
-    enable: true
   - id: 16263c56
     name: ""
     type: namespace
@@ -9687,11 +9687,6 @@ groups:
     name: ""
     type: domain
     rule: pinia-colada.esm.dev
-    enable: true
-  - id: 4ca73b1f
-    name: ""
-    type: namespace
-    rule: pinterest.com
     enable: true
   - id: 13a66ad0
     name: ""
@@ -15146,8 +15141,8 @@ groups:
 - id: 2f9be9d6
   name: Telegram
   color: '#9cf254'
-  interface: pppoe-wan
-  enable: false
+  interface: Mihomo
+  enable: true
   rules:
   - id: 915a7f0e
     name: ""
@@ -15596,6 +15591,17 @@ groups:
     type: namespace
     rule: x.com
     enable: true
+- id: 4e8ce948
+  name: GoogleVideo VPN
+  color: '#0e7490'
+  interface: Mihomo
+  enable: true
+  rules:
+  - id: 1fc97a5b
+    name: ""
+    type: namespace
+    rule: googlevideo.com
+    enable: true
 - id: 145328f2
   name: Youtube
   color: '#54f296'
@@ -15606,11 +15612,6 @@ groups:
     name: ""
     type: namespace
     rule: cdn.youtube.com
-    enable: true
-  - id: be02bf07
-    name: ""
-    type: namespace
-    rule: googlevideo.com
     enable: true
   - id: dc01379a
     name: ""
@@ -15631,11 +15632,6 @@ groups:
     name: ""
     type: namespace
     rule: m.youtube.com
-    enable: true
-  - id: 7973c2b1
-    name: ""
-    type: namespace
-    rule: manifest.googlevideo.com
     enable: true
   - id: 40ab07d5
     name: ""

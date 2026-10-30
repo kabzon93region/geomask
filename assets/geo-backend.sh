@@ -818,9 +818,16 @@ _upd_local_block() { # $1 = latest version (no leading v)
   _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION); [ -n "$_guard" ] || _guard=none
   _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION); [ -n "$_backend" ] || _backend=none
   _LNEED=false
-  if [ "$_core" = "none" ]; then _LNEED=true
-  elif _upd_newer "$1" "$_core"; then _LNEED=true
-  elif [ "$_core" = "$1" ] && { [ "$_panel" != "$1" ] || [ "$_guard" != "$1" ] || [ "$_backend" != "$1" ]; }; then
+  # The "core" marker is an installer copy under /tmp and dies on every reboot, so it must NOT
+  # decide whether an update is needed - otherwise a healthy router asks to reinstall after a
+  # restart. The release identity comes from the deployed (flash) components instead.
+  _cur=$_core
+  for _cand in "$_backend" "$_panel" "$_guard"; do
+    [ "$_cur" = "none" ] && [ -n "$_cand" ] && [ "$_cand" != "none" ] && _cur=$_cand
+  done
+  if [ "$_cur" = "none" ]; then _LNEED=true          # nothing deployed at all -> really needs install
+  elif _upd_newer "$1" "$_cur"; then _LNEED=true
+  elif [ "$_cur" = "$1" ] && { [ "$_panel" != "$1" ] || [ "$_guard" != "$1" ] || [ "$_backend" != "$1" ]; }; then
     _LNEED=true   # partial/misaligned deploy of the same release -> repair
   fi
   _LBLK=$(printf '{"core":"%s","panel":"%s","guard":"%s","backend":"%s"}' "$_core" "$_panel" "$_guard" "$_backend")

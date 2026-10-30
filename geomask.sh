@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.14.2"
+GM_VERSION="1.14.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.14.2"
+BACKEND_VERSION="1.14.3"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1000,9 +1000,16 @@ _upd_local_block() { # $1 = latest version (no leading v)
   _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION); [ -n "$_guard" ] || _guard=none
   _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION); [ -n "$_backend" ] || _backend=none
   _LNEED=false
-  if [ "$_core" = "none" ]; then _LNEED=true
-  elif _upd_newer "$1" "$_core"; then _LNEED=true
-  elif [ "$_core" = "$1" ] && { [ "$_panel" != "$1" ] || [ "$_guard" != "$1" ] || [ "$_backend" != "$1" ]; }; then
+  # The "core" marker is an installer copy under /tmp and dies on every reboot, so it must NOT
+  # decide whether an update is needed - otherwise a healthy router asks to reinstall after a
+  # restart. The release identity comes from the deployed (flash) components instead.
+  _cur=$_core
+  for _cand in "$_backend" "$_panel" "$_guard"; do
+    [ "$_cur" = "none" ] && [ -n "$_cand" ] && [ "$_cand" != "none" ] && _cur=$_cand
+  done
+  if [ "$_cur" = "none" ]; then _LNEED=true          # nothing deployed at all -> really needs install
+  elif _upd_newer "$1" "$_cur"; then _LNEED=true
+  elif [ "$_cur" = "$1" ] && { [ "$_panel" != "$1" ] || [ "$_guard" != "$1" ] || [ "$_backend" != "$1" ]; }; then
     _LNEED=true   # partial/misaligned deploy of the same release -> repair
   fi
   _LBLK=$(printf '{"core":"%s","panel":"%s","guard":"%s","backend":"%s"}' "$_core" "$_panel" "$_guard" "$_backend")
@@ -1578,7 +1585,7 @@ var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  ex
 var callYtGet      = rpc.declare({ object: 'geo-sync', method: 'yt_get',      expect: {} });
 var callYtMode     = rpc.declare({ object: 'geo-sync', method: 'yt_mode',     params: { mode: null }, expect: {} });
 var callYtReset    = rpc.declare({ object: 'geo-sync', method: 'yt_reset',    expect: {} });
-var PANEL_VERSION = '1.14.2';
+var PANEL_VERSION = '1.14.3';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -20511,7 +20518,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.14.2"
+GUARD_VERSION="1.14.3"
 
 log() { logger -t geomask-guard "$*"; }
 

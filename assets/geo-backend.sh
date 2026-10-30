@@ -1178,6 +1178,29 @@ cmd_yt_reset() {
   printf '{"ok":true}\n'
 }
 
+# v1.15.0: torrent admin (tracker ruleset + DIRECT listener)
+TORRENT_SH=/usr/bin/geomask-torrent.sh
+
+_torrent_missing() { printf '{"ok":false,"error":"torrent admin not installed"}\n'; }
+
+cmd_torrent_get() {
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --status 2>/dev/null
+}
+cmd_torrent_refresh() {
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --refresh 2>/dev/null | tail -1
+}
+cmd_torrent_listener() {
+  case "$1" in on|off) : ;; *) printf '{"ok":false,"error":"bad state"}\n'; return 1 ;; esac
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --listener "$1" 2>/dev/null | tail -1
+}
+cmd_torrent_extra() {
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --extra "$1" 2>/dev/null | tail -1
+}
+
 case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
@@ -1197,6 +1220,10 @@ case "$1" in
   yt_get)     cmd_yt_get ;;
   yt_mode)    cmd_yt_mode "$2" ;;
   yt_reset)   cmd_yt_reset ;;
+  torrent_get)      cmd_torrent_get ;;
+  torrent_refresh)  cmd_torrent_refresh ;;
+  torrent_listener) cmd_torrent_listener "$2" ;;
+  torrent_extra)    cmd_torrent_extra "$2" ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;

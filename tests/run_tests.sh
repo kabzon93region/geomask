@@ -85,6 +85,9 @@ echo 'bad_asns=AS210976' > "$R/etc/geomask-nodes.conf"
 # youtube edge watchdog (v1.14.0): script + conf fixtures
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-ytwatch.sh"; chmod +x "$R/usr/bin/geomask-ytwatch.sh"
 echo 'mode=auto' > "$R/etc/geomask-ytwatch.conf"
+# torrent admin (v1.15.0): script + state dir fixtures
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-torrent.sh"; chmod +x "$R/usr/bin/geomask-torrent.sh"
+mkdir -p "$R/etc/geomask/torrent"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytvpn.yaml"
 printf 'payload:\n  - DOMAIN-SUFFIX,tracker.example.org\n' > "$R/etc/mihomo/ruleset/torrentdirect.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/mtrickle.yaml"
@@ -112,7 +115,6 @@ rule-providers:
   torrentdirect:
     type: file
 rules:
-  - DST-PORT,6969,DIRECT
   - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT
   - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT
   - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT
@@ -539,7 +541,7 @@ if grep -qE 'x-hwid|token|password|secret|/sub' "$HERE/../assets/torrentdirect.y
   echo "FAIL: S23 ruleset asset contains a secret-looking string"; failn=$((failn+1))
 else echo "PASS: S23 ruleset asset has no secrets"; pass=$((pass+1)); fi
 grep -qF '"torrentdirect.yaml"' "$HERE/../build.py" && { echo "PASS: S23 wired into build MAP"; pass=$((pass+1)); } || { echo "FAIL: S23 not in build MAP"; failn=$((failn+1)); }
-for _p in '/etc/mihomo/ruleset/torrentdirect.yaml' 'RULE-SET,torrentdirect,DIRECT' 'torrentdirect->DIRECT rule' 'P2P/tracker ports -> DIRECT'; do
+for _p in '/etc/mihomo/ruleset/torrentdirect.yaml' 'RULE-SET,torrentdirect,DIRECT' 'torrentdirect->DIRECT rule' 'no blanket P2P port rules'; do
   if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S23 installer has: $_p"; pass=$((pass+1))
   else echo "FAIL: S23 installer missing: $_p"; failn=$((failn+1)); fi
 done
@@ -562,6 +564,35 @@ else echo "FAIL: S23 template rule order wrong (ai=$_la td=$_lt mt=$_lm)"; failn
 # the DIRECT listener for torrent clients is documented in the template too
 grep -qF 'torrent-direct' "$HERE/../geomask.sh.in" || grep -qF 'torrent-direct' "$HERE/../docs/YOUTUBE.md" || grep -qF 'torrent-direct' "$HERE/../docs/ARCHITECTURE.md" \
   && { echo "PASS: S23 DIRECT listener documented"; pass=$((pass+1)); } || { echo "FAIL: S23 torrent-direct listener not documented"; failn=$((failn+1)); }
+
+# ---------- scenario 24: torrent admin in the panel (v1.15.0) ----------
+echo "=== S24: torrent admin (geomask-torrent.sh + panel) ==="
+if [ -s "$HERE/../assets/geomask-torrent.sh" ]; then
+  echo "PASS: S24 admin script present"; pass=$((pass+1))
+else echo "FAIL: S24 admin script missing"; failn=$((failn+1)); fi
+for _p in '--status' '--refresh' '--listener' '--extra' 'mihomo -t' 'Authorization'; do
+  if grep -qF -- "$_p" "$HERE/../assets/geomask-torrent.sh"; then echo "PASS: S24 script has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S24 script missing: $_p"; failn=$((failn+1)); fi
+done
+grep -qF '"geomask-torrent.sh"' "$HERE/../build.py" && { echo "PASS: S24 in build MAP"; pass=$((pass+1)); } || { echo "FAIL: S24 not in build MAP"; failn=$((failn+1)); }
+for _p in '/usr/bin/geomask-torrent.sh' '/etc/geomask/torrent' 'torrent admin: installed' 'removed: torrent admin'; do
+  if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S24 installer has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S24 installer missing: $_p"; failn=$((failn+1)); fi
+done
+# every admin method must exist in backend, rpcd wrapper AND acl (same trap as v1.13.0)
+for _m in torrent_get torrent_refresh torrent_listener torrent_extra; do
+  _ok=1
+  grep -qF "cmd_$_m" "$HERE/../assets/geo-backend.sh" || { echo "  MISSING backend: $_m"; _ok=0; }
+  grep -qF "\"$_m\"" "$HERE/../assets/geo-sync" || { echo "  MISSING rpcd wrapper: $_m"; _ok=0; }
+  grep -qF "\"$_m\"" "$HERE/../assets/acl-geo-sync.json" || { echo "  MISSING acl: $_m"; _ok=0; }
+  if [ "$_ok" = 1 ]; then echo "PASS: S24 $_m wired in backend+wrapper+acl"; pass=$((pass+1))
+  else echo "FAIL: S24 $_m not wired everywhere"; failn=$((failn+1)); fi
+done
+for _p in 'callTorGet' 'callTorRefresh' 'callTorListener' 'callTorExtra' 'Торренты и трекеры'; do
+  grep -qF -- "$_p" "$SCRIPT" && { echo "PASS: S24 panel has: $_p"; pass=$((pass+1)); } || { echo "FAIL: S24 panel missing: $_p"; failn=$((failn+1)); }
+done
+# the panel must read the 13th promise slot
+grep -qF 'all[12]' "$HERE/../assets/geo-sync-page.js" && { echo "PASS: S24 panel consumes the new RPC slot"; pass=$((pass+1)); } || { echo "FAIL: S24 new RPC result not consumed"; failn=$((failn+1)); }
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

@@ -28,6 +28,7 @@ MAP = {
     "geomask-ytwatch.sh":    "geomask-ytwatch.sh",
     "geomask-ytwatch.conf":  "geomask-ytwatch.conf",
     "torrentdirect.yaml":    "torrentdirect.yaml",
+    "geomask-torrent.sh":    "geomask-torrent.sh",
 }
 
 # menu.json asset file on disk (same acl download name collision): we saved menu as second luci-app-geo-sync.json

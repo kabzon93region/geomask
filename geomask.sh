@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.14.4"
+GM_VERSION="1.15.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.14.4"
+BACKEND_VERSION="1.15.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1360,6 +1360,29 @@ cmd_yt_reset() {
   printf '{"ok":true}\n'
 }
 
+# v1.15.0: torrent admin (tracker ruleset + DIRECT listener)
+TORRENT_SH=/usr/bin/geomask-torrent.sh
+
+_torrent_missing() { printf '{"ok":false,"error":"torrent admin not installed"}\n'; }
+
+cmd_torrent_get() {
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --status 2>/dev/null
+}
+cmd_torrent_refresh() {
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --refresh 2>/dev/null | tail -1
+}
+cmd_torrent_listener() {
+  case "$1" in on|off) : ;; *) printf '{"ok":false,"error":"bad state"}\n'; return 1 ;; esac
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --listener "$1" 2>/dev/null | tail -1
+}
+cmd_torrent_extra() {
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --extra "$1" 2>/dev/null | tail -1
+}
+
 case "$1" in
   status)     cmd_status ;;
   leases)     cmd_leases ;;
@@ -1379,6 +1402,10 @@ case "$1" in
   yt_get)     cmd_yt_get ;;
   yt_mode)    cmd_yt_mode "$2" ;;
   yt_reset)   cmd_yt_reset ;;
+  torrent_get)      cmd_torrent_get ;;
+  torrent_refresh)  cmd_torrent_refresh ;;
+  torrent_listener) cmd_torrent_listener "$2" ;;
+  torrent_extra)    cmd_torrent_extra "$2" ;;
   sync_lists) cmd_sync_lists ;;
   aidns)      cmd_aidns_apply ;;
   google)     cmd_google ;;
@@ -1427,6 +1454,10 @@ list_methods() {
 	json_add_object "yt_get";     json_close_object
 	json_add_object "yt_mode";    json_add_string "mode" "string"; json_close_object
 	json_add_object "yt_reset";   json_close_object
+	json_add_object "torrent_get"; json_close_object
+	json_add_object "torrent_refresh"; json_close_object
+	json_add_object "torrent_listener"; json_add_string "state" "string"; json_close_object
+	json_add_object "torrent_extra"; json_add_string "hosts" "string"; json_close_object
 	json_add_object "sync_lists"; json_close_object
 	json_add_object "aidns";      json_close_object
 	json_add_object "google";     json_close_object
@@ -1470,6 +1501,10 @@ call_method() {
 		yt_get)     "$BACKEND" yt_get ;;
 		yt_mode)    json_get_var mode mode; "$BACKEND" yt_mode "$mode" ;;
 		yt_reset)   "$BACKEND" yt_reset ;;
+		torrent_get)      "$BACKEND" torrent_get ;;
+		torrent_refresh)  "$BACKEND" torrent_refresh ;;
+		torrent_listener) json_get_var state state; "$BACKEND" torrent_listener "$state" ;;
+		torrent_extra)    json_get_var hosts hosts; "$BACKEND" torrent_extra "$hosts" ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;
@@ -1515,13 +1550,13 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "ai_sub_get", "subs_list", "upd_check", "upd_status", "lists_get", "yt_get" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "ai_sub_get", "subs_list", "upd_check", "upd_status", "lists_get", "yt_get", "torrent_get" ],
 				"system": [ "info" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset" ]
+				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra" ]
 			}
 		}
 	}
@@ -1585,7 +1620,11 @@ var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  ex
 var callYtGet      = rpc.declare({ object: 'geo-sync', method: 'yt_get',      expect: {} });
 var callYtMode     = rpc.declare({ object: 'geo-sync', method: 'yt_mode',     params: { mode: null }, expect: {} });
 var callYtReset    = rpc.declare({ object: 'geo-sync', method: 'yt_reset',    expect: {} });
-var PANEL_VERSION = '1.14.4';
+var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', expect: {} });
+var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
+var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
+var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
+var PANEL_VERSION = '1.15.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1754,7 +1793,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet() ]);
 	},
 
 	render: function(all) {
@@ -1768,6 +1807,7 @@ return view.extend({
 		var nd = all[9] || {};
 		var lt = all[10] || {};
 		var yt = all[11] || {};
+		var tor = all[12] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -2434,6 +2474,68 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [ btnYtRel ])
 		]));
 
+		/* ===================== Torrents (lists tab, v1.15.0) ===================== */
+		var torOn = !!tor.listener_present;
+		var setListener = function(state, btn) {
+			btn.disabled = true;
+			callTorListener({ state: state }).then(function(res) {
+				btn.disabled = false;
+				if (res && res.ok) ui.addNotification(null, E('p', {}, state === 'on' ? 'Слушатель включён' : 'Слушатель выключен'), 'info');
+				else ui.addNotification(null, E('p', {}, 'Не удалось изменить (см. /root/geo-sync.log)'), 'error');
+				return view.reload();
+			}).catch(function(e) { btn.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		};
+		var btnTorOff = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+			if (!confirm('Выключить слушатель? Клиенты, указавшие его как прокси, потеряют выход в DIRECT.')) return;
+			setListener('off', btnTorOff);
+		} }, 'Выключить слушатель');
+		var btnTorOn = E('button', { 'class': 'gs-btn' + (torOn ? '' : ' gs-btn-primary'), 'click': function() { setListener('on', btnTorOn); } }, 'Включить слушатель');
+		var btnTorUpd = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnTorUpd.disabled = true; btnTorUpd.textContent = 'Обновляю…';
+			callTorRefresh().then(function(res) {
+				btnTorUpd.disabled = false; btnTorUpd.textContent = 'Обновить списки трекеров';
+				ui.addNotification(null, E('p', {}, (res && res.changed) ? ('Список пересобран: доменов ' + res.domains + ', IP ' + res.raw_ips) : 'Изменений нет'), 'info');
+				return view.reload();
+			}).catch(function(e) { btnTorUpd.disabled = false; btnTorUpd.textContent = 'Обновить списки трекеров'; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Обновить списки трекеров');
+		var inTorExtra = E('textarea', { 'class': 'gs-text', rows: 3, style: 'width:100%;font-family:monospace' });
+		inTorExtra.value = (tor.extras || []).join('\n');
+		var btnTorExtra = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnTorExtra.disabled = true;
+			callTorExtra({ hosts: inTorExtra.value }).then(function(res) {
+				btnTorExtra.disabled = false;
+				if (res && res.ok) ui.addNotification(null, E('p', {}, 'Сохранено, правил: ' + res.domains), 'info');
+				else ui.addNotification(null, E('p', {}, 'Отклонено: ' + ((res && res.rejected || []).join(', ') || 'ошибка')), 'error');
+				return view.reload();
+			}).catch(function(e) { btnTorExtra.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Сохранить и пересобрать');
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Торренты и трекеры'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Ни одно торрент-соединение не должно идти через подписки. Клиент указывает прокси ' +
+				'на локальный слушатель — всё, что он инициирует, выходит напрямую (через запрет на WAN). ' +
+				'Дополнительно домены трекеров закреплены отдельным ruleset, чтобы их не засасывали ' +
+				'VPN-списки по IP. Раньше те же порты фиксировались правилом DST-PORT — оно стояло выше ' +
+				'правил AI и перехватывало AI-релеи, поэтому убрано (v1.15.0).'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Слушатель'),
+				E('span', { 'class': 'gs-badge ' + (torOn ? 'gs-ok' : 'gs-off') }, torOn ? ('работает :' + (tor.listener_port || 7894)) : 'выключен'),
+				E('span', { 'class': 'gs-val gs-mono' }, tor.proxy_hint || ''),
+				(torOn ? btnTorOff : btnTorOn)
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Список трекеров'),
+				E('span', { 'class': 'gs-val gs-mono' }, 'доменов ' + (tor.domains || 0) + ' · IP ' + (tor.raw_ips || 0)),
+				E('span', { 'class': 'gs-badge ' + (tor.provider_loaded ? 'gs-ok' : 'gs-off') }, 'в mihomo: ' + (tor.provider_loaded || 0)),
+				btnTorUpd
+			]),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:6px 0 4px' },
+				'Свои домены (по строке). Пересобираются вместе с публичными списками: ' +
+				((tor.sources || []).join(' , ') || '—')),
+			inTorExtra,
+			E('div', { 'class': 'gs-row' }, [ btnTorExtra ])
+		]));
+
 		/* ===================== Node audit (nodes tab, v1.12.0) ===================== */
 		var conf = nd.conf || {};
 		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
@@ -2546,7 +2648,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);
@@ -2590,9 +2692,12 @@ step3_check() {
   grep -q 'RULE-SET,ytvpn,VPN' "$_c" 2>/dev/null && info "ytvpn->VPN rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to VPN)"
   # v1.14.4: torrents must never be swallowed by the VPN lists (owner policy 30.10)
   grep -q 'RULE-SET,torrentdirect,DIRECT' "$_c" 2>/dev/null && info "torrentdirect->DIRECT rule: present" || warn "torrentdirect rule missing (tracker domains can still go to VPN)"
-  if grep -qE '^  - DST-PORT,6969,DIRECT' "$_c" 2>/dev/null; then info "P2P/tracker ports -> DIRECT: present"
-  elif grep -qE '^  - DST-PORT,6969,VPN' "$_c" 2>/dev/null; then bad "DST-PORT,6969 still sends tracker announces to VPN (legacy rule)"
-  else warn "no DST-PORT,6969 rule at all"; fi
+  if grep -qE '^  - DST-PORT,(6969|1337|2710|8081|451|5944),' "$_c" 2>/dev/null; then
+    bad "legacy blanket P2P DST-PORT rule present - it sits above the ai ruleset and hijacks AI relays on those ports"
+    _need=1
+  else
+    info "no blanket P2P port rules (trackers pinned by torrentdirect only)"
+  fi
   for rf in /etc/mihomo/ruleset/mtrickle.yaml /etc/mihomo/ruleset/ai.yaml /etc/mihomo/ruleset/ytdirect.yaml /etc/mihomo/ruleset/ytvpn.yaml /etc/mihomo/ruleset/torrentdirect.yaml; do
     if [ -s "$(P "$rf")" ]; then info "ruleset: $rf ($(grep -c 'DOMAIN-SUFFIX' "$(P "$rf")" 2>/dev/null || echo '?') suffixes)"; else warn "ruleset empty/missing: $rf (sync step will create)"; fi
   done
@@ -2792,13 +2897,9 @@ write_mihomo_config() {
     printf '\n'
     printf '%s\n' 'rules:'
     printf '%s\n' '  # AUTO-SYNC from magitrickle: /root/sync_mtrickle_mihomo.sh - DO NOT EDIT MANUALLY'
-    printf '%s\n' '  # P2P/tracker ports: never via VPN (owner policy 30.10 - torrents must not touch mihomo)'
-    printf '%s\n' '  - DST-PORT,1337,DIRECT'
-    printf '%s\n' '  - DST-PORT,6969,DIRECT'
-    printf '%s\n' '  - DST-PORT,451,DIRECT'
-    printf '%s\n' '  - DST-PORT,5944,DIRECT'
-    printf '%s\n' '  - DST-PORT,2710,DIRECT'
-    printf '%s\n' '  - DST-PORT,8081,DIRECT'
+    printf '%s\n' '  # v1.15.0: no blanket DST-PORT rules for P2P - they sat ABOVE the ai ruleset and'
+    printf '%s\n' '  # hijacked AI relays that happen to use those ports. Trackers are pinned by the'
+    printf '%s\n' '  # torrentdirect ruleset below (managed by geomask-torrent.sh).'
     printf '%s\n' '  # direct fallback: these SNIs are filtered at VPN exit (verified: all 19 nodes fail, direct works)'
     printf '%s\n' '  - DOMAIN-SUFFIX,thepiratebay.org,DIRECT'
     printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.org,DIRECT'
@@ -19993,6 +20094,9 @@ step5_check() {
   else bad "ytwatch missing (script/conf)"; _need=1; fi
   if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch$'; then info "ytwatch cron */5: present"; else bad "ytwatch cron missing"; _need=1; fi
   if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch-reset$'; then info "ytwatch reset cron: present"; else bad "ytwatch reset cron missing"; _need=1; fi
+  # v1.15.0: torrent admin
+  if [ -x "$(P /usr/bin/geomask-torrent.sh)" ] && [ -d "$(P /etc/geomask/torrent)" ]; then info "torrent admin: installed"
+  else bad "torrent admin missing (script/dir)"; _need=1; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -20581,6 +20685,223 @@ ASSET_EOF
   else
     info "torrentdirect list: keeping existing /etc/mihomo/ruleset/torrentdirect.yaml"
   fi
+  # v1.15.0: torrent admin - rebuild the tracker ruleset / toggle the DIRECT listener from the panel
+  mkdir -p "$(P /etc/geomask/torrent)" 2>/dev/null
+  save_stream /usr/bin/geomask-torrent.sh 755 <<'ASSET_EOF'
+#!/bin/sh
+# geomask-torrent.sh - manage the torrent/tracker DIRECT bypass (geomask v1.15.0+).
+#
+#   geomask-torrent.sh --status                 JSON for the panel
+#   geomask-torrent.sh --refresh                rebuild the ruleset from the public lists + extras
+#   geomask-torrent.sh --listener enable|off    toggle the SOCKS5/HTTP listener that pins torrents to DIRECT
+#   geomask-torrent.sh --extra "a.org b.org"    replace the user-added tracker hosts (then rebuild)
+#
+# Everything it writes is validated with `mihomo -t` and rolled back on failure; reload goes
+# through the local controller API with the bearer token, never via argv.
+exec python3 - "$@" <<'PYEOF'
+import json, os, re, subprocess, sys, time, urllib.request
+
+CFG='/etc/mihomo/config.yaml'
+RS='/etc/mihomo/ruleset/torrentdirect.yaml'
+DIR='/etc/geomask/torrent'
+SOURCES=DIR+'/sources.conf'
+EXTRA=DIR+'/extra.txt'
+JOURNAL='/root/geo-sync.log'
+LISTENER_PORT='7894'
+
+def log(msg):
+    try:
+        with open(JOURNAL,'a',encoding='utf-8') as f:
+            f.write('%s TORRENT %s\n' % (time.strftime('%F %T'), msg))
+    except Exception:
+        pass
+
+def read(p, default=''):
+    try:
+        return open(p, encoding='utf-8').read()
+    except Exception:
+        return default
+
+def sources():
+    s=[l.strip() for l in read(SOURCES).splitlines() if l.strip() and not l.strip().startswith('#')]
+    return s or ['https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt',
+                 'https://raw.githubusercontent.com/XIU2/TrackersListCollection/master/all.txt']
+
+def extras():
+    out=set()
+    for l in read(EXTRA).splitlines():
+        l=l.strip().lower().strip('.').rstrip('/')
+        if l and not l.startswith('#'): out.add(l)
+    return out
+
+# ---------- controller ----------
+def secret():
+    for ln in read(CFG).splitlines():
+        m=re.match(r'^secret:\s*["\']?([^"\'\s]+)', ln)
+        if m: return m.group(1)
+    return ''
+
+def api(method, path, body=None):
+    req=urllib.request.Request('http://127.0.0.1:9090'+path, method=method,
+                               data=(json.dumps(body).encode() if body is not None else None))
+    s=secret()
+    if s: req.add_header('Authorization','Bearer '+s)
+    if body is not None: req.add_header('Content-Type','application/json')
+    try:
+        return urllib.request.urlopen(req, timeout=10).getcode()
+    except Exception as e:
+        log('controller %s %s failed: %s' % (method, path, e)); return 0
+
+def validate():
+    return subprocess.run(['/usr/bin/mihomo','-t','-d','/etc/mihomo'],
+                          capture_output=True, timeout=60).returncode == 0
+
+# ---------- ruleset build ----------
+def fetch(url):
+    try:
+        r=urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent':'geomask'}), timeout=25)
+        return r.read().decode('utf-8','replace')
+    except Exception as e:
+        log('source fetch failed %s: %s' % (url, e)); return ''
+
+def build_ruleset():
+    import ipaddress
+    hosts=set(); ips=set(); bad=0
+    for u in sources():
+        for ln in fetch(u).splitlines():
+            ln=ln.strip()
+            if not ln: continue
+            m=re.match(r'^(?:udp|https?)://([^/]+)', ln, re.I)
+            if not m: bad+=1; continue
+            h=re.sub(r':\d+$','',m.group(1)).strip('.').lower()
+            if not h: continue
+            try:
+                ipaddress.ip_address(h); ips.add(h); continue
+            except ValueError:
+                pass
+            if re.fullmatch(r'[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+', h):
+                hosts.add(h)
+            else:
+                bad+=1
+    hosts |= extras()
+    hosts = {h for h in hosts if not any(h != a and h.endswith('.'+a) for a in hosts)}
+    body=('# AUTO-GENERATED by geomask-torrent.sh from the public tracker lists + user extras - DO NOT EDIT\n'
+          '# regenerate: geomask-torrent.sh --refresh ; user hosts: %s\n' % EXTRA)
+    body+='payload:\n'
+    for h in sorted(hosts): body+='  - DOMAIN-SUFFIX,%s\n' % h
+    for i in sorted(ips, key=lambda x: tuple(int(o) for o in x.split('.'))): body+='  - IP-CIDR,%s/32,no-resolve\n' % i
+    os.makedirs('/etc/mihomo/ruleset', exist_ok=True)
+    tmp=RS+'.tmp'
+    open(tmp,'w',encoding='utf-8',newline='').write(body)
+    old=read(RS)
+    if old == body:
+        os.remove(tmp)
+        return len(hosts), len(ips), False
+    open(RS+'.bak','w',encoding='utf-8',newline='').write(old) if old else None
+    os.replace(tmp, RS)
+    if not validate():
+        if old: open(RS,'w',encoding='utf-8',newline='').write(old)
+        log('ruleset rejected by mihomo -t, restored previous'); return len(hosts), len(ips), False
+    return len(hosts), len(ips), True
+
+# ---------- listener toggle ----------
+LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
+                '    listen: 192.168.0.1','    proxy: DIRECT']
+
+def listener_present():
+    return 'torrent-direct' in read(CFG)
+
+def set_listener(on):
+    t=read(CFG); lines=t.splitlines(True)
+    if on:
+        if listener_present(): return False
+        idx=next((i for i,l in enumerate(lines) if re.match(r'^\s+proxy: AI\s*$', l)), None)
+        if idx is None: log('no ai-devices listener to anchor to'); return False
+        lines.insert(idx+1, ''.join(x+'\n' for x in LISTENER_BLOCK))
+    else:
+        if not listener_present(): return False
+        out=[]; i=0
+        while i < len(lines):
+            if re.match(r'^\s*-\s*name:\s*torrent-direct\s*$', lines[i]):
+                i+=1
+                while i < len(lines) and (lines[i].startswith('    ') or lines[i].strip()==''):
+                    if i+1 < len(lines) and re.match(r'^\s*-\s*name:', lines[i+1]): break
+                    if lines[i].strip()=='' and i+1 < len(lines) and not lines[i+1].startswith(' '): break
+                    i+=1
+                continue
+            out.append(lines[i]); i+=1
+        lines=out
+    new=''.join(lines)
+    bak=CFG+'.bak_torrent'; open(bak,'w',encoding='utf-8',newline='').write(t)
+    open(CFG,'w',encoding='utf-8',newline='').write(new)
+    if not validate():
+        open(CFG,'w',encoding='utf-8',newline='').write(t)
+        log('listener change rejected by mihomo -t, config restored'); return False
+    api('PUT','/configs?force=true', {'path': CFG})
+    log('listener %s' % ('enabled' if on else 'disabled'))
+    return True
+
+# ---------- commands ----------
+def status():
+    prov=0
+    try:
+        req=urllib.request.Request('http://127.0.0.1:9090/providers/rules')
+        s=secret()
+        if s: req.add_header('Authorization','Bearer '+s)
+        d=json.load(urllib.request.urlopen(req, timeout=8))
+        prov=(d.get('providers') or d).get('torrentdirect',{}).get('ruleCount',0)
+    except Exception:
+        pass
+    rs=read(RS)
+    return {
+        'ok': True,
+        'listener_present': listener_present(),
+        'listener_port': int(LISTENER_PORT),
+        'ruleset_present': bool(rs.strip()),
+        'domains': len(re.findall(r'DOMAIN-SUFFIX,', rs)),
+        'raw_ips': len(re.findall(r'IP-CIDR,', rs)),
+        'provider_loaded': prov,
+        'extras': sorted(extras()),
+        'sources': sources(),
+        'proxy_hint': 'socks5h://192.168.0.1:%s' % LISTENER_PORT,
+    }
+
+args=sys.argv[1:]
+if '--status' in args:
+    print(json.dumps(status(), ensure_ascii=False)); sys.exit(0)
+if '--listener' in args:
+    i=args.index('--listener'); want=args[i+1] if i+1 < len(args) else 'enable'
+    ok=set_listener(want in ('enable','on','true','1'))
+    print(json.dumps({'ok': ok, 'listener_present': listener_present()})); sys.exit(0 if ok else 1)
+if '--extra' in args:
+    i=args.index('--extra'); val=args[i+1] if i+1 < len(args) else ''
+    os.makedirs(DIR, exist_ok=True)
+    hosts=[h.strip().lower().strip('.') for h in re.split(r'[\s,;]+', val) if h.strip()]
+    bad=[h for h in hosts if not re.fullmatch(r'[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+', h)]
+    if bad:
+        print(json.dumps({'ok': False, 'rejected': bad})); sys.exit(1)
+    open(EXTRA,'w',encoding='utf-8',newline='').write('\n'.join(sorted(set(hosts)))+'\n' if hosts else '')
+    d,i2,changed=build_ruleset()
+    if changed: api('PUT','/configs?force=true', {'path': CFG})
+    log('extras set: %d host(s)' % len(hosts))
+    print(json.dumps({'ok': True, 'domains': d, 'raw_ips': i2, 'changed': changed})); sys.exit(0)
+# default: --refresh
+os.makedirs(DIR, exist_ok=True)
+if not os.path.exists(SOURCES):
+    open(SOURCES,'w',encoding='utf-8',newline='').write(
+        '# tracker announce lists used to build the DIRECT ruleset\n'
+        + '\n'.join(sources()) + '\n')
+d,i2,changed=build_ruleset()
+if changed:
+    time.sleep(1)
+    api('PUT','/configs?force=true', {'path': CFG})
+    log('ruleset refreshed: %d domains, %d raw ips' % (d, i2))
+else:
+    log('ruleset refresh: nothing changed (%d domains)' % d)
+print(json.dumps({'ok': True, 'domains': d, 'raw_ips': i2, 'changed': changed}))
+PYEOF
+
+ASSET_EOF
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 #!/bin/sh
 # Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
@@ -20670,7 +20991,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.14.4"
+GUARD_VERSION="1.15.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -21813,6 +22134,9 @@ geomask_uninstall() {
   fi
   rm -f "$(P /usr/bin/geomask-ytwatch.sh)" "$(P /tmp/geomask-ytwatch.state)"
   info "removed: ytwatch (conf /etc/geomask-ytwatch.conf left for reference)"
+  # v1.15.0: torrent admin removal (ruleset + listener left in place: they belong to mihomo config)
+  rm -f "$(P /usr/bin/geomask-torrent.sh)"
+  info "removed: torrent admin (lists in /etc/geomask/torrent and the ruleset kept for reference)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

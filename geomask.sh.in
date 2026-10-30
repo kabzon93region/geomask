@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.14.4"
+GM_VERSION="1.15.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -229,9 +229,12 @@ step3_check() {
   grep -q 'RULE-SET,ytvpn,VPN' "$_c" 2>/dev/null && info "ytvpn->VPN rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to VPN)"
   # v1.14.4: torrents must never be swallowed by the VPN lists (owner policy 30.10)
   grep -q 'RULE-SET,torrentdirect,DIRECT' "$_c" 2>/dev/null && info "torrentdirect->DIRECT rule: present" || warn "torrentdirect rule missing (tracker domains can still go to VPN)"
-  if grep -qE '^  - DST-PORT,6969,DIRECT' "$_c" 2>/dev/null; then info "P2P/tracker ports -> DIRECT: present"
-  elif grep -qE '^  - DST-PORT,6969,VPN' "$_c" 2>/dev/null; then bad "DST-PORT,6969 still sends tracker announces to VPN (legacy rule)"
-  else warn "no DST-PORT,6969 rule at all"; fi
+  if grep -qE '^  - DST-PORT,(6969|1337|2710|8081|451|5944),' "$_c" 2>/dev/null; then
+    bad "legacy blanket P2P DST-PORT rule present - it sits above the ai ruleset and hijacks AI relays on those ports"
+    _need=1
+  else
+    info "no blanket P2P port rules (trackers pinned by torrentdirect only)"
+  fi
   for rf in /etc/mihomo/ruleset/mtrickle.yaml /etc/mihomo/ruleset/ai.yaml /etc/mihomo/ruleset/ytdirect.yaml /etc/mihomo/ruleset/ytvpn.yaml /etc/mihomo/ruleset/torrentdirect.yaml; do
     if [ -s "$(P "$rf")" ]; then info "ruleset: $rf ($(grep -c 'DOMAIN-SUFFIX' "$(P "$rf")" 2>/dev/null || echo '?') suffixes)"; else warn "ruleset empty/missing: $rf (sync step will create)"; fi
   done
@@ -431,13 +434,9 @@ write_mihomo_config() {
     printf '\n'
     printf '%s\n' 'rules:'
     printf '%s\n' '  # AUTO-SYNC from magitrickle: /root/sync_mtrickle_mihomo.sh - DO NOT EDIT MANUALLY'
-    printf '%s\n' '  # P2P/tracker ports: never via VPN (owner policy 30.10 - torrents must not touch mihomo)'
-    printf '%s\n' '  - DST-PORT,1337,DIRECT'
-    printf '%s\n' '  - DST-PORT,6969,DIRECT'
-    printf '%s\n' '  - DST-PORT,451,DIRECT'
-    printf '%s\n' '  - DST-PORT,5944,DIRECT'
-    printf '%s\n' '  - DST-PORT,2710,DIRECT'
-    printf '%s\n' '  - DST-PORT,8081,DIRECT'
+    printf '%s\n' '  # v1.15.0: no blanket DST-PORT rules for P2P - they sat ABOVE the ai ruleset and'
+    printf '%s\n' '  # hijacked AI relays that happen to use those ports. Trackers are pinned by the'
+    printf '%s\n' '  # torrentdirect ruleset below (managed by geomask-torrent.sh).'
     printf '%s\n' '  # direct fallback: these SNIs are filtered at VPN exit (verified: all 19 nodes fail, direct works)'
     printf '%s\n' '  - DOMAIN-SUFFIX,thepiratebay.org,DIRECT'
     printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.org,DIRECT'
@@ -943,6 +942,9 @@ step5_check() {
   else bad "ytwatch missing (script/conf)"; _need=1; fi
   if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch$'; then info "ytwatch cron */5: present"; else bad "ytwatch cron missing"; _need=1; fi
   if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch-reset$'; then info "ytwatch reset cron: present"; else bad "ytwatch reset cron missing"; _need=1; fi
+  # v1.15.0: torrent admin
+  if [ -x "$(P /usr/bin/geomask-torrent.sh)" ] && [ -d "$(P /etc/geomask/torrent)" ]; then info "torrent admin: installed"
+  else bad "torrent admin missing (script/dir)"; _need=1; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -972,6 +974,11 @@ ASSET_EOF
   else
     info "torrentdirect list: keeping existing /etc/mihomo/ruleset/torrentdirect.yaml"
   fi
+  # v1.15.0: torrent admin - rebuild the tracker ruleset / toggle the DIRECT listener from the panel
+  mkdir -p "$(P /etc/geomask/torrent)" 2>/dev/null
+  save_stream /usr/bin/geomask-torrent.sh 755 <<'ASSET_EOF'
+@@ASSET:geomask-torrent.sh@@
+ASSET_EOF
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 @@ASSET:99-default-vpn-route@@
 ASSET_EOF
@@ -1396,6 +1403,9 @@ geomask_uninstall() {
   fi
   rm -f "$(P /usr/bin/geomask-ytwatch.sh)" "$(P /tmp/geomask-ytwatch.state)"
   info "removed: ytwatch (conf /etc/geomask-ytwatch.conf left for reference)"
+  # v1.15.0: torrent admin removal (ruleset + listener left in place: they belong to mihomo config)
+  rm -f "$(P /usr/bin/geomask-torrent.sh)"
+  info "removed: torrent admin (lists in /etc/geomask/torrent and the ruleset kept for reference)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

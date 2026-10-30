@@ -24,6 +24,10 @@ list_methods() {
 	json_add_object "yt_get";     json_close_object
 	json_add_object "yt_mode";    json_add_string "mode" "string"; json_close_object
 	json_add_object "yt_reset";   json_close_object
+	json_add_object "torrent_get"; json_close_object
+	json_add_object "torrent_refresh"; json_close_object
+	json_add_object "torrent_listener"; json_add_string "state" "string"; json_close_object
+	json_add_object "torrent_extra"; json_add_string "hosts" "string"; json_close_object
 	json_add_object "sync_lists"; json_close_object
 	json_add_object "aidns";      json_close_object
 	json_add_object "google";     json_close_object
@@ -67,6 +71,10 @@ call_method() {
 		yt_get)     "$BACKEND" yt_get ;;
 		yt_mode)    json_get_var mode mode; "$BACKEND" yt_mode "$mode" ;;
 		yt_reset)   "$BACKEND" yt_reset ;;
+		torrent_get)      "$BACKEND" torrent_get ;;
+		torrent_refresh)  "$BACKEND" torrent_refresh ;;
+		torrent_listener) json_get_var state state; "$BACKEND" torrent_listener "$state" ;;
+		torrent_extra)    json_get_var hosts hosts; "$BACKEND" torrent_extra "$hosts" ;;
 		sync_lists) "$BACKEND" sync_lists ;;
 		aidns)      "$BACKEND" aidns ;;
 		google)     "$BACKEND" google ;;

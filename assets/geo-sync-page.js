@@ -38,6 +38,10 @@ var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  ex
 var callYtGet      = rpc.declare({ object: 'geo-sync', method: 'yt_get',      expect: {} });
 var callYtMode     = rpc.declare({ object: 'geo-sync', method: 'yt_mode',     params: { mode: null }, expect: {} });
 var callYtReset    = rpc.declare({ object: 'geo-sync', method: 'yt_reset',    expect: {} });
+var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', expect: {} });
+var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
+var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
+var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
 var PANEL_VERSION = '@@PANEL_VERSION@@';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
@@ -207,7 +211,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet() ]);
 	},
 
 	render: function(all) {
@@ -221,6 +225,7 @@ return view.extend({
 		var nd = all[9] || {};
 		var lt = all[10] || {};
 		var yt = all[11] || {};
+		var tor = all[12] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -887,6 +892,68 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [ btnYtRel ])
 		]));
 
+		/* ===================== Torrents (lists tab, v1.15.0) ===================== */
+		var torOn = !!tor.listener_present;
+		var setListener = function(state, btn) {
+			btn.disabled = true;
+			callTorListener({ state: state }).then(function(res) {
+				btn.disabled = false;
+				if (res && res.ok) ui.addNotification(null, E('p', {}, state === 'on' ? 'Слушатель включён' : 'Слушатель выключен'), 'info');
+				else ui.addNotification(null, E('p', {}, 'Не удалось изменить (см. /root/geo-sync.log)'), 'error');
+				return view.reload();
+			}).catch(function(e) { btn.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		};
+		var btnTorOff = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+			if (!confirm('Выключить слушатель? Клиенты, указавшие его как прокси, потеряют выход в DIRECT.')) return;
+			setListener('off', btnTorOff);
+		} }, 'Выключить слушатель');
+		var btnTorOn = E('button', { 'class': 'gs-btn' + (torOn ? '' : ' gs-btn-primary'), 'click': function() { setListener('on', btnTorOn); } }, 'Включить слушатель');
+		var btnTorUpd = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnTorUpd.disabled = true; btnTorUpd.textContent = 'Обновляю…';
+			callTorRefresh().then(function(res) {
+				btnTorUpd.disabled = false; btnTorUpd.textContent = 'Обновить списки трекеров';
+				ui.addNotification(null, E('p', {}, (res && res.changed) ? ('Список пересобран: доменов ' + res.domains + ', IP ' + res.raw_ips) : 'Изменений нет'), 'info');
+				return view.reload();
+			}).catch(function(e) { btnTorUpd.disabled = false; btnTorUpd.textContent = 'Обновить списки трекеров'; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Обновить списки трекеров');
+		var inTorExtra = E('textarea', { 'class': 'gs-text', rows: 3, style: 'width:100%;font-family:monospace' });
+		inTorExtra.value = (tor.extras || []).join('\n');
+		var btnTorExtra = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnTorExtra.disabled = true;
+			callTorExtra({ hosts: inTorExtra.value }).then(function(res) {
+				btnTorExtra.disabled = false;
+				if (res && res.ok) ui.addNotification(null, E('p', {}, 'Сохранено, правил: ' + res.domains), 'info');
+				else ui.addNotification(null, E('p', {}, 'Отклонено: ' + ((res && res.rejected || []).join(', ') || 'ошибка')), 'error');
+				return view.reload();
+			}).catch(function(e) { btnTorExtra.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Сохранить и пересобрать');
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Торренты и трекеры'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Ни одно торрент-соединение не должно идти через подписки. Клиент указывает прокси ' +
+				'на локальный слушатель — всё, что он инициирует, выходит напрямую (через запрет на WAN). ' +
+				'Дополнительно домены трекеров закреплены отдельным ruleset, чтобы их не засасывали ' +
+				'VPN-списки по IP. Раньше те же порты фиксировались правилом DST-PORT — оно стояло выше ' +
+				'правил AI и перехватывало AI-релеи, поэтому убрано (v1.15.0).'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Слушатель'),
+				E('span', { 'class': 'gs-badge ' + (torOn ? 'gs-ok' : 'gs-off') }, torOn ? ('работает :' + (tor.listener_port || 7894)) : 'выключен'),
+				E('span', { 'class': 'gs-val gs-mono' }, tor.proxy_hint || ''),
+				(torOn ? btnTorOff : btnTorOn)
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Список трекеров'),
+				E('span', { 'class': 'gs-val gs-mono' }, 'доменов ' + (tor.domains || 0) + ' · IP ' + (tor.raw_ips || 0)),
+				E('span', { 'class': 'gs-badge ' + (tor.provider_loaded ? 'gs-ok' : 'gs-off') }, 'в mihomo: ' + (tor.provider_loaded || 0)),
+				btnTorUpd
+			]),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:6px 0 4px' },
+				'Свои домены (по строке). Пересобираются вместе с публичными списками: ' +
+				((tor.sources || []).join(' , ') || '—')),
+			inTorExtra,
+			E('div', { 'class': 'gs-row' }, [ btnTorExtra ])
+		]));
+
 		/* ===================== Node audit (nodes tab, v1.12.0) ===================== */
 		var conf = nd.conf || {};
 		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
@@ -999,7 +1066,7 @@ return view.extend({
 	reload: function() {
 		var view = this;
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet() ]).then(function(all) {
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet() ]).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);

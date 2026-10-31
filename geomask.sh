@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.15.3"
+GM_VERSION="1.16.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.15.3"
+BACKEND_VERSION="1.16.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1624,7 +1624,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.15.3';
+var PANEL_VERSION = '1.16.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2499,7 +2499,7 @@ return view.extend({
 			}).catch(function(e) { btn.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
 		};
 		var btnTorOff = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
-			if (!confirm('Выключить слушатель? Клиенты, указавшие его как прокси, потеряют выход в DIRECT.')) return;
+			if (!confirm('Выключить слушатель? Клиенты, указавшие его как прокси, потеряют обход VPN-подписки и пойдут по обычным правилам.')) return;
 			setListener('off', btnTorOff);
 		} }, 'Выключить слушатель');
 		var btnTorOn = E('button', { 'class': 'gs-btn' + (torOn ? '' : ' gs-btn-primary'), 'click': function() { setListener('on', btnTorOn); } }, 'Включить слушатель');
@@ -2525,14 +2525,17 @@ return view.extend({
 		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Торренты и трекеры'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
-				'Ни одно торрент-соединение не должно идти через подписки. Клиент указывает прокси ' +
-				'на локальный слушатель — всё, что он инициирует, выходит напрямую (через запрет на WAN). ' +
-				'Дополнительно домены трекеров закреплены отдельным ruleset, чтобы их не засасывали ' +
-				'VPN-списки по IP. Раньше те же порты фиксировались правилом DST-PORT — оно стояло выше ' +
-				'правил AI и перехватывало AI-релеи, поэтому убрано (v1.15.0).'),
+				'Ни одно торрент-соединение не должно идти через обычную VPN-подписку — провайдер это ' +
+				'запрещает и 31.10 заблокировал подписку, увидев BitTorrent в туннеле. Клиент указывает ' +
+				'прокси на локальный слушатель с жёсткой политикой: торренты уходят в AI-подписку ' +
+				'(ограничений на P2P у неё нет), а AI-домены через тот же слушатель попадают в AI — ' +
+				'утечка в DIRECT исключена по построению. Дополнительно: домены трекеров закреплены ' +
+				'ruleset\'ом (DIRECT), а ответы входящим пирам — правилом SRC-PORT (AI), потому что ' +
+				'1300 IP-CIDR хостинговых групп уводят пиров на OVH/Hetzner/DO в VPN.'),
 			E('div', { 'class': 'gs-row' }, [
 				E('span', { 'class': 'gs-label' }, 'Слушатель'),
-				E('span', { 'class': 'gs-badge ' + (torOn ? 'gs-ok' : 'gs-off') }, torOn ? ('работает :' + (tor.listener_port || 7894)) : 'выключен'),
+				E('span', { 'class': 'gs-badge ' + (torOn ? 'gs-ok' : 'gs-off') },
+					torOn ? ('работает :' + (tor.listener_port || 7894) + ' → ' + (tor.listener_policy || 'без политики')) : 'выключен'),
 				E('span', { 'class': 'gs-val gs-mono' }, tor.proxy_hint || ''),
 				(torOn ? btnTorOff : btnTorOn)
 			]),
@@ -2699,11 +2702,20 @@ step3_check() {
   grep -q 'RULE-SET,mtrickle,VPN' "$_c" 2>/dev/null && info "rule mtrickle->VPN: present" || { bad "rule mtrickle->VPN missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
   if grep -q 'torrent-direct' "$_c" 2>/dev/null; then
-    if awk '/name: torrent-direct/{f=1;next} f&&/^[^ ]/{exit} f&&/proxy:/{print}' "$_c" | grep -q .; then
-      bad "torrent-direct listener forces a policy - AI domains sent through it would leak to DIRECT"
-      _need=1
-    else info "listener (torrent-direct:7894, rule-based): present"; fi
-  else warn "torrent-direct listener missing (torrent clients cannot be pinned to DIRECT via proxy)"; fi
+    # v1.16.0: the torrent listener must carry a fixed policy, and it must be the AI sub.
+    # No policy = the rule chain decides = peers inside the hosting CIDRs go to the VPN sub
+    # (that is how the provider saw BitTorrent and blocked the subscription on 31.10).
+    _tp=$(awk '/name: torrent-direct/{f=1;next} f&&/^[^ ]/{exit} f&&/^    proxy:/{sub(/^[^:]*:[[:space:]]*/,"");print;exit}' "$_c")
+    case "$_tp" in
+      AI)     info "listener (torrent-direct:7894 -> AI sub): present" ;;
+      DIRECT) warn "torrent listener forces DIRECT - fine only if your VPN subscription allows P2P" ;;
+      '')     bad "torrent listener has no fixed policy - peers in the hosting lists will reach the VPN sub"; _need=1 ;;
+      *)      bad "torrent listener policy is '$_tp' - expected AI (VPN-forbidden P2P traffic must not reach the VPN sub)"; _need=1 ;;
+    esac
+  else warn "torrent-direct listener missing (torrent clients cannot be pinned away from the VPN sub)"; fi
+  grep -qE '^  - SRC-PORT,41552,AI$' "$_c" 2>/dev/null \
+    && info "torrent peer guard (SRC-PORT -> AI): present" \
+    || warn "SRC-PORT,41552 guard missing - incoming peers may still be routed to the VPN sub"
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
@@ -2838,12 +2850,15 @@ write_mihomo_config() {
     printf '%s\n' '    port: 7891'
     printf '%s\n' '    listen: 127.0.0.1'
     printf '%s\n' '    proxy: AI'
-    printf '%s\n' '  # torrent clients point here (SOCKS5/HTTP). No fixed policy on purpose: the rule'
-    printf '%s\n' '  # chain decides, so AI domains sent through it still go to AI (never leaked)'
+    printf '%s\n' '  # torrent clients point here (SOCKS5/HTTP). Fixed policy = AI subscription:'
+    printf '%s\n' '  # the plain VPN sub forbids P2P (and got blocked for it on 31.10), the AI sub has'
+    printf '%s\n' '  # no such rule, and AI domains through this listener land in AI too - so nothing'
+    printf '%s\n' '  # can leak to DIRECT. Change to DIRECT only if your VPN sub allows P2P.'
     printf '%s\n' '  - name: torrent-direct'
     printf '%s\n' '    type: mixed'
     printf '%s\n' '    port: 7894'
     printf '%s\n' '    listen: 192.168.0.1'
+    printf '%s\n' '    proxy: AI'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
     printf '%s\n' '  sub:'
@@ -2934,6 +2949,8 @@ write_mihomo_config() {
     printf '%s\n' '  - RULE-SET,ai,AI'
     printf '%s\n' '  # torrent tracker endpoints (public lists) - DIRECT, after ai so the AI policy always wins'
     printf '%s\n' '  - RULE-SET,torrentdirect,DIRECT'
+    printf '%s\n' '  # torrent client listening port: peers that dial US get answered via AI, never the VPN sub'
+    printf '%s\n' '  - SRC-PORT,41552,AI'
     printf '%s\n' '  - RULE-SET,mtrickle,VPN'
     printf '%s\n' '  # STUN via VPN: stop WebRTC leaking the real (RU) IP, keep calls working'
     printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN'
@@ -20823,10 +20840,17 @@ def build_ruleset():
     return len(hosts), len(ips), True
 
 # ---------- listener toggle ----------
-# No fixed policy: the rule chain decides, so AI domains sent through the listener still
-# match RULE-SET,ai and go to AI (a forced "proxy: DIRECT" would leak them).
+# Fixed policy = AI subscription (owner, 31.10): the plain VPN sub forbids P2P and got blocked
+# by it; the AI sub has no such rule. Without a fixed policy the rule chain decides, and peers
+# whose IP sits in the hosting lists (OVH/Hetzner/DO...) end up in the VPN sub - that was the leak.
+# AI domains through this listener land in AI too, so nothing can leak to DIRECT.
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
-                '    listen: 192.168.0.1']
+                '    listen: 192.168.0.1','    proxy: AI']
+
+def listener_policy():
+    t=read(CFG)
+    m=re.search(r'(?m)^  - name: torrent-direct\n(?:[ ]{4}.*\n)*?[ ]{4}proxy:\s*(\S+)', t)
+    return m.group(1) if m else ''
 
 def listener_present():
     return 'torrent-direct' in read(CFG)
@@ -20876,6 +20900,7 @@ def status():
     return {
         'ok': True,
         'listener_present': listener_present(),
+        'listener_policy': listener_policy(),
         'listener_port': int(LISTENER_PORT),
         'ruleset_present': bool(rs.strip()),
         'domains': len(re.findall(r'DOMAIN-SUFFIX,', rs)),
@@ -21011,7 +21036,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.15.3"
+GUARD_VERSION="1.16.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -22239,8 +22264,12 @@ geomask_uninstall() {
   fi
   rm -f "$(P /usr/bin/geomask-node-scan.sh)"
   info "removed: node-scan (conf /etc/geomask-nodes.conf left for reference)"
-  # v1.14.0: youtube edge watchdog removal (release any auto-pins first so edges return to zapret)
-  [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ] && "$(P /usr/bin/geomask-ytwatch.sh)" --reset >/dev/null 2>&1
+  # v1.14.0: youtube edge watchdog removal. Release the auto-pins ONLY on a real uninstall:
+  # --reinstall calls this too, and resetting there wiped every accumulated edge pin
+  # (observed 31.10 18:21 - a self-update dropped 10 working pins).
+  if [ -z "$1" ] && [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ]; then
+    "$(P /usr/bin/geomask-ytwatch.sh)" --reset >/dev/null 2>&1
+  fi
   if crontab -l 2>/dev/null | grep -q 'geomask-ytwatch'; then
     crontab -l 2>/dev/null | grep -v 'geomask-ytwatch' | crontab - 2>/dev/null || true
   fi

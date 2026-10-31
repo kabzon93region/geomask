@@ -604,14 +604,24 @@ for _p in 'callTorGet' 'callTorRefresh' 'callTorListener' 'callTorExtra' 'Тор
 done
 # the panel must read the 13th promise slot
 grep -qF 'all[12]' "$HERE/../assets/geo-sync-page.js" && { echo "PASS: S24 panel consumes the new RPC slot"; pass=$((pass+1)); } || { echo "FAIL: S24 new RPC result not consumed"; failn=$((failn+1)); }
-# v1.15.1: the listener must NOT force a policy, otherwise AI domains through it leak to DIRECT
-if grep -qF "'    proxy: DIRECT'" "$HERE/../assets/geomask-torrent.sh"; then
-  echo "FAIL: S24 torrent script still forces proxy: DIRECT (AI leak vector)"; failn=$((failn+1))
-else echo "PASS: S24 listener is rule-based in the admin script"; pass=$((pass+1)); fi
-if awk "/name: torrent-direct/{f=1;next} f&&/^ *printf .*'  - name:/{exit} f" "$HERE/../geomask.sh.in" | grep -qF "proxy: DIRECT"; then
-  echo "FAIL: S24 template listener block forces a policy"; failn=$((failn+1))
-else echo "PASS: S24 template listener block has no forced policy"; pass=$((pass+1)); fi
-grep -qF 'forces a policy' "$HERE/../geomask.sh.in" && { echo "PASS: S24 --check detects a forced policy"; pass=$((pass+1)); } || { echo "FAIL: S24 --check cannot detect a forced policy"; failn=$((failn+1)); }
+# v1.16.0: the listener must carry a FIXED policy = AI. Without it the rule chain decides and
+# peers whose IP sits in the hosting CIDRs reach the VPN sub (that blocked the subscription).
+if grep -qF "'    proxy: AI'" "$HERE/../assets/geomask-torrent.sh"; then
+  echo "PASS: S24 admin script recreates the listener with proxy: AI"; pass=$((pass+1))
+else echo "FAIL: S24 admin script does not set the AI policy"; failn=$((failn+1)); fi
+if awk "/name: torrent-direct/{f=1;next} f&&/^ *printf .*'  - name:/{exit} f" "$HERE/../geomask.sh.in" | grep -qF "proxy: AI"; then
+  echo "PASS: S24 template listener block pins AI"; pass=$((pass+1))
+else echo "FAIL: S24 template listener block lacks the AI policy"; failn=$((failn+1)); fi
+grep -qF 'torrent listener has no fixed policy' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 --check rejects a policy-less listener"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 --check does not reject a policy-less listener"; failn=$((failn+1)); }
+grep -qF 'SRC-PORT,41552,AI' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 peer-reply guard in the template"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 peer-reply guard missing"; failn=$((failn+1)); }
+# a self-update must not wipe accumulated YouTube pins (observed 31.10: --reinstall reset 10 pins)
+grep -qF 'if [ -z "$1" ] && [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ]' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 pins are released only on a real uninstall"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 reinstall still releases YouTube pins"; failn=$((failn+1)); }
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

@@ -115,10 +115,17 @@ def build_ruleset():
     return len(hosts), len(ips), True
 
 # ---------- listener toggle ----------
-# No fixed policy: the rule chain decides, so AI domains sent through the listener still
-# match RULE-SET,ai and go to AI (a forced "proxy: DIRECT" would leak them).
+# Fixed policy = AI subscription (owner, 31.10): the plain VPN sub forbids P2P and got blocked
+# by it; the AI sub has no such rule. Without a fixed policy the rule chain decides, and peers
+# whose IP sits in the hosting lists (OVH/Hetzner/DO...) end up in the VPN sub - that was the leak.
+# AI domains through this listener land in AI too, so nothing can leak to DIRECT.
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
-                '    listen: 192.168.0.1']
+                '    listen: 192.168.0.1','    proxy: AI']
+
+def listener_policy():
+    t=read(CFG)
+    m=re.search(r'(?m)^  - name: torrent-direct\n(?:[ ]{4}.*\n)*?[ ]{4}proxy:\s*(\S+)', t)
+    return m.group(1) if m else ''
 
 def listener_present():
     return 'torrent-direct' in read(CFG)
@@ -168,6 +175,7 @@ def status():
     return {
         'ok': True,
         'listener_present': listener_present(),
+        'listener_policy': listener_policy(),
         'listener_port': int(LISTENER_PORT),
         'ruleset_present': bool(rs.strip()),
         'domains': len(re.findall(r'DOMAIN-SUFFIX,', rs)),

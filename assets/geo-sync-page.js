@@ -917,7 +917,7 @@ return view.extend({
 			}).catch(function(e) { btn.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
 		};
 		var btnTorOff = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
-			if (!confirm('Выключить слушатель? Клиенты, указавшие его как прокси, потеряют выход в DIRECT.')) return;
+			if (!confirm('Выключить слушатель? Клиенты, указавшие его как прокси, потеряют обход VPN-подписки и пойдут по обычным правилам.')) return;
 			setListener('off', btnTorOff);
 		} }, 'Выключить слушатель');
 		var btnTorOn = E('button', { 'class': 'gs-btn' + (torOn ? '' : ' gs-btn-primary'), 'click': function() { setListener('on', btnTorOn); } }, 'Включить слушатель');
@@ -943,14 +943,17 @@ return view.extend({
 		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Торренты и трекеры'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
-				'Ни одно торрент-соединение не должно идти через подписки. Клиент указывает прокси ' +
-				'на локальный слушатель — всё, что он инициирует, выходит напрямую (через запрет на WAN). ' +
-				'Дополнительно домены трекеров закреплены отдельным ruleset, чтобы их не засасывали ' +
-				'VPN-списки по IP. Раньше те же порты фиксировались правилом DST-PORT — оно стояло выше ' +
-				'правил AI и перехватывало AI-релеи, поэтому убрано (v1.15.0).'),
+				'Ни одно торрент-соединение не должно идти через обычную VPN-подписку — провайдер это ' +
+				'запрещает и 31.10 заблокировал подписку, увидев BitTorrent в туннеле. Клиент указывает ' +
+				'прокси на локальный слушатель с жёсткой политикой: торренты уходят в AI-подписку ' +
+				'(ограничений на P2P у неё нет), а AI-домены через тот же слушатель попадают в AI — ' +
+				'утечка в DIRECT исключена по построению. Дополнительно: домены трекеров закреплены ' +
+				'ruleset\'ом (DIRECT), а ответы входящим пирам — правилом SRC-PORT (AI), потому что ' +
+				'1300 IP-CIDR хостинговых групп уводят пиров на OVH/Hetzner/DO в VPN.'),
 			E('div', { 'class': 'gs-row' }, [
 				E('span', { 'class': 'gs-label' }, 'Слушатель'),
-				E('span', { 'class': 'gs-badge ' + (torOn ? 'gs-ok' : 'gs-off') }, torOn ? ('работает :' + (tor.listener_port || 7894)) : 'выключен'),
+				E('span', { 'class': 'gs-badge ' + (torOn ? 'gs-ok' : 'gs-off') },
+					torOn ? ('работает :' + (tor.listener_port || 7894) + ' → ' + (tor.listener_policy || 'без политики')) : 'выключен'),
 				E('span', { 'class': 'gs-val gs-mono' }, tor.proxy_hint || ''),
 				(torOn ? btnTorOff : btnTorOn)
 			]),

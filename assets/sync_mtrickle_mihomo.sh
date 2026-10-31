@@ -268,15 +268,19 @@ def _zapret_sync():
         old = open(ZEXCL, encoding='utf-8', errors='replace').read().splitlines()
     except Exception as e:
         print('zapret: cannot read exclude file (%s)' % e); return False
-    # keep everything outside our managed block, including the "# nochange" guard line
-    head, mid, tail = [], None, []
-    for ln in old:
-        if ln.strip() == ZBEG: mid = head; head = None; continue
-        if mid is not None and ln.strip() == ZEND: tail = []; continue
-        if head is not None and mid is None: head.append(ln)
-        elif tail is not None and mid is not None: tail.append(ln)
+    # drop our previous block by marker positions, keep everything else (line 1 is the
+    # "# nochange" guard and must survive)
+    try:
+        bi = next(i for i, l in enumerate(old) if l.strip() == ZBEG)
+        ei = next(i for i, l in enumerate(old) if l.strip() == ZEND)
+    except StopIteration:
+        bi = ei = None
+    if bi is not None and ei is not None and ei > bi:
+        pre, post = old[:bi], old[ei+1:]
+    else:
+        pre, post = old, []
     body = [ZBEG] + sorted(tunnel) + [ZEND]
-    new = head + body + tail
+    new = pre + body + post
     if new == old:
         print('zapret exclude: up-to-date (%d tunneled domains)' % len(tunnel)); return False
     try:
@@ -288,7 +292,12 @@ def _zapret_sync():
     except Exception as e:
         print('zapret exclude: write failed (%s)' % e); return False
 
-ZAPRET_CHANGED = _zapret_sync()
+try:
+    ZAPRET_CHANGED = _zapret_sync()
+except Exception as _ze:
+    # a zapret problem must never block the mihomo ruleset sync
+    ZAPRET_CHANGED = False
+    print('zapret exclude: skipped (%s)' % _ze)
 
 if c1 or c2 or c3 or c4:
     _r_ok = False

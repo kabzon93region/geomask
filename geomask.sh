@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.20.0"
+GM_VERSION="1.20.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.20.0"
+BACKEND_VERSION="1.20.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.20.0';
+var PANEL_VERSION = '1.20.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -20609,15 +20609,19 @@ def _zapret_sync():
         old = open(ZEXCL, encoding='utf-8', errors='replace').read().splitlines()
     except Exception as e:
         print('zapret: cannot read exclude file (%s)' % e); return False
-    # keep everything outside our managed block, including the "# nochange" guard line
-    head, mid, tail = [], None, []
-    for ln in old:
-        if ln.strip() == ZBEG: mid = head; head = None; continue
-        if mid is not None and ln.strip() == ZEND: tail = []; continue
-        if head is not None and mid is None: head.append(ln)
-        elif tail is not None and mid is not None: tail.append(ln)
+    # drop our previous block by marker positions, keep everything else (line 1 is the
+    # "# nochange" guard and must survive)
+    try:
+        bi = next(i for i, l in enumerate(old) if l.strip() == ZBEG)
+        ei = next(i for i, l in enumerate(old) if l.strip() == ZEND)
+    except StopIteration:
+        bi = ei = None
+    if bi is not None and ei is not None and ei > bi:
+        pre, post = old[:bi], old[ei+1:]
+    else:
+        pre, post = old, []
     body = [ZBEG] + sorted(tunnel) + [ZEND]
-    new = head + body + tail
+    new = pre + body + post
     if new == old:
         print('zapret exclude: up-to-date (%d tunneled domains)' % len(tunnel)); return False
     try:
@@ -20629,7 +20633,12 @@ def _zapret_sync():
     except Exception as e:
         print('zapret exclude: write failed (%s)' % e); return False
 
-ZAPRET_CHANGED = _zapret_sync()
+try:
+    ZAPRET_CHANGED = _zapret_sync()
+except Exception as _ze:
+    # a zapret problem must never block the mihomo ruleset sync
+    ZAPRET_CHANGED = False
+    print('zapret exclude: skipped (%s)' % _ze)
 
 if c1 or c2 or c3 or c4:
     _r_ok = False
@@ -21555,7 +21564,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.20.0"
+GUARD_VERSION="1.20.1"
 
 log() { logger -t geomask-guard "$*"; }
 

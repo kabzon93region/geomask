@@ -764,6 +764,15 @@ if grep -qE 'ccBadge\((aiCc|vpnCc|laneCc)\)' "$HERE/../assets/geo-sync-page.js";
   echo "FAIL: S26 some node badge still gets no name (flag lost)"; failn=$((failn+1))
 else echo "PASS: S26 all three slot badges receive the node name"; pass=$((pass+1)); fi
 
+# v1.20.1: the first implementation used a None sentinel for the pre-block list and crashed on
+# the SECOND run (when the block already existed) - a crash here also skips the mihomo reload.
+grep -qF 'pre, post = old[:bi], old[ei+1:]' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && { echo "PASS: S26 exclude block is replaced by marker positions"; pass=$((pass+1)); } \
+  || { echo "FAIL: S26 exclude block rewrite looks fragile again"; failn=$((failn+1)); }
+grep -qF 'a zapret problem must never block the mihomo ruleset sync' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && { echo "PASS: S26 zapret errors cannot break the ruleset sync"; pass=$((pass+1)); } \
+  || { echo "FAIL: S26 a zapret error would abort the sync"; failn=$((failn+1)); }
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

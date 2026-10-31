@@ -743,6 +743,13 @@ grep -qF 'keep everything outside our managed block' "$HERE/../assets/sync_mtric
 grep -qF 'send ports/IPs/protocols to VPN-noP2P' "$HERE/../geomask.sh.in" \
   && { echo "PASS: S26 --check rejects port/IP rules on the restricted slot"; pass=$((pass+1)); } \
   || { echo "FAIL: S26 --check has no port-rule invariant"; failn=$((failn+1)); }
+# v1.19.1: the actions column holds four buttons - nowrap pushed them out of the card
+if grep -qF 'gs-subs td:last-child{width:200px;white-space:nowrap}' "$HERE/../assets/geo-sync-page.js"; then
+  echo "FAIL: S26 subscription actions still force a single nowrap line"; failn=$((failn+1))
+else echo "PASS: S26 subscription actions may wrap inside the card"; pass=$((pass+1)); fi
+grep -qF '.gs-subs td:nth-child(3) .gs-badge{white-space:nowrap}' "$HERE/../assets/geo-sync-page.js" \
+  && { echo "PASS: S26 the slot badge stays on one line"; pass=$((pass+1)); } \
+  || { echo "FAIL: S26 the slot badge can break across lines"; failn=$((failn+1)); }
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

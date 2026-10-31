@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.19.0"
+GM_VERSION="1.19.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.19.0"
+BACKEND_VERSION="1.19.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.19.0';
+var PANEL_VERSION = '1.19.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1804,11 +1804,12 @@ var STYLE = [
 	'.gs-table td,.gs-table th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left}',
 	'.gs-subs{width:100%;table-layout:fixed}',
 	'.gs-subs td{overflow-wrap:anywhere;vertical-align:middle}',
-	'.gs-subs td:first-child{width:110px;font-weight:600}',
+	'.gs-subs td:first-child{width:126px;font-weight:600}',
 	'.gs-subs td:nth-child(2){font-family:monospace;font-size:12px;color:#8b949e}',
-	'.gs-subs td:nth-child(3){width:110px}',
-	'.gs-subs td:last-child{width:200px;white-space:nowrap}',
-	'.gs-subs .gs-btn-use{background:#21262d;border-color:#30363d;color:#c9d1d9;padding:5px 10px;margin-right:4px}',
+	'.gs-subs td:nth-child(3){width:104px}',
+	'.gs-subs td:nth-child(3) .gs-badge{white-space:nowrap}',
+	'.gs-subs td:last-child{width:272px;white-space:normal}',
+	'.gs-subs .gs-btn-use{background:#21262d;border-color:#30363d;color:#c9d1d9;padding:5px 9px;margin:0 4px 4px 0}',
 	'.gs-btn-vpn-on{background:#1f6feb;border-color:#58a6ff;color:#fff}',
 	'.gs-btn-vpn-on:hover{background:#388bfd}',
 	'.gs-btn-ai-on{background:#238636;border-color:#3fb950;color:#fff}',
@@ -21547,7 +21548,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.19.0"
+GUARD_VERSION="1.19.1"
 
 log() { logger -t geomask-guard "$*"; }
 

@@ -889,6 +889,19 @@ return view.extend({
 				E('span', { 'class': 'gs-hint' }, 'порог ' + (yt.threshold || 2) + ' ошибок за ' + (yt.window_min || 30) + ' мин, максимум ' + (yt.max_pins || 40))
 			]),
 			ytPins.length ? E('div', { 'class': 'gs-blocklist' }, ytPins.join('\n')) : null,
+			(function(){
+				var st = yt.stalled || {}, ks = Object.keys(st).sort();
+				return E('div', { 'class': 'gs-row' }, [
+					E('span', { 'class': 'gs-label' }, 'Зависшие рёбра'),
+					E('span', { 'class': 'gs-badge ' + (ks.length ? 'gs-warn' : 'gs-ok') }, ks.length ? (ks.length + ' без данных') : 'нет'),
+					E('span', { 'class': 'gs-hint' }, 'считается зависшим: живёт >' + (yt.stall_min_age || 25) + ' с и скачано <' +
+						Math.round((yt.stall_max_bytes || 10000)/1024) + ' КБ — такое ребро пинится в VPN')
+				]);
+			})(),
+			(function(){
+				var st = yt.stalled || {}, ks = Object.keys(st).sort();
+				return ks.length ? E('div', { 'class': 'gs-blocklist' }, ks.join('\n')) : null;
+			})(),
 			E('div', { 'class': 'gs-row' }, [ btnYtRel ])
 		]));
 

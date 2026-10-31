@@ -508,6 +508,17 @@ for _p in 'callYtGet' 'callYtMode' 'callYtReset' 'yt_get' 'yt_mode' 'yt_reset'; 
   if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S20 panel/backend has: $_p"; pass=$((pass+1))
   else echo "FAIL: S20 panel/backend missing: $_p"; failn=$((failn+1)); fi
 done
+# v1.15.2: stalled-edge detection (DPI kills the stream AFTER the handshake -> no dial error at all)
+for _p in 'stall_min_age' 'stall_max_bytes' 'stall_threshold' 'stall_seen' '/connections' "Bearer "; do
+  if grep -qF -- "$_p" "$HERE/../assets/geomask-ytwatch.sh"; then echo "PASS: S20 ytwatch has: $_p"; pass=$((pass+1))
+  else echo "FAIL: S20 ytwatch missing: $_p"; failn=$((failn+1)); fi
+done
+if grep -qF 'stall_min_age=' "$HERE/../assets/geomask-ytwatch.conf"; then
+  echo "PASS: S20 stall thresholds shipped in the conf"; pass=$((pass+1))
+else echo "FAIL: S20 stall thresholds missing from the conf"; failn=$((failn+1)); fi
+grep -qF 'Зависшие рёбра' "$HERE/../assets/geo-sync-page.js" \
+  && { echo "PASS: S20 panel shows stalled edges"; pass=$((pass+1)); } \
+  || { echo "FAIL: S20 panel does not show stalled edges"; failn=$((failn+1)); }
 
 # ---------- scenario 21: update card must not show stale installed versions (v1.14.2) ----------
 echo "=== S21: live installed-version block in update check ==="

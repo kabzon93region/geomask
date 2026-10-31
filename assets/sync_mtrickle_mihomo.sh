@@ -258,10 +258,17 @@ def _zapret_sync():
             r'-\s*DOMAIN-SUFFIX,([a-z0-9.\-]+),DIRECT', cfg, re.I)}
     except Exception:
         pass
-    tunnel = set(mt_dom)
-    tunnel |= {p.split(',', 1)[1] for p in ai_payload if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,'))}
-    tunnel |= {p.split(',', 1)[1] for p in ytvpn_payload if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,'))}
-    tunnel = {d.lower() for d in tunnel} - pinned_direct
+    # zapret's hostlist format is a BARE domain; our payload items carry the mihomo rule type
+    # ("DOMAIN-SUFFIX,example.com"), which zapret would treat as a literal hostname and never
+    # match. Strip the type from every source before writing.
+    def bare(p):
+        return p.split(',', 1)[1].lower() if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,')) else None
+
+    tunnel = {d for d in (bare(p) for p in mt_dom) if d}
+    tunnel |= {d for d in (bare(p) for p in ai_payload) if d}
+    tunnel |= {d for d in (bare(p) for p in ytvpn_payload) if d}
+    tunnel = tunnel - pinned_direct
+    tunnel = {d for d in tunnel if re.fullmatch(r'[a-z0-9.\-\u0080-\uffff]+', d)}
     if not tunnel:
         print('zapret: nothing to exclude - skip'); return False
     try:

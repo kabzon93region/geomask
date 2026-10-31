@@ -737,9 +737,15 @@ grep -qF 'ZEXCL' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
 grep -qF 'pinned_direct' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
   && { echo "PASS: S26 DIRECT-pinned domains stay under DPI"; pass=$((pass+1)); } \
   || { echo "FAIL: S26 would exclude domains that go DIRECT"; failn=$((failn+1)); }
-grep -qF 'keep everything outside our managed block' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+# the exclude file keeps its own content: the block is replaced by markers, not by rewriting
+grep -qF 'drop our previous block by marker positions' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
   && { echo "PASS: S26 exclude file keeps its own content around the block"; pass=$((pass+1)); } \
   || { echo "FAIL: S26 may clobber the exclude file"; failn=$((failn+1)); }
+# v1.20.2: zapret wants BARE domains - writing "DOMAIN-SUFFIX,foo" would never match
+grep -qF 'zapret' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && grep -qF 'def bare(p)' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && { echo "PASS: S26 exclude entries are stripped to bare domains"; pass=$((pass+1)); } \
+  || { echo "FAIL: S26 would write mihomo rule syntax into zapret"; failn=$((failn+1)); }
 grep -qF 'send ports/IPs/protocols to VPN-noP2P' "$HERE/../geomask.sh.in" \
   && { echo "PASS: S26 --check rejects port/IP rules on the restricted slot"; pass=$((pass+1)); } \
   || { echo "FAIL: S26 --check has no port-rule invariant"; failn=$((failn+1)); }

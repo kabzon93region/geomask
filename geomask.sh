@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.20.1"
+GM_VERSION="1.20.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.20.1"
+BACKEND_VERSION="1.20.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.20.1';
+var PANEL_VERSION = '1.20.2';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -20599,10 +20599,17 @@ def _zapret_sync():
             r'-\s*DOMAIN-SUFFIX,([a-z0-9.\-]+),DIRECT', cfg, re.I)}
     except Exception:
         pass
-    tunnel = set(mt_dom)
-    tunnel |= {p.split(',', 1)[1] for p in ai_payload if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,'))}
-    tunnel |= {p.split(',', 1)[1] for p in ytvpn_payload if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,'))}
-    tunnel = {d.lower() for d in tunnel} - pinned_direct
+    # zapret's hostlist format is a BARE domain; our payload items carry the mihomo rule type
+    # ("DOMAIN-SUFFIX,example.com"), which zapret would treat as a literal hostname and never
+    # match. Strip the type from every source before writing.
+    def bare(p):
+        return p.split(',', 1)[1].lower() if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,')) else None
+
+    tunnel = {d for d in (bare(p) for p in mt_dom) if d}
+    tunnel |= {d for d in (bare(p) for p in ai_payload) if d}
+    tunnel |= {d for d in (bare(p) for p in ytvpn_payload) if d}
+    tunnel = tunnel - pinned_direct
+    tunnel = {d for d in tunnel if re.fullmatch(r'[a-z0-9.\-\u0080-\uffff]+', d)}
     if not tunnel:
         print('zapret: nothing to exclude - skip'); return False
     try:
@@ -21564,7 +21571,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.20.1"
+GUARD_VERSION="1.20.2"
 
 log() { logger -t geomask-guard "$*"; }
 

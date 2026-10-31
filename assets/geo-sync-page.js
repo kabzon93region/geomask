@@ -725,6 +725,23 @@ return view.extend({
 					? E('span', { 'class': 'gs-badge gs-warn' }, 'доступно обновление')
 					: E('span', { 'class': 'gs-badge gs-ok' }, 'актуально')
 			]));
+			/* The GitHub answer is cached for an hour on purpose (unauthenticated API allows
+			   ~60 requests/hour), so a release published minutes ago stays invisible. This
+			   button forces one live poll. */
+			var btnUpdPoll = E('button', { 'class': 'gs-btn', 'click': function() {
+				btnUpdPoll.disabled = true; btnUpdPoll.textContent = 'Проверяю…';
+				callUpdCheck({ force: 'force' }).then(function() {
+					btnUpdPoll.disabled = false; btnUpdPoll.textContent = 'Проверить сейчас';
+					return view.reload();
+				}).catch(function(e) {
+					btnUpdPoll.disabled = false; btnUpdPoll.textContent = 'Проверить сейчас';
+					ui.addNotification(null, E('p', {}, 'Не удалось проверить: ' + e), 'error');
+				});
+			} }, 'Проверить сейчас');
+			updChildren.push(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-hint' }, 'опрос GitHub кэшируется на 60 мин — кнопка ниже опрашивает его напрямую'),
+				btnUpdPoll
+			]));
 			if (upd.need === true) {
 				var btnUpd = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
 					if (!confirm('Обновить geomask до ' + latTag + '?\n\n' +

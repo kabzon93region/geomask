@@ -634,6 +634,14 @@ grep -qF 'if [ -z "$1" ] && [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ]' "$HERE/..
   && { echo "PASS: S24 pins are released only on a real uninstall"; pass=$((pass+1)); } \
   || { echo "FAIL: S24 reinstall still releases YouTube pins"; failn=$((failn+1)); }
 
+# v1.16.2: the panel must be able to bypass its own 1-hour cache for the GitHub poll
+grep -qF "callUpdCheck({ force: 'force' })" "$HERE/../assets/geo-sync-page.js" \
+  && { echo "PASS: S21 panel can force a live update check"; pass=$((pass+1)); } \
+  || { echo "FAIL: S21 panel cannot force a live update check"; failn=$((failn+1)); }
+grep -qF 'Проверить сейчас' "$HERE/../assets/geo-sync-page.js" \
+  && { echo "PASS: S21 force-check control is labelled"; pass=$((pass+1)); } \
+  || { echo "FAIL: S21 force-check control missing"; failn=$((failn+1)); }
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

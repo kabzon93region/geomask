@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.16.1"
+GM_VERSION="1.16.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.16.1"
+BACKEND_VERSION="1.16.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1624,7 +1624,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.16.1';
+var PANEL_VERSION = '1.16.2';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2306,6 +2306,23 @@ return view.extend({
 				upd.need === true
 					? E('span', { 'class': 'gs-badge gs-warn' }, 'доступно обновление')
 					: E('span', { 'class': 'gs-badge gs-ok' }, 'актуально')
+			]));
+			/* The GitHub answer is cached for an hour on purpose (unauthenticated API allows
+			   ~60 requests/hour), so a release published minutes ago stays invisible. This
+			   button forces one live poll. */
+			var btnUpdPoll = E('button', { 'class': 'gs-btn', 'click': function() {
+				btnUpdPoll.disabled = true; btnUpdPoll.textContent = 'Проверяю…';
+				callUpdCheck({ force: 'force' }).then(function() {
+					btnUpdPoll.disabled = false; btnUpdPoll.textContent = 'Проверить сейчас';
+					return view.reload();
+				}).catch(function(e) {
+					btnUpdPoll.disabled = false; btnUpdPoll.textContent = 'Проверить сейчас';
+					ui.addNotification(null, E('p', {}, 'Не удалось проверить: ' + e), 'error');
+				});
+			} }, 'Проверить сейчас');
+			updChildren.push(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-hint' }, 'опрос GitHub кэшируется на 60 мин — кнопка ниже опрашивает его напрямую'),
+				btnUpdPoll
 			]));
 			if (upd.need === true) {
 				var btnUpd = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
@@ -21036,7 +21053,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.16.1"
+GUARD_VERSION="1.16.2"
 
 log() { logger -t geomask-guard "$*"; }
 

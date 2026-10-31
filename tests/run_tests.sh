@@ -701,9 +701,10 @@ grep -qF '"vpn_nop2p_node"' "$HERE/../assets/geo-backend.sh" \
   && { echo "PASS: S25 status reports both VPN slots"; pass=$((pass+1)); } \
   || { echo "FAIL: S25 status misses a slot"; failn=$((failn+1)); }
 # lane creation must be reversible: backup + validate + rollback
-grep -qF 'bak_lane' "$HERE/../assets/geo-backend.sh" \
-  && { echo "PASS: S25 lane edit keeps a rollback copy"; pass=$((pass+1)); } \
-  || { echo "FAIL: S25 lane edit has no rollback"; failn=$((failn+1)); }
+grep -qF 'bak_slot' "$HERE/../assets/geo-backend.sh" \
+  && grep -qF 'mihomo config test failed - old config kept' "$HERE/../assets/geo-backend.sh" \
+  && { echo "PASS: S25 slot edit validates and rolls back"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 slot edit has no rollback"; failn=$((failn+1)); }
 for _p in 'geomask-vpnwatch.sh' 'geomask-vpnwatch.conf'; do
   grep -qF "\"$_p\"" "$HERE/../build.py" \
     && { echo "PASS: S25 asset in build MAP: $_p"; pass=$((pass+1)); } \

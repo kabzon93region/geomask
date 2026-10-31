@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.18.1"
+GM_VERSION="1.18.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -219,9 +219,13 @@ step3_check() {
   for g in VPN-noP2P AI; do
     if grep -q "name: $g$" "$_c" 2>/dev/null; then info "slot $g: present"; else bad "slot $g: missing"; _need=1; fi
   done
-  if grep -q 'name: VPN$' "$_c" 2>/dev/null; then info "slot VPN (P2P-tolerant lane): present"; else info "slot VPN: not configured (single tunnel - IP rules stay on VPN-noP2P)"; fi
+  grep -qE '^  - name: VPN$' "$_c" 2>/dev/null \
+    && info "default tunnel group VPN: present (main lists ride the P2P-tolerant subscription)" \
+    || info "default tunnel group VPN: absent (single tunnel - main lists ride VPN-noP2P)"
   grep -q 'RULE-SET,ai,AI' "$_c" 2>/dev/null && info "rule ai->AI: present" || { bad "rule ai->AI missing"; _need=1; }
-  grep -q 'RULE-SET,mtrickle,VPN-noP2P' "$_c" 2>/dev/null && info "rule mtrickle->VPN-noP2P: present" || { bad "rule mtrickle->VPN-noP2P missing"; _need=1; }
+  grep -qE 'RULE-SET,mtrickle,(VPN|VPN-noP2P)' "$_c" 2>/dev/null \
+    && info "rule mtrickle->$(grep -oE 'RULE-SET,mtrickle,[A-Za-z0-9_-]+' "$_c" | head -1 | cut -d, -f3): present" \
+    || { bad "rule mtrickle->VPN missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
   if grep -q 'torrent-direct' "$_c" 2>/dev/null; then
     # v1.18.0: with the P2P-tolerant "VPN" lane configured, no IP rule can reach the restricted

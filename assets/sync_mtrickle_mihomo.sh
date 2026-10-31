@@ -37,6 +37,11 @@ def controller_headers(path):
 
 SRC = '/etc/magitrickle/state/config.yaml'
 MT  = '/etc/mihomo/ruleset/mtrickle.yaml'
+# v1.17.0: IP-based rules are emitted separately. The restricted VPN subscription must never see
+# P2P, and a torrent peer is always a raw IP - so every IP-CIDR rule is routed to the RESERVE
+# group (a subscription that allows torrents) instead. Invariant enforced by geomask --check:
+# mtrickle.yaml must contain zero IP-CIDR entries.
+MTBULK = '/etc/mihomo/ruleset/mtrickle_bulk.yaml'
 AI  = '/etc/mihomo/ruleset/ai.yaml'
 # v1.13.3: googlevideo edges -> VPN. Generated from the dedicated MagiTrickle group so the
 # user edits ONE place (:8080); no hand-maintained ruleset file. Rule precedes ytdirect->DIRECT.
@@ -205,7 +210,13 @@ def write_if_changed(path, payload):
     os.replace(tmp, path)
     return True, len(payload)
 
-c1, n1 = write_if_changed(MT, mt_payload)
+# v1.17.0: split by rule TYPE. Domain rules may stay on the restricted VPN subscription;
+# IP rules cannot, because a torrent peer is always a bare address.
+mt_dom = [p for p in mt_payload if not p.startswith('IP-CIDR')]
+mt_ip  = [p for p in mt_payload if p.startswith('IP-CIDR')]
+
+c1, n1 = write_if_changed(MT, mt_dom)
+c4, n4 = write_if_changed(MTBULK, mt_ip)
 c2, n2 = write_if_changed(AI, ai_payload)
 # v1.14.0: write ytvpn.yaml whenever the GoogleVideo group EXISTS (even with zero rules - that is
 # the legitimate "auto mode, nothing broken right now" state). Only an absent group leaves the file
@@ -213,11 +224,12 @@ c2, n2 = write_if_changed(AI, ai_payload)
 c3 = False; n3 = len(ytvpn_payload)
 if yt_group_found or ytvpn_payload:
     c3, n3 = write_if_changed(YTVPN, ytvpn_payload)
-print('mtrickle.yaml: %d rules (%s)' % (n1, 'updated' if c1 else 'up-to-date'))
+print('mtrickle.yaml: %d domain rules (%s)' % (n1, 'updated' if c1 else 'up-to-date'))
+print('mtrickle_bulk.yaml: %d IP rules -> RESERVE (%s)' % (n4, 'updated' if c4 else 'up-to-date'))
 print('ai.yaml:       %d rules (%s, + %d moved from non-AI groups by domain pattern)' % (n2, 'updated' if c2 else 'up-to-date', moved))
 print('ytvpn.yaml:    %d rules (%s)' % (n3, 'updated' if c3 else 'up-to-date'))
 
-if c1 or c2 or c3:
+if c1 or c2 or c3 or c4:
     _r_ok = False
     try:
         req = urllib.request.Request(

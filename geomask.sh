@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.16.2"
+GM_VERSION="1.17.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.16.2"
+BACKEND_VERSION="1.17.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1624,7 +1624,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.16.2';
+var PANEL_VERSION = '1.17.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2719,19 +2719,22 @@ step3_check() {
   grep -q 'RULE-SET,mtrickle,VPN' "$_c" 2>/dev/null && info "rule mtrickle->VPN: present" || { bad "rule mtrickle->VPN missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
   if grep -q 'torrent-direct' "$_c" 2>/dev/null; then
-    # v1.16.0: the torrent listener must carry a fixed policy, and it must be the AI sub.
-    # No policy = the rule chain decides = peers inside the hosting CIDRs go to the VPN sub
-    # (that is how the provider saw BitTorrent and blocked the subscription on 31.10).
+    # v1.17.0: with the RESERVE lane configured, no IP rule can reach the restricted sub, so the
+    # listener may be rule-based (and AI domains through it still land in AI). Without lanes the
+    # listener MUST carry a fixed policy - that is what blocked the subscription on 31.10.
     _tp=$(awk '/name: torrent-direct/{f=1;next} f&&/^[^ ]/{exit} f&&/^    proxy:/{sub(/^[^:]*:[[:space:]]*/,"");print;exit}' "$_c")
-    case "$_tp" in
-      AI)     info "listener (torrent-direct:7894 -> AI sub): present" ;;
-      DIRECT) warn "torrent listener forces DIRECT - fine only if your VPN subscription allows P2P" ;;
-      '')     bad "torrent listener has no fixed policy - peers in the hosting lists will reach the VPN sub"; _need=1 ;;
-      *)      bad "torrent listener policy is '$_tp' - expected AI (VPN-forbidden P2P traffic must not reach the VPN sub)"; _need=1 ;;
-    esac
+    if grep -qE '^  - name: RESERVE$' "$_c" 2>/dev/null; then
+      info "listener (torrent-direct:7894, rule-based + RESERVE lane): present"
+    else
+      case "$_tp" in
+        AI|DIRECT) info "listener (torrent-direct:7894 -> $_tp): present" ;;
+        '')        bad "torrent listener has no fixed policy and no RESERVE lane - peers can reach the VPN sub"; _need=1 ;;
+        *)         bad "torrent listener policy is '$_tp' - expected AI or DIRECT (or configure the RESERVE lane)"; _need=1 ;;
+      esac
+    fi
   else warn "torrent-direct listener missing (torrent clients cannot be pinned away from the VPN sub)"; fi
-  grep -qE '^  - SRC-PORT,41552,AI$' "$_c" 2>/dev/null \
-    && info "torrent peer guard (SRC-PORT -> AI): present" \
+  grep -qE '^  - SRC-PORT,41552,(RESERVE|AI|DIRECT)$' "$_c" 2>/dev/null \
+    && info "torrent peer guard (SRC-PORT): present" \
     || warn "SRC-PORT,41552 guard missing - incoming peers may still be routed to the VPN sub"
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
@@ -2739,6 +2742,22 @@ step3_check() {
   grep -q 'RULE-SET,ytvpn,VPN' "$_c" 2>/dev/null && info "ytvpn->VPN rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to VPN)"
   # v1.14.4: torrents must never be swallowed by the VPN lists (owner policy 30.10)
   grep -q 'RULE-SET,torrentdirect,DIRECT' "$_c" 2>/dev/null && info "torrentdirect->DIRECT rule: present" || warn "torrentdirect rule missing (tracker domains can still go to VPN)"
+  # v1.17.0: lane invariant. A torrent peer is always a bare IP, so no IP rule may reach the
+  # subscription that forbids P2P. When a RESERVE group exists the IP ruleset must be split out.
+  if grep -qE '^  - name: RESERVE$' "$_c" 2>/dev/null; then
+    if grep -qE '^\s*-\s*IP-CIDR' "$(P /etc/mihomo/ruleset/mtrickle.yaml)" 2>/dev/null; then
+      bad "mtrickle.yaml still contains IP-CIDR rules - P2P peers can reach the restricted VPN sub"
+      _need=1
+    else info "lane invariant: mtrickle.yaml has no IP rules"; fi
+    grep -q 'RULE-SET,mtrickle_bulk,RESERVE' "$_c" 2>/dev/null \
+      && info "lane: IP ruleset -> RESERVE" \
+      || { bad "lane: mtrickle_bulk -> RESERVE rule missing"; _need=1; }
+    grep -q 'RULE-SET,ytvpn,RESERVE' "$_c" 2>/dev/null \
+      && info "lane: youtube edge pins -> RESERVE" \
+      || warn "ytvpn pins still go to VPN (blocked-by-P2P subscription risk if that sub forbids bulk traffic)"
+  else
+    info "lane: RESERVE not configured (single-VPN setup - IP rules stay on the VPN subscription)"
+  fi
   if grep -qE '^  - DST-PORT,(6969|1337|2710|8081|451|5944),' "$_c" 2>/dev/null; then
     bad "legacy blanket P2P DST-PORT rule present - it sits above the ai ruleset and hijacks AI relays on those ports"
     _need=1
@@ -2867,15 +2886,16 @@ write_mihomo_config() {
     printf '%s\n' '    port: 7891'
     printf '%s\n' '    listen: 127.0.0.1'
     printf '%s\n' '    proxy: AI'
-    printf '%s\n' '  # torrent clients point here (SOCKS5/HTTP). Fixed policy = AI subscription:'
-    printf '%s\n' '  # the plain VPN sub forbids P2P (and got blocked for it on 31.10), the AI sub has'
-    printf '%s\n' '  # no such rule, and AI domains through this listener land in AI too - so nothing'
-    printf '%s\n' '  # can leak to DIRECT. Change to DIRECT only if your VPN sub allows P2P.'
+    printf '%s\n' '  # torrent clients point here (SOCKS5/HTTP). Fresh installs have no RESERVE lane,'
+    printf '%s\n' '  # so a fixed policy is REQUIRED: without it the rule chain decides and peers on'
+    printf '%s\n' '  # hosting-provider IPs land on the VPN sub (that is what got it blocked, 31.10).'
+    printf '%s\n' '  # DIRECT keeps P2P off the VPN sub entirely; switch to AI if your VPN sub is the'
+    printf '%s\n' '  # only usable tunnel, or drop the policy once a RESERVE lane takes the IP rules.'
     printf '%s\n' '  - name: torrent-direct'
     printf '%s\n' '    type: mixed'
     printf '%s\n' '    port: 7894'
     printf '%s\n' '    listen: 192.168.0.1'
-    printf '%s\n' '    proxy: AI'
+    printf '%s\n' '    proxy: DIRECT'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
     printf '%s\n' '  sub:'
@@ -20193,6 +20213,11 @@ def controller_headers(path):
 
 SRC = '/etc/magitrickle/state/config.yaml'
 MT  = '/etc/mihomo/ruleset/mtrickle.yaml'
+# v1.17.0: IP-based rules are emitted separately. The restricted VPN subscription must never see
+# P2P, and a torrent peer is always a raw IP - so every IP-CIDR rule is routed to the RESERVE
+# group (a subscription that allows torrents) instead. Invariant enforced by geomask --check:
+# mtrickle.yaml must contain zero IP-CIDR entries.
+MTBULK = '/etc/mihomo/ruleset/mtrickle_bulk.yaml'
 AI  = '/etc/mihomo/ruleset/ai.yaml'
 # v1.13.3: googlevideo edges -> VPN. Generated from the dedicated MagiTrickle group so the
 # user edits ONE place (:8080); no hand-maintained ruleset file. Rule precedes ytdirect->DIRECT.
@@ -20361,7 +20386,13 @@ def write_if_changed(path, payload):
     os.replace(tmp, path)
     return True, len(payload)
 
-c1, n1 = write_if_changed(MT, mt_payload)
+# v1.17.0: split by rule TYPE. Domain rules may stay on the restricted VPN subscription;
+# IP rules cannot, because a torrent peer is always a bare address.
+mt_dom = [p for p in mt_payload if not p.startswith('IP-CIDR')]
+mt_ip  = [p for p in mt_payload if p.startswith('IP-CIDR')]
+
+c1, n1 = write_if_changed(MT, mt_dom)
+c4, n4 = write_if_changed(MTBULK, mt_ip)
 c2, n2 = write_if_changed(AI, ai_payload)
 # v1.14.0: write ytvpn.yaml whenever the GoogleVideo group EXISTS (even with zero rules - that is
 # the legitimate "auto mode, nothing broken right now" state). Only an absent group leaves the file
@@ -20369,11 +20400,12 @@ c2, n2 = write_if_changed(AI, ai_payload)
 c3 = False; n3 = len(ytvpn_payload)
 if yt_group_found or ytvpn_payload:
     c3, n3 = write_if_changed(YTVPN, ytvpn_payload)
-print('mtrickle.yaml: %d rules (%s)' % (n1, 'updated' if c1 else 'up-to-date'))
+print('mtrickle.yaml: %d domain rules (%s)' % (n1, 'updated' if c1 else 'up-to-date'))
+print('mtrickle_bulk.yaml: %d IP rules -> RESERVE (%s)' % (n4, 'updated' if c4 else 'up-to-date'))
 print('ai.yaml:       %d rules (%s, + %d moved from non-AI groups by domain pattern)' % (n2, 'updated' if c2 else 'up-to-date', moved))
 print('ytvpn.yaml:    %d rules (%s)' % (n3, 'updated' if c3 else 'up-to-date'))
 
-if c1 or c2 or c3:
+if c1 or c2 or c3 or c4:
     _r_ok = False
     try:
         req = urllib.request.Request(
@@ -20617,8 +20649,15 @@ ASSET_EOF
   else
     info "ytvpn list: keeping existing /etc/mihomo/ruleset/ytvpn.yaml (sync-managed)"
   fi
-  # v1.14.4: torrent tracker allow-list -> DIRECT. Static asset built from the public tracker lists
-  # (ngosang/trackerslist, XIU2/TrackersListCollection). Existing file is kept: owners edit it.
+  # v1.17.0: lane split - IP rules must never reach the restricted VPN subscription.
+  # mtrickle_bulk.yaml is sync-generated; seed it empty so mihomo -t passes before the first sync.
+  if [ ! -s "$(P /etc/mihomo/ruleset/mtrickle_bulk.yaml)" ]; then
+    printf '%s\n%s\n' '# AUTO-GENERATED by /root/sync_mtrickle_mihomo.sh from magitrickle config - DO NOT EDIT' 'payload: []' > "$(P /etc/mihomo/ruleset/mtrickle_bulk.yaml)"
+    info "mtrickle_bulk list: created empty (sync will fill it)"
+  else
+    info "mtrickle_bulk list: keeping existing /etc/mihomo/ruleset/mtrickle_bulk.yaml"
+  fi
+  # v1.15.0: torrent tracker allow-list -> DIRECT (static asset, generated by geomask-torrent.sh)
   if [ ! -s "$(P /etc/mihomo/ruleset/torrentdirect.yaml)" ]; then
     save_stream /etc/mihomo/ruleset/torrentdirect.yaml 644 <<'ASSET_EOF'
 # AUTO-GENERATED from public tracker lists (ngosang/trackerslist, XIU2/TrackersListCollection)
@@ -20857,12 +20896,25 @@ def build_ruleset():
     return len(hosts), len(ips), True
 
 # ---------- listener toggle ----------
-# Fixed policy = AI subscription (owner, 31.10): the plain VPN sub forbids P2P and got blocked
-# by it; the AI sub has no such rule. Without a fixed policy the rule chain decides, and peers
-# whose IP sits in the hosting lists (OVH/Hetzner/DO...) end up in the VPN sub - that was the leak.
-# AI domains through this listener land in AI too, so nothing can leak to DIRECT.
+# The listener is the torrent client's egress. Policy rules (v1.17.0):
+#   RESERVE lane configured -> no fixed policy: the rule chain decides, so AI domains sent here
+#     still match RULE-SET,ai and go to AI, while every IP rule (peers on hosting providers)
+#     goes to RESERVE, never to the P2P-restricted VPN sub.
+#   no RESERVE lane         -> fixed "proxy: DIRECT", because otherwise peers whose IP sits in
+#     the hosting lists end up on the VPN sub - exactly what got the subscription blocked (31.10).
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
-                '    listen: 192.168.0.1','    proxy: AI']
+                '    listen: 192.168.0.1']
+
+def has_reserve_lane():
+    """A RESERVE group means every IP rule is routed away from the P2P-restricted VPN sub,
+    so the listener can be left to the rule chain. Without it a fixed policy is mandatory."""
+    return re.search(r'(?m)^  - name: RESERVE\s*$', read(CFG)) is not None
+
+def listener_block():
+    blk = list(LISTENER_BLOCK)
+    if not has_reserve_lane():
+        blk.append('    proxy: DIRECT')   # keeps P2P off the VPN subscription by force
+    return blk
 
 def listener_policy():
     t=read(CFG)
@@ -20878,7 +20930,7 @@ def set_listener(on):
         if listener_present(): return False
         idx=next((i for i,l in enumerate(lines) if re.match(r'^\s+proxy: AI\s*$', l)), None)
         if idx is None: log('no ai-devices listener to anchor to'); return False
-        lines.insert(idx+1, ''.join(x+'\n' for x in LISTENER_BLOCK))
+        lines.insert(idx+1, ''.join(x+'\n' for x in listener_block()))
     else:
         if not listener_present(): return False
         out=[]; i=0
@@ -21053,7 +21105,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.16.2"
+GUARD_VERSION="1.17.0"
 
 log() { logger -t geomask-guard "$*"; }
 

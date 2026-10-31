@@ -115,12 +115,25 @@ def build_ruleset():
     return len(hosts), len(ips), True
 
 # ---------- listener toggle ----------
-# Fixed policy = AI subscription (owner, 31.10): the plain VPN sub forbids P2P and got blocked
-# by it; the AI sub has no such rule. Without a fixed policy the rule chain decides, and peers
-# whose IP sits in the hosting lists (OVH/Hetzner/DO...) end up in the VPN sub - that was the leak.
-# AI domains through this listener land in AI too, so nothing can leak to DIRECT.
+# The listener is the torrent client's egress. Policy rules (v1.17.0):
+#   RESERVE lane configured -> no fixed policy: the rule chain decides, so AI domains sent here
+#     still match RULE-SET,ai and go to AI, while every IP rule (peers on hosting providers)
+#     goes to RESERVE, never to the P2P-restricted VPN sub.
+#   no RESERVE lane         -> fixed "proxy: DIRECT", because otherwise peers whose IP sits in
+#     the hosting lists end up on the VPN sub - exactly what got the subscription blocked (31.10).
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
-                '    listen: 192.168.0.1','    proxy: AI']
+                '    listen: 192.168.0.1']
+
+def has_reserve_lane():
+    """A RESERVE group means every IP rule is routed away from the P2P-restricted VPN sub,
+    so the listener can be left to the rule chain. Without it a fixed policy is mandatory."""
+    return re.search(r'(?m)^  - name: RESERVE\s*$', read(CFG)) is not None
+
+def listener_block():
+    blk = list(LISTENER_BLOCK)
+    if not has_reserve_lane():
+        blk.append('    proxy: DIRECT')   # keeps P2P off the VPN subscription by force
+    return blk
 
 def listener_policy():
     t=read(CFG)
@@ -136,7 +149,7 @@ def set_listener(on):
         if listener_present(): return False
         idx=next((i for i,l in enumerate(lines) if re.match(r'^\s+proxy: AI\s*$', l)), None)
         if idx is None: log('no ai-devices listener to anchor to'); return False
-        lines.insert(idx+1, ''.join(x+'\n' for x in LISTENER_BLOCK))
+        lines.insert(idx+1, ''.join(x+'\n' for x in listener_block()))
     else:
         if not listener_present(): return False
         out=[]; i=0

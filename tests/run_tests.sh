@@ -90,6 +90,8 @@ printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-torrent.sh"; chmod +x "$R/usr
 mkdir -p "$R/etc/geomask/torrent"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytvpn.yaml"
 printf 'payload:\n  - DOMAIN-SUFFIX,tracker.example.org\n' > "$R/etc/mihomo/ruleset/torrentdirect.yaml"
+# v1.17.0: the IP half of the mtrickle ruleset - must contain NO domain rules and vice versa
+printf 'payload:\n  - IP-CIDR,203.0.113.0/24,no-resolve\n' > "$R/etc/mihomo/ruleset/mtrickle_bulk.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/mtrickle.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ai.yaml"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytdirect.yaml"
@@ -105,10 +107,13 @@ proxy-providers:
 proxy-groups:
   - name: VPN
   - name: AI
+  - name: RESERVE
 rule-providers:
   ai:
     type: file
   mtrickle:
+    type: file
+  mtrickle_bulk:
     type: file
   ytdirect:
     type: file
@@ -121,6 +126,8 @@ rules:
   - RULE-SET,ytdirect,DIRECT
   - RULE-SET,ai,AI
   - RULE-SET,torrentdirect,DIRECT
+  - SRC-PORT,41552,RESERVE
+  - RULE-SET,mtrickle_bulk,RESERVE
   - RULE-SET,mtrickle,VPN
   - MATCH,GLOBAL
 listeners:
@@ -129,6 +136,10 @@ listeners:
     port: 7891
     listen: 127.0.0.1
     proxy: AI
+  - name: torrent-direct
+    type: mixed
+    port: 7894
+    listen: 192.168.0.1
 sniffer:
   enable: true
   parse-pure-ip: true
@@ -615,20 +626,35 @@ for _p in 'callTorGet' 'callTorRefresh' 'callTorListener' 'callTorExtra' 'Тор
 done
 # the panel must read the 13th promise slot
 grep -qF 'all[12]' "$HERE/../assets/geo-sync-page.js" && { echo "PASS: S24 panel consumes the new RPC slot"; pass=$((pass+1)); } || { echo "FAIL: S24 new RPC result not consumed"; failn=$((failn+1)); }
-# v1.16.0: the listener must carry a FIXED policy = AI. Without it the rule chain decides and
-# peers whose IP sits in the hosting CIDRs reach the VPN sub (that blocked the subscription).
-if grep -qF "'    proxy: AI'" "$HERE/../assets/geomask-torrent.sh"; then
-  echo "PASS: S24 admin script recreates the listener with proxy: AI"; pass=$((pass+1))
-else echo "FAIL: S24 admin script does not set the AI policy"; failn=$((failn+1)); fi
-if awk "/name: torrent-direct/{f=1;next} f&&/^ *printf .*'  - name:/{exit} f" "$HERE/../geomask.sh.in" | grep -qF "proxy: AI"; then
-  echo "PASS: S24 template listener block pins AI"; pass=$((pass+1))
-else echo "FAIL: S24 template listener block lacks the AI policy"; failn=$((failn+1)); fi
-grep -qF 'torrent listener has no fixed policy' "$HERE/../geomask.sh.in" \
-  && { echo "PASS: S24 --check rejects a policy-less listener"; pass=$((pass+1)); } \
-  || { echo "FAIL: S24 --check does not reject a policy-less listener"; failn=$((failn+1)); }
-grep -qF 'SRC-PORT,41552,AI' "$HERE/../geomask.sh.in" \
-  && { echo "PASS: S24 peer-reply guard in the template"; pass=$((pass+1)); } \
-  || { echo "FAIL: S24 peer-reply guard missing"; failn=$((failn+1)); }
+# v1.17.0: lanes. IP rules must never reach the P2P-restricted VPN subscription, because a
+# torrent peer is always a bare address. The sync splits them out; --check enforces the invariant.
+grep -qF 'MTBULK' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && { echo "PASS: S24 sync emits a separate IP ruleset"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 sync does not split IP rules"; failn=$((failn+1)); }
+grep -qF "mt_dom = [p for p in mt_payload if not p.startswith('IP-CIDR')]" "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && { echo "PASS: S24 split is by rule TYPE (not by group name)"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 split is not type-based"; failn=$((failn+1)); }
+grep -qF 'lane invariant: mtrickle.yaml has no IP rules' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 --check verifies the lane invariant"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 --check does not verify the invariant"; failn=$((failn+1)); }
+grep -qF 'mtrickle_bulk -> RESERVE rule missing' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 --check requires the RESERVE routing rule"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 --check does not require the RESERVE rule"; failn=$((failn+1)); }
+# the listener is rule-based only BECAUSE the lanes exist; without a RESERVE lane a fixed
+# policy is still demanded - the check must keep both branches
+grep -qF 'no RESERVE lane - peers can reach the VPN sub' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 policy-less listener is still rejected without lanes"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 lost the no-lanes safety branch"; failn=$((failn+1)); }
+if grep -qF 'def listener_block' "$HERE/../assets/geomask-torrent.sh" \
+   && grep -qF "'    proxy: DIRECT'" "$HERE/../assets/geomask-torrent.sh"; then
+  echo "PASS: S24 admin script: rule-based with lanes, DIRECT fallback without"; pass=$((pass+1))
+else echo "FAIL: S24 admin script has no lane-aware policy logic"; failn=$((failn+1)); fi
+grep -qF "'    proxy: DIRECT'" "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 fresh-install template pins a safe policy"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 template ships a policy-less listener without lanes"; failn=$((failn+1)); }
+grep -qE 'SRC-PORT,41552,(\(RESERVE\|AI\|DIRECT\)|RESERVE)' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 peer-reply guard accepts the lane targets"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 peer-reply guard check is wrong"; failn=$((failn+1)); }
 # a self-update must not wipe accumulated YouTube pins (observed 31.10: --reinstall reset 10 pins)
 grep -qF 'if [ -z "$1" ] && [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ]' "$HERE/../geomask.sh.in" \
   && { echo "PASS: S24 pins are released only on a real uninstall"; pass=$((pass+1)); } \

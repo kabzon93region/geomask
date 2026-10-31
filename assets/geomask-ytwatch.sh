@@ -17,7 +17,7 @@ exec python3 - "$@" <<'PYEOF'
 import calendar, json, os, re, socket, subprocess, sys, time, urllib.request, http.client
 
 CONF='/etc/geomask-ytwatch.conf'
-STATE='/tmp/geomask-ytwatch.state'
+STATE='/etc/geomask/ytwatch.state'
 JOURNAL='/root/geo-sync.log'
 SOCKPATH='/var/run/magitrickle.sock'
 BLANKET='googlevideo.com'
@@ -83,6 +83,12 @@ def rule_state(gid):
     edges={str(x.get('rule','')).lower(): x.get('id') for x in rs
            if str(x.get('rule','')).endswith('googlevideo.com') and x not in blanket}
     return blanket, edges
+
+def auto_rule_ids(gid):
+    """Rules the watcher itself created are tagged name='ytwatch' inside MagiTrickle.
+    That tag is the durable source of truth for what may be released - the state file lives
+    in /tmp and is lost on reboot or reinstall."""
+    return [x.get('id') for x in group_rules(gid) if str(x.get('name','')).strip()=='ytwatch']
 
 # ---------- failure scan from mihomo's own log ----------
 FAIL_RE=re.compile(r'msg="\[(?:TCP|UDP)\] dial \S+ \(match [^)]*\) \S+ --> ([a-z0-9.\-]+\.googlevideo\.com):\d+ error: ')
@@ -169,6 +175,7 @@ def load_state():
 def save_state(st):
     st['last']=time.strftime('%F %T')
     try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
         with open(STATE+'.tmp','w',encoding='utf-8') as f: json.dump(st,f)
         os.replace(STATE+'.tmp', STATE)
     except Exception as e:
@@ -233,6 +240,9 @@ def do_reset():
     st=load_state()
     blanket, edges = rule_state(gid)
     removed=0
+    # release by the MagiTrickle tag (authoritative) and, for safety, by the recorded list too
+    for rid in auto_rule_ids(gid):
+        api('DELETE','/api/v1/groups/%s/rules/%s?save=true'%(gid,rid)); removed+=1
     for host in st.get('pins',[]):
         rid=edges.get(host.lower())
         if rid:

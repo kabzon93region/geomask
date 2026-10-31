@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.16.0"
+GM_VERSION="1.16.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -1424,8 +1424,8 @@ geomask_uninstall() {
   if crontab -l 2>/dev/null | grep -q 'geomask-ytwatch'; then
     crontab -l 2>/dev/null | grep -v 'geomask-ytwatch' | crontab - 2>/dev/null || true
   fi
-  rm -f "$(P /usr/bin/geomask-ytwatch.sh)" "$(P /tmp/geomask-ytwatch.state)"
-  info "removed: ytwatch (conf /etc/geomask-ytwatch.conf left for reference)"
+  rm -f "$(P /usr/bin/geomask-ytwatch.sh)"
+  info "removed: ytwatch (conf /etc/geomask-ytwatch.conf and /etc/geomask/ytwatch.state kept for reference)"
   # v1.15.0: torrent admin removal (ruleset + listener left in place: they belong to mihomo config)
   rm -f "$(P /usr/bin/geomask-torrent.sh)"
   info "removed: torrent admin (lists in /etc/geomask/torrent and the ruleset kept for reference)"

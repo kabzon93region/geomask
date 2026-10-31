@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.16.0"
+GM_VERSION="1.16.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.16.0"
+BACKEND_VERSION="1.16.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1624,7 +1624,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.16.0';
+var PANEL_VERSION = '1.16.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -21036,7 +21036,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.16.0"
+GUARD_VERSION="1.16.1"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -21518,7 +21518,7 @@ exec python3 - "$@" <<'PYEOF'
 import calendar, json, os, re, socket, subprocess, sys, time, urllib.request, http.client
 
 CONF='/etc/geomask-ytwatch.conf'
-STATE='/tmp/geomask-ytwatch.state'
+STATE='/etc/geomask/ytwatch.state'
 JOURNAL='/root/geo-sync.log'
 SOCKPATH='/var/run/magitrickle.sock'
 BLANKET='googlevideo.com'
@@ -21584,6 +21584,12 @@ def rule_state(gid):
     edges={str(x.get('rule','')).lower(): x.get('id') for x in rs
            if str(x.get('rule','')).endswith('googlevideo.com') and x not in blanket}
     return blanket, edges
+
+def auto_rule_ids(gid):
+    """Rules the watcher itself created are tagged name='ytwatch' inside MagiTrickle.
+    That tag is the durable source of truth for what may be released - the state file lives
+    in /tmp and is lost on reboot or reinstall."""
+    return [x.get('id') for x in group_rules(gid) if str(x.get('name','')).strip()=='ytwatch']
 
 # ---------- failure scan from mihomo's own log ----------
 FAIL_RE=re.compile(r'msg="\[(?:TCP|UDP)\] dial \S+ \(match [^)]*\) \S+ --> ([a-z0-9.\-]+\.googlevideo\.com):\d+ error: ')
@@ -21670,6 +21676,7 @@ def load_state():
 def save_state(st):
     st['last']=time.strftime('%F %T')
     try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
         with open(STATE+'.tmp','w',encoding='utf-8') as f: json.dump(st,f)
         os.replace(STATE+'.tmp', STATE)
     except Exception as e:
@@ -21734,6 +21741,9 @@ def do_reset():
     st=load_state()
     blanket, edges = rule_state(gid)
     removed=0
+    # release by the MagiTrickle tag (authoritative) and, for safety, by the recorded list too
+    for rid in auto_rule_ids(gid):
+        api('DELETE','/api/v1/groups/%s/rules/%s?save=true'%(gid,rid)); removed+=1
     for host in st.get('pins',[]):
         rid=edges.get(host.lower())
         if rid:
@@ -22273,8 +22283,8 @@ geomask_uninstall() {
   if crontab -l 2>/dev/null | grep -q 'geomask-ytwatch'; then
     crontab -l 2>/dev/null | grep -v 'geomask-ytwatch' | crontab - 2>/dev/null || true
   fi
-  rm -f "$(P /usr/bin/geomask-ytwatch.sh)" "$(P /tmp/geomask-ytwatch.state)"
-  info "removed: ytwatch (conf /etc/geomask-ytwatch.conf left for reference)"
+  rm -f "$(P /usr/bin/geomask-ytwatch.sh)"
+  info "removed: ytwatch (conf /etc/geomask-ytwatch.conf and /etc/geomask/ytwatch.state kept for reference)"
   # v1.15.0: torrent admin removal (ruleset + listener left in place: they belong to mihomo config)
   rm -f "$(P /usr/bin/geomask-torrent.sh)"
   info "removed: torrent admin (lists in /etc/geomask/torrent and the ruleset kept for reference)"

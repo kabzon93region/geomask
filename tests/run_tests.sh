@@ -519,6 +519,17 @@ else echo "FAIL: S20 stall thresholds missing from the conf"; failn=$((failn+1))
 grep -qF 'Зависшие рёбра' "$HERE/../assets/geo-sync-page.js" \
   && { echo "PASS: S20 panel shows stalled edges"; pass=$((pass+1)); } \
   || { echo "FAIL: S20 panel does not show stalled edges"; failn=$((failn+1)); }
+# v1.16.1: state must survive a reboot/reinstall, and the MagiTrickle tag is the source of truth
+if grep -qF "STATE='/etc/geomask/ytwatch.state'" "$HERE/../assets/geomask-ytwatch.sh"; then
+  echo "PASS: S20 ytwatch state is persistent (not /tmp)"; pass=$((pass+1))
+else echo "FAIL: S20 ytwatch state still lives in /tmp"; failn=$((failn+1)); fi
+grep -qF 'def auto_rule_ids' "$HERE/../assets/geomask-ytwatch.sh" \
+  && { echo "PASS: S20 reset uses the ytwatch rule tag"; pass=$((pass+1)); } \
+  || { echo "FAIL: S20 reset has no tag-based fallback"; failn=$((failn+1)); }
+grep -qF "rm -f \"\$(P /usr/bin/geomask-ytwatch.sh)\"" "$HERE/../geomask.sh.in" \
+  && ! grep -qF 'tmp/geomask-ytwatch.state' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S20 uninstall does not delete the state"; pass=$((pass+1)); } \
+  || { echo "FAIL: S20 uninstall still deletes the state"; failn=$((failn+1)); }
 
 # ---------- scenario 21: update card must not show stale installed versions (v1.14.2) ----------
 echo "=== S21: live installed-version block in update check ==="

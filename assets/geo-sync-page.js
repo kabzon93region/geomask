@@ -25,6 +25,7 @@ var callSubAdd   = rpc.declare({ object: 'geo-sync', method: 'sub_add',   params
 var callSubDel   = rpc.declare({ object: 'geo-sync', method: 'sub_del',   params: { id: null }, expect: {} });
 var callAiSubUse   = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use',   params: { id: null }, expect: {} });
 var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  params: { id: null }, expect: {} });
+var callVpnnpSubUse = rpc.declare({ object: 'geo-sync', method: 'vpnnp_sub_use', params: { id: null }, expect: {} });
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
@@ -260,7 +261,7 @@ return view.extend({
 		showTab(panels[curTab] ? curTab : 'obzor');
 
 		/* ===================== HERO: dual subscription ===================== */
-		var aiCc = st.ai_cc || '', vpnCc = st.vpn_cc || '';
+		var aiCc = st.ai_cc || '', vpnCc = st.vpn_nop2p_cc || '', laneCc = st.vpn_cc || '';
 		var aiSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
 			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc), cleanName(st.ai_node) || '—' ]),
@@ -271,16 +272,24 @@ return view.extend({
 				st.aidns === 2 ? 'ПРОБЛЕМА — не через туннель (проверьте шаг aidns)' : 'не настроено (утечка DNS!)'))
 		]);
 		var vpnSub = E('div', { 'class': 'gs-sub-card' }, [
-			E('div', { 'class': 'gs-ent' }, 'Общая VPN · всё магитрикле (не-ИИ)'),
-			E('div', { 'class': 'gs-node' }, [ ccBadge(vpnCc), cleanName(st.vpn_node) || '—' ]),
-			E('div', { 'class': 'gs-meta' }, 'Подписка vlessi · выход ' + ((CCNAME[vpnCc] || vpnCc) ? (CCNAME[vpnCc] || vpnCc) : '—'))
+			E('div', { 'class': 'gs-ent' }, 'VPN-noP2P · доменные списки MagiTrickle'),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(vpnCc), cleanName(st.vpn_nop2p_node) || '—' ]),
+			E('div', { 'class': 'gs-meta' }, 'Слот VPN-noP2P · выход ' + ((CCNAME[vpnCc] || vpnCc) ? (CCNAME[vpnCc] || vpnCc) : '—') +
+				' · сюда нельзя торренты'),
+			E('div', { 'class': 'gs-meta' }, 'IP-правил на этом пути: быть не должно (проверка geomask --check)')
+		]);
+		var laneSub = E('div', { 'class': 'gs-sub-card' }, [
+			E('div', { 'class': 'gs-ent' }, 'VPN · полоса для P2P и IP-списков'),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(laneCc), cleanName(st.vpn_node) || 'не настроена' ]),
+			E('div', { 'class': 'gs-meta' }, 'Слот VPN · выход ' + ((CCNAME[laneCc] || laneCc) ? (CCNAME[laneCc] || laneCc) : '—')),
+			E('div', { 'class': 'gs-meta' }, 'mtrickle_bulk (IP), пины googlevideo, ответы входящим пирам')
 		]);
 
 		var counters = E('div', { 'class': 'gs-counters' }, [
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.ai_rules != null ? st.ai_rules : '—')),
 				E('div', { 'class': 'gs-cap' }, 'правил ИИ-пути (ai.yaml → AI)') ]),
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.mt_rules != null ? st.mt_rules : '—')),
-				E('div', { 'class': 'gs-cap' }, 'правил общего пути (mtrickle.yaml → VPN)') ]),
+				E('div', { 'class': 'gs-cap' }, 'правил общего пути (mtrickle.yaml → VPN-noP2P)') ]),
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.n_bypass != null ? st.n_bypass : (st.devices || []).length)),
 				E('div', { 'class': 'gs-cap' }, 'мимо VPN (реальный IP)') ])
 		]);
@@ -288,7 +297,7 @@ return view.extend({
 		var hero = E('div', { 'class': 'gs-hero' }, [
 			E('h2', {}, 'Гео-маскировка и маршрутизация AI'),
 			E('div', { 'class': 'gs-sub' }, 'Google и ИИ-сервисы идут через AI-подписку (какую страну видит Google — показывает блок выше), всё остальное — через общую VPN.'),
-			E('div', { 'class': 'gs-duo' }, [ aiSub, vpnSub ]),
+			E('div', { 'class': 'gs-duo' }, [ aiSub, vpnSub, laneSub ]),
 			counters
 		]);
 		panels.obzor.appendChild(hero);
@@ -300,12 +309,23 @@ return view.extend({
 		}
 		function subRow(s) {
 			var isVpn = !!(st.vpn_sub && st.vpn_sub === s.id);
+			var isVpnNP = !!(st.vpn_nop2p_sub && st.vpn_nop2p_sub === s.id);
 			var isAi = !!(st.ai_sub && st.ai_sub === s.id);
-			var dest = '—';
-			if (isVpn && isAi) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN + AI');
-			else if (isVpn) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN');
-			else if (isAi) dest = E('span', { 'class': 'gs-badge gs-ok' }, 'AI');
-			var bV = { 'class': 'gs-btn gs-btn-use' + (isVpn ? ' gs-btn-vpn-on' : ''), 'title': isVpn ? 'Эта подписка используется для общего VPN' : 'Переключить общий VPN на эту подписку', 'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } };
+			var dest = [];
+			if (isVpn)   dest.push(E('span', { 'class': 'gs-badge gs-on' }, 'VPN'));
+			if (isVpnNP) dest.push(E('span', { 'class': 'gs-badge gs-warn' }, 'VPN-noP2P'));
+			if (isAi)    dest.push(E('span', { 'class': 'gs-badge gs-ok' }, 'AI'));
+			if (!dest.length) dest = ['—'];
+			var bV = { 'class': 'gs-btn gs-btn-use' + (isVpn ? ' gs-btn-vpn-on' : ''), 'title': isVpn ? 'Эта подписка держит слот VPN (P2P разрешён)' : 'Отдать слот VPN (полоса для торрентов и IP-списков) этой подписке' };
+			bV.click = function() {
+				if (!confirm('Отдать слот VPN этой подписке?\n\nНа неё перейдут правила по IP (mtrickle_bulk), пины зависших YouTube-рёбер и ответы входящим пирам. Полоса создаётся автоматически, если её ещё нет.')) return;
+				view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN');
+			};
+			var bN = { 'class': 'gs-btn gs-btn-use' + (isVpnNP ? ' gs-btn-vpn-on' : ''), 'title': isVpnNP ? 'Эта подписка держит слот VPN-noP2P (провайдер запрещает торренты)' : 'Отдать слот VPN-noP2P (общий VPN по доменным спискам) этой подписке' };
+			bN.click = function() {
+				if (!confirm('Отдать слот VPN-noP2P этой подписке?\n\nНа неё останутся только доменные правила (mtrickle) и STUN. Убедитесь, что провайдер этой подписки разрешает трафик из ваших списков.')) return;
+				view.act(callVpnnpSubUse, { id: s.id }, 'Подписка применена для VPN-noP2P');
+			};
 			var bA = { 'class': 'gs-btn gs-btn-use' + (isAi ? ' gs-btn-ai-on' : ''), 'title': isAi ? 'Эта подписка используется для AI-маршрутов' : 'Переключить AI-маршруты на эту подписку', 'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } };
 			var bD = { 'class': 'gs-btn gs-btn-warn', 'title': 'Убрать из реестра', 'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } };
 			return E('tr', {}, [
@@ -313,6 +333,7 @@ return view.extend({
 				E('td', { 'class': 'gs-subs-url' }, maskUrl(s.url)),
 				E('td', {}, dest),
 				E('td', { 'class': 'gs-subs-actions' }, [
+					E('button', bN, '→ VPN-noP2P'),
 					E('button', bV, '→ VPN'),
 					E('button', bA, '→ AI'),
 					E('button', bD, 'Удалить')
@@ -357,7 +378,11 @@ return view.extend({
 		var subsCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Подписки'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
-				'Реестр подписок. В колонке «Назначение» показано, чем подписка занята СЕЙЧАС; кнопки «→ VPN»/«→ AI» переключают соответствующий маршрут на эту подписку (активная кнопка неактивна). Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
+				'Реестр подписок. В колонке «Назначение» показано, чем подписка занята СЕЙЧАС. Три слота: ' +
+				'«VPN-noP2P» — общий VPN по доменным спискам (сюда нельзя торренты: провайдер это запрещает), ' +
+				'«VPN» — полоса для всего, что выглядит как P2P (правила по IP, пины зависших YouTube-рёбер, ' +
+				'ответы входящим пирам), «AI» — Google и AI-сервисы. Кнопка активного слота подсвечена. ' +
+				'Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
 			E('table', { 'class': 'gs-table gs-subs' },
 				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
 					.concat(subs.map(subRow))),

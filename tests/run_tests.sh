@@ -87,6 +87,10 @@ printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-ytwatch.sh"; chmod +x "$R/usr
 echo 'mode=auto' > "$R/etc/geomask-ytwatch.conf"
 # torrent admin (v1.15.0): script + state dir fixtures
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-torrent.sh"; chmod +x "$R/usr/bin/geomask-torrent.sh"
+# v1.18.0: VPN lane audit (step5_check requires script + conf)
+mkdir -p "$R/etc/geomask"
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-vpnwatch.sh"; chmod +x "$R/usr/bin/geomask-vpnwatch.sh"
+printf 'group=VPN-noP2P\nlogfile=/root/geomask-vpn-audit.log\n' > "$R/etc/geomask/vpnwatch.conf"
 mkdir -p "$R/etc/geomask/torrent"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytvpn.yaml"
 printf 'payload:\n  - DOMAIN-SUFFIX,tracker.example.org\n' > "$R/etc/mihomo/ruleset/torrentdirect.yaml"
@@ -105,9 +109,9 @@ proxy-providers:
     type: http
     url: "https://example.com/b"
 proxy-groups:
+  - name: VPN-noP2P
   - name: VPN
   - name: AI
-  - name: RESERVE
 rule-providers:
   ai:
     type: file
@@ -123,12 +127,13 @@ rules:
   - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT
   - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT
   - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT
+  - RULE-SET,ytvpn,VPN
   - RULE-SET,ytdirect,DIRECT
   - RULE-SET,ai,AI
   - RULE-SET,torrentdirect,DIRECT
-  - SRC-PORT,41552,RESERVE
-  - RULE-SET,mtrickle_bulk,RESERVE
-  - RULE-SET,mtrickle,VPN
+  - SRC-PORT,41552,VPN
+  - RULE-SET,mtrickle_bulk,VPN
+  - RULE-SET,mtrickle,VPN-noP2P
   - MATCH,GLOBAL
 listeners:
   - name: ai-devices
@@ -160,6 +165,7 @@ echo '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard' >> 
 echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' >> "$HERE/state/crontab"
 echo '*/5 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch' >> "$HERE/state/crontab"
 echo '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset' >> "$HERE/state/crontab"
+echo '* * * * * /usr/bin/geomask-vpnwatch.sh --tick >/dev/null 2>&1 # geomask-vpnwatch' >> "$HERE/state/crontab"
 echo '32666: from all iif br-lan ipproto icmp lookup main' > "$HERE/state/ip_rules"
 # pgrep stub state: syncd watchdog considered running in healthy/apply scenarios
 printf 'geomask-syncd.sh\n' > "$HERE/state/pgrep"
@@ -464,7 +470,7 @@ if grep -qE 'googlevideo\.com$' "$HERE/../assets/ytdirect.yaml"; then
   echo "FAIL: S18 ytdirect still contains googlevideo suffix"; failn=$((failn+1))
 else echo "PASS: S18 ytdirect free of googlevideo"; pass=$((pass+1)); fi
 # built script wires provider + rule + check
-for _p in 'path: /etc/mihomo/ruleset/ytvpn.yaml' 'RULE-SET,ytvpn,VPN' 'ytvpn->VPN rule: present'; do
+for _p in 'path: /etc/mihomo/ruleset/ytvpn.yaml' 'RULE-SET,ytvpn,VPN' 'ytvpn rule: present'; do
   if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S18 has: $_p"; pass=$((pass+1))
   else echo "FAIL: S18 missing: $_p"; failn=$((failn+1)); fi
 done
@@ -637,14 +643,17 @@ grep -qF "mt_dom = [p for p in mt_payload if not p.startswith('IP-CIDR')]" "$HER
 grep -qF 'lane invariant: mtrickle.yaml has no IP rules' "$HERE/../geomask.sh.in" \
   && { echo "PASS: S24 --check verifies the lane invariant"; pass=$((pass+1)); } \
   || { echo "FAIL: S24 --check does not verify the invariant"; failn=$((failn+1)); }
-grep -qF 'mtrickle_bulk -> RESERVE rule missing' "$HERE/../geomask.sh.in" \
-  && { echo "PASS: S24 --check requires the RESERVE routing rule"; pass=$((pass+1)); } \
-  || { echo "FAIL: S24 --check does not require the RESERVE rule"; failn=$((failn+1)); }
-# the listener is rule-based only BECAUSE the lanes exist; without a RESERVE lane a fixed
+grep -qF 'lane: mtrickle_bulk -> VPN rule missing' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 --check requires the lane routing rule"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 --check does not require the lane rule"; failn=$((failn+1)); }
+# the listener is rule-based only BECAUSE the lane exists; without a lane a fixed
 # policy is still demanded - the check must keep both branches
-grep -qF 'no RESERVE lane - peers can reach the VPN sub' "$HERE/../geomask.sh.in" \
-  && { echo "PASS: S24 policy-less listener is still rejected without lanes"; pass=$((pass+1)); } \
+grep -qF 'no fixed policy and no VPN lane' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 policy-less listener is still rejected without a lane"; pass=$((pass+1)); } \
   || { echo "FAIL: S24 lost the no-lanes safety branch"; failn=$((failn+1)); }
+grep -qE 'SRC-PORT,41552,\(VPN\|AI\|DIRECT\)' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S24 peer-reply guard accepts the lane targets"; pass=$((pass+1)); } \
+  || { echo "FAIL: S24 peer-reply guard check is wrong"; failn=$((failn+1)); }
 if grep -qF 'def listener_block' "$HERE/../assets/geomask-torrent.sh" \
    && grep -qF "'    proxy: DIRECT'" "$HERE/../assets/geomask-torrent.sh"; then
   echo "PASS: S24 admin script: rule-based with lanes, DIRECT fallback without"; pass=$((pass+1))
@@ -652,9 +661,6 @@ else echo "FAIL: S24 admin script has no lane-aware policy logic"; failn=$((fail
 grep -qF "'    proxy: DIRECT'" "$HERE/../geomask.sh.in" \
   && { echo "PASS: S24 fresh-install template pins a safe policy"; pass=$((pass+1)); } \
   || { echo "FAIL: S24 template ships a policy-less listener without lanes"; failn=$((failn+1)); }
-grep -qE 'SRC-PORT,41552,(\(RESERVE\|AI\|DIRECT\)|RESERVE)' "$HERE/../geomask.sh.in" \
-  && { echo "PASS: S24 peer-reply guard accepts the lane targets"; pass=$((pass+1)); } \
-  || { echo "FAIL: S24 peer-reply guard check is wrong"; failn=$((failn+1)); }
 # a self-update must not wipe accumulated YouTube pins (observed 31.10: --reinstall reset 10 pins)
 grep -qF 'if [ -z "$1" ] && [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ]' "$HERE/../geomask.sh.in" \
   && { echo "PASS: S24 pins are released only on a real uninstall"; pass=$((pass+1)); } \
@@ -667,6 +673,58 @@ grep -qF "callUpdCheck({ force: 'force' })" "$HERE/../assets/geo-sync-page.js" \
 grep -qF 'Проверить сейчас' "$HERE/../assets/geo-sync-page.js" \
   && { echo "PASS: S21 force-check control is labelled"; pass=$((pass+1)); } \
   || { echo "FAIL: S21 force-check control missing"; failn=$((failn+1)); }
+
+# ==================== S25: route slots + VPN lane audit (v1.18.0) ====================
+echo ""
+echo "=== S25: slots VPN-noP2P / VPN / AI + lane audit ==="
+# the restricted slot must be the one geomask ships and checks
+grep -qF "'  - name: VPN-noP2P'" "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S25 template creates the VPN-noP2P slot"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 template has no VPN-noP2P slot"; failn=$((failn+1)); }
+grep -qF 'name: VPN$' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S25 --check distinguishes the optional VPN lane"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 --check cannot tell a lane apart from no lane"; failn=$((failn+1)); }
+# the new ubus method must exist in backend, wrapper AND acl (v1.13.0 trap)
+for _m in vpnnp_sub_use; do
+  grep -qF "$_m)" "$HERE/../assets/geo-backend.sh" \
+    && grep -qF "\"$_m\"" "$HERE/../assets/geo-sync" \
+    && grep -qF "\"$_m\"" "$HERE/../assets/acl-geo-sync.json" \
+    && { echo "PASS: S25 $_m wired in backend+wrapper+acl"; pass=$((pass+1)); } \
+    || { echo "FAIL: S25 $_m missing in one of backend/wrapper/acl"; failn=$((failn+1)); }
+done
+grep -qF 'callVpnnpSubUse' "$HERE/../assets/geo-sync-page.js" \
+  && { echo "PASS: S25 panel exposes the third slot"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 panel has no VPN-noP2P button"; failn=$((failn+1)); }
+# status must report both tunnels, or the panel cards would lie
+grep -qF '"vpn_nop2p_node"' "$HERE/../assets/geo-backend.sh" \
+  && grep -qF '"vpn_nop2p_sub"' "$HERE/../assets/geo-backend.sh" \
+  && { echo "PASS: S25 status reports both VPN slots"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 status misses a slot"; failn=$((failn+1)); }
+# lane creation must be reversible: backup + validate + rollback
+grep -qF 'bak_lane' "$HERE/../assets/geo-backend.sh" \
+  && { echo "PASS: S25 lane edit keeps a rollback copy"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 lane edit has no rollback"; failn=$((failn+1)); }
+for _p in 'geomask-vpnwatch.sh' 'geomask-vpnwatch.conf'; do
+  grep -qF "\"$_p\"" "$HERE/../build.py" \
+    && { echo "PASS: S25 asset in build MAP: $_p"; pass=$((pass+1)); } \
+    || { echo "FAIL: S25 asset not in build MAP: $_p"; failn=$((failn+1)); }
+done
+grep -qF 'geomask-vpnwatch.sh 755' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S25 installer installs the audit script"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 installer does not ship the audit script"; failn=$((failn+1)); }
+grep -qF '# geomask-vpnwatch' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S25 audit cron tagged for clean removal"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 cron is not tagged"; failn=$((failn+1)); }
+grep -qF 'geomask-vpnwatch.sh)' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S25 uninstall removes the audit script"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 uninstall leaves the audit script"; failn=$((failn+1)); }
+# the audit must never touch routing - it only reads
+if grep -nE 'PUT .*proxies|/proxies/.{0,20}DELETE|url-test' "$HERE/../assets/geomask-vpnwatch.sh" | grep -q .; then
+  echo "FAIL: S25 audit script tries to change routing"; failn=$((failn+1))
+else echo "PASS: S25 audit script is read-only"; pass=$((pass+1)); fi
+grep -qF 'group=VPN-noP2P' "$HERE/../assets/geomask-vpnwatch.conf" \
+  && { echo "PASS: S25 audit watches the restricted slot by default"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 audit default group is wrong"; failn=$((failn+1)); }
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

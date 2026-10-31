@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.17.0"
+GM_VERSION="1.18.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -216,51 +216,53 @@ step3_check() {
   if [ ! -s "$_c" ]; then bad "$MIHOMO_CONF missing (шаг subs при запуске создаст конфиг и спросит обе ссылки)"; return 1; fi
   _np=$(grep -c 'type: http' "$_c" 2>/dev/null || echo 0)
   if [ "$_np" -ge 2 ] 2>/dev/null; then info "proxy-providers: $_np (need >=2)"; else bad "proxy-providers: $_np (need 2: VPN + AI)"; _need=1; fi
-  for g in VPN AI; do
-    if grep -q "name: $g$" "$_c" 2>/dev/null; then info "group $g: present"; else bad "group $g: missing"; _need=1; fi
+  for g in VPN-noP2P AI; do
+    if grep -q "name: $g$" "$_c" 2>/dev/null; then info "slot $g: present"; else bad "slot $g: missing"; _need=1; fi
   done
+  if grep -q 'name: VPN$' "$_c" 2>/dev/null; then info "slot VPN (P2P-tolerant lane): present"; else info "slot VPN: not configured (single tunnel - IP rules stay on VPN-noP2P)"; fi
   grep -q 'RULE-SET,ai,AI' "$_c" 2>/dev/null && info "rule ai->AI: present" || { bad "rule ai->AI missing"; _need=1; }
-  grep -q 'RULE-SET,mtrickle,VPN' "$_c" 2>/dev/null && info "rule mtrickle->VPN: present" || { bad "rule mtrickle->VPN missing"; _need=1; }
+  grep -q 'RULE-SET,mtrickle,VPN-noP2P' "$_c" 2>/dev/null && info "rule mtrickle->VPN-noP2P: present" || { bad "rule mtrickle->VPN-noP2P missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
   if grep -q 'torrent-direct' "$_c" 2>/dev/null; then
-    # v1.17.0: with the RESERVE lane configured, no IP rule can reach the restricted sub, so the
-    # listener may be rule-based (and AI domains through it still land in AI). Without lanes the
-    # listener MUST carry a fixed policy - that is what blocked the subscription on 31.10.
+    # v1.18.0: with the P2P-tolerant "VPN" lane configured, no IP rule can reach the restricted
+    # slot, so the listener may be rule-based (and AI domains through it still land in AI). Without
+    # the lane the listener MUST carry a fixed policy - that is what blocked the subscription.
     _tp=$(awk '/name: torrent-direct/{f=1;next} f&&/^[^ ]/{exit} f&&/^    proxy:/{sub(/^[^:]*:[[:space:]]*/,"");print;exit}' "$_c")
-    if grep -qE '^  - name: RESERVE$' "$_c" 2>/dev/null; then
-      info "listener (torrent-direct:7894, rule-based + RESERVE lane): present"
+    if grep -q 'name: VPN$' "$_c" 2>/dev/null; then
+      info "listener (torrent-direct:7894, rule-based + VPN lane): present"
     else
       case "$_tp" in
         AI|DIRECT) info "listener (torrent-direct:7894 -> $_tp): present" ;;
-        '')        bad "torrent listener has no fixed policy and no RESERVE lane - peers can reach the VPN sub"; _need=1 ;;
-        *)         bad "torrent listener policy is '$_tp' - expected AI or DIRECT (or configure the RESERVE lane)"; _need=1 ;;
+        '')        bad "torrent listener has no fixed policy and no VPN lane - peers can reach the restricted sub"; _need=1 ;;
+        *)         bad "torrent listener policy is '$_tp' - expected AI or DIRECT (or configure the VPN lane)"; _need=1 ;;
       esac
     fi
   else warn "torrent-direct listener missing (torrent clients cannot be pinned away from the VPN sub)"; fi
-  grep -qE '^  - SRC-PORT,41552,(RESERVE|AI|DIRECT)$' "$_c" 2>/dev/null \
+  grep -qE '^  - SRC-PORT,41552,(VPN|AI|DIRECT)$' "$_c" 2>/dev/null \
     && info "torrent peer guard (SRC-PORT): present" \
     || warn "SRC-PORT,41552 guard missing - incoming peers may still be routed to the VPN sub"
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
-  grep -q 'RULE-SET,ytvpn,VPN' "$_c" 2>/dev/null && info "ytvpn->VPN rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to VPN)"
+  grep -qE 'RULE-SET,ytvpn,(VPN|VPN-noP2P)' "$_c" 2>/dev/null && info "ytvpn rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to a tunnel)"
   # v1.14.4: torrents must never be swallowed by the VPN lists (owner policy 30.10)
   grep -q 'RULE-SET,torrentdirect,DIRECT' "$_c" 2>/dev/null && info "torrentdirect->DIRECT rule: present" || warn "torrentdirect rule missing (tracker domains can still go to VPN)"
   # v1.17.0: lane invariant. A torrent peer is always a bare IP, so no IP rule may reach the
-  # subscription that forbids P2P. When a RESERVE group exists the IP ruleset must be split out.
-  if grep -qE '^  - name: RESERVE$' "$_c" 2>/dev/null; then
+  # subscription that forbids P2P. When the P2P-tolerant "VPN" lane exists the IP ruleset must be
+  # split out into mtrickle_bulk.yaml and routed there.
+  if grep -q 'name: VPN$' "$_c" 2>/dev/null; then
     if grep -qE '^\s*-\s*IP-CIDR' "$(P /etc/mihomo/ruleset/mtrickle.yaml)" 2>/dev/null; then
-      bad "mtrickle.yaml still contains IP-CIDR rules - P2P peers can reach the restricted VPN sub"
+      bad "mtrickle.yaml still contains IP-CIDR rules - P2P peers can reach the restricted VPN-noP2P sub"
       _need=1
     else info "lane invariant: mtrickle.yaml has no IP rules"; fi
-    grep -q 'RULE-SET,mtrickle_bulk,RESERVE' "$_c" 2>/dev/null \
-      && info "lane: IP ruleset -> RESERVE" \
-      || { bad "lane: mtrickle_bulk -> RESERVE rule missing"; _need=1; }
-    grep -q 'RULE-SET,ytvpn,RESERVE' "$_c" 2>/dev/null \
-      && info "lane: youtube edge pins -> RESERVE" \
-      || warn "ytvpn pins still go to VPN (blocked-by-P2P subscription risk if that sub forbids bulk traffic)"
+    grep -q 'RULE-SET,mtrickle_bulk,VPN' "$_c" 2>/dev/null \
+      && info "lane: IP ruleset -> VPN (P2P-tolerant)" \
+      || { bad "lane: mtrickle_bulk -> VPN rule missing"; _need=1; }
+    grep -q 'RULE-SET,ytvpn,VPN' "$_c" 2>/dev/null \
+      && info "lane: youtube edge pins -> VPN" \
+      || warn "ytvpn pins still go to VPN-noP2P (bulk video traffic on a sub that may dislike it)"
   else
-    info "lane: RESERVE not configured (single-VPN setup - IP rules stay on the VPN subscription)"
+    info "lane: VPN not configured (single tunnel - IP rules stay on VPN-noP2P)"
   fi
   if grep -qE '^  - DST-PORT,(6969|1337|2710|8081|451|5944),' "$_c" 2>/dev/null; then
     bad "legacy blanket P2P DST-PORT rule present - it sits above the ai ruleset and hijacks AI relays on those ports"
@@ -429,7 +431,10 @@ write_mihomo_config() {
     printf '%s\n' '      expected-status: 204'
     printf '\n'
     printf '%s\n' 'proxy-groups:'
-    printf '%s\n' '  - name: VPN'
+    printf '%s\n' '  # slot VPN-noP2P: the subscription whose provider forbids P2P (default tunnel).'
+    printf '%s\n' '  # A second, P2P-tolerant tunnel (slot VPN -> group "VPN") is created by the panel'
+    printf '%s\n' '  # when a subscription is assigned to it; IP rules then move over there.'
+    printf '%s\n' '  - name: VPN-noP2P'
     printf '%s\n' '    type: url-test'
     printf '%s\n' '    use:'
     printf '%s\n' '      - sub'
@@ -484,18 +489,19 @@ write_mihomo_config() {
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT'
-    printf '%s\n' '  - RULE-SET,ytvpn,VPN'
+    printf '%s\n' '  - RULE-SET,ytvpn,VPN-noP2P'
     printf '%s\n' '  - RULE-SET,ytdirect,DIRECT'
     printf '%s\n' '  - DOMAIN-SUFFIX,cloudflare-ech.com,AI'
     printf '%s\n' '  - RULE-SET,ai,AI'
     printf '%s\n' '  # torrent tracker endpoints (public lists) - DIRECT, after ai so the AI policy always wins'
     printf '%s\n' '  - RULE-SET,torrentdirect,DIRECT'
-    printf '%s\n' '  # torrent client listening port: peers that dial US get answered via AI, never the VPN sub'
+    printf '%s\n' '  # torrent client listening port: peers that dial US must not reach the VPN slot;'
+    printf '%s\n' '  # with a RESERVE/VPN lane configured geomask repoints this to that lane'
     printf '%s\n' '  - SRC-PORT,41552,AI'
-    printf '%s\n' '  - RULE-SET,mtrickle,VPN'
-    printf '%s\n' '  # STUN via VPN: stop WebRTC leaking the real (RU) IP, keep calls working'
-    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN'
-    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,19302)),VPN'
+    printf '%s\n' '  - RULE-SET,mtrickle,VPN-noP2P'
+    printf '%s\n' '  # STUN: stop WebRTC leaking the real (RU) IP, keep calls working'
+    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN-noP2P'
+    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,19302)),VPN-noP2P'
     printf '%s\n' '  - MATCH,GLOBAL'
     printf '\n'
     printf '%s\n' 'sniffer:'
@@ -984,6 +990,11 @@ step5_check() {
   # v1.15.0: torrent admin
   if [ -x "$(P /usr/bin/geomask-torrent.sh)" ] && [ -d "$(P /etc/geomask/torrent)" ]; then info "torrent admin: installed"
   else bad "torrent admin missing (script/dir)"; _need=1; fi
+  # v1.18.0: VPN lane audit
+  if [ -x "$(P /usr/bin/geomask-vpnwatch.sh)" ] && [ -s "$(P /etc/geomask/vpnwatch.conf)" ]; then info "vpnwatch: installed"
+  else bad "vpnwatch missing (script/conf)"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-vpnwatch$'; then info "vpnwatch cron */1: present"
+  else warn "vpnwatch cron missing - the lane audit will not run"; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -1025,6 +1036,23 @@ ASSET_EOF
   save_stream /usr/bin/geomask-torrent.sh 755 <<'ASSET_EOF'
 @@ASSET:geomask-torrent.sh@@
 ASSET_EOF
+  # v1.18.0: VPN lane audit - record what tries to use the P2P-restricted subscription while it
+  # is offline, so the operator can see the future load before switching it back on.
+  if [ ! -s "$(P /etc/geomask/vpnwatch.conf)" ]; then
+    save_stream /etc/geomask/vpnwatch.conf 644 <<'ASSET_EOF'
+@@ASSET:geomask-vpnwatch.conf@@
+ASSET_EOF
+  else
+    info "vpnwatch conf: keeping existing /etc/geomask/vpnwatch.conf"
+  fi
+  save_stream /usr/bin/geomask-vpnwatch.sh 755 <<'ASSET_EOF'
+@@ASSET:geomask-vpnwatch.sh@@
+ASSET_EOF
+  if crontab -l 2>/dev/null | grep -qE '# geomask-vpnwatch$'; then
+    info "vpnwatch cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '* * * * * /usr/bin/geomask-vpnwatch.sh --tick >/dev/null 2>&1 # geomask-vpnwatch' ) | crontab - 2>/dev/null && info "cron added: */1 vpnwatch" || warn "cannot set crontab"
+  fi
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 @@ASSET:99-default-vpn-route@@
 ASSET_EOF
@@ -1456,6 +1484,12 @@ geomask_uninstall() {
   # v1.15.0: torrent admin removal (ruleset + listener left in place: they belong to mihomo config)
   rm -f "$(P /usr/bin/geomask-torrent.sh)"
   info "removed: torrent admin (lists in /etc/geomask/torrent and the ruleset kept for reference)"
+  # v1.18.0: vpnwatch removal (the audit log is kept - it is the evidence the operator collected)
+  if crontab -l 2>/dev/null | grep -q 'geomask-vpnwatch'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-vpnwatch' | crontab - 2>/dev/null || true
+  fi
+  rm -f "$(P /usr/bin/geomask-vpnwatch.sh)"
+  info "removed: vpnwatch (conf /etc/geomask/vpnwatch.conf and the audit log kept)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.17.0"
+GM_VERSION="1.18.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.17.0"
+BACKEND_VERSION="1.18.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -310,7 +310,8 @@ _migrate() {
 
 cmd_status() {
   _migrate
-  VPN_NODE=$(_grp_node VPN)
+  VPN_NODE=$(_grp_node VPN)          # slot VPN: P2P-tolerant tunnel (may be absent)
+  VPNNP_NODE=$(_grp_node VPN-noP2P)  # slot VPN-noP2P: the subscription whose provider forbids P2P
   AI_NODE=$(_grp_node AI)
   GLOBAL=$(controller_curl -s -m3 "$MIHOMO_API/proxies/GLOBAL" | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//; s/"$//')
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then LCRON=1; else LCRON=0; fi
@@ -338,8 +339,10 @@ cmd_status() {
   RULES=$(ip rule show | grep -c 'lookup main' || echo 0)
   _de5u=$(awk '/^  de5:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
   _subu=$(awk '/^  sub:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  _sub2u=$(awk '/^  sub2:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
   AI_SUB_ID=$(_sub_id_by_url "$_de5u" 2>/dev/null || echo '')
-  VPN_SUB_ID=$(_sub_id_by_url "$_subu" 2>/dev/null || echo '')
+  VPN_SUB_ID=$(_sub_id_by_url "$_sub2u" 2>/dev/null || echo '')
+  VPNNP_SUB_ID=$(_sub_id_by_url "$_subu" 2>/dev/null || echo '')
   if ip link show "$AI_TUN_DEV" >/dev/null 2>&1; then AI_TUN=1; else AI_TUN=0; fi
   if netstat -lntp 2>/dev/null | grep -q ':7891'; then AI_LST=1; else AI_LST=0; fi
   # AI-DNS (no DNS leak for AI devices): 0=off/absent, 1=working, 2=partial
@@ -348,14 +351,15 @@ cmd_status() {
   elif ip route get 1.1.1.1 mark 0x64 2>/dev/null | grep -q 'dev AI' \
        && netstat -ltnpu 2>/dev/null | grep -q '192.168.0.53:5353 '; then AIDNS=1
   else AIDNS=2; fi
-  printf '{"vpn_node":"%s","vpn_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","ai_url":"%s","vpn_url":"%s","aidns":%s}' \
+  printf '{"vpn_node":"%s","vpn_cc":"%s","vpn_nop2p_node":"%s","vpn_nop2p_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","vpn_nop2p_sub":"%s","ai_url":"%s","vpn_url":"%s","vpn_nop2p_url":"%s","aidns":%s}' \
     "$(json_esc "$VPN_NODE")" "$(_node_cc "$VPN_NODE")" \
+    "$(json_esc "$VPNNP_NODE")" "$(_node_cc "$VPNNP_NODE")" \
     "$(json_esc "$AI_NODE")" "$(_node_cc "$AI_NODE")" \
     "$(json_esc "$GLOBAL")" "$LCRON" "$V6" "$(json_esc "$DOH")" \
     "$AI_RC" "$MT_RC" "$(json_esc "$GOOGLE_CC")" "$(json_esc "$SYNC_AT")" \
     "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES" \
-    "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPN_SUB_ID")" \
-    "$(json_esc "$_de5u")" "$(json_esc "$_subu")" "$AIDNS"
+    "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPN_SUB_ID")" "$(json_esc "$VPNNP_SUB_ID")" \
+    "$(json_esc "$_de5u")" "$(json_esc "$_sub2u")" "$(json_esc "$_subu")" "$AIDNS"
 }
 
 # country fragment from a node name (flag emoji or RU word) - coarse, for display
@@ -916,6 +920,12 @@ cmd_sub_del() {
   printf '{"ok":true,"subs":%s}' "$(_subs_json)"
 }
 
+_mihomo_reload() { # re-read the config in the running core (no service restart)
+  controller_curl -s -m15 -f -X PUT "$MIHOMO_API/configs" \
+    -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" >/dev/null 2>&1
+  sleep 2
+}
+
 cmd_ai_sub_use() {
   ID="$1"
   URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
@@ -924,12 +934,67 @@ cmd_ai_sub_use() {
   printf '{"ok":true,"url":"%s","ai_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$AI_NODE")"
 }
 
+# v1.18.0: three assignable route slots.
+#   ai        -> provider de5  / group AI
+#   vpn       -> provider sub2 / group VPN        (P2P-tolerant tunnel; created on first use)
+#   vpn_nop2p -> provider sub  / group VPN-noP2P  (the subscription whose provider forbids P2P)
+_LANE_PY='
+import re, sys
+cfg, url = sys.argv[1], sys.argv[2]
+t = open(cfg, encoding="utf-8").read()
+if re.search(r"(?m)^  sub2:\n", t):
+    t = re.sub(r"(?m)^(  sub2:\n(?:.*\n)*?    url: )\"[^\"]*\"", r"\\1\"" + url + "\"", t, count=1)
+    action = "updated"
+else:
+    prov = ("  sub2:\n    type: http\n    url: \"%s\"\n    interval: 3600\n"
+            "    health-check:\n      enable: true\n      url: \"https://www.gstatic.com/generate_204\"\n"
+            "      interval: 180\n      timeout: 5\n      expected-status: 204\n" % url)
+    m = re.search(r"(?m)^  de5:\n", t) or re.search(r"(?m)^  sub:\n", t)
+    if not m:
+        sys.stderr.write("no proxy-providers anchor\n"); sys.exit(2)
+    t = t[:m.start()] + prov + t[m.start():]
+    grp = ("\n  - name: VPN\n    type: url-test\n    use:\n      - sub2\n"
+           "    url: \"https://www.gstatic.com/generate_204\"\n    interval: 180\n"
+           "    tolerance: 50\n    lazy: false\n")
+    gm = re.search(r"(?m)^  - name: AI\s*\n(?:^(?:    .*|\s*)\n)*", t)
+    if not gm:
+        sys.stderr.write("no AI group anchor\n"); sys.exit(2)
+    t = t[:gm.end()] + grp + t[gm.end():]
+    # move the IP-shaped traffic onto the new lane: that is the whole point of having it
+    if "RULE-SET,mtrickle_bulk" not in t:
+        t = t.replace("  - RULE-SET,mtrickle,VPN-noP2P\n",
+                      "  - RULE-SET,mtrickle_bulk,VPN\n  - RULE-SET,mtrickle,VPN-noP2P\n", 1)
+    t = t.replace("- RULE-SET,ytvpn,VPN-noP2P", "- RULE-SET,ytvpn,VPN")
+    t = t.replace("- SRC-PORT,41552,AI", "- SRC-PORT,41552,VPN")
+    action = "created"
+open(cfg, "w", encoding="utf-8", newline="").write(t)
+print(action)
+'
+
+_ensure_vpn_lane() { # $1 = url ; creates or repoints the P2P-tolerant lane, rolls back on failure
+  _c="$(P /etc/mihomo/config.yaml)"
+  cp -p "$_c" "$_c.bak_lane" 2>/dev/null
+  _act=$(python3 -c "$_LANE_PY" "$_c" "$1" 2>&1) || { printf '{"ok":false,"error":"lane edit failed: %s"}' "$(json_esc "$_act")"; mv -f "$_c.bak_lane" "$_c" 2>/dev/null; return 1; }
+  rm -f "$_c.bak_lane"
+  printf '%s' "$_act"
+}
+
 cmd_vpn_sub_use() {
   ID="$1"
   URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
-  _mihomo_set_provider sub "$URL"
+  _lane=$(_ensure_vpn_lane "$URL") || return 1
+  _mihomo_reload
   VPN_NODE=$(_grp_node VPN)
-  printf '{"ok":true,"url":"%s","vpn_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$VPN_NODE")"
+  printf '{"ok":true,"lane":"%s","url":"%s","vpn_node":"%s"}' "$(json_esc "$_lane")" "$(json_esc "$URL")" "$(json_esc "$VPN_NODE")"
+}
+
+cmd_vpnnp_sub_use() {
+  ID="$1"
+  URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
+  _mihomo_set_provider sub "$URL"
+  _mihomo_reload
+  VPN_NODE=$(_grp_node VPN-noP2P)
+  printf '{"ok":true,"url":"%s","vpn_nop2p_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$VPN_NODE")"
 }
 
 # ---------------- self-update (v1.7.0): check / status / apply ----------------
@@ -1420,6 +1485,7 @@ case "$1" in
   sub_del)    cmd_sub_del "$2" ;;
   ai_sub_use)   cmd_ai_sub_use "$2" ;;
   vpn_sub_use)  cmd_vpn_sub_use "$2" ;;
+  vpnnp_sub_use) cmd_vpnnp_sub_use "$2" ;;
   upd_check)    cmd_upd_check "$2" ;;
   upd_status)   cmd_upd_status ;;
   upd_apply)    cmd_upd_apply ;;
@@ -1473,6 +1539,7 @@ list_methods() {
 	json_add_object "sub_del";    json_add_string "id" "string"; json_close_object
 	json_add_object "ai_sub_use";   json_add_string "id" "string"; json_close_object
 	json_add_object "vpn_sub_use";  json_add_string "id" "string"; json_close_object
+	json_add_object "vpnnp_sub_use"; json_add_string "id" "string"; json_close_object
 	json_add_object "upd_check";    json_add_string "force" "string"; json_close_object
 	json_add_object "upd_status";   json_close_object
 	json_add_object "upd_apply";    json_close_object
@@ -1520,6 +1587,7 @@ call_method() {
 		sub_del)    json_get_var id id; "$BACKEND" sub_del "$id" ;;
 		ai_sub_use)   json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;
 		vpn_sub_use)  json_get_var id id; "$BACKEND" vpn_sub_use "$id" ;;
+		vpnnp_sub_use) json_get_var id id; "$BACKEND" vpnnp_sub_use "$id" ;;
 		upd_check)    json_get_var force force; "$BACKEND" upd_check "$force" ;;
 		upd_status)   "$BACKEND" upd_status ;;
 		upd_apply)    "$BACKEND" upd_apply ;;
@@ -1556,7 +1624,7 @@ ASSET_EOF
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra" ]
+				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra" ]
 			}
 		}
 	}
@@ -1607,6 +1675,7 @@ var callSubAdd   = rpc.declare({ object: 'geo-sync', method: 'sub_add',   params
 var callSubDel   = rpc.declare({ object: 'geo-sync', method: 'sub_del',   params: { id: null }, expect: {} });
 var callAiSubUse   = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use',   params: { id: null }, expect: {} });
 var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  params: { id: null }, expect: {} });
+var callVpnnpSubUse = rpc.declare({ object: 'geo-sync', method: 'vpnnp_sub_use', params: { id: null }, expect: {} });
 var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
 var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
 var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
@@ -1624,7 +1693,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.17.0';
+var PANEL_VERSION = '1.18.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1842,7 +1911,7 @@ return view.extend({
 		showTab(panels[curTab] ? curTab : 'obzor');
 
 		/* ===================== HERO: dual subscription ===================== */
-		var aiCc = st.ai_cc || '', vpnCc = st.vpn_cc || '';
+		var aiCc = st.ai_cc || '', vpnCc = st.vpn_nop2p_cc || '', laneCc = st.vpn_cc || '';
 		var aiSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
 			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc), cleanName(st.ai_node) || '—' ]),
@@ -1853,16 +1922,24 @@ return view.extend({
 				st.aidns === 2 ? 'ПРОБЛЕМА — не через туннель (проверьте шаг aidns)' : 'не настроено (утечка DNS!)'))
 		]);
 		var vpnSub = E('div', { 'class': 'gs-sub-card' }, [
-			E('div', { 'class': 'gs-ent' }, 'Общая VPN · всё магитрикле (не-ИИ)'),
-			E('div', { 'class': 'gs-node' }, [ ccBadge(vpnCc), cleanName(st.vpn_node) || '—' ]),
-			E('div', { 'class': 'gs-meta' }, 'Подписка vlessi · выход ' + ((CCNAME[vpnCc] || vpnCc) ? (CCNAME[vpnCc] || vpnCc) : '—'))
+			E('div', { 'class': 'gs-ent' }, 'VPN-noP2P · доменные списки MagiTrickle'),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(vpnCc), cleanName(st.vpn_nop2p_node) || '—' ]),
+			E('div', { 'class': 'gs-meta' }, 'Слот VPN-noP2P · выход ' + ((CCNAME[vpnCc] || vpnCc) ? (CCNAME[vpnCc] || vpnCc) : '—') +
+				' · сюда нельзя торренты'),
+			E('div', { 'class': 'gs-meta' }, 'IP-правил на этом пути: быть не должно (проверка geomask --check)')
+		]);
+		var laneSub = E('div', { 'class': 'gs-sub-card' }, [
+			E('div', { 'class': 'gs-ent' }, 'VPN · полоса для P2P и IP-списков'),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(laneCc), cleanName(st.vpn_node) || 'не настроена' ]),
+			E('div', { 'class': 'gs-meta' }, 'Слот VPN · выход ' + ((CCNAME[laneCc] || laneCc) ? (CCNAME[laneCc] || laneCc) : '—')),
+			E('div', { 'class': 'gs-meta' }, 'mtrickle_bulk (IP), пины googlevideo, ответы входящим пирам')
 		]);
 
 		var counters = E('div', { 'class': 'gs-counters' }, [
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.ai_rules != null ? st.ai_rules : '—')),
 				E('div', { 'class': 'gs-cap' }, 'правил ИИ-пути (ai.yaml → AI)') ]),
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.mt_rules != null ? st.mt_rules : '—')),
-				E('div', { 'class': 'gs-cap' }, 'правил общего пути (mtrickle.yaml → VPN)') ]),
+				E('div', { 'class': 'gs-cap' }, 'правил общего пути (mtrickle.yaml → VPN-noP2P)') ]),
 			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.n_bypass != null ? st.n_bypass : (st.devices || []).length)),
 				E('div', { 'class': 'gs-cap' }, 'мимо VPN (реальный IP)') ])
 		]);
@@ -1870,7 +1947,7 @@ return view.extend({
 		var hero = E('div', { 'class': 'gs-hero' }, [
 			E('h2', {}, 'Гео-маскировка и маршрутизация AI'),
 			E('div', { 'class': 'gs-sub' }, 'Google и ИИ-сервисы идут через AI-подписку (какую страну видит Google — показывает блок выше), всё остальное — через общую VPN.'),
-			E('div', { 'class': 'gs-duo' }, [ aiSub, vpnSub ]),
+			E('div', { 'class': 'gs-duo' }, [ aiSub, vpnSub, laneSub ]),
 			counters
 		]);
 		panels.obzor.appendChild(hero);
@@ -1882,12 +1959,23 @@ return view.extend({
 		}
 		function subRow(s) {
 			var isVpn = !!(st.vpn_sub && st.vpn_sub === s.id);
+			var isVpnNP = !!(st.vpn_nop2p_sub && st.vpn_nop2p_sub === s.id);
 			var isAi = !!(st.ai_sub && st.ai_sub === s.id);
-			var dest = '—';
-			if (isVpn && isAi) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN + AI');
-			else if (isVpn) dest = E('span', { 'class': 'gs-badge gs-on' }, 'VPN');
-			else if (isAi) dest = E('span', { 'class': 'gs-badge gs-ok' }, 'AI');
-			var bV = { 'class': 'gs-btn gs-btn-use' + (isVpn ? ' gs-btn-vpn-on' : ''), 'title': isVpn ? 'Эта подписка используется для общего VPN' : 'Переключить общий VPN на эту подписку', 'click': function() { view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN'); } };
+			var dest = [];
+			if (isVpn)   dest.push(E('span', { 'class': 'gs-badge gs-on' }, 'VPN'));
+			if (isVpnNP) dest.push(E('span', { 'class': 'gs-badge gs-warn' }, 'VPN-noP2P'));
+			if (isAi)    dest.push(E('span', { 'class': 'gs-badge gs-ok' }, 'AI'));
+			if (!dest.length) dest = ['—'];
+			var bV = { 'class': 'gs-btn gs-btn-use' + (isVpn ? ' gs-btn-vpn-on' : ''), 'title': isVpn ? 'Эта подписка держит слот VPN (P2P разрешён)' : 'Отдать слот VPN (полоса для торрентов и IP-списков) этой подписке' };
+			bV.click = function() {
+				if (!confirm('Отдать слот VPN этой подписке?\n\nНа неё перейдут правила по IP (mtrickle_bulk), пины зависших YouTube-рёбер и ответы входящим пирам. Полоса создаётся автоматически, если её ещё нет.')) return;
+				view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN');
+			};
+			var bN = { 'class': 'gs-btn gs-btn-use' + (isVpnNP ? ' gs-btn-vpn-on' : ''), 'title': isVpnNP ? 'Эта подписка держит слот VPN-noP2P (провайдер запрещает торренты)' : 'Отдать слот VPN-noP2P (общий VPN по доменным спискам) этой подписке' };
+			bN.click = function() {
+				if (!confirm('Отдать слот VPN-noP2P этой подписке?\n\nНа неё останутся только доменные правила (mtrickle) и STUN. Убедитесь, что провайдер этой подписки разрешает трафик из ваших списков.')) return;
+				view.act(callVpnnpSubUse, { id: s.id }, 'Подписка применена для VPN-noP2P');
+			};
 			var bA = { 'class': 'gs-btn gs-btn-use' + (isAi ? ' gs-btn-ai-on' : ''), 'title': isAi ? 'Эта подписка используется для AI-маршрутов' : 'Переключить AI-маршруты на эту подписку', 'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } };
 			var bD = { 'class': 'gs-btn gs-btn-warn', 'title': 'Убрать из реестра', 'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } };
 			return E('tr', {}, [
@@ -1895,6 +1983,7 @@ return view.extend({
 				E('td', { 'class': 'gs-subs-url' }, maskUrl(s.url)),
 				E('td', {}, dest),
 				E('td', { 'class': 'gs-subs-actions' }, [
+					E('button', bN, '→ VPN-noP2P'),
 					E('button', bV, '→ VPN'),
 					E('button', bA, '→ AI'),
 					E('button', bD, 'Удалить')
@@ -1939,7 +2028,11 @@ return view.extend({
 		var subsCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Подписки'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
-				'Реестр подписок. В колонке «Назначение» показано, чем подписка занята СЕЙЧАС; кнопки «→ VPN»/«→ AI» переключают соответствующий маршрут на эту подписку (активная кнопка неактивна). Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
+				'Реестр подписок. В колонке «Назначение» показано, чем подписка занята СЕЙЧАС. Три слота: ' +
+				'«VPN-noP2P» — общий VPN по доменным спискам (сюда нельзя торренты: провайдер это запрещает), ' +
+				'«VPN» — полоса для всего, что выглядит как P2P (правила по IP, пины зависших YouTube-рёбер, ' +
+				'ответы входящим пирам), «AI» — Google и AI-сервисы. Кнопка активного слота подсвечена. ' +
+				'Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
 			E('table', { 'class': 'gs-table gs-subs' },
 				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
 					.concat(subs.map(subRow))),
@@ -2712,51 +2805,53 @@ step3_check() {
   if [ ! -s "$_c" ]; then bad "$MIHOMO_CONF missing (шаг subs при запуске создаст конфиг и спросит обе ссылки)"; return 1; fi
   _np=$(grep -c 'type: http' "$_c" 2>/dev/null || echo 0)
   if [ "$_np" -ge 2 ] 2>/dev/null; then info "proxy-providers: $_np (need >=2)"; else bad "proxy-providers: $_np (need 2: VPN + AI)"; _need=1; fi
-  for g in VPN AI; do
-    if grep -q "name: $g$" "$_c" 2>/dev/null; then info "group $g: present"; else bad "group $g: missing"; _need=1; fi
+  for g in VPN-noP2P AI; do
+    if grep -q "name: $g$" "$_c" 2>/dev/null; then info "slot $g: present"; else bad "slot $g: missing"; _need=1; fi
   done
+  if grep -q 'name: VPN$' "$_c" 2>/dev/null; then info "slot VPN (P2P-tolerant lane): present"; else info "slot VPN: not configured (single tunnel - IP rules stay on VPN-noP2P)"; fi
   grep -q 'RULE-SET,ai,AI' "$_c" 2>/dev/null && info "rule ai->AI: present" || { bad "rule ai->AI missing"; _need=1; }
-  grep -q 'RULE-SET,mtrickle,VPN' "$_c" 2>/dev/null && info "rule mtrickle->VPN: present" || { bad "rule mtrickle->VPN missing"; _need=1; }
+  grep -q 'RULE-SET,mtrickle,VPN-noP2P' "$_c" 2>/dev/null && info "rule mtrickle->VPN-noP2P: present" || { bad "rule mtrickle->VPN-noP2P missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
   if grep -q 'torrent-direct' "$_c" 2>/dev/null; then
-    # v1.17.0: with the RESERVE lane configured, no IP rule can reach the restricted sub, so the
-    # listener may be rule-based (and AI domains through it still land in AI). Without lanes the
-    # listener MUST carry a fixed policy - that is what blocked the subscription on 31.10.
+    # v1.18.0: with the P2P-tolerant "VPN" lane configured, no IP rule can reach the restricted
+    # slot, so the listener may be rule-based (and AI domains through it still land in AI). Without
+    # the lane the listener MUST carry a fixed policy - that is what blocked the subscription.
     _tp=$(awk '/name: torrent-direct/{f=1;next} f&&/^[^ ]/{exit} f&&/^    proxy:/{sub(/^[^:]*:[[:space:]]*/,"");print;exit}' "$_c")
-    if grep -qE '^  - name: RESERVE$' "$_c" 2>/dev/null; then
-      info "listener (torrent-direct:7894, rule-based + RESERVE lane): present"
+    if grep -q 'name: VPN$' "$_c" 2>/dev/null; then
+      info "listener (torrent-direct:7894, rule-based + VPN lane): present"
     else
       case "$_tp" in
         AI|DIRECT) info "listener (torrent-direct:7894 -> $_tp): present" ;;
-        '')        bad "torrent listener has no fixed policy and no RESERVE lane - peers can reach the VPN sub"; _need=1 ;;
-        *)         bad "torrent listener policy is '$_tp' - expected AI or DIRECT (or configure the RESERVE lane)"; _need=1 ;;
+        '')        bad "torrent listener has no fixed policy and no VPN lane - peers can reach the restricted sub"; _need=1 ;;
+        *)         bad "torrent listener policy is '$_tp' - expected AI or DIRECT (or configure the VPN lane)"; _need=1 ;;
       esac
     fi
   else warn "torrent-direct listener missing (torrent clients cannot be pinned away from the VPN sub)"; fi
-  grep -qE '^  - SRC-PORT,41552,(RESERVE|AI|DIRECT)$' "$_c" 2>/dev/null \
+  grep -qE '^  - SRC-PORT,41552,(VPN|AI|DIRECT)$' "$_c" 2>/dev/null \
     && info "torrent peer guard (SRC-PORT): present" \
     || warn "SRC-PORT,41552 guard missing - incoming peers may still be routed to the VPN sub"
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
-  grep -q 'RULE-SET,ytvpn,VPN' "$_c" 2>/dev/null && info "ytvpn->VPN rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to VPN)"
+  grep -qE 'RULE-SET,ytvpn,(VPN|VPN-noP2P)' "$_c" 2>/dev/null && info "ytvpn rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to a tunnel)"
   # v1.14.4: torrents must never be swallowed by the VPN lists (owner policy 30.10)
   grep -q 'RULE-SET,torrentdirect,DIRECT' "$_c" 2>/dev/null && info "torrentdirect->DIRECT rule: present" || warn "torrentdirect rule missing (tracker domains can still go to VPN)"
   # v1.17.0: lane invariant. A torrent peer is always a bare IP, so no IP rule may reach the
-  # subscription that forbids P2P. When a RESERVE group exists the IP ruleset must be split out.
-  if grep -qE '^  - name: RESERVE$' "$_c" 2>/dev/null; then
+  # subscription that forbids P2P. When the P2P-tolerant "VPN" lane exists the IP ruleset must be
+  # split out into mtrickle_bulk.yaml and routed there.
+  if grep -q 'name: VPN$' "$_c" 2>/dev/null; then
     if grep -qE '^\s*-\s*IP-CIDR' "$(P /etc/mihomo/ruleset/mtrickle.yaml)" 2>/dev/null; then
-      bad "mtrickle.yaml still contains IP-CIDR rules - P2P peers can reach the restricted VPN sub"
+      bad "mtrickle.yaml still contains IP-CIDR rules - P2P peers can reach the restricted VPN-noP2P sub"
       _need=1
     else info "lane invariant: mtrickle.yaml has no IP rules"; fi
-    grep -q 'RULE-SET,mtrickle_bulk,RESERVE' "$_c" 2>/dev/null \
-      && info "lane: IP ruleset -> RESERVE" \
-      || { bad "lane: mtrickle_bulk -> RESERVE rule missing"; _need=1; }
-    grep -q 'RULE-SET,ytvpn,RESERVE' "$_c" 2>/dev/null \
-      && info "lane: youtube edge pins -> RESERVE" \
-      || warn "ytvpn pins still go to VPN (blocked-by-P2P subscription risk if that sub forbids bulk traffic)"
+    grep -q 'RULE-SET,mtrickle_bulk,VPN' "$_c" 2>/dev/null \
+      && info "lane: IP ruleset -> VPN (P2P-tolerant)" \
+      || { bad "lane: mtrickle_bulk -> VPN rule missing"; _need=1; }
+    grep -q 'RULE-SET,ytvpn,VPN' "$_c" 2>/dev/null \
+      && info "lane: youtube edge pins -> VPN" \
+      || warn "ytvpn pins still go to VPN-noP2P (bulk video traffic on a sub that may dislike it)"
   else
-    info "lane: RESERVE not configured (single-VPN setup - IP rules stay on the VPN subscription)"
+    info "lane: VPN not configured (single tunnel - IP rules stay on VPN-noP2P)"
   fi
   if grep -qE '^  - DST-PORT,(6969|1337|2710|8081|451|5944),' "$_c" 2>/dev/null; then
     bad "legacy blanket P2P DST-PORT rule present - it sits above the ai ruleset and hijacks AI relays on those ports"
@@ -2925,7 +3020,10 @@ write_mihomo_config() {
     printf '%s\n' '      expected-status: 204'
     printf '\n'
     printf '%s\n' 'proxy-groups:'
-    printf '%s\n' '  - name: VPN'
+    printf '%s\n' '  # slot VPN-noP2P: the subscription whose provider forbids P2P (default tunnel).'
+    printf '%s\n' '  # A second, P2P-tolerant tunnel (slot VPN -> group "VPN") is created by the panel'
+    printf '%s\n' '  # when a subscription is assigned to it; IP rules then move over there.'
+    printf '%s\n' '  - name: VPN-noP2P'
     printf '%s\n' '    type: url-test'
     printf '%s\n' '    use:'
     printf '%s\n' '      - sub'
@@ -2980,18 +3078,19 @@ write_mihomo_config() {
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT'
-    printf '%s\n' '  - RULE-SET,ytvpn,VPN'
+    printf '%s\n' '  - RULE-SET,ytvpn,VPN-noP2P'
     printf '%s\n' '  - RULE-SET,ytdirect,DIRECT'
     printf '%s\n' '  - DOMAIN-SUFFIX,cloudflare-ech.com,AI'
     printf '%s\n' '  - RULE-SET,ai,AI'
     printf '%s\n' '  # torrent tracker endpoints (public lists) - DIRECT, after ai so the AI policy always wins'
     printf '%s\n' '  - RULE-SET,torrentdirect,DIRECT'
-    printf '%s\n' '  # torrent client listening port: peers that dial US get answered via AI, never the VPN sub'
+    printf '%s\n' '  # torrent client listening port: peers that dial US must not reach the VPN slot;'
+    printf '%s\n' '  # with a RESERVE/VPN lane configured geomask repoints this to that lane'
     printf '%s\n' '  - SRC-PORT,41552,AI'
-    printf '%s\n' '  - RULE-SET,mtrickle,VPN'
-    printf '%s\n' '  # STUN via VPN: stop WebRTC leaking the real (RU) IP, keep calls working'
-    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN'
-    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,19302)),VPN'
+    printf '%s\n' '  - RULE-SET,mtrickle,VPN-noP2P'
+    printf '%s\n' '  # STUN: stop WebRTC leaking the real (RU) IP, keep calls working'
+    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN-noP2P'
+    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,19302)),VPN-noP2P'
     printf '%s\n' '  - MATCH,GLOBAL'
     printf '\n'
     printf '%s\n' 'sniffer:'
@@ -20169,6 +20268,11 @@ step5_check() {
   # v1.15.0: torrent admin
   if [ -x "$(P /usr/bin/geomask-torrent.sh)" ] && [ -d "$(P /etc/geomask/torrent)" ]; then info "torrent admin: installed"
   else bad "torrent admin missing (script/dir)"; _need=1; fi
+  # v1.18.0: VPN lane audit
+  if [ -x "$(P /usr/bin/geomask-vpnwatch.sh)" ] && [ -s "$(P /etc/geomask/vpnwatch.conf)" ]; then info "vpnwatch: installed"
+  else bad "vpnwatch missing (script/conf)"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -qE '# geomask-vpnwatch$'; then info "vpnwatch cron */1: present"
+  else warn "vpnwatch cron missing - the lane audit will not run"; fi
   svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
   return $_need
 }
@@ -21016,6 +21120,228 @@ print(json.dumps({'ok': True, 'domains': d, 'raw_ips': i2, 'changed': changed}))
 PYEOF
 
 ASSET_EOF
+  # v1.18.0: VPN lane audit - record what tries to use the P2P-restricted subscription while it
+  # is offline, so the operator can see the future load before switching it back on.
+  if [ ! -s "$(P /etc/geomask/vpnwatch.conf)" ]; then
+    save_stream /etc/geomask/vpnwatch.conf 644 <<'ASSET_EOF'
+# geomask vpnwatch configuration
+# Records everything that tries to use a subscription that must not carry P2P, so the operator
+# can see what would flow through it before it is switched on.
+#
+#   geomask-vpnwatch.sh --tick     called from cron (every minute), appends new events
+#   geomask-vpnwatch.sh --report   prints a summary of what was captured
+#   geomask-vpnwatch.sh --clear    empties the log
+
+# Proxy group whose traffic is being watched (the P2P-restricted tunnel)
+group=VPN-noP2P
+
+# Where to write. Kept outside /tmp so a reboot does not lose the night's evidence.
+logfile=/root/geomask-vpn-audit.log
+
+# Keep at most this many lines (oldest are dropped)
+max_lines=20000
+
+ASSET_EOF
+  else
+    info "vpnwatch conf: keeping existing /etc/geomask/vpnwatch.conf"
+  fi
+  save_stream /usr/bin/geomask-vpnwatch.sh 755 <<'ASSET_EOF'
+#!/bin/sh
+# geomask-vpnwatch.sh - record everything that tries to use the P2P-restricted subscription.
+#
+# The subscription is currently disabled by its provider, so nothing actually flows - but the
+# proxy core still logs every routing decision. Capturing those decisions answers the only
+# question that matters before switching it back on: what WOULD go through it, and does any of
+# it look like P2P (bare-IP destinations, non-443 ports).
+#
+#   geomask-vpnwatch.sh --tick     cron every minute: append new events, rotate the log
+#   geomask-vpnwatch.sh --report   summary: hosts, counts, sources, P2P-looking share
+#   geomask-vpnwatch.sh --clear    empty the log
+#
+# Config: /etc/geomask/vpnwatch.conf. Nothing here changes routing.
+exec python3 - "$@" <<'PYEOF'
+import hashlib, json, os, re, subprocess, sys, time, urllib.request
+
+CONF='/etc/geomask/vpnwatch.conf'
+CURSOR='/etc/geomask/vpnwatch.cursor'
+CFG='/etc/mihomo/config.yaml'
+
+def read(p, default=''):
+    try:
+        return open(p, encoding='utf-8').read()
+    except Exception:
+        return default
+
+cfgd={}
+for ln in read(CONF).splitlines():
+    ln=ln.strip()
+    if ln and not ln.startswith('#') and '=' in ln:
+        k,_,v=ln.partition('='); cfgd[k.strip()]=v.strip()
+
+GROUP=cfgd.get('group','VPN-noP2P')
+LOGF=cfgd.get('logfile','/root/geomask-vpn-audit.log')
+MAXL=max(500,int(cfgd.get('max_lines','20000')))
+
+def secret():
+    for ln in read(CFG).splitlines():
+        m=re.match(r'^secret:\s*["\']?([^"\'\s]+)', ln)
+        if m: return m.group(1)
+    return ''
+
+def api(path):
+    req=urllib.request.Request('http://127.0.0.1:9090'+path)
+    s=secret()
+    if s: req.add_header('Authorization','Bearer '+s)
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=8))
+    except Exception:
+        return {}
+
+# ---- parsing ----
+MSG_RE=re.compile(r'time="([^"]*)".*?msg="(.*)"')
+DIAL_RE=re.compile(r'\[(TCP|UDP)\] dial (\S+)(?: \(match ([^)]*)\))? (\S+)? --> (\S+)(?: error: (.*))?')
+USE_RE=re.compile(r'\[(TCP|UDP)\] (\S+) --> (\S+)(?: match (\S+))? using (\S+)')
+
+def log_events():
+    """lines from the system log that mention the watched group"""
+    try:
+        out=subprocess.run(['logread'], capture_output=True, timeout=25).stdout.decode('utf-8','replace')
+    except Exception as e:
+        sys.stderr.write('logread failed: %s\n' % e); return []
+    ev=[]
+    for ln in out.splitlines():
+        if GROUP not in ln: continue
+        m=MSG_RE.search(ln)
+        ts, msg = (m.group(1), m.group(2)) if m else ('', ln)
+        d=DIAL_RE.search(msg)
+        if d:
+            ev.append({'ts': ts, 'proto': d.group(1), 'target': d.group(5),
+                       'rule': d.group(3) or '', 'error': d.group(6) or '',
+                       'kind': 'dial', 'src': d.group(4) or ''})
+            continue
+        u=USE_RE.search(msg)
+        if u:
+            ev.append({'ts': ts, 'proto': u.group(1), 'target': u.group(3),
+                       'rule': u.group(4) or '', 'error': '',
+                       'kind': 'route', 'src': u.group(2)})
+    return ev
+
+def conn_events():
+    """currently open connections routed to the watched group (catches long-lived flows)"""
+    d=api('/connections')
+    out=[]
+    for c in (d.get('connections') or []):
+        chains=[str(x) for x in (c.get('chains') or [])]
+        if not chains or chains[0] != GROUP: continue
+        md=c.get('metadata') or {}
+        host=str(md.get('host') or md.get('destinationIP') or '')
+        out.append({'id': str(c.get('id')), 'host': host,
+                    'port': md.get('destinationPort'), 'proto': md.get('network'),
+                    'src': md.get('sourceIP'), 'down': c.get('download'), 'up': c.get('upload'),
+                    'rule': c.get('rulePayload') or c.get('rule') or ''})
+    return out
+
+def load_cursor():
+    try:
+        d=json.loads(read(CURSOR) or '{}')
+        return set(d.get('seen', [])), d.get('conns', [])
+    except Exception:
+        return set(), []
+
+def save_cursor(seen, conns):
+    # keep the dedupe set bounded
+    seen=list(seen)[-4000:]
+    try:
+        os.makedirs(os.path.dirname(CURSOR), exist_ok=True)
+        json.dump({'seen': seen, 'conns': conns, 'at': time.strftime('%F %T')},
+                  open(CURSOR+'.tmp','w'))
+        os.replace(CURSOR+'.tmp', CURSOR)
+    except Exception:
+        pass
+
+def append(lines):
+    if not lines: return
+    try:
+        with open(LOGF,'a',encoding='utf-8') as f:
+            f.write('\n'.join(lines)+'\n')
+        # rotate
+        n=sum(1 for _ in open(LOGF, encoding='utf-8', errors='replace'))
+        if n > MAXL:
+            keep=open(LOGF, encoding='utf-8', errors='replace').read().splitlines()[-MAXL:]
+            open(LOGF,'w',encoding='utf-8',newline='\n').write('\n'.join(keep)+'\n')
+    except Exception as e:
+        sys.stderr.write('log write failed: %s\n' % e)
+
+def is_bare_ip(h):
+    return bool(re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', h or ''))
+
+def do_tick():
+    seen, known = load_cursor()
+    lines=[]
+    for e in log_events():
+        key=hashlib.md5(('%s|%s|%s|%s' % (e['ts'], e['kind'], e['target'], e['error'])).encode()).hexdigest()[:16]
+        if key in seen: continue
+        seen.add(key)
+        lines.append('%s %s %s %s %s%s' % (e['ts'], e['kind'], e['proto'], e['target'],
+                        e['rule'] or '-', (' err=' + e['error']) if e['error'] else ''))
+    cur=conn_events()
+    for c in cur:
+        if c['id'] in known: continue
+        lines.append('%s live %s %s:%s src=%s rule=%s up=%s down=%s' % (
+            time.strftime('%FT%T'), c['proto'], c['host'], c['port'], c['src'],
+            c['rule'] or '-', c['up'], c['down']))
+    append(lines)
+    save_cursor(seen, [c['id'] for c in cur])
+    print(json.dumps({'ok': True, 'events': len(lines), 'group': GROUP,
+                      'open_now': len(cur), 'logfile': LOGF}))
+
+def do_report():
+    try:
+        raw=open(LOGF, encoding='utf-8', errors='replace').read().splitlines()
+    except Exception:
+        print(json.dumps({'ok': False, 'error': 'no log yet'})); return
+    hosts={}; bare=0; errs={}; srcs={}; first=last=''
+    for ln in raw:
+        p=ln.split()
+        if len(p) < 4: continue
+        if not first: first=p[0]+' '+p[1] if len(p)>1 else p[0]
+        last=p[0]+' '+p[1] if len(p)>1 else p[0]
+        tgt=p[3] if len(p)>3 else ''
+        host=re.sub(r':\d+$','', tgt.split(' ')[0])
+        if host:
+            hosts[host]=hosts.get(host,0)+1
+            if is_bare_ip(host): bare+=1
+        m=re.search(r'err=(.*)', ln)
+        if m:
+            k=m.group(1)[:60]; errs[k]=errs.get(k,0)+1
+        s=re.search(r'src=(192\.168\.\d+\.\d+)', ln)
+        if s: srcs[s.group(1)]=srcs.get(s.group(1),0)+1
+    top=sorted(hosts.items(), key=lambda x:-x[1])[:25]
+    print('watched group : %s' % GROUP)
+    print('log lines     : %d  (%s .. %s)' % (len(raw), first or '-', last or '-'))
+    print('distinct dests: %d, of them bare IPs (P2P-shaped): %d' % (len(hosts), bare))
+    print('sources       : %s' % (dict(sorted(srcs.items(), key=lambda x:-x[1])[:8]) or '-'))
+    print('errors        :')
+    for k,v in sorted(errs.items(), key=lambda x:-x[1])[:6]: print('   %5d  %s' % (v,k))
+    print('top destinations:')
+    for h,v in top: print('   %5d  %s%s' % (v, h, '   <- bare IP' if is_bare_ip(h) else ''))
+
+args=sys.argv[1:]
+if '--report' in args: do_report(); sys.exit(0)
+if '--clear' in args:
+    try: os.remove(LOGF)
+    except Exception: pass
+    save_cursor(set(), [])
+    print(json.dumps({'ok': True, 'cleared': LOGF})); sys.exit(0)
+do_tick()
+PYEOF
+
+ASSET_EOF
+  if crontab -l 2>/dev/null | grep -qE '# geomask-vpnwatch$'; then
+    info "vpnwatch cron already present"
+  else
+    ( crontab -l 2>/dev/null; echo '* * * * * /usr/bin/geomask-vpnwatch.sh --tick >/dev/null 2>&1 # geomask-vpnwatch' ) | crontab - 2>/dev/null && info "cron added: */1 vpnwatch" || warn "cannot set crontab"
+  fi
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 #!/bin/sh
 # Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
@@ -21105,7 +21431,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.17.0"
+GUARD_VERSION="1.18.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -22357,6 +22683,12 @@ geomask_uninstall() {
   # v1.15.0: torrent admin removal (ruleset + listener left in place: they belong to mihomo config)
   rm -f "$(P /usr/bin/geomask-torrent.sh)"
   info "removed: torrent admin (lists in /etc/geomask/torrent and the ruleset kept for reference)"
+  # v1.18.0: vpnwatch removal (the audit log is kept - it is the evidence the operator collected)
+  if crontab -l 2>/dev/null | grep -q 'geomask-vpnwatch'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-vpnwatch' | crontab - 2>/dev/null || true
+  fi
+  rm -f "$(P /usr/bin/geomask-vpnwatch.sh)"
+  info "removed: vpnwatch (conf /etc/geomask/vpnwatch.conf and the audit log kept)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

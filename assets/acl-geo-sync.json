@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra" ]
+				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra" ]
 			}
 		}
 	}

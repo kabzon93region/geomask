@@ -128,7 +128,8 @@ _migrate() {
 
 cmd_status() {
   _migrate
-  VPN_NODE=$(_grp_node VPN)
+  VPN_NODE=$(_grp_node VPN)          # slot VPN: P2P-tolerant tunnel (may be absent)
+  VPNNP_NODE=$(_grp_node VPN-noP2P)  # slot VPN-noP2P: the subscription whose provider forbids P2P
   AI_NODE=$(_grp_node AI)
   GLOBAL=$(controller_curl -s -m3 "$MIHOMO_API/proxies/GLOBAL" | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//; s/"$//')
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then LCRON=1; else LCRON=0; fi
@@ -156,8 +157,10 @@ cmd_status() {
   RULES=$(ip rule show | grep -c 'lookup main' || echo 0)
   _de5u=$(awk '/^  de5:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
   _subu=$(awk '/^  sub:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  _sub2u=$(awk '/^  sub2:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
   AI_SUB_ID=$(_sub_id_by_url "$_de5u" 2>/dev/null || echo '')
-  VPN_SUB_ID=$(_sub_id_by_url "$_subu" 2>/dev/null || echo '')
+  VPN_SUB_ID=$(_sub_id_by_url "$_sub2u" 2>/dev/null || echo '')
+  VPNNP_SUB_ID=$(_sub_id_by_url "$_subu" 2>/dev/null || echo '')
   if ip link show "$AI_TUN_DEV" >/dev/null 2>&1; then AI_TUN=1; else AI_TUN=0; fi
   if netstat -lntp 2>/dev/null | grep -q ':7891'; then AI_LST=1; else AI_LST=0; fi
   # AI-DNS (no DNS leak for AI devices): 0=off/absent, 1=working, 2=partial
@@ -166,14 +169,15 @@ cmd_status() {
   elif ip route get 1.1.1.1 mark 0x64 2>/dev/null | grep -q 'dev AI' \
        && netstat -ltnpu 2>/dev/null | grep -q '192.168.0.53:5353 '; then AIDNS=1
   else AIDNS=2; fi
-  printf '{"vpn_node":"%s","vpn_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","ai_url":"%s","vpn_url":"%s","aidns":%s}' \
+  printf '{"vpn_node":"%s","vpn_cc":"%s","vpn_nop2p_node":"%s","vpn_nop2p_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","vpn_nop2p_sub":"%s","ai_url":"%s","vpn_url":"%s","vpn_nop2p_url":"%s","aidns":%s}' \
     "$(json_esc "$VPN_NODE")" "$(_node_cc "$VPN_NODE")" \
+    "$(json_esc "$VPNNP_NODE")" "$(_node_cc "$VPNNP_NODE")" \
     "$(json_esc "$AI_NODE")" "$(_node_cc "$AI_NODE")" \
     "$(json_esc "$GLOBAL")" "$LCRON" "$V6" "$(json_esc "$DOH")" \
     "$AI_RC" "$MT_RC" "$(json_esc "$GOOGLE_CC")" "$(json_esc "$SYNC_AT")" \
     "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES" \
-    "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPN_SUB_ID")" \
-    "$(json_esc "$_de5u")" "$(json_esc "$_subu")" "$AIDNS"
+    "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPN_SUB_ID")" "$(json_esc "$VPNNP_SUB_ID")" \
+    "$(json_esc "$_de5u")" "$(json_esc "$_sub2u")" "$(json_esc "$_subu")" "$AIDNS"
 }
 
 # country fragment from a node name (flag emoji or RU word) - coarse, for display
@@ -734,6 +738,12 @@ cmd_sub_del() {
   printf '{"ok":true,"subs":%s}' "$(_subs_json)"
 }
 
+_mihomo_reload() { # re-read the config in the running core (no service restart)
+  controller_curl -s -m15 -f -X PUT "$MIHOMO_API/configs" \
+    -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" >/dev/null 2>&1
+  sleep 2
+}
+
 cmd_ai_sub_use() {
   ID="$1"
   URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
@@ -742,12 +752,67 @@ cmd_ai_sub_use() {
   printf '{"ok":true,"url":"%s","ai_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$AI_NODE")"
 }
 
+# v1.18.0: three assignable route slots.
+#   ai        -> provider de5  / group AI
+#   vpn       -> provider sub2 / group VPN        (P2P-tolerant tunnel; created on first use)
+#   vpn_nop2p -> provider sub  / group VPN-noP2P  (the subscription whose provider forbids P2P)
+_LANE_PY='
+import re, sys
+cfg, url = sys.argv[1], sys.argv[2]
+t = open(cfg, encoding="utf-8").read()
+if re.search(r"(?m)^  sub2:\n", t):
+    t = re.sub(r"(?m)^(  sub2:\n(?:.*\n)*?    url: )\"[^\"]*\"", r"\\1\"" + url + "\"", t, count=1)
+    action = "updated"
+else:
+    prov = ("  sub2:\n    type: http\n    url: \"%s\"\n    interval: 3600\n"
+            "    health-check:\n      enable: true\n      url: \"https://www.gstatic.com/generate_204\"\n"
+            "      interval: 180\n      timeout: 5\n      expected-status: 204\n" % url)
+    m = re.search(r"(?m)^  de5:\n", t) or re.search(r"(?m)^  sub:\n", t)
+    if not m:
+        sys.stderr.write("no proxy-providers anchor\n"); sys.exit(2)
+    t = t[:m.start()] + prov + t[m.start():]
+    grp = ("\n  - name: VPN\n    type: url-test\n    use:\n      - sub2\n"
+           "    url: \"https://www.gstatic.com/generate_204\"\n    interval: 180\n"
+           "    tolerance: 50\n    lazy: false\n")
+    gm = re.search(r"(?m)^  - name: AI\s*\n(?:^(?:    .*|\s*)\n)*", t)
+    if not gm:
+        sys.stderr.write("no AI group anchor\n"); sys.exit(2)
+    t = t[:gm.end()] + grp + t[gm.end():]
+    # move the IP-shaped traffic onto the new lane: that is the whole point of having it
+    if "RULE-SET,mtrickle_bulk" not in t:
+        t = t.replace("  - RULE-SET,mtrickle,VPN-noP2P\n",
+                      "  - RULE-SET,mtrickle_bulk,VPN\n  - RULE-SET,mtrickle,VPN-noP2P\n", 1)
+    t = t.replace("- RULE-SET,ytvpn,VPN-noP2P", "- RULE-SET,ytvpn,VPN")
+    t = t.replace("- SRC-PORT,41552,AI", "- SRC-PORT,41552,VPN")
+    action = "created"
+open(cfg, "w", encoding="utf-8", newline="").write(t)
+print(action)
+'
+
+_ensure_vpn_lane() { # $1 = url ; creates or repoints the P2P-tolerant lane, rolls back on failure
+  _c="$(P /etc/mihomo/config.yaml)"
+  cp -p "$_c" "$_c.bak_lane" 2>/dev/null
+  _act=$(python3 -c "$_LANE_PY" "$_c" "$1" 2>&1) || { printf '{"ok":false,"error":"lane edit failed: %s"}' "$(json_esc "$_act")"; mv -f "$_c.bak_lane" "$_c" 2>/dev/null; return 1; }
+  rm -f "$_c.bak_lane"
+  printf '%s' "$_act"
+}
+
 cmd_vpn_sub_use() {
   ID="$1"
   URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
-  _mihomo_set_provider sub "$URL"
+  _lane=$(_ensure_vpn_lane "$URL") || return 1
+  _mihomo_reload
   VPN_NODE=$(_grp_node VPN)
-  printf '{"ok":true,"url":"%s","vpn_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$VPN_NODE")"
+  printf '{"ok":true,"lane":"%s","url":"%s","vpn_node":"%s"}' "$(json_esc "$_lane")" "$(json_esc "$URL")" "$(json_esc "$VPN_NODE")"
+}
+
+cmd_vpnnp_sub_use() {
+  ID="$1"
+  URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
+  _mihomo_set_provider sub "$URL"
+  _mihomo_reload
+  VPN_NODE=$(_grp_node VPN-noP2P)
+  printf '{"ok":true,"url":"%s","vpn_nop2p_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$VPN_NODE")"
 }
 
 # ---------------- self-update (v1.7.0): check / status / apply ----------------
@@ -1238,6 +1303,7 @@ case "$1" in
   sub_del)    cmd_sub_del "$2" ;;
   ai_sub_use)   cmd_ai_sub_use "$2" ;;
   vpn_sub_use)  cmd_vpn_sub_use "$2" ;;
+  vpnnp_sub_use) cmd_vpnnp_sub_use "$2" ;;
   upd_check)    cmd_upd_check "$2" ;;
   upd_status)   cmd_upd_status ;;
   upd_apply)    cmd_upd_apply ;;

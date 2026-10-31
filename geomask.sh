@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.18.2"
+GM_VERSION="1.19.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.18.2"
+BACKEND_VERSION="1.19.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.18.2';
+var PANEL_VERSION = '1.19.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2893,6 +2893,18 @@ step3_check() {
       || warn "ytvpn pins still go to VPN-noP2P (bulk video traffic on a sub that may dislike it)"
   else
     info "lane: VPN not configured (single tunnel - IP rules stay on VPN-noP2P)"
+  fi
+  # v1.19.0: a port or protocol match is not a protocol classifier - any client can pick that
+  # port, so nothing address-shaped may be routed to the subscription that forbids P2P.
+  # Only meaningful when a separate P2P-tolerant lane exists: on a single-tunnel box the one
+  # group is both, and port rules have nowhere else to go.
+  if grep -qE '^  - name: VPN-noP2P$' "$_c" 2>/dev/null && grep -qE '^  - name: VPN$' "$_c" 2>/dev/null; then
+    _np_bad=$(awk '/^rules:/{f=1;next} f&&/^[^ ]/{exit} f' "$_c" \
+      | grep -E 'VPN-noP2P$' | grep -cE 'SRC-PORT|DST-PORT|IP-CIDR|NETWORK')
+    if [ "${_np_bad:-0}" -gt 0 ]; then
+      bad "$_np_bad rule(s) send ports/IPs/protocols to VPN-noP2P - a torrent client can just pick that port"
+      _need=1
+    else info "restricted slot takes domain rules only (no port/IP/protocol matches)"; fi
   fi
   if grep -qE '^  - DST-PORT,(6969|1337|2710|8081|451|5944),' "$_c" 2>/dev/null; then
     bad "legacy blanket P2P DST-PORT rule present - it sits above the ai ruleset and hijacks AI relays on those ports"
@@ -20550,6 +20562,67 @@ print('mtrickle_bulk.yaml: %d IP rules -> RESERVE (%s)' % (n4, 'updated' if c4 e
 print('ai.yaml:       %d rules (%s, + %d moved from non-AI groups by domain pattern)' % (n2, 'updated' if c2 else 'up-to-date', moved))
 print('ytvpn.yaml:    %d rules (%s)' % (n3, 'updated' if c3 else 'up-to-date'))
 
+# ---------------------------------------------------------------------------
+# v1.19.0: zapret sync, direction A - everything that rides a TUNNEL must be
+# excluded from DPI processing.
+#
+# Why: zapret's hostlist mode also rewrites DNS answers and injects fake packets for
+# the domains it knows. For a domain that leaves through a proxy tunnel that is pure
+# noise - the DPI on WAN sees only the encrypted hop to the proxy anyway. Excluding
+# tunnel-bound domains keeps zapret focused on what actually goes out in the clear.
+#
+# Direction B (zapret's force-list -> a MagiTrickle group that bypasses mihomo) is
+# deliberately NOT automated: adding those domains to a direct group would create
+# cross-lane conflicts with the curated lists, and resolving those is a human call.
+# Nothing is ever copied the other way either (zapret exclude -> MagiTrickle): the
+# exclude list contains plain RU sites.
+ZEXCL = '/opt/zapret/ipset/zapret-hosts-user-exclude.txt'
+ZBEG  = '# >>> geomask sync: tunneled domains (generated) >>>'
+ZEND  = '# <<< geomask sync: tunneled domains <<<'
+
+def _zapret_sync():
+    if not os.path.exists(ZEXCL):
+        print('zapret: %s absent - skip' % ZEXCL); return False
+    # domains that mihomo sends DIRECT must KEEP being processed by zapret
+    pinned_direct = set()
+    try:
+        cfg = open('/etc/mihomo/config.yaml', encoding='utf-8', errors='replace').read()
+        pinned_direct = {m.lower() for m in re.findall(
+            r'-\s*DOMAIN-SUFFIX,([a-z0-9.\-]+),DIRECT', cfg, re.I)}
+    except Exception:
+        pass
+    tunnel = set(mt_dom)
+    tunnel |= {p.split(',', 1)[1] for p in ai_payload if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,'))}
+    tunnel |= {p.split(',', 1)[1] for p in ytvpn_payload if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,'))}
+    tunnel = {d.lower() for d in tunnel} - pinned_direct
+    if not tunnel:
+        print('zapret: nothing to exclude - skip'); return False
+    try:
+        old = open(ZEXCL, encoding='utf-8', errors='replace').read().splitlines()
+    except Exception as e:
+        print('zapret: cannot read exclude file (%s)' % e); return False
+    # keep everything outside our managed block, including the "# nochange" guard line
+    head, mid, tail = [], None, []
+    for ln in old:
+        if ln.strip() == ZBEG: mid = head; head = None; continue
+        if mid is not None and ln.strip() == ZEND: tail = []; continue
+        if head is not None and mid is None: head.append(ln)
+        elif tail is not None and mid is not None: tail.append(ln)
+    body = [ZBEG] + sorted(tunnel) + [ZEND]
+    new = head + body + tail
+    if new == old:
+        print('zapret exclude: up-to-date (%d tunneled domains)' % len(tunnel)); return False
+    try:
+        with open(ZEXCL + '.tmp', 'w', encoding='utf-8', newline='\n') as f:
+            f.write('\n'.join(new) + '\n')
+        os.replace(ZEXCL + '.tmp', ZEXCL)
+        print('zapret exclude: wrote %d tunneled domains (reload needed)' % len(tunnel))
+        return True
+    except Exception as e:
+        print('zapret exclude: write failed (%s)' % e); return False
+
+ZAPRET_CHANGED = _zapret_sync()
+
 if c1 or c2 or c3 or c4:
     _r_ok = False
     try:
@@ -21474,7 +21547,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.18.2"
+GUARD_VERSION="1.19.0"
 
 log() { logger -t geomask-guard "$*"; }
 

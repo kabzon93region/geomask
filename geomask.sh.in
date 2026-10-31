@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.18.2"
+GM_VERSION="1.19.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -267,6 +267,18 @@ step3_check() {
       || warn "ytvpn pins still go to VPN-noP2P (bulk video traffic on a sub that may dislike it)"
   else
     info "lane: VPN not configured (single tunnel - IP rules stay on VPN-noP2P)"
+  fi
+  # v1.19.0: a port or protocol match is not a protocol classifier - any client can pick that
+  # port, so nothing address-shaped may be routed to the subscription that forbids P2P.
+  # Only meaningful when a separate P2P-tolerant lane exists: on a single-tunnel box the one
+  # group is both, and port rules have nowhere else to go.
+  if grep -qE '^  - name: VPN-noP2P$' "$_c" 2>/dev/null && grep -qE '^  - name: VPN$' "$_c" 2>/dev/null; then
+    _np_bad=$(awk '/^rules:/{f=1;next} f&&/^[^ ]/{exit} f' "$_c" \
+      | grep -E 'VPN-noP2P$' | grep -cE 'SRC-PORT|DST-PORT|IP-CIDR|NETWORK')
+    if [ "${_np_bad:-0}" -gt 0 ]; then
+      bad "$_np_bad rule(s) send ports/IPs/protocols to VPN-noP2P - a torrent client can just pick that port"
+      _need=1
+    else info "restricted slot takes domain rules only (no port/IP/protocol matches)"; fi
   fi
   if grep -qE '^  - DST-PORT,(6969|1337|2710|8081|451|5944),' "$_c" 2>/dev/null; then
     bad "legacy blanket P2P DST-PORT rule present - it sits above the ai ruleset and hijacks AI relays on those ports"

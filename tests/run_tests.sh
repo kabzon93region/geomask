@@ -727,6 +727,23 @@ grep -qF 'group=VPN-noP2P' "$HERE/../assets/geomask-vpnwatch.conf" \
   && { echo "PASS: S25 audit watches the restricted slot by default"; pass=$((pass+1)); } \
   || { echo "FAIL: S25 audit default group is wrong"; failn=$((failn+1)); }
 
+# ==================== S26: zapret sync + port-rule invariant (v1.19.0) ====================
+echo ""
+echo "=== S26: zapret exclude sync and the restricted-slot invariant ==="
+grep -qF 'ZEXCL' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && grep -qF 'geomask sync: tunneled domains' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && { echo "PASS: S26 sync writes a managed zapret exclude block"; pass=$((pass+1)); } \
+  || { echo "FAIL: S26 sync has no zapret exclude block"; failn=$((failn+1)); }
+grep -qF 'pinned_direct' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && { echo "PASS: S26 DIRECT-pinned domains stay under DPI"; pass=$((pass+1)); } \
+  || { echo "FAIL: S26 would exclude domains that go DIRECT"; failn=$((failn+1)); }
+grep -qF 'keep everything outside our managed block' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+  && { echo "PASS: S26 exclude file keeps its own content around the block"; pass=$((pass+1)); } \
+  || { echo "FAIL: S26 may clobber the exclude file"; failn=$((failn+1)); }
+grep -qF 'send ports/IPs/protocols to VPN-noP2P' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S26 --check rejects port/IP rules on the restricted slot"; pass=$((pass+1)); } \
+  || { echo "FAIL: S26 --check has no port-rule invariant"; failn=$((failn+1)); }
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

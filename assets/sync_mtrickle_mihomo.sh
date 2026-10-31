@@ -229,6 +229,67 @@ print('mtrickle_bulk.yaml: %d IP rules -> RESERVE (%s)' % (n4, 'updated' if c4 e
 print('ai.yaml:       %d rules (%s, + %d moved from non-AI groups by domain pattern)' % (n2, 'updated' if c2 else 'up-to-date', moved))
 print('ytvpn.yaml:    %d rules (%s)' % (n3, 'updated' if c3 else 'up-to-date'))
 
+# ---------------------------------------------------------------------------
+# v1.19.0: zapret sync, direction A - everything that rides a TUNNEL must be
+# excluded from DPI processing.
+#
+# Why: zapret's hostlist mode also rewrites DNS answers and injects fake packets for
+# the domains it knows. For a domain that leaves through a proxy tunnel that is pure
+# noise - the DPI on WAN sees only the encrypted hop to the proxy anyway. Excluding
+# tunnel-bound domains keeps zapret focused on what actually goes out in the clear.
+#
+# Direction B (zapret's force-list -> a MagiTrickle group that bypasses mihomo) is
+# deliberately NOT automated: adding those domains to a direct group would create
+# cross-lane conflicts with the curated lists, and resolving those is a human call.
+# Nothing is ever copied the other way either (zapret exclude -> MagiTrickle): the
+# exclude list contains plain RU sites.
+ZEXCL = '/opt/zapret/ipset/zapret-hosts-user-exclude.txt'
+ZBEG  = '# >>> geomask sync: tunneled domains (generated) >>>'
+ZEND  = '# <<< geomask sync: tunneled domains <<<'
+
+def _zapret_sync():
+    if not os.path.exists(ZEXCL):
+        print('zapret: %s absent - skip' % ZEXCL); return False
+    # domains that mihomo sends DIRECT must KEEP being processed by zapret
+    pinned_direct = set()
+    try:
+        cfg = open('/etc/mihomo/config.yaml', encoding='utf-8', errors='replace').read()
+        pinned_direct = {m.lower() for m in re.findall(
+            r'-\s*DOMAIN-SUFFIX,([a-z0-9.\-]+),DIRECT', cfg, re.I)}
+    except Exception:
+        pass
+    tunnel = set(mt_dom)
+    tunnel |= {p.split(',', 1)[1] for p in ai_payload if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,'))}
+    tunnel |= {p.split(',', 1)[1] for p in ytvpn_payload if p.startswith(('DOMAIN,', 'DOMAIN-SUFFIX,'))}
+    tunnel = {d.lower() for d in tunnel} - pinned_direct
+    if not tunnel:
+        print('zapret: nothing to exclude - skip'); return False
+    try:
+        old = open(ZEXCL, encoding='utf-8', errors='replace').read().splitlines()
+    except Exception as e:
+        print('zapret: cannot read exclude file (%s)' % e); return False
+    # keep everything outside our managed block, including the "# nochange" guard line
+    head, mid, tail = [], None, []
+    for ln in old:
+        if ln.strip() == ZBEG: mid = head; head = None; continue
+        if mid is not None and ln.strip() == ZEND: tail = []; continue
+        if head is not None and mid is None: head.append(ln)
+        elif tail is not None and mid is not None: tail.append(ln)
+    body = [ZBEG] + sorted(tunnel) + [ZEND]
+    new = head + body + tail
+    if new == old:
+        print('zapret exclude: up-to-date (%d tunneled domains)' % len(tunnel)); return False
+    try:
+        with open(ZEXCL + '.tmp', 'w', encoding='utf-8', newline='\n') as f:
+            f.write('\n'.join(new) + '\n')
+        os.replace(ZEXCL + '.tmp', ZEXCL)
+        print('zapret exclude: wrote %d tunneled domains (reload needed)' % len(tunnel))
+        return True
+    except Exception as e:
+        print('zapret exclude: write failed (%s)' % e); return False
+
+ZAPRET_CHANGED = _zapret_sync()
+
 if c1 or c2 or c3 or c4:
     _r_ok = False
     try:

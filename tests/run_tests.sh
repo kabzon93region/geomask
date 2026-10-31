@@ -751,6 +751,19 @@ grep -qF '.gs-subs td:nth-child(3) .gs-badge{white-space:nowrap}' "$HERE/../asse
   && { echo "PASS: S26 the slot badge stays on one line"; pass=$((pass+1)); } \
   || { echo "FAIL: S26 the slot badge can break across lines"; failn=$((failn+1)); }
 
+# v1.20.0: hand-written DIRECT pins outrank whatever group the owner picks - they must be gone
+if grep -qE "DOMAIN-SUFFIX,(thepiratebay|rutracker)[a-z.]*,DIRECT" "$HERE/../geomask.sh.in"; then
+  echo "FAIL: S26 template still emits hardcoded torrent DIRECT pins"; failn=$((failn+1))
+else echo "PASS: S26 no hardcoded torrent pins in the template"; pass=$((pass+1)); fi
+# node flags must reach the UI: cleanName strips them, so the badge has to carry them
+grep -qF 'function flagOf' "$HERE/../assets/geo-sync-page.js" \
+  && grep -qF 'ccBadge(cc, name)' "$HERE/../assets/geo-sync-page.js" \
+  && { echo "PASS: S26 the badge renders the flag from the node name"; pass=$((pass+1)); } \
+  || { echo "FAIL: S26 flags are still stripped everywhere"; failn=$((failn+1)); }
+if grep -qE 'ccBadge\((aiCc|vpnCc|laneCc)\)' "$HERE/../assets/geo-sync-page.js"; then
+  echo "FAIL: S26 some node badge still gets no name (flag lost)"; failn=$((failn+1))
+else echo "PASS: S26 all three slot badges receive the node name"; pass=$((pass+1)); fi
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.19.1"
+GM_VERSION="1.20.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -495,12 +495,10 @@ write_mihomo_config() {
     printf '%s\n' '  # v1.15.0: no blanket DST-PORT rules for P2P - they sat ABOVE the ai ruleset and'
     printf '%s\n' '  # hijacked AI relays that happen to use those ports. Trackers are pinned by the'
     printf '%s\n' '  # torrentdirect ruleset below (managed by geomask-torrent.sh).'
-    printf '%s\n' '  # direct fallback: these SNIs are filtered at VPN exit (verified: all 19 nodes fail, direct works)'
-    printf '%s\n' '  - DOMAIN-SUFFIX,thepiratebay.org,DIRECT'
-    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.org,DIRECT'
-    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.net,DIRECT'
-    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.wiki,DIRECT'
-    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.cc,DIRECT'
+    printf '%s\n' '  # v1.20.0: the old hand-written "DOMAIN-SUFFIX,rutracker.*,DIRECT" pins were removed.'
+    printf '%s\n' '  # Torrent sites belong in a MagiTrickle group on a direct interface - that is the'
+    printf '%s\n' '  # single place where direction is decided; a pin above the rules silently outranks'
+    printf '%s\n' '  # whatever group the owner puts the domain in.'
     printf '%s\n' '  # QUIC forced to TCP for video hosts (RKN UDP-443 throttle, B-016)'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT'

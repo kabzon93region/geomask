@@ -190,8 +190,17 @@ function cleanName(s) {
 }
 
 /* Country badge as plain text (code chip) - no flag emoji, renders everywhere. */
-function ccBadge(cc) {
-	return E('span', { 'class': 'gs-cc' }, cc || '—');
+function flagOf(s) {
+	/* the first flag emoji in a node name, e.g. "🇦🇱 Албания-1" -> "🇦🇱" */
+	var m = String(s || '').match(/[\u{1F1E6}-\u{1F1FF}][\u{1F1E6}-\u{1F1FF}]/u);
+	return m ? m[0] : '';
+}
+
+function ccBadge(cc, name) {
+	/* cleanName() strips flags from the node text on purpose; the badge is where the flag
+	   belongs, so it is taken from the raw name and kept here (owner, 31.10: "пропали банеры") */
+	var f = flagOf(name);
+	return E('span', { 'class': 'gs-cc' }, (f ? f + ' ' : '') + (cc || '—'));
 }
 
 var E = (function(raw) {
@@ -265,7 +274,7 @@ return view.extend({
 		var aiCc = st.ai_cc || '', vpnCc = st.vpn_nop2p_cc || '', laneCc = st.vpn_cc || '';
 		var aiSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
-			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc), cleanName(st.ai_node) || '—' ]),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc, st.ai_node), cleanName(st.ai_node) || '—' ]),
 			E('div', { 'class': 'gs-meta' }, 'Подписка de5 · выход ' + ((CCNAME[aiCc] || aiCc) ? (CCNAME[aiCc] || aiCc) : '—') +
 				(st.google ? ' · Google видит: ' + st.google : '')),
 			E('div', { 'class': 'gs-meta' }, 'DNS AI-устройств: ' + (
@@ -274,14 +283,14 @@ return view.extend({
 		]);
 		var vpnSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'VPN-noP2P · доменные списки MagiTrickle'),
-			E('div', { 'class': 'gs-node' }, [ ccBadge(vpnCc), cleanName(st.vpn_nop2p_node) || '—' ]),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(vpnCc, st.vpn_nop2p_node), cleanName(st.vpn_nop2p_node) || '—' ]),
 			E('div', { 'class': 'gs-meta' }, 'Слот VPN-noP2P · выход ' + ((CCNAME[vpnCc] || vpnCc) ? (CCNAME[vpnCc] || vpnCc) : '—') +
 				' · сюда нельзя торренты'),
 			E('div', { 'class': 'gs-meta' }, 'IP-правил на этом пути: быть не должно (проверка geomask --check)')
 		]);
 		var laneSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'VPN · полоса для P2P и IP-списков'),
-			E('div', { 'class': 'gs-node' }, [ ccBadge(laneCc), cleanName(st.vpn_node) || 'не настроена' ]),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(laneCc, st.vpn_node), cleanName(st.vpn_node) || 'не настроена' ]),
 			E('div', { 'class': 'gs-meta' }, 'Слот VPN · выход ' + ((CCNAME[laneCc] || laneCc) ? (CCNAME[laneCc] || laneCc) : '—')),
 			E('div', { 'class': 'gs-meta' }, 'mtrickle_bulk (IP), пины googlevideo, ответы входящим пирам')
 		]);

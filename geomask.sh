@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.19.1"
+GM_VERSION="1.20.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.19.1"
+BACKEND_VERSION="1.20.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.19.1';
+var PANEL_VERSION = '1.20.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1877,8 +1877,17 @@ function cleanName(s) {
 }
 
 /* Country badge as plain text (code chip) - no flag emoji, renders everywhere. */
-function ccBadge(cc) {
-	return E('span', { 'class': 'gs-cc' }, cc || '—');
+function flagOf(s) {
+	/* the first flag emoji in a node name, e.g. "🇦🇱 Албания-1" -> "🇦🇱" */
+	var m = String(s || '').match(/[\u{1F1E6}-\u{1F1FF}][\u{1F1E6}-\u{1F1FF}]/u);
+	return m ? m[0] : '';
+}
+
+function ccBadge(cc, name) {
+	/* cleanName() strips flags from the node text on purpose; the badge is where the flag
+	   belongs, so it is taken from the raw name and kept here (owner, 31.10: "пропали банеры") */
+	var f = flagOf(name);
+	return E('span', { 'class': 'gs-cc' }, (f ? f + ' ' : '') + (cc || '—'));
 }
 
 var E = (function(raw) {
@@ -1952,7 +1961,7 @@ return view.extend({
 		var aiCc = st.ai_cc || '', vpnCc = st.vpn_nop2p_cc || '', laneCc = st.vpn_cc || '';
 		var aiSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
-			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc), cleanName(st.ai_node) || '—' ]),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc, st.ai_node), cleanName(st.ai_node) || '—' ]),
 			E('div', { 'class': 'gs-meta' }, 'Подписка de5 · выход ' + ((CCNAME[aiCc] || aiCc) ? (CCNAME[aiCc] || aiCc) : '—') +
 				(st.google ? ' · Google видит: ' + st.google : '')),
 			E('div', { 'class': 'gs-meta' }, 'DNS AI-устройств: ' + (
@@ -1961,14 +1970,14 @@ return view.extend({
 		]);
 		var vpnSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'VPN-noP2P · доменные списки MagiTrickle'),
-			E('div', { 'class': 'gs-node' }, [ ccBadge(vpnCc), cleanName(st.vpn_nop2p_node) || '—' ]),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(vpnCc, st.vpn_nop2p_node), cleanName(st.vpn_nop2p_node) || '—' ]),
 			E('div', { 'class': 'gs-meta' }, 'Слот VPN-noP2P · выход ' + ((CCNAME[vpnCc] || vpnCc) ? (CCNAME[vpnCc] || vpnCc) : '—') +
 				' · сюда нельзя торренты'),
 			E('div', { 'class': 'gs-meta' }, 'IP-правил на этом пути: быть не должно (проверка geomask --check)')
 		]);
 		var laneSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'VPN · полоса для P2P и IP-списков'),
-			E('div', { 'class': 'gs-node' }, [ ccBadge(laneCc), cleanName(st.vpn_node) || 'не настроена' ]),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(laneCc, st.vpn_node), cleanName(st.vpn_node) || 'не настроена' ]),
 			E('div', { 'class': 'gs-meta' }, 'Слот VPN · выход ' + ((CCNAME[laneCc] || laneCc) ? (CCNAME[laneCc] || laneCc) : '—')),
 			E('div', { 'class': 'gs-meta' }, 'mtrickle_bulk (IP), пины googlevideo, ответы входящим пирам')
 		]);
@@ -3122,12 +3131,10 @@ write_mihomo_config() {
     printf '%s\n' '  # v1.15.0: no blanket DST-PORT rules for P2P - they sat ABOVE the ai ruleset and'
     printf '%s\n' '  # hijacked AI relays that happen to use those ports. Trackers are pinned by the'
     printf '%s\n' '  # torrentdirect ruleset below (managed by geomask-torrent.sh).'
-    printf '%s\n' '  # direct fallback: these SNIs are filtered at VPN exit (verified: all 19 nodes fail, direct works)'
-    printf '%s\n' '  - DOMAIN-SUFFIX,thepiratebay.org,DIRECT'
-    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.org,DIRECT'
-    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.net,DIRECT'
-    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.wiki,DIRECT'
-    printf '%s\n' '  - DOMAIN-SUFFIX,rutracker.cc,DIRECT'
+    printf '%s\n' '  # v1.20.0: the old hand-written "DOMAIN-SUFFIX,rutracker.*,DIRECT" pins were removed.'
+    printf '%s\n' '  # Torrent sites belong in a MagiTrickle group on a direct interface - that is the'
+    printf '%s\n' '  # single place where direction is decided; a pin above the rules silently outranks'
+    printf '%s\n' '  # whatever group the owner puts the domain in.'
     printf '%s\n' '  # QUIC forced to TCP for video hosts (RKN UDP-443 throttle, B-016)'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT'
@@ -21548,7 +21555,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.19.1"
+GUARD_VERSION="1.20.0"
 
 log() { logger -t geomask-guard "$*"; }
 

@@ -91,6 +91,12 @@ class WiringTests(unittest.TestCase):
     def test_reset_clears_stall_counters(self):
         self.assertRegex(BODY, r"st\['stall_seen'\]=\{\}")
 
+    def test_pinned_edges_are_not_reported_as_stalled(self):
+        # connections opened before a pin stay "stalled" until they time out; counting them
+        # makes the panel claim an already-fixed edge is still broken (seen live on 31.10)
+        self.assertRegex(BODY, r"stalled=\{h:n for h,n in stalled_all\.items\(\) if h not in edges\}")
+        self.assertRegex(BODY, r"st\.get\('stall_seen'\) or \{\}\)\.items\(\) if h not in edges")
+
 
 if __name__ == '__main__':
     unittest.main()

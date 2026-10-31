@@ -262,11 +262,14 @@ def do_scan():
         blanket, edges = rule_state(gid)
     counts=recent_failures()
     st['failures']=counts
-    stalled=stalled_edges()
+    stalled_all=stalled_edges()
+    # Connections opened BEFORE a pin keep showing as stalled until they time out, but they are
+    # already fixed - counting/reporting them makes the panel claim a pinned edge is still broken.
+    stalled={h:n for h,n in stalled_all.items() if h not in edges}
     st['stalled']=stalled
     # a stalled connection is a per-sample observation: count consecutive sightings so one
     # transient sample cannot pin an edge on its own
-    seen=st.get('stall_seen') or {}
+    seen={h:int(n) for h,n in (st.get('stall_seen') or {}).items() if h not in edges}
     fresh={}
     for h,n in stalled.items(): fresh[h]=int(seen.get(h,0))+int(n)
     st['stall_seen']=fresh

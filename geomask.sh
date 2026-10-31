@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.15.2"
+GM_VERSION="1.15.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.15.2"
+BACKEND_VERSION="1.15.3"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1624,7 +1624,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.15.2';
+var PANEL_VERSION = '1.15.3';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -21011,7 +21011,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.15.2"
+GUARD_VERSION="1.15.3"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -21738,11 +21738,14 @@ def do_scan():
         blanket, edges = rule_state(gid)
     counts=recent_failures()
     st['failures']=counts
-    stalled=stalled_edges()
+    stalled_all=stalled_edges()
+    # Connections opened BEFORE a pin keep showing as stalled until they time out, but they are
+    # already fixed - counting/reporting them makes the panel claim a pinned edge is still broken.
+    stalled={h:n for h,n in stalled_all.items() if h not in edges}
     st['stalled']=stalled
     # a stalled connection is a per-sample observation: count consecutive sightings so one
     # transient sample cannot pin an edge on its own
-    seen=st.get('stall_seen') or {}
+    seen={h:int(n) for h,n in (st.get('stall_seen') or {}).items() if h not in edges}
     fresh={}
     for h,n in stalled.items(): fresh[h]=int(seen.get(h,0))+int(n)
     st['stall_seen']=fresh

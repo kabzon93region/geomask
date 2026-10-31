@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.18.0"
+GM_VERSION="1.18.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.18.0"
+BACKEND_VERSION="1.18.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1693,7 +1693,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.18.0';
+var PANEL_VERSION = '1.18.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -21282,8 +21282,9 @@ def do_tick():
         key=hashlib.md5(('%s|%s|%s|%s' % (e['ts'], e['kind'], e['target'], e['error'])).encode()).hexdigest()[:16]
         if key in seen: continue
         seen.add(key)
-        lines.append('%s %s %s %s %s%s' % (e['ts'], e['kind'], e['proto'], e['target'],
-                        e['rule'] or '-', (' err=' + e['error']) if e['error'] else ''))
+        lines.append('%s %s %s %s %s src=%s%s' % (e['ts'], e['kind'], e['proto'], e['target'],
+                        e['rule'] or '-', e['src'] or '-',
+                        (' err=' + e['error']) if e['error'] else ''))
     cur=conn_events()
     for c in cur:
         if c['id'] in known: continue
@@ -21304,9 +21305,10 @@ def do_report():
     for ln in raw:
         p=ln.split()
         if len(p) < 4: continue
-        if not first: first=p[0]+' '+p[1] if len(p)>1 else p[0]
-        last=p[0]+' '+p[1] if len(p)>1 else p[0]
-        tgt=p[3] if len(p)>3 else ''
+        if not first: first=p[0]
+        last=p[0]
+        m=re.search(r'-->\s+(\S+)', ln)
+        tgt=(m.group(1) if m else (p[3] if len(p)>3 else ''))
         host=re.sub(r':\d+$','', tgt.split(' ')[0])
         if host:
             hosts[host]=hosts.get(host,0)+1
@@ -21431,7 +21433,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.18.0"
+GUARD_VERSION="1.18.1"
 
 log() { logger -t geomask-guard "$*"; }
 

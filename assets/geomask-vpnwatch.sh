@@ -134,8 +134,9 @@ def do_tick():
         key=hashlib.md5(('%s|%s|%s|%s' % (e['ts'], e['kind'], e['target'], e['error'])).encode()).hexdigest()[:16]
         if key in seen: continue
         seen.add(key)
-        lines.append('%s %s %s %s %s%s' % (e['ts'], e['kind'], e['proto'], e['target'],
-                        e['rule'] or '-', (' err=' + e['error']) if e['error'] else ''))
+        lines.append('%s %s %s %s %s src=%s%s' % (e['ts'], e['kind'], e['proto'], e['target'],
+                        e['rule'] or '-', e['src'] or '-',
+                        (' err=' + e['error']) if e['error'] else ''))
     cur=conn_events()
     for c in cur:
         if c['id'] in known: continue
@@ -156,9 +157,10 @@ def do_report():
     for ln in raw:
         p=ln.split()
         if len(p) < 4: continue
-        if not first: first=p[0]+' '+p[1] if len(p)>1 else p[0]
-        last=p[0]+' '+p[1] if len(p)>1 else p[0]
-        tgt=p[3] if len(p)>3 else ''
+        if not first: first=p[0]
+        last=p[0]
+        m=re.search(r'-->\s+(\S+)', ln)
+        tgt=(m.group(1) if m else (p[3] if len(p)>3 else ''))
         host=re.sub(r':\d+$','', tgt.split(' ')[0])
         if host:
             hosts[host]=hosts.get(host,0)+1

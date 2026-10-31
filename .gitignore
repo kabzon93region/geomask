@@ -3,6 +3,9 @@ sandbox/
 *.pyc
 __pycache__/
 
+# agent runtime artifacts (session logs, code-map index) - local only, never published
+.dsh/
+
 # tests runtime artifacts (tests/ is published; its generated state is not)
 tests/last_out.txt
 tests/s10_out.txt

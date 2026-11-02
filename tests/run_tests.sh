@@ -1061,6 +1061,17 @@ grep -qF '_teardown_netfw' "$HERE/../assets/geomask-lane.sh" \
   && { echo "PASS: S41 lane removal tears the zone/network down too"; pass=$((pass+1)); } \
   || { echo "FAIL: S41 removal leaves an orphan zone/network behind"; failn=$((failn+1)); }
 
+# v1.22.8: the AI lane must be USA-filtered (un1.pro routes OpenAI via a blocked Helsinki relay)
+if grep -A8 "  - name: AI" "$HERE/../geomask.sh.in" | grep -qE "use:|      - sub" \
+   && grep -A8 "  - name: AI" "$HERE/../geomask.sh.in" | grep -qF "filter: 'USA'"; then
+  echo "PASS: S42 AI group borrows node-relay and filters to USA"; pass=$((pass+1))
+else
+  echo "FAIL: S42 AI group is not USA-filtered (OpenAI would see the RU-mapped relay)"; failn=$((failn+1))
+fi
+grep -A8 "  - name: AI" "$HERE/../geomask.sh.in" | grep -qF "exclude-filter: 'HY2'" \
+  && { echo "PASS: S42 the dead USA-HY2 node is excluded from AI"; pass=$((pass+1)); } \
+  || { echo "FAIL: S42 USA-HY2 (unreachable) is left in the AI group"; failn=$((failn+1)); }
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.22.7"
+GM_VERSION="1.22.8"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -459,10 +459,16 @@ write_mihomo_config() {
     printf '%s\n' '    interval: 180'
     printf '%s\n' '    tolerance: 50'
     printf '%s\n' '    lazy: false'
+    printf '%s\n' '  # AI lane: v1.22.8 - the un1.pro AI subscription (de5) routes OpenAI/ChatGPT'
+    printf '%s\n' '  # through a Helsinki/Russia relay on ALL its USA nodes (OpenAI -> unsupported_country),'
+    printf '%s\n' '  # so AI now borrows node-relay (sub) and keeps only its genuine-USA nodes. de5 stays'
+    printf '%s\n' '  # defined for the subscription switcher in the panel and for a future un1.pro fix.'
     printf '%s\n' '  - name: AI'
     printf '%s\n' '    type: url-test'
     printf '%s\n' '    use:'
-    printf '%s\n' '      - de5'
+    printf '%s\n' '      - sub'
+    printf '%s\n' "    filter: 'USA'"
+    printf '%s\n' "    exclude-filter: 'HY2'"
     printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
     printf '%s\n' '    interval: 180'
     printf '%s\n' '    tolerance: 50'

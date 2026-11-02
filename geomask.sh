@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.22.7"
+GM_VERSION="1.22.8"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.22.7"
+BACKEND_VERSION="1.22.8"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.22.7';
+var PANEL_VERSION = '1.22.8';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -3095,10 +3095,16 @@ write_mihomo_config() {
     printf '%s\n' '    interval: 180'
     printf '%s\n' '    tolerance: 50'
     printf '%s\n' '    lazy: false'
+    printf '%s\n' '  # AI lane: v1.22.8 - the un1.pro AI subscription (de5) routes OpenAI/ChatGPT'
+    printf '%s\n' '  # through a Helsinki/Russia relay on ALL its USA nodes (OpenAI -> unsupported_country),'
+    printf '%s\n' '  # so AI now borrows node-relay (sub) and keeps only its genuine-USA nodes. de5 stays'
+    printf '%s\n' '  # defined for the subscription switcher in the panel and for a future un1.pro fix.'
     printf '%s\n' '  - name: AI'
     printf '%s\n' '    type: url-test'
     printf '%s\n' '    use:'
-    printf '%s\n' '      - de5'
+    printf '%s\n' '      - sub'
+    printf '%s\n' "    filter: 'USA'"
+    printf '%s\n' "    exclude-filter: 'HY2'"
     printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
     printf '%s\n' '    interval: 180'
     printf '%s\n' '    tolerance: 50'
@@ -22284,7 +22290,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.22.7"
+GUARD_VERSION="1.22.8"
 
 log() { logger -t geomask-guard "$*"; }
 

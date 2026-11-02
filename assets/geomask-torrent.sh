@@ -141,25 +141,27 @@ def build_ruleset():
     return len(hosts), len(ips), True
 
 # ---------- listener toggle ----------
-# The listener is the torrent client's egress. Policy rules (v1.17.0):
-#   RESERVE lane configured -> no fixed policy: the rule chain decides, so AI domains sent here
-#     still match RULE-SET,ai and go to AI, while every IP rule (peers on hosting providers)
-#     goes to RESERVE, never to the P2P-restricted VPN sub.
-#   no RESERVE lane         -> fixed "proxy: DIRECT", because otherwise peers whose IP sits in
-#     the hosting lists end up on the VPN sub - exactly what got the subscription blocked (31.10).
+# The listener is the torrent client's egress. Policy (v1.23.1, owner decision 02.11):
+#   P2P must NEVER reach node-relay (the provider that banned the sub for BitTorrent). The
+#   torrent client is told to proxy ALL traffic (peers/DHT/trackers) through this SOCKS listener,
+#   so MagiTrickle never sees a raw peer IP to fwmark. The listener is therefore pinned to the
+#   P2P-TOLERANT lane: "proxy: VPN" (the sub2/vlessi group). If that lane is absent, fall back to
+#   "proxy: DIRECT" (real IP, but off the forbidden subscription). It is NEVER left rule-based
+#   (that let AI domains through) and NEVER pinned to AI (node-relay = instant ban).
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
                 '    listen: 192.168.0.1']
 
-def has_reserve_lane():
-    """A RESERVE group means every IP rule is routed away from the P2P-restricted VPN sub,
-    so the listener can be left to the rule chain. Without it a fixed policy is mandatory."""
-    return re.search(r'(?m)^  - name: RESERVE\s*$', read(CFG)) is not None
+def tolerant_lane():
+    """The P2P-tolerant mihomo group: 'VPN' (sub2). Absent on a single-lane box."""
+    t = read(CFG)
+    return 'VPN' if re.search(r'(?m)^  - name: VPN\s*$', t) else ''
+
+def listener_policy_target():
+    """Where the torrent listener is pinned: the tolerant lane, else DIRECT. Never AI."""
+    return tolerant_lane() or 'DIRECT'
 
 def listener_block():
-    blk = list(LISTENER_BLOCK)
-    if not has_reserve_lane():
-        blk.append('    proxy: DIRECT')   # keeps P2P off the VPN subscription by force
-    return blk
+    return LISTENER_BLOCK + ['    proxy: %s' % listener_policy_target()]
 
 def listener_policy():
     t=read(CFG)
@@ -172,7 +174,21 @@ def listener_present():
 def set_listener(on):
     t=read(CFG); lines=t.splitlines(True)
     if on:
-        if listener_present(): return False
+        if listener_present():
+            # v1.23.1 repair: an existing listener must be pinned to the tolerant lane
+            # (never rule-based, never AI). Rewrite its proxy line to the required target.
+            tgt=listener_policy_target()
+            if listener_policy()==tgt: return False
+            def fix(m):
+                blk=m.group(0)
+                if re.search(r'(?m)^\s{4}proxy:\s*\S+\s*$', blk):
+                    blk=re.sub(r'(?m)^(\s{4})proxy:\s*\S+\s*$', r'\g<1>proxy: '+tgt, blk, count=1)
+                else:
+                    blk=blk.rstrip('\n')+'\n    proxy: '+tgt+'\n'
+                return blk
+            new=re.sub(r'(?m)^  - name: torrent-direct\n(?:[ ]{4}.*\n)+', fix, t, count=1)
+            if new==t: log('could not locate torrent-direct block to repair'); return False
+            return _commit_listener(t,new,'policy -> %s'%tgt)
         idx=next((i for i,l in enumerate(lines) if re.match(r'^\s+proxy: AI\s*$', l)), None)
         if idx is None: log('no ai-devices listener to anchor to'); return False
         lines.insert(idx+1, ''.join(x+'\n' for x in listener_block()))
@@ -189,14 +205,17 @@ def set_listener(on):
                 continue
             out.append(lines[i]); i+=1
         lines=out
-    new=''.join(lines)
-    bak=CFG+'.bak_torrent'; open(bak,'w',encoding='utf-8',newline='').write(t)
+    return _commit_listener(t, ''.join(lines), 'enabled' if on else 'disabled')
+
+def _commit_listener(old, new, why):
+    if new==old: return False
+    bak=CFG+'.bak_torrent'; open(bak,'w',encoding='utf-8',newline='').write(old)
     open(CFG,'w',encoding='utf-8',newline='').write(new)
     if not validate():
-        open(CFG,'w',encoding='utf-8',newline='').write(t)
+        open(CFG,'w',encoding='utf-8',newline='').write(old)
         log('listener change rejected by mihomo -t, config restored'); return False
     api('PUT','/configs?force=true', {'path': CFG})
-    log('listener %s' % ('enabled' if on else 'disabled'))
+    log('listener %s' % why)
     return True
 
 # ---------- commands ----------

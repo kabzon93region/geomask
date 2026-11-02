@@ -156,6 +156,7 @@ listeners:
     type: mixed
     port: 7894
     listen: 192.168.0.1
+    proxy: VPN
 sniffer:
   enable: true
   parse-pure-ip: true
@@ -658,18 +659,21 @@ grep -qF 'lane invariant: mtrickle.yaml has no IP rules' "$HERE/../geomask.sh.in
 grep -qF 'lane: mtrickle_bulk -> VPN rule missing' "$HERE/../geomask.sh.in" \
   && { echo "PASS: S24 --check requires the lane routing rule"; pass=$((pass+1)); } \
   || { echo "FAIL: S24 --check does not require the lane rule"; failn=$((failn+1)); }
-# the listener is rule-based only BECAUSE the lane exists; without a lane a fixed
-# policy is still demanded - the check must keep both branches
-grep -qF 'no fixed policy and no VPN lane' "$HERE/../geomask.sh.in" \
-  && { echo "PASS: S24 policy-less listener is still rejected without a lane"; pass=$((pass+1)); } \
-  || { echo "FAIL: S24 lost the no-lanes safety branch"; failn=$((failn+1)); }
-grep -qE 'SRC-PORT,41552,\(VPN\|AI\|DIRECT\)' "$HERE/../geomask.sh.in" \
-  && { echo "PASS: S24 peer-reply guard accepts the lane targets"; pass=$((pass+1)); } \
-  || { echo "FAIL: S24 peer-reply guard check is wrong"; failn=$((failn+1)); }
-if grep -qF 'def listener_block' "$HERE/../assets/geomask-torrent.sh" \
-   && grep -qF "'    proxy: DIRECT'" "$HERE/../assets/geomask-torrent.sh"; then
-  echo "PASS: S24 admin script: rule-based with lanes, DIRECT fallback without"; pass=$((pass+1))
-else echo "FAIL: S24 admin script has no lane-aware policy logic"; failn=$((failn+1)); fi
+# v1.23.1 (owner decision 02.11): the torrent listener must be pinned to the P2P-tolerant lane
+# (VPN) or DIRECT - NEVER to AI (AI is node-relay, the provider that banned the sub) and never
+# rule-based (then peers leak to node-relay via MagiTrickle IP marks). --check enforces this.
+if grep -qF 'pinned to AI = node-relay' "$HERE/../geomask.sh.in"; then
+  echo "PASS: S24 --check rejects an AI-pinned torrent listener"; pass=$((pass+1))
+else echo "FAIL: S24 --check does not reject AI listener (ban vector)"; failn=$((failn+1)); fi
+if grep -qF 'no fixed policy - peers can reach node-relay' "$HERE/../geomask.sh.in"; then
+  echo "PASS: S24 --check rejects a policy-less listener"; pass=$((pass+1))
+else echo "FAIL: S24 lost the no-policy safety branch"; failn=$((failn+1)); fi
+if grep -qE 'SRC-PORT,41552,\(VPN\|DIRECT\)' "$HERE/../geomask.sh.in"; then
+  echo "PASS: S24 peer-reply guard is VPN/DIRECT only (not AI)"; pass=$((pass+1))
+else echo "FAIL: S24 peer-reply guard still allows AI"; failn=$((failn+1)); fi
+if grep -qF 'def tolerant_lane' "$HERE/../assets/geomask-torrent.sh" && grep -qF "return tolerant_lane() or 'DIRECT'" "$HERE/../assets/geomask-torrent.sh"; then
+  echo "PASS: S24 admin script pins to tolerant lane/DIRECT (never AI)"; pass=$((pass+1))
+else echo "FAIL: S24 admin script has no tolerant-lane policy"; failn=$((failn+1)); fi
 grep -qF "'    proxy: DIRECT'" "$HERE/../geomask.sh.in" \
   && { echo "PASS: S24 fresh-install template pins a safe policy"; pass=$((pass+1)); } \
   || { echo "FAIL: S24 template ships a policy-less listener without lanes"; failn=$((failn+1)); }

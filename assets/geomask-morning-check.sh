@@ -51,9 +51,11 @@ echo
 echo "--- 3. tracker: attempts against the restricted slot ---"
 /usr/bin/geomask-vpnwatch.sh --report | sed 's/^/  /'
 LINES=$(wc -l < /root/geomask-vpn-audit.log 2>/dev/null || echo 0)
-BARE=$(/usr/bin/geomask-vpnwatch.sh --report | grep -oE 'bare IPs \(P2P-shaped\): [0-9]+' | grep -oE '[0-9]+$')
-[ "${BARE:-0}" = "0" ] && ok "no bare-IP destination ever tried the restricted slot" \
-  || bad "$BARE bare-IP destinations tried it - do NOT start torrenting"
+BARE=$(/usr/bin/geomask-vpnwatch.sh --report 2>/dev/null | grep -oE 'PEER-SHAPED \(bare IP, not multicast\): [0-9]+' | grep -oE '[0-9]+$')
+# v1.23.1 (R26): unknown != 0. If the count can't be read, do NOT print a green "no P2P".
+if [ -z "$BARE" ]; then warn "peer-shaped count unreadable from vpnwatch (format drift?) - P2P safety NOT confirmed"
+elif [ "$BARE" = "0" ]; then ok "no bare-IP destination ever tried the restricted slot"
+else bad "$BARE bare-IP destinations tried it - do NOT start torrenting"; fi
 echo "    (log lines: $LINES; last entry: $(tail -1 /root/geomask-vpn-audit.log 2>/dev/null | cut -c1-19))"
 
 if [ "$Q" = "--quick" ]; then

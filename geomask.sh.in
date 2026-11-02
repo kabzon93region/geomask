@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.23.0"
+GM_VERSION="1.23.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -228,23 +228,21 @@ step3_check() {
     || { bad "rule mtrickle->VPN missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
   if grep -q 'torrent-direct' "$_c" 2>/dev/null; then
-    # v1.18.0: with the P2P-tolerant "VPN" lane configured, no IP rule can reach the restricted
-    # slot, so the listener may be rule-based (and AI domains through it still land in AI). Without
-    # the lane the listener MUST carry a fixed policy - that is what blocked the subscription.
+    # v1.23.1: the torrent listener is the P2P egress. It MUST be pinned to the P2P-tolerant
+    # lane (VPN/sub2) or to DIRECT - NEVER to AI (AI is now node-relay, the provider that banned
+    # the sub for BitTorrent) and never rule-based (then peers leak to node-relay via IP marks).
     _tp=$(awk '/name: torrent-direct/{f=1;next} f&&/^[^ ]/{exit} f&&/^    proxy:/{sub(/^[^:]*:[[:space:]]*/,"");print;exit}' "$_c")
-    if grep -q 'name: VPN$' "$_c" 2>/dev/null; then
-      info "listener (torrent-direct:7894, rule-based + VPN lane): present"
-    else
-      case "$_tp" in
-        AI|DIRECT) info "listener (torrent-direct:7894 -> $_tp): present" ;;
-        '')        bad "torrent listener has no fixed policy and no VPN lane - peers can reach the restricted sub"; _need=1 ;;
-        *)         bad "torrent listener policy is '$_tp' - expected AI or DIRECT (or configure the VPN lane)"; _need=1 ;;
-      esac
-    fi
-  else warn "torrent-direct listener missing (torrent clients cannot be pinned away from the VPN sub)"; fi
-  grep -qE '^  - SRC-PORT,41552,(VPN|AI|DIRECT)$' "$_c" 2>/dev/null \
-    && info "torrent peer guard (SRC-PORT): present" \
-    || warn "SRC-PORT,41552 guard missing - incoming peers may still be routed to the VPN sub"
+    case "$_tp" in
+      VPN)    info "listener (torrent-direct:7894 -> VPN, P2P-tolerant): present" ;;
+      DIRECT) info "listener (torrent-direct:7894 -> DIRECT): present (off node-relay; add the VPN lane to hide the real IP)" ;;
+      AI)     bad "torrent listener pinned to AI = node-relay - P2P would re-ban the subscription"; _need=1 ;;
+      '')     bad "torrent listener has no fixed policy - peers can reach node-relay via MagiTrickle IP marks"; _need=1 ;;
+      *)      bad "torrent listener policy '$_tp' - expected VPN or DIRECT (never AI)"; _need=1 ;;
+    esac
+  else warn "torrent-direct listener missing (torrent clients cannot be pinned away from node-relay)"; fi
+  grep -qE '^  - SRC-PORT,41552,(VPN|DIRECT)$' "$_c" 2>/dev/null \
+    && info "torrent peer guard (SRC-PORT -> tolerant/DIRECT): present" \
+    || warn "SRC-PORT,41552 guard absent or not on VPN/DIRECT - incoming peers may reach node-relay"
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"

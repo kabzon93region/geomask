@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.23.0"
+GM_VERSION="1.23.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.23.0"
+BACKEND_VERSION="1.23.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.23.0';
+var PANEL_VERSION = '1.23.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2864,23 +2864,21 @@ step3_check() {
     || { bad "rule mtrickle->VPN missing"; _need=1; }
   grep -q 'ai-devices' "$_c" 2>/dev/null && info "listeners (ai-devices): present" || { bad "listeners (ai-devices:7891) missing"; _need=1; }
   if grep -q 'torrent-direct' "$_c" 2>/dev/null; then
-    # v1.18.0: with the P2P-tolerant "VPN" lane configured, no IP rule can reach the restricted
-    # slot, so the listener may be rule-based (and AI domains through it still land in AI). Without
-    # the lane the listener MUST carry a fixed policy - that is what blocked the subscription.
+    # v1.23.1: the torrent listener is the P2P egress. It MUST be pinned to the P2P-tolerant
+    # lane (VPN/sub2) or to DIRECT - NEVER to AI (AI is now node-relay, the provider that banned
+    # the sub for BitTorrent) and never rule-based (then peers leak to node-relay via IP marks).
     _tp=$(awk '/name: torrent-direct/{f=1;next} f&&/^[^ ]/{exit} f&&/^    proxy:/{sub(/^[^:]*:[[:space:]]*/,"");print;exit}' "$_c")
-    if grep -q 'name: VPN$' "$_c" 2>/dev/null; then
-      info "listener (torrent-direct:7894, rule-based + VPN lane): present"
-    else
-      case "$_tp" in
-        AI|DIRECT) info "listener (torrent-direct:7894 -> $_tp): present" ;;
-        '')        bad "torrent listener has no fixed policy and no VPN lane - peers can reach the restricted sub"; _need=1 ;;
-        *)         bad "torrent listener policy is '$_tp' - expected AI or DIRECT (or configure the VPN lane)"; _need=1 ;;
-      esac
-    fi
-  else warn "torrent-direct listener missing (torrent clients cannot be pinned away from the VPN sub)"; fi
-  grep -qE '^  - SRC-PORT,41552,(VPN|AI|DIRECT)$' "$_c" 2>/dev/null \
-    && info "torrent peer guard (SRC-PORT): present" \
-    || warn "SRC-PORT,41552 guard missing - incoming peers may still be routed to the VPN sub"
+    case "$_tp" in
+      VPN)    info "listener (torrent-direct:7894 -> VPN, P2P-tolerant): present" ;;
+      DIRECT) info "listener (torrent-direct:7894 -> DIRECT): present (off node-relay; add the VPN lane to hide the real IP)" ;;
+      AI)     bad "torrent listener pinned to AI = node-relay - P2P would re-ban the subscription"; _need=1 ;;
+      '')     bad "torrent listener has no fixed policy - peers can reach node-relay via MagiTrickle IP marks"; _need=1 ;;
+      *)      bad "torrent listener policy '$_tp' - expected VPN or DIRECT (never AI)"; _need=1 ;;
+    esac
+  else warn "torrent-direct listener missing (torrent clients cannot be pinned away from node-relay)"; fi
+  grep -qE '^  - SRC-PORT,41552,(VPN|DIRECT)$' "$_c" 2>/dev/null \
+    && info "torrent peer guard (SRC-PORT -> tolerant/DIRECT): present" \
+    || warn "SRC-PORT,41552 guard absent or not on VPN/DIRECT - incoming peers may reach node-relay"
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
@@ -21305,25 +21303,27 @@ def build_ruleset():
     return len(hosts), len(ips), True
 
 # ---------- listener toggle ----------
-# The listener is the torrent client's egress. Policy rules (v1.17.0):
-#   RESERVE lane configured -> no fixed policy: the rule chain decides, so AI domains sent here
-#     still match RULE-SET,ai and go to AI, while every IP rule (peers on hosting providers)
-#     goes to RESERVE, never to the P2P-restricted VPN sub.
-#   no RESERVE lane         -> fixed "proxy: DIRECT", because otherwise peers whose IP sits in
-#     the hosting lists end up on the VPN sub - exactly what got the subscription blocked (31.10).
+# The listener is the torrent client's egress. Policy (v1.23.1, owner decision 02.11):
+#   P2P must NEVER reach node-relay (the provider that banned the sub for BitTorrent). The
+#   torrent client is told to proxy ALL traffic (peers/DHT/trackers) through this SOCKS listener,
+#   so MagiTrickle never sees a raw peer IP to fwmark. The listener is therefore pinned to the
+#   P2P-TOLERANT lane: "proxy: VPN" (the sub2/vlessi group). If that lane is absent, fall back to
+#   "proxy: DIRECT" (real IP, but off the forbidden subscription). It is NEVER left rule-based
+#   (that let AI domains through) and NEVER pinned to AI (node-relay = instant ban).
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
                 '    listen: 192.168.0.1']
 
-def has_reserve_lane():
-    """A RESERVE group means every IP rule is routed away from the P2P-restricted VPN sub,
-    so the listener can be left to the rule chain. Without it a fixed policy is mandatory."""
-    return re.search(r'(?m)^  - name: RESERVE\s*$', read(CFG)) is not None
+def tolerant_lane():
+    """The P2P-tolerant mihomo group: 'VPN' (sub2). Absent on a single-lane box."""
+    t = read(CFG)
+    return 'VPN' if re.search(r'(?m)^  - name: VPN\s*$', t) else ''
+
+def listener_policy_target():
+    """Where the torrent listener is pinned: the tolerant lane, else DIRECT. Never AI."""
+    return tolerant_lane() or 'DIRECT'
 
 def listener_block():
-    blk = list(LISTENER_BLOCK)
-    if not has_reserve_lane():
-        blk.append('    proxy: DIRECT')   # keeps P2P off the VPN subscription by force
-    return blk
+    return LISTENER_BLOCK + ['    proxy: %s' % listener_policy_target()]
 
 def listener_policy():
     t=read(CFG)
@@ -21336,7 +21336,21 @@ def listener_present():
 def set_listener(on):
     t=read(CFG); lines=t.splitlines(True)
     if on:
-        if listener_present(): return False
+        if listener_present():
+            # v1.23.1 repair: an existing listener must be pinned to the tolerant lane
+            # (never rule-based, never AI). Rewrite its proxy line to the required target.
+            tgt=listener_policy_target()
+            if listener_policy()==tgt: return False
+            def fix(m):
+                blk=m.group(0)
+                if re.search(r'(?m)^\s{4}proxy:\s*\S+\s*$', blk):
+                    blk=re.sub(r'(?m)^(\s{4})proxy:\s*\S+\s*$', r'\g<1>proxy: '+tgt, blk, count=1)
+                else:
+                    blk=blk.rstrip('\n')+'\n    proxy: '+tgt+'\n'
+                return blk
+            new=re.sub(r'(?m)^  - name: torrent-direct\n(?:[ ]{4}.*\n)+', fix, t, count=1)
+            if new==t: log('could not locate torrent-direct block to repair'); return False
+            return _commit_listener(t,new,'policy -> %s'%tgt)
         idx=next((i for i,l in enumerate(lines) if re.match(r'^\s+proxy: AI\s*$', l)), None)
         if idx is None: log('no ai-devices listener to anchor to'); return False
         lines.insert(idx+1, ''.join(x+'\n' for x in listener_block()))
@@ -21353,14 +21367,17 @@ def set_listener(on):
                 continue
             out.append(lines[i]); i+=1
         lines=out
-    new=''.join(lines)
-    bak=CFG+'.bak_torrent'; open(bak,'w',encoding='utf-8',newline='').write(t)
+    return _commit_listener(t, ''.join(lines), 'enabled' if on else 'disabled')
+
+def _commit_listener(old, new, why):
+    if new==old: return False
+    bak=CFG+'.bak_torrent'; open(bak,'w',encoding='utf-8',newline='').write(old)
     open(CFG,'w',encoding='utf-8',newline='').write(new)
     if not validate():
-        open(CFG,'w',encoding='utf-8',newline='').write(t)
+        open(CFG,'w',encoding='utf-8',newline='').write(old)
         log('listener change rejected by mihomo -t, config restored'); return False
     api('PUT','/configs?force=true', {'path': CFG})
-    log('listener %s' % ('enabled' if on else 'disabled'))
+    log('listener %s' % why)
     return True
 
 # ---------- commands ----------
@@ -21899,9 +21916,11 @@ echo
 echo "--- 3. tracker: attempts against the restricted slot ---"
 /usr/bin/geomask-vpnwatch.sh --report | sed 's/^/  /'
 LINES=$(wc -l < /root/geomask-vpn-audit.log 2>/dev/null || echo 0)
-BARE=$(/usr/bin/geomask-vpnwatch.sh --report | grep -oE 'bare IPs \(P2P-shaped\): [0-9]+' | grep -oE '[0-9]+$')
-[ "${BARE:-0}" = "0" ] && ok "no bare-IP destination ever tried the restricted slot" \
-  || bad "$BARE bare-IP destinations tried it - do NOT start torrenting"
+BARE=$(/usr/bin/geomask-vpnwatch.sh --report 2>/dev/null | grep -oE 'PEER-SHAPED \(bare IP, not multicast\): [0-9]+' | grep -oE '[0-9]+$')
+# v1.23.1 (R26): unknown != 0. If the count can't be read, do NOT print a green "no P2P".
+if [ -z "$BARE" ]; then warn "peer-shaped count unreadable from vpnwatch (format drift?) - P2P safety NOT confirmed"
+elif [ "$BARE" = "0" ]; then ok "no bare-IP destination ever tried the restricted slot"
+else bad "$BARE bare-IP destinations tried it - do NOT start torrenting"; fi
 echo "    (log lines: $LINES; last entry: $(tail -1 /root/geomask-vpn-audit.log 2>/dev/null | cut -c1-19))"
 
 if [ "$Q" = "--quick" ]; then
@@ -22288,7 +22307,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.23.0"
+GUARD_VERSION="1.23.1"
 
 log() { logger -t geomask-guard "$*"; }
 

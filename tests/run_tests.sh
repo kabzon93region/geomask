@@ -674,6 +674,10 @@ else echo "FAIL: S24 peer-reply guard still allows AI"; failn=$((failn+1)); fi
 if grep -qF 'def tolerant_lane' "$HERE/../assets/geomask-torrent.sh" && grep -qF "return tolerant_lane() or 'DIRECT'" "$HERE/../assets/geomask-torrent.sh"; then
   echo "PASS: S24 admin script pins to tolerant lane/DIRECT (never AI)"; pass=$((pass+1))
 else echo "FAIL: S24 admin script has no tolerant-lane policy"; failn=$((failn+1)); fi
+# v1.23.2 (R01/P1): --check must guard that node-relay groups carry no static IP ranges
+if grep -qF 'static IP range(s)' "$HERE/../geomask.sh.in" && grep -qF 'type: subnet' "$HERE/../geomask.sh.in"; then
+  echo "PASS: S24 --check guards node-relay static IP ranges (R01/P1)"; pass=$((pass+1))
+else echo "FAIL: S24 --check missing node-relay static-IP guard"; failn=$((failn+1)); fi
 grep -qF "'    proxy: DIRECT'" "$HERE/../geomask.sh.in" \
   && { echo "PASS: S24 fresh-install template pins a safe policy"; pass=$((pass+1)); } \
   || { echo "FAIL: S24 template ships a policy-less listener without lanes"; failn=$((failn+1)); }

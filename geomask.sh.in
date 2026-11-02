@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.23.1"
+GM_VERSION="1.23.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -242,7 +242,16 @@ step3_check() {
   else warn "torrent-direct listener missing (torrent clients cannot be pinned away from node-relay)"; fi
   grep -qE '^  - SRC-PORT,41552,(VPN|DIRECT)$' "$_c" 2>/dev/null \
     && info "torrent peer guard (SRC-PORT -> tolerant/DIRECT): present" \
-    || warn "SRC-PORT,41552 guard absent or not on VPN/DIRECT - incoming peers may reach node-relay"
+    || warn "SRC-PORT,41552 guard absent or not on VPN-DIRECT - incoming peers may reach node-relay"
+  # R01/P1 (v1.23.2): node-relay (VPN-noP2P) MagiTrickle groups must carry NO static IP
+  # ranges - a bare-IP torrent peer matching one is fwmarked straight to the P2P-forbidden
+  # provider, bypassing mihomo. Domain rules are fine (they route via DNS-learned ipsets).
+  _mts="$(P /etc/magitrickle/state/config.yaml)"
+  if [ -f "$_mts" ]; then
+    _nrs=$(awk '/^  interface:/{r=($0 ~ /VPN-noP2P/)} r&&/^    type: subnet/{c++} END{print c+0}' "$_mts")
+    [ "${_nrs:-0}" = "0" ] && info "node-relay groups: no static IP ranges (a torrent peer cannot be fwmarked to the forbidden sub)" \
+      || bad "node-relay (VPN-noP2P) has $_nrs static IP range(s) - a torrent peer could match one; remove them (R01)"
+  fi
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"

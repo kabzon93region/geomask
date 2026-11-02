@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.23.1"
+GM_VERSION="1.23.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.23.1"
+BACKEND_VERSION="1.23.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.23.1';
+var PANEL_VERSION = '1.23.2';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2878,7 +2878,16 @@ step3_check() {
   else warn "torrent-direct listener missing (torrent clients cannot be pinned away from node-relay)"; fi
   grep -qE '^  - SRC-PORT,41552,(VPN|DIRECT)$' "$_c" 2>/dev/null \
     && info "torrent peer guard (SRC-PORT -> tolerant/DIRECT): present" \
-    || warn "SRC-PORT,41552 guard absent or not on VPN/DIRECT - incoming peers may reach node-relay"
+    || warn "SRC-PORT,41552 guard absent or not on VPN-DIRECT - incoming peers may reach node-relay"
+  # R01/P1 (v1.23.2): node-relay (VPN-noP2P) MagiTrickle groups must carry NO static IP
+  # ranges - a bare-IP torrent peer matching one is fwmarked straight to the P2P-forbidden
+  # provider, bypassing mihomo. Domain rules are fine (they route via DNS-learned ipsets).
+  _mts="$(P /etc/magitrickle/state/config.yaml)"
+  if [ -f "$_mts" ]; then
+    _nrs=$(awk '/^  interface:/{r=($0 ~ /VPN-noP2P/)} r&&/^    type: subnet/{c++} END{print c+0}' "$_mts")
+    [ "${_nrs:-0}" = "0" ] && info "node-relay groups: no static IP ranges (a torrent peer cannot be fwmarked to the forbidden sub)" \
+      || bad "node-relay (VPN-noP2P) has $_nrs static IP range(s) - a torrent peer could match one; remove them (R01)"
+  fi
   grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
@@ -22307,7 +22316,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.23.1"
+GUARD_VERSION="1.23.2"
 
 log() { logger -t geomask-guard "$*"; }
 

@@ -1107,6 +1107,15 @@ grep -qF 'retired de5 provider removed' "$HERE/../geomask.sh.in" \
   && { echo "PASS: S44 reinstall strips a stale de5 from an existing config"; pass=$((pass+1)); } \
   || { echo "FAIL: S44 reinstall would not clean a leftover de5"; failn=$((failn+1)); }
 
+# v1.24.0: lane groups must be `select` (manual pick sticks), not `url-test` (auto-switch
+# makes metacubexd re-render and the "servers for selection" list flicker/disappear).
+if grep -qF "    type: select" "$HERE/../geomask.sh.in" && ! grep -qF 'type: url-test' "$HERE/../geomask.sh.in"; then
+  echo "PASS: S45 template lane groups are type: select (not url-test)"; pass=$((pass+1))
+else echo "FAIL: S45 template still emits url-test (selection flickers in the dashboard)"; failn=$((failn+1)); fi
+if grep -qF 'type: select' "$HERE/../assets/geo-backend.sh" && ! grep -qF 'type: url-test' "$HERE/../assets/geo-backend.sh"; then
+  echo "PASS: S45 panel slot-creator makes select groups"; pass=$((pass+1))
+else echo "FAIL: S45 panel slot-creator still makes url-test groups"; failn=$((failn+1)); fi
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

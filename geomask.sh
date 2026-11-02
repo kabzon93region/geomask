@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.23.2"
+GM_VERSION="1.24.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.23.2"
+BACKEND_VERSION="1.24.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -995,9 +995,9 @@ am = re.search(r"(?m)^  de5:\n", t) or re.search(r"(?m)^  sub:\n", t)
 if not am:
     sys.stderr.write("no proxy-providers anchor\\n"); sys.exit(2)
 t = t[:am.start()] + tpl + t[am.start():]
-grp = ("\\n  - name: %s\\n    type: url-test\\n    use:\\n      - %s\\n"
+grp = ("\\n  - name: %s\\n    type: select\\n    use:\\n      - %s\\n"
        "    url: \\"https://www.gstatic.com/generate_204\\"\\n    interval: 180\\n"
-       "    tolerance: 50\\n    lazy: false\\n" % (group, prov))
+       "    lazy: false\\n" % (group, prov))
 gm2 = re.search(r"(?m)^  - name: AI\\s*\\n(?:^(?:    .*|\\s*)\\n)*", t)
 if not gm2:
     sys.stderr.write("no AI group anchor\\n"); sys.exit(2)
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.23.2';
+var PANEL_VERSION = '1.24.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -3093,26 +3093,24 @@ write_mihomo_config() {
     printf '%s\n' '  # A second, P2P-tolerant tunnel (slot VPN -> group "VPN") is created by the panel'
     printf '%s\n' '  # when a subscription is assigned to it; IP rules then move over there.'
     printf '%s\n' '  - name: VPN-noP2P'
-    printf '%s\n' '    type: url-test'
+    printf '%s\n' '    type: select'
     printf '%s\n' '    use:'
     printf '%s\n' '      - sub'
     printf '%s\n' '    exclude-filter: "Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания|Финляндия|Нидерланды-(5|13|16|18)($|[^0-9])|Германия-[234]($|[^0-9])|США-1($|[^0-9])|Турция"'
     printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
     printf '%s\n' '    interval: 180'
-    printf '%s\n' '    tolerance: 50'
     printf '%s\n' '    lazy: false'
     printf '%s\n' '  # AI lane: v1.22.8 - AI borrows the node-relay subscription (sub) and keeps only'
     printf '%s\n' '  # its genuine-USA nodes (the old un1.pro AI sub routed OpenAI via a Helsinki relay'
     printf '%s\n' '  # -> unsupported_country). v1.22.9 guards the egress nightly; v1.23.0 retires de5.'
     printf '%s\n' '  - name: AI'
-    printf '%s\n' '    type: url-test'
+    printf '%s\n' '    type: select'
     printf '%s\n' '    use:'
     printf '%s\n' '      - sub'
     printf '%s\n' "    filter: 'USA'"
     printf '%s\n' "    exclude-filter: 'HY2'"
     printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
     printf '%s\n' '    interval: 180'
-    printf '%s\n' '    tolerance: 50'
     printf '%s\n' '    lazy: false'
     printf '\n'
     printf '%s\n' 'rule-providers:'
@@ -22316,7 +22314,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.23.2"
+GUARD_VERSION="1.24.0"
 
 log() { logger -t geomask-guard "$*"; }
 

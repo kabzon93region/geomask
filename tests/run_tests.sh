@@ -31,6 +31,10 @@ contains() { # contains <file> <pattern> <name>
   if grep -q "$2" "$1" 2>/dev/null; then echo "PASS: $3"; pass=$((pass+1));
   else echo "FAIL: $3 (pattern '$2' not found)"; tail -15 "$1" | sed 's/^/    | /'; failn=$((failn+1)); fi
 }
+lacks() { # lacks <file> <pattern> <name>
+  if grep -q "$2" "$1" 2>/dev/null; then echo "FAIL: $3 (pattern '$2' unexpectedly present)"; tail -15 "$1" | sed 's/^/    | /'; failn=$((failn+1));
+  else echo "PASS: $3"; pass=$((pass+1)); fi
+}
 
 rm -rf "$HERE/root_empty" "$HERE/root_healthy" "$HERE/root_apply" "$HERE/state"
 mkdir -p "$HERE/state" "$HERE/root_empty/tmp" "$HERE/root_healthy/tmp" "$HERE/root_apply/tmp"
@@ -190,7 +194,8 @@ rm -f "$R/etc/mihomo/config.yaml"   # break it
 export GM_PREFIX="$HERE/root_apply"
 t "S3 auto exits zero" 0 sh "$SCRIPT" --auto --yes --restart --vpn-url "https://vpn.example/sub1" --ai-url "https://ai.example/sub2"
 contains "$R/etc/mihomo/config.yaml" 'url: "https://vpn.example/sub1"' "S3 vpn url written"
-contains "$R/etc/mihomo/config.yaml" 'url: "https://ai.example/sub2"' "S3 ai url written"
+contains "$R/etc/mihomo/config.yaml" "name: AI" "S3 AI group written (rides sub)"
+lacks "$R/etc/mihomo/config.yaml" '^  de5:' "S3 fresh config emits no de5"
 contains "$R/etc/mihomo/config.yaml" "name: VPN" "S3 VPN group written"
 contains "$R/etc/mihomo/config.yaml" "RULE-SET,mtrickle,VPN" "S3 mtrickle rule written"
 contains "$R/etc/mihomo/config.yaml" "port: 7891" "S3 AI-devices listener written"
@@ -239,7 +244,7 @@ sh "$SCRIPT" --reinstall --yes >"$HERE/last_out.txt" 2>&1
 _rc=$?
 if [ "$_rc" = 0 ]; then echo "PASS: S7 reinstall rc=0"; pass=$((pass+1)); else echo "FAIL: S7 reinstall rc=$_rc"; sed 's/^/    | /' "$HERE/last_out.txt" | tail -25; failn=$((failn+1)); fi
 contains "$R/etc/mihomo/config.yaml" 'url: "https://vpn.example/p1"' "S7 kept VPN url"
-contains "$R/etc/mihomo/config.yaml" 'url: "https://ai.example/p2"' "S7 kept AI url"
+lacks "$R/etc/mihomo/config.yaml" '^  de5:' "S7 reinstall strips the retired de5 provider"
 contains "$HERE/last_out.txt" "verify: PASS" "S7 verify passed"
 if grep -q "restarting mihomo" "$HERE/last_out.txt"; then
   echo "FAIL: S7 restarted mihomo despite no-restart policy"; failn=$((failn+1))
@@ -1083,6 +1088,16 @@ grep -qF "'--ai-guard'" "$HERE/../assets/geomask-node-scan.sh" \
 grep -qF 'ai_expect' "$HERE/../assets/geomask-nodes.conf" \
   && { echo "PASS: S43 AI guard config present in geomask-nodes.conf"; pass=$((pass+1)); } \
   || { echo "FAIL: S43 geomask-nodes.conf has no AI guard keys"; failn=$((failn+1)); }
+
+# v1.23.0: de5 (the rejected un1.pro AI sub) must no longer be emitted; AI rides sub
+if ! grep -qE "printf '%s\\\\n' '  de5:'" "$HERE/../geomask.sh.in"; then
+  echo "PASS: S44 fresh config no longer emits the de5 provider"; pass=$((pass+1))
+else
+  echo "FAIL: S44 the template still emits de5 (panel shows a dead subscription)"; failn=$((failn+1))
+fi
+grep -qF 'retired de5 provider removed' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S44 reinstall strips a stale de5 from an existing config"; pass=$((pass+1)); } \
+  || { echo "FAIL: S44 reinstall would not clean a leftover de5"; failn=$((failn+1)); }
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

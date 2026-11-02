@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.22.9"
+GM_VERSION="1.23.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.22.9"
+BACKEND_VERSION="1.23.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.22.9';
+var PANEL_VERSION = '1.23.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2851,7 +2851,7 @@ step3_check() {
   _c="$(P $MIHOMO_CONF)"
   if [ ! -s "$_c" ]; then bad "$MIHOMO_CONF missing (шаг subs при запуске создаст конфиг и спросит обе ссылки)"; return 1; fi
   _np=$(grep -c 'type: http' "$_c" 2>/dev/null || echo 0)
-  if [ "$_np" -ge 2 ] 2>/dev/null; then info "proxy-providers: $_np (need >=2)"; else bad "proxy-providers: $_np (need 2: VPN + AI)"; _need=1; fi
+  if [ "$_np" -ge 1 ] 2>/dev/null; then info "proxy-providers: $_np (need >=1: VPN sub; AI borrows its USA nodes)"; else bad "proxy-providers: $_np (need >=1 VPN subscription)"; _need=1; fi
   for g in VPN-noP2P AI; do
     if grep -q "name: $g$" "$_c" 2>/dev/null; then info "slot $g: present"; else bad "slot $g: missing"; _need=1; fi
   done
@@ -2937,29 +2937,27 @@ step3_check() {
 }
 step3_apply() {
   _c="$(P $MIHOMO_CONF)"
-  _vpnu="$GM_VPN_URL"; _aiu="$GM_AI_URL"
+  _vpnu="$GM_VPN_URL"
   if [ -s "$_c" ]; then
     [ -z "$_vpnu" ] && _vpnu=$(_prov_url "$_c" sub)
-    [ -z "$_aiu" ]  && _aiu=$(_prov_url "$_c" de5)
   fi
-  if [ -z "$_vpnu" ] || [ -z "$_aiu" ]; then
-    # fresh router (no config / no flags): ask for both subscription URLs interactively
+  # v1.23.0: AI no longer has its own subscription - it borrows node-relay (sub) and keeps only
+  # USA nodes (v1.22.8). Only the VPN subscription URL is required; the old AI sub (de5) is retired.
+  if [ -z "$_vpnu" ]; then
     if [ "$GM_AUTO" != 1 ] && [ "$GM_YES" != 1 ] && [ -t 0 ]; then
-      info "Подписки не заданы — введите ссылки (общая VPN-подписка и AI-подписка)"
+      info "Подписка не задана — введите ссылку (общая VPN-подписка; AI берёт из неё USA-узлы)"
       _vpnu=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку" "" "") || { bad "URL VPN-подписки не задан"; return 1; }
-      _aiu=$(prompt_url "Ссылка на AI-подписку (для Google/AI)" "" "") || { bad "URL AI-подписки не задан"; return 1; }
     else
-      bad "subscription URLs unknown - pass --vpn-url and --ai-url (or keep existing config)"
+      bad "subscription URL unknown - pass --vpn-url (or keep existing config)"
       return 1
     fi
   fi
   info "VPN provider URL: $(_maskurl "$_vpnu")"
-  info "AI  provider URL: $(_maskurl "$_aiu")"
-  ask "  Write mihomo config with these 2 providers (backup kept)?" || { warn "skipped"; return 1; }
-  write_mihomo_config "$_vpnu" "$_aiu" || return 1
+  ask "  Write mihomo config (VPN sub + AI USA from it; backup kept)?" || { warn "skipped"; return 1; }
+  write_mihomo_config "$_vpnu" "" || return 1
   if [ "$GM_RESTART" = 1 ]; then
     safe_mihomo_restart || true
-  elif api_refresh_provider sub "$_vpnu" && api_refresh_provider de5 "$_aiu"; then
+  elif api_refresh_provider sub "$_vpnu"; then
     info "providers refreshed via API (no restart, VPN stays up)"
   elif svc_alive mihomo; then
     warn "mihomo is running: restart later to apply (rerun with --restart)"
@@ -2978,15 +2976,21 @@ write_mihomo_config() {
   _vpnu="$1"; _aiu="$2"
   # --- existing 2-subscription config: keep it as-is (custom rules, headers, sniffer)
   #     and only patch provider urls / ensure the ai-devices listener ---
-  if [ -s "$_c" ] && grep -q '^  sub:' "$_c" && grep -q '^  de5:' "$_c" \
+  # --- existing config: keep it as-is (custom rules, headers, sniffer) and only patch
+  #     provider urls / ensure the ai-devices listener. v1.23.0: de5 (the retired un1.pro AI
+  #     sub) is no longer required and is stripped if still present; AI rides `sub`.
+  if [ -s "$_c" ] && grep -q '^  sub:' "$_c" \
      && grep -q 'name: VPN' "$_c" && grep -q 'name: AI' "$_c"; then
-    _curv=$(_prov_url "$_c" sub)
-    _cura=$(_prov_url "$_c" de5)
-    if [ -n "${_vpnu:-}" ] && [ "$_vpnu" != "$_curv" ]; then _swap=1; fi
-    if [ -n "${_aiu:-}" ] && [ "$_aiu" != "$_cura" ]; then _swap=1; fi
-    if [ "${_swap:-0}" = 1 ]; then
+    if grep -q '^  de5:' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
-      if ! awk -v pn="^  $([ "$_vpnu" != "$_curv" ] && echo sub || echo de5):" -v nu="$([ "$_vpnu" != "$_curv" ] && printf '%s' "$_vpnu" || printf '%s' "$_aiu")" '
+      awk 'BEGIN{d=0} /^  de5:/{d=1;next} d&&/^  [A-Za-z0-9_-]+:/{d=0} d&&!/^    /{d=0} !d{print}' "$_c" > "$_c.de5rm" \
+        && mihomo -d /etc/mihomo -t >/dev/null 2>&1 && mv -f "$_c.de5rm" "$_c" && rm -f "$_c.de5rm" \
+        && info "retired de5 provider removed from config" || { rm -f "$_c.de5rm"; warn "de5 removal skipped (validation)"; }
+    fi
+    _curv=$(_prov_url "$_c" sub)
+    if [ -n "${_vpnu:-}" ] && [ "$_vpnu" != "$_curv" ]; then
+      cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+      if ! awk -v pn="^  sub:" -v nu="$_vpnu" '
         BEGIN{f=0;done=0}
         $0 ~ pn {f=1; print; next}
         f && /^    url:/{print "    url: \"" nu "\""; done=1; next}
@@ -2997,7 +3001,7 @@ write_mihomo_config() {
         rm -f "$_c.urlnew"; bad "provider url patch failed"; return 1
       fi
       mihomo -d /etc/mihomo -t >/dev/null 2>&1 && mv -f "$_c.urlnew" "$_c" || { rm -f "$_c.urlnew"; bad "mihomo -t failed - config kept"; return 1; }
-      info "provider url(s) updated in place (sub=$( [ "$_vpnu" != "$_curv" ] && echo sub || echo de5))"
+      info "provider url updated in place (sub)"
     fi
     if ! grep -q 'ai-devices' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
@@ -3076,11 +3080,6 @@ write_mihomo_config() {
     # NO provider health-check on purpose (v1.21.3): mihomo removes nodes that fail it from the
     # group, so a slow or briefly unreachable subscription silently empties the lane and every
     # rule pointing at it starts returning 502. The proxy-group tests are enough.
-    printf '%s\n' '  de5:'
-    printf '%s\n' '    type: http'
-    printf '%s\n' '    proxy: DIRECT'
-    printf '%s\n' "    url: \"$_aiu\""
-    printf '%s\n' '    interval: 3600'
     printf '\n'
     printf '%s\n' 'proxy-groups:'
     printf '%s\n' '  # slot VPN-noP2P: the subscription whose provider forbids P2P (default tunnel).'
@@ -3095,10 +3094,9 @@ write_mihomo_config() {
     printf '%s\n' '    interval: 180'
     printf '%s\n' '    tolerance: 50'
     printf '%s\n' '    lazy: false'
-    printf '%s\n' '  # AI lane: v1.22.8 - the un1.pro AI subscription (de5) routes OpenAI/ChatGPT'
-    printf '%s\n' '  # through a Helsinki/Russia relay on ALL its USA nodes (OpenAI -> unsupported_country),'
-    printf '%s\n' '  # so AI now borrows node-relay (sub) and keeps only its genuine-USA nodes. de5 stays'
-    printf '%s\n' '  # defined for the subscription switcher in the panel and for a future un1.pro fix.'
+    printf '%s\n' '  # AI lane: v1.22.8 - AI borrows the node-relay subscription (sub) and keeps only'
+    printf '%s\n' '  # its genuine-USA nodes (the old un1.pro AI sub routed OpenAI via a Helsinki relay'
+    printf '%s\n' '  # -> unsupported_country). v1.22.9 guards the egress nightly; v1.23.0 retires de5.'
     printf '%s\n' '  - name: AI'
     printf '%s\n' '    type: url-test'
     printf '%s\n' '    use:'
@@ -22290,7 +22288,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.22.9"
+GUARD_VERSION="1.23.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -23952,20 +23950,15 @@ menu_reinstall() {
   warn "без конфига/маркеров подписок — запись шаблоном (старый — в бэкапе)."
   warn "Mihomo НЕ перезапускается: подписки применяются через API без обрыва VPN."
   _c="$(P $MIHOMO_CONF)"
-  _curv=""; _cura=""
-  if [ -s "$_c" ]; then
-    _curv=$(_prov_url "$_c" sub)
-    _cura=$(_prov_url "$_c" de5)
-  fi
-  ask "Продолжить пересстановку?" || { warn "отменено"; return 1; }
-  _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
-  _ai=$(prompt_url "Ссылка на AI-подписку (Германия)" "$_cura" "$GM_AI_URL") || { bad "URL AI-подписки не задан"; return 1; }
+  _curv=""
+  if [ -s "$_c" ]; then _curv=$(_prov_url "$_c" sub); fi
+  ask "Продолжить переустановку?" || { warn "отменено"; return 1; }
+  _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
   hdr "1/6" "удаление geomask"; geomask_uninstall noreload || true
   hdr "2/6" "гео-оверлей LuCI"; step2_apply || true
-  hdr "3/6" "mihomo: 2 подписки"
-  if write_mihomo_config "$_vpn" "$_ai"; then
+  hdr "3/6" "mihomo: подписка + AI-USA"
+  if write_mihomo_config "$_vpn" ""; then
     api_refresh_provider sub "$_vpn" && info "provider sub refreshed (no restart)" || warn "provider sub: refresh failed, применится при старте mihomo"
-    api_refresh_provider de5 "$_ai" && info "provider de5 refreshed (no restart)" || warn "provider de5: refresh failed, применится при старте mihomo"
   else
     bad "конфиг mihomo не записан"; return 1
   fi

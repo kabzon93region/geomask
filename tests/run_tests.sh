@@ -1072,6 +1072,18 @@ grep -A8 "  - name: AI" "$HERE/../geomask.sh.in" | grep -qF "exclude-filter: 'HY
   && { echo "PASS: S42 the dead USA-HY2 node is excluded from AI"; pass=$((pass+1)); } \
   || { echo "FAIL: S42 USA-HY2 (unreachable) is left in the AI group"; failn=$((failn+1)); }
 
+# v1.22.9: the AI group must be guarded by an ACTIVE OpenAI-egress test, not just a name filter
+grep -qF "'--ai-guard'" "$HERE/../assets/geomask-node-scan.sh" \
+  && grep -qF 'cdn-cgi/trace' "$HERE/../assets/geomask-node-scan.sh" \
+  && { echo "PASS: S43 nodescan has an active AI OpenAI-egress guard"; pass=$((pass+1)); } \
+  || { echo "FAIL: S43 no active egress guard - a USA-labelled node leaking to OpenAI from FI slips through"; failn=$((failn+1)); }
+grep -qF "'--ai-guard'" "$HERE/../assets/geomask-node-scan.sh" \
+  && { echo "PASS: S43 the all-provider pass invokes the AI guard"; pass=$((pass+1)); } \
+  || { echo "FAIL: S43 the guard is never invoked from the nightly pass"; failn=$((failn+1)); }
+grep -qF 'ai_expect' "$HERE/../assets/geomask-nodes.conf" \
+  && { echo "PASS: S43 AI guard config present in geomask-nodes.conf"; pass=$((pass+1)); } \
+  || { echo "FAIL: S43 geomask-nodes.conf has no AI guard keys"; failn=$((failn+1)); }
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.22.8"
+GM_VERSION="1.22.9"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.22.8"
+BACKEND_VERSION="1.22.9"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.22.8';
+var PANEL_VERSION = '1.22.9';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -22290,7 +22290,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.22.8"
+GUARD_VERSION="1.22.9"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -22544,6 +22544,78 @@ if '--list-providers' in _argv:
     print(','.join(p for p in re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', _h, re.M)
                    if re.search(r'^  %s:\n(?:.*\n)*?\s+url:' % re.escape(p), _h, re.M)))
     sys.exit(0)
+# v1.22.9: active OpenAI-egress guard for the AI group. A node labelled "USA" can still reach
+# OpenAI from elsewhere - un1.pro's servers resolved to US IPs but routed OpenAI traffic through
+# a Helsinki/Russia relay, so a name filter and even a server-country check both passed it. Only
+# an actual OpenAI request reveals the truth. Test every node the AI group would use through the
+# AI listener and exclude the liars by exact name. Never empties the group (if all fail, that is
+# a provider outage to investigate, not something to hide by deleting the last node).
+if '--ai-guard' in _argv:
+    import ssl, time as _t
+    text=open(CFG,encoding='utf-8',errors='replace').read()
+    sm=re.search(r'^secret:\s*(\S+)',text,re.M); sec=sm.group(1).strip().strip('"\'') if sm else ''
+    ai_group=cfgd.get('ai_group','AI')
+    egress_url=cfgd.get('ai_egress_url','https://chatgpt.com/cdn-cgi/trace')
+    expect=cfgd.get('ai_expect','US').strip().upper()
+    listener=cfgd.get('ai_listener','http://127.0.0.1:7891')
+    static_ex=cfgd.get('ai_exclude_base','HY2')
+    def _api(path,data=None):
+        r=urllib.request.Request('http://127.0.0.1:9090'+path,method='PUT' if data else 'GET')
+        if sec: r.add_header('Authorization','Bearer '+sec)
+        if data: r.add_header('Content-Type','application/json'); data=json.dumps(data).encode()
+        try: return json.load(urllib.request.urlopen(r,data,timeout=15))
+        except Exception as e: return {'_err':str(e)}
+    def _egress():
+        try:
+            op=urllib.request.build_opener(urllib.request.ProxyHandler({'http':listener,'https':listener}),
+                urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+            return op.open(urllib.request.Request(egress_url,headers={'User-Agent':'curl/8'}),timeout=18).read(4000).decode('utf-8','replace')
+        except Exception: return ''
+    g=_api('/proxies/'+ai_group); members=list(g.get('all') or [])
+    if not members:
+        log('ai-guard: AI group empty or unreachable - skip'); sys.exit(0)
+    liars=[]
+    for m in members:
+        _api('/proxies/'+ai_group,{'name':m}); _t.sleep(1.2)
+        b=_egress(); mm=re.search(r'(?m)^loc=(\w+)',b); loc=(mm.group(1).upper() if mm else '')
+        if loc!=expect:
+            liars.append(m); log('ai-guard: %s egress loc=%r != %s -> exclude' % (m,loc,expect))
+        else:
+            log('ai-guard: %s ok (loc=%s)' % (m,expect))
+    if len(liars)>=len(members):
+        log('ai-guard: ALL %d AI nodes fail the egress test - NOT excluding (would empty the group); provider issue to investigate' % len(members))
+        sys.exit(0)
+    seen=set(); parts=[]
+    for p in ([x for x in static_ex.split('|') if x.strip()] if static_ex.strip() else [])+[re.escape(n) for n in sorted(liars)]:
+        p=p.strip()
+        if p and p not in seen: seen.add(p); parts.append(p)
+    new_ex='|'.join(parts)
+    mb=re.search(r'(?m)^  - name: '+re.escape(ai_group)+r'\n(?:    .*\n|\n)*?(?=^  - name:|^[a-z]|\Z)', text)
+    if not mb: log('ai-guard: AI group block not found'); sys.exit(1)
+    blk=mb.group(0); esc=new_ex.replace("'","''"); line="    exclude-filter: '%s'"%esc
+    if re.search(r'(?m)^\s*exclude-filter:',blk):
+        nb=re.sub(r'(?m)^\s*exclude-filter:.*$', line, blk, count=1)
+    else:
+        nb=re.sub(r"(?m)^(\s*filter:.*\n)", r"\g<0>"+line+"\n", blk, count=1)
+    if nb==blk:
+        log('ai-guard: AI exclude-filter already up to date'); sys.exit(0)
+    out=text[:mb.start()]+nb+text[mb.end():]
+    open(CFG+'.bak_aiguard','w',encoding='utf-8').write(text)
+    open(CFG+'.tmp','w',encoding='utf-8').write(out)
+    try: rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',CFG+'.tmp','-t'],capture_output=True,timeout=30).returncode
+    except Exception: rc=1
+    if rc!=0:
+        try: os.remove(CFG+'.tmp')
+        except Exception: pass
+        log('ai-guard: VALIDATION FAILED, config untouched (rc=%d)'%rc); sys.exit(1)
+    os.replace(CFG+'.tmp',CFG)
+    try:
+        r=urllib.request.Request('http://127.0.0.1:9090/configs?force=true',data=json.dumps({'path':CFG}).encode(),method='PUT',headers={'Content-Type':'application/json'})
+        if sec: r.add_header('Authorization','Bearer '+sec)
+        urllib.request.urlopen(r,timeout=8).read()
+    except Exception as e: log('ai-guard: reload failed %s'%e)
+    log('ai-guard: applied, excluded %d liar(s): %s' % (len(liars), ','.join(liars)))
+    sys.exit(0)
 if '--provider' in _argv:
     provider=_argv[_argv.index('--provider')+1]
 elif provider.strip()=='all':
@@ -22577,6 +22649,9 @@ elif provider.strip()=='all':
         % (','.join(_ok), ','.join(_skip), ','.join(_bad)))
     if not _ok and not _skip:
         log('every provider failed - nothing was updated'); sys.exit(1)
+    # run the AI OpenAI-egress guard once per scan (not per provider)
+    if cfgd.get('ai_guard','1').strip().lower() in ('1','true','yes','on'):
+        subprocess.run(['/bin/sh', '/usr/bin/geomask-node-scan.sh', '--ai-guard'])
     sys.exit(0)
 # v1.13.7: the panel (Remnawave) serves a 1-node stub ("Приложение не поддерживается") to
 # unknown clients, so the scan must identify itself. clash-meta -> YAML, v2rayNG -> links.
@@ -22881,6 +22956,18 @@ sub_user_agent=clash-meta
 # to a single pseudo-node when it was applied there by mistake. Geo/ASN rules still apply to
 # every subscription - only the name filter is scoped here.
 name_filter_groups='VPN,VPN-noP2P'
+
+# v1.22.9 - active OpenAI-egress guard for the AI group. A node named "USA" can still reach
+# OpenAI from another country (un1.pro's US-labelled servers routed OpenAI via a Helsinki relay),
+# which neither a name filter nor a server-country check catches. The guard dials the real
+# OpenAI trace endpoint through the AI listener for every node the group would use and excludes
+# any whose reported location is not ai_expect. It never empties the group.
+ai_guard=1
+ai_group=AI
+ai_egress_url=https://chatgpt.com/cdn-cgi/trace
+ai_expect=US
+ai_listener=http://127.0.0.1:7891
+ai_exclude_base=HY2
 
 ASSET_EOF
   else

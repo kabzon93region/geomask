@@ -813,9 +813,9 @@ am = re.search(r"(?m)^  de5:\n", t) or re.search(r"(?m)^  sub:\n", t)
 if not am:
     sys.stderr.write("no proxy-providers anchor\\n"); sys.exit(2)
 t = t[:am.start()] + tpl + t[am.start():]
-grp = ("\\n  - name: %s\\n    type: select\\n    use:\\n      - %s\\n"
+grp = ("\\n  - name: %s\\n    type: url-test\\n    use:\\n      - %s\\n"
        "    url: \\"https://www.gstatic.com/generate_204\\"\\n    interval: 180\\n"
-       "    lazy: false\\n" % (group, prov))
+       "    tolerance: 99999\\n    lazy: false\\n" % (group, prov))
 gm2 = re.search(r"(?m)^  - name: AI\\s*\\n(?:^(?:    .*|\\s*)\\n)*", t)
 if not gm2:
     sys.stderr.write("no AI group anchor\\n"); sys.exit(2)

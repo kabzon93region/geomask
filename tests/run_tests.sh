@@ -1107,14 +1107,16 @@ grep -qF 'retired de5 provider removed' "$HERE/../geomask.sh.in" \
   && { echo "PASS: S44 reinstall strips a stale de5 from an existing config"; pass=$((pass+1)); } \
   || { echo "FAIL: S44 reinstall would not clean a leftover de5"; failn=$((failn+1)); }
 
-# v1.24.0: lane groups must be `select` (manual pick sticks), not `url-test` (auto-switch
-# makes metacubexd re-render and the "servers for selection" list flicker/disappear).
-if grep -qF "    type: select" "$HERE/../geomask.sh.in" && ! grep -qF 'type: url-test' "$HERE/../geomask.sh.in"; then
-  echo "PASS: S45 template lane groups are type: select (not url-test)"; pass=$((pass+1))
-else echo "FAIL: S45 template still emits url-test (selection flickers in the dashboard)"; failn=$((failn+1)); fi
-if grep -qF 'type: select' "$HERE/../assets/geo-backend.sh" && ! grep -qF 'type: url-test' "$HERE/../assets/geo-backend.sh"; then
-  echo "PASS: S45 panel slot-creator makes select groups"; pass=$((pass+1))
-else echo "FAIL: S45 panel slot-creator still makes url-test groups"; failn=$((failn+1)); fi
+# v1.24.1: lane groups must be url-test WITH a huge tolerance so mihomo auto-tests every node
+# (metacubexd always has fresh per-node data -> the servers never vanish from the list) while the
+# huge tolerance stops it from auto-switching `now` (a manual pick still sticks). Plain `select`
+# gave testUrl="" (no auto-test) -> metacubexd rendered the group empty.
+if grep -qF '    tolerance: 99999' "$HERE/../geomask.sh.in" && grep -qF "    type: url-test" "$HERE/../geomask.sh.in"; then
+  echo "PASS: S45 template lane groups are url-test + huge tolerance (auto-test, no switch)"; pass=$((pass+1))
+else echo "FAIL: S45 template lane groups not url-test+tolerance (metacubexd shows them empty)"; failn=$((failn+1)); fi
+if grep -qF 'tolerance: 99999' "$HERE/../assets/geo-backend.sh"; then
+  echo "PASS: S45 panel slot-creator makes url-test+tolerance groups"; pass=$((pass+1))
+else echo "FAIL: S45 panel slot-creator missing url-test+tolerance"; failn=$((failn+1)); fi
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

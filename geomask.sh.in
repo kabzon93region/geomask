@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.24.0"
+GM_VERSION="1.24.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -457,24 +457,26 @@ write_mihomo_config() {
     printf '%s\n' '  # A second, P2P-tolerant tunnel (slot VPN -> group "VPN") is created by the panel'
     printf '%s\n' '  # when a subscription is assigned to it; IP rules then move over there.'
     printf '%s\n' '  - name: VPN-noP2P'
-    printf '%s\n' '    type: select'
+    printf '%s\n' '    type: url-test'
     printf '%s\n' '    use:'
     printf '%s\n' '      - sub'
     printf '%s\n' '    exclude-filter: "Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания|Финляндия|Нидерланды-(5|13|16|18)($|[^0-9])|Германия-[234]($|[^0-9])|США-1($|[^0-9])|Турция"'
     printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
     printf '%s\n' '    interval: 180'
+    printf '%s\n' '    tolerance: 99999'
     printf '%s\n' '    lazy: false'
     printf '%s\n' '  # AI lane: v1.22.8 - AI borrows the node-relay subscription (sub) and keeps only'
     printf '%s\n' '  # its genuine-USA nodes (the old un1.pro AI sub routed OpenAI via a Helsinki relay'
     printf '%s\n' '  # -> unsupported_country). v1.22.9 guards the egress nightly; v1.23.0 retires de5.'
     printf '%s\n' '  - name: AI'
-    printf '%s\n' '    type: select'
+    printf '%s\n' '    type: url-test'
     printf '%s\n' '    use:'
     printf '%s\n' '      - sub'
     printf '%s\n' "    filter: 'USA'"
     printf '%s\n' "    exclude-filter: 'HY2'"
     printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
     printf '%s\n' '    interval: 180'
+    printf '%s\n' '    tolerance: 99999'
     printf '%s\n' '    lazy: false'
     printf '\n'
     printf '%s\n' 'rule-providers:'

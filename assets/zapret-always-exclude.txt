@@ -1,0 +1,28 @@
+# geomask: domains that must NEVER be processed by zapret (nfqws), even though they
+# go DIRECT. One bare domain per line (DOMAIN-SUFFIX semantics). The sync merges these
+# into zapret-hosts-user-exclude.txt on every run, after the tunnel set is computed,
+# so they are excluded regardless of autohostlist behaviour.
+#
+# Yandex (owner 03.11): Yandex Go / Plus / Bank are geo- and DPI-sensitive; any nfqws
+# mangling breaks the app. All Yandex zones must leave the router raw and in the clear.
+yandex.ru
+yandex.net
+yandex.com
+yandexcloud.net
+yandex-net.ru
+yandexcom.net
+yandex-team.ru
+yastatic.net
+yasandbox.net
+ya.ru
+yandex.kz
+yandex.by
+yandex.az
+yandex.am
+yandex.ge
+yandex.tj
+yandex.tm
+yandex.uz
+yandex.md
+yandex.aero
+yandex.co.il

@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.24.1"
+GM_VERSION="1.25.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.24.1"
+BACKEND_VERSION="1.25.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.24.1';
+var PANEL_VERSION = '1.25.0';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -3154,6 +3154,14 @@ write_mihomo_config() {
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT'
     printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT'
+    printf '%s\n' '  # v1.25.0: ALL Yandex domains go DIRECT (RU). Yandex Go / Plus / Bank are geo-'
+    printf '%s\n' '  # sensitive and break on any non-RU exit; the app uses yandex-net.ru /'
+    printf '%s\n' '  # yandexcom.net which are NOT covered by the yandex.ru/.net namespace. These'
+    printf '%s\n' '  # are also listed in /etc/geomask/zapret-always-exclude.txt so nfqws never'
+    printf '%s\n' '  # DPI-mangles them (owner: Yandex must bypass zapret too).'
+    for _yd in yandex.ru yandex.net yandex.com yandexcloud.net yandex-net.ru yandexcom.net yandex-team.ru yastatic.net yasandbox.net ya.ru yandex.kz yandex.by yandex.az yandex.am yandex.ge yandex.tj yandex.tm yandex.uz yandex.md yandex.aero yandex.co.il; do
+      printf '  - DOMAIN-SUFFIX,%s,DIRECT\n' "$_yd"
+    done
     printf '%s\n' '  - RULE-SET,ytvpn,VPN-noP2P'
     printf '%s\n' '  - RULE-SET,ytdirect,DIRECT'
     printf '%s\n' '  - DOMAIN-SUFFIX,cloudflare-ech.com,AI'
@@ -20657,6 +20665,7 @@ print('ytvpn.yaml:    %d rules (%s)' % (n3, 'updated' if c3 else 'up-to-date'))
 # Nothing is ever copied the other way either (zapret exclude -> MagiTrickle): the
 # exclude list contains plain RU sites.
 ZEXCL = '/opt/zapret/ipset/zapret-hosts-user-exclude.txt'
+ZALWAYS = '/etc/geomask/zapret-always-exclude.txt'
 ZBEG  = '# >>> geomask sync: tunneled domains (generated) >>>'
 ZEND  = '# <<< geomask sync: tunneled domains <<<'
 
@@ -20682,6 +20691,14 @@ def _zapret_sync():
     tunnel |= {d for d in (bare(p) for p in ytvpn_payload) if d}
     tunnel = tunnel - pinned_direct
     tunnel = {d for d in tunnel if re.fullmatch(r'[a-z0-9.\-\u0080-\uffff]+', d)}
+    # v1.25.0: always-exclude - domains that go DIRECT but must still bypass DPI (Yandex).
+    # Added AFTER the pinned_direct subtraction so they are excluded regardless of the
+    # tunnel-vs-direct logic (a DOMAIN-SUFFIX,...,DIRECT rule would otherwise keep them in).
+    if os.path.exists(ZALWAYS):
+        for _l in open(ZALWAYS, encoding='utf-8', errors='replace'):
+            _d = _l.strip().lower()
+            if _d and not _d.startswith('#') and re.fullmatch(r'[a-z0-9.\-\u0080-\uffff]+', _d):
+                tunnel.add(_d)
     global TUNNEL_SET
     TUNNEL_SET = set(tunnel)          # direction B below works on exactly this set
     if not tunnel:
@@ -21163,6 +21180,43 @@ ASSET_EOF
 api.epicgames.dev
 firstlook.gg
 live.wardogs.bulkhead.pragmaengine.com
+
+ASSET_EOF
+  fi
+  # v1.25.0: domains that must bypass zapret DPI even though they go DIRECT (Yandex).
+  if [ -s "$(P /etc/geomask/zapret-always-exclude.txt)" ]; then
+    info "zapret always-exclude: keeping existing /etc/geomask/zapret-always-exclude.txt"
+  else
+    mkdir -p "$(P /etc/geomask)" 2>/dev/null
+    save_stream /etc/geomask/zapret-always-exclude.txt 644 <<'ASSET_EOF'
+# geomask: domains that must NEVER be processed by zapret (nfqws), even though they
+# go DIRECT. One bare domain per line (DOMAIN-SUFFIX semantics). The sync merges these
+# into zapret-hosts-user-exclude.txt on every run, after the tunnel set is computed,
+# so they are excluded regardless of autohostlist behaviour.
+#
+# Yandex (owner 03.11): Yandex Go / Plus / Bank are geo- and DPI-sensitive; any nfqws
+# mangling breaks the app. All Yandex zones must leave the router raw and in the clear.
+yandex.ru
+yandex.net
+yandex.com
+yandexcloud.net
+yandex-net.ru
+yandexcom.net
+yandex-team.ru
+yastatic.net
+yasandbox.net
+ya.ru
+yandex.kz
+yandex.by
+yandex.az
+yandex.am
+yandex.ge
+yandex.tj
+yandex.tm
+yandex.uz
+yandex.md
+yandex.aero
+yandex.co.il
 
 ASSET_EOF
   fi
@@ -22316,7 +22370,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.24.1"
+GUARD_VERSION="1.25.0"
 
 log() { logger -t geomask-guard "$*"; }
 

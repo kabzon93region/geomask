@@ -1118,6 +1118,24 @@ if grep -qF 'tolerance: 99999' "$HERE/../assets/geo-backend.sh"; then
   echo "PASS: S45 panel slot-creator makes url-test+tolerance groups"; pass=$((pass+1))
 else echo "FAIL: S45 panel slot-creator missing url-test+tolerance"; failn=$((failn+1)); fi
 
+# v1.25.0: all Yandex domains go DIRECT and bypass zapret DPI (Yandex Go / Plus / Bank).
+if grep -qF 'DOMAIN-SUFFIX,%s,DIRECT' "$HERE/../geomask.sh.in" \
+   && grep -qF 'yandex-net.ru' "$HERE/../geomask.sh.in" \
+   && grep -qF 'yandexcom.net' "$HERE/../geomask.sh.in"; then
+  echo "PASS: S46 template emits Yandex DIRECT rules incl. app zones (yandex-net.ru/.com)"; pass=$((pass+1))
+else echo "FAIL: S46 template missing Yandex DIRECT rules"; failn=$((failn+1)); fi
+if [ -s "$HERE/../assets/zapret-always-exclude.txt" ] \
+   && grep -qF 'yandex.ru' "$HERE/../assets/zapret-always-exclude.txt"; then
+  echo "PASS: S46 zapret-always-exclude asset lists Yandex"; pass=$((pass+1))
+else echo "FAIL: S46 zapret-always-exclude asset missing Yandex"; failn=$((failn+1)); fi
+grep -qF '"zapret-always-exclude.txt"' "$HERE/../build.py" \
+  && { echo "PASS: S46 always-exclude in build MAP"; pass=$((pass+1)); } \
+  || { echo "FAIL: S46 always-exclude not in build MAP"; failn=$((failn+1)); }
+if grep -qF 'ZALWAYS' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
+   && grep -qF 'tunnel.add(_d)' "$HERE/../assets/sync_mtrickle_mihomo.sh"; then
+  echo "PASS: S46 sync merges always-exclude into zapret exclude"; pass=$((pass+1))
+else echo "FAIL: S46 sync does not merge always-exclude"; failn=$((failn+1)); fi
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

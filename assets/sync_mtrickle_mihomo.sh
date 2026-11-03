@@ -272,6 +272,7 @@ print('ytvpn.yaml:    %d rules (%s)' % (n3, 'updated' if c3 else 'up-to-date'))
 # Nothing is ever copied the other way either (zapret exclude -> MagiTrickle): the
 # exclude list contains plain RU sites.
 ZEXCL = '/opt/zapret/ipset/zapret-hosts-user-exclude.txt'
+ZALWAYS = '/etc/geomask/zapret-always-exclude.txt'
 ZBEG  = '# >>> geomask sync: tunneled domains (generated) >>>'
 ZEND  = '# <<< geomask sync: tunneled domains <<<'
 
@@ -297,6 +298,14 @@ def _zapret_sync():
     tunnel |= {d for d in (bare(p) for p in ytvpn_payload) if d}
     tunnel = tunnel - pinned_direct
     tunnel = {d for d in tunnel if re.fullmatch(r'[a-z0-9.\-\u0080-\uffff]+', d)}
+    # v1.25.0: always-exclude - domains that go DIRECT but must still bypass DPI (Yandex).
+    # Added AFTER the pinned_direct subtraction so they are excluded regardless of the
+    # tunnel-vs-direct logic (a DOMAIN-SUFFIX,...,DIRECT rule would otherwise keep them in).
+    if os.path.exists(ZALWAYS):
+        for _l in open(ZALWAYS, encoding='utf-8', errors='replace'):
+            _d = _l.strip().lower()
+            if _d and not _d.startswith('#') and re.fullmatch(r'[a-z0-9.\-\u0080-\uffff]+', _d):
+                tunnel.add(_d)
     global TUNNEL_SET
     TUNNEL_SET = set(tunnel)          # direction B below works on exactly this set
     if not tunnel:

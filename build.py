@@ -32,6 +32,7 @@ MAP = {
     "geomask-vpnwatch.sh":   "geomask-vpnwatch.sh",
     "geomask-vpnwatch.conf": "geomask-vpnwatch.conf",
     "zapret-force-keep.txt":  "zapret-force-keep.txt",
+    "zapret-always-exclude.txt": "zapret-always-exclude.txt",
     "geomask-morning-check.sh": "geomask-morning-check.sh",
     "geomask-lane.sh":       "geomask-lane.sh",
     "geomask-dnscheck.sh":   "geomask-dnscheck.sh",

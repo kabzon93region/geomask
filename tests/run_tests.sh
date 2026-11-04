@@ -976,12 +976,9 @@ if grep -nE 'health-check:' "$HERE/../assets/geo-backend.sh" | grep -v '^[0-9]*:
 else
   echo "PASS: S31 no provider health-check when adding a subscription"; pass=$((pass+1))
 fi
-_o=$(grep -oE "E\('button', b[VN]," "$HERE/../assets/geo-sync-page.js" | grep -oE 'b[VN]' | tr -d 'b' | tr '\n' ' ')
-[ "$_o" = "V N " ] && { echo "PASS: S31 assignment buttons are VPN + VPN-noP2P only (dead AI switch removed)"; pass=$((pass+1)); } \
+_o=$(grep -oE "E\('button', b[VAN]," "$HERE/../assets/geo-sync-page.js" | grep -oE 'b[VAN]' | tr -d 'b' | tr '\n' ' ')
+[ "$_o" = "V A N " ] && { echo "PASS: S31 assignment buttons ordered VPN, AI, VPN-noP2P (AI switch restored, isolated)"; pass=$((pass+1)); } \
   || { echo "FAIL: S31 assignment buttons ordered '$_o'"; failn=$((failn+1)); }
-grep -qE "E\('button', bA," "$HERE/../assets/geo-sync-page.js" \
-  && { echo "FAIL: S31 the dead '→ AI' button is back (cmd_ai_sub_use -> provider de5 not found)"; failn=$((failn+1)); } \
-  || { echo "PASS: S31 no '→ AI' button in the subscriptions registry"; pass=$((pass+1)); }
 
 # v1.21.4: --reinstall runs the uninstall path too, and it used to destroy the lane - which
 # silently deleted an interface the owner had already assigned MagiTrickle lists to.

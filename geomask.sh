@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.25.1"
+GM_VERSION="1.25.2"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -190,7 +190,7 @@ step2_apply() {
 #   global <direct|vpn> | ipv6 <on|off>
 #   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
 #     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
-#   ai_sub_get | ai_sub_set <url>   (AI subscription / mihomo provider de5)
+#   ai_sub_get                       (which provider the AI group rides; AI owns no subscription)
 #   subs_list | sub_add <name> <url> | sub_del <id>
 #   ai_sub_use <id> | vpn_sub_use <id>  (switch provider url from registry, no mihomo restart)
 #   upd_check [force] | upd_status | upd_apply   (self-update from GitHub releases, v1.7.0+)
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.25.1"
+BACKEND_VERSION="1.25.2"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -354,13 +354,12 @@ cmd_status() {
   REALTZ=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"realtz"' | wc -l | tr -d ' ')
   N_AI=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"ai"' | wc -l | tr -d ' ')
   RULES=$(ip rule show | grep -c 'lookup main' || echo 0)
-  _de5u=$(_url_of_provider "$(_prov_of_group AI)")
-  [ -n "$_de5u" ] || _de5u=$(_url_of_provider de5)
   _sub2u=$(_url_of_provider "$(_prov_of_group VPN)")
   _subu=$(_url_of_provider "$(_prov_of_group VPN-noP2P)")
-  AI_SUB_ID=$(_sub_id_by_url "$_de5u" 2>/dev/null || echo '')
+  _aiu=$(_url_of_provider "$(_prov_of_group AI)")
   VPN_SUB_ID=$(_sub_id_by_url "$_sub2u" 2>/dev/null || echo '')
   VPNNP_SUB_ID=$(_sub_id_by_url "$_subu" 2>/dev/null || echo '')
+  AI_SUB_ID=$(_sub_id_by_url "$_aiu" 2>/dev/null || echo '')
   if ip link show "$AI_TUN_DEV" >/dev/null 2>&1; then AI_TUN=1; else AI_TUN=0; fi
   if netstat -lntp 2>/dev/null | grep -q ':7891'; then AI_LST=1; else AI_LST=0; fi
   # AI-DNS (no DNS leak for AI devices): 0=off/absent, 1=working, 2=partial
@@ -369,15 +368,15 @@ cmd_status() {
   elif ip route get 1.1.1.1 mark 0x64 2>/dev/null | grep -q 'dev AI' \
        && netstat -ltnpu 2>/dev/null | grep -q '192.168.0.53:5353 '; then AIDNS=1
   else AIDNS=2; fi
-  printf '{"vpn_node":"%s","vpn_cc":"%s","vpn_nop2p_node":"%s","vpn_nop2p_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"ai_sub":"%s","vpn_sub":"%s","vpn_nop2p_sub":"%s","ai_url":"%s","vpn_url":"%s","vpn_nop2p_url":"%s","aidns":%s}' \
+  printf '{"vpn_node":"%s","vpn_cc":"%s","vpn_nop2p_node":"%s","vpn_nop2p_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"vpn_sub":"%s","ai_sub":"%s","vpn_nop2p_sub":"%s","vpn_url":"%s","ai_url":"%s","vpn_nop2p_url":"%s","aidns":%s}' \
     "$(json_esc "$VPN_NODE")" "$(_node_cc "$VPN_NODE")" \
     "$(json_esc "$VPNNP_NODE")" "$(_node_cc "$VPNNP_NODE")" \
     "$(json_esc "$AI_NODE")" "$(_node_cc "$AI_NODE")" \
     "$(json_esc "$GLOBAL")" "$LCRON" "$V6" "$(json_esc "$DOH")" \
     "$AI_RC" "$MT_RC" "$(json_esc "$GOOGLE_CC")" "$(json_esc "$SYNC_AT")" \
     "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES" \
-    "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPN_SUB_ID")" "$(json_esc "$VPNNP_SUB_ID")" \
-    "$(json_esc "$_de5u")" "$(json_esc "$_sub2u")" "$(json_esc "$_subu")" "$AIDNS"
+    "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$VPN_SUB_ID")" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPNNP_SUB_ID")" \
+    "$(json_esc "$_sub2u")" "$(json_esc "$_aiu")" "$(json_esc "$_subu")" "$AIDNS"
 }
 
 # country fragment from a node name (flag emoji or RU word) - coarse, for display
@@ -780,16 +779,26 @@ EOF
     echo '{"error":"hotplug syntax"}'
 }
 
-# ---- AI subscription (mihomo provider "de5") ----
+# ---- AI path (no own subscription since v1.23.0; rides the provider its group uses) ----
 cmd_ai_sub_get() {
-  u=$(awk '/^  de5:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
-  printf '{"url":"%s"}' "$(json_esc "$u")"
+  # the old code read a hardcoded "de5" provider that is retired - the honest answer is
+  # whatever provider the AI group is currently fed by (or empty if none).
+  p=$(_prov_of_group AI)
+  u=''
+  [ -n "$p" ] && u=$(_url_of_provider "$p")
+  printf '{"url":"%s","provider":"%s"}' "$(json_esc "$u")" "$(json_esc "$p")"
 }
 
-# patch provider url in mihomo config + hot-refresh via API (no mihomo restart)
-# _mihomo_set_provider <provider> <url>
-_mihomo_set_provider() {
-  PN="$1"; URL="$2"
+# ---- slot patcher: point a group (VPN / VPN-noP2P / AI) at a subscription URL ----
+# v1.25.2: the patcher used to live in the _SLOT_PY shell variable with doubled backslashes;
+# python received "\\n" and "\\"" literally, died with a SyntaxError, and every slot switch
+# failed with "provider de5 not found in config". A quoted heredoc is verbatim AND pycheck.py
+# syntax-validates it on every test run.
+# Isolation: if the target provider is shared with another group (e.g. AI rides the same
+# provider as VPN), this group gets its own "slot" provider instead of silently re-pointing
+# the shared one - switching AI must never move VPN/VPN-noP2P nodes.
+_slot_apply() { # _slot_apply <group> <url> -> patch config so <group> is fed by <url>
+  _g="$1"; URL="$2"
   case "$URL" in
     http://*|https://*) ;;
     *) printf '{"error":"url must start with http:// or https://"}'; return 1 ;;
@@ -798,63 +807,127 @@ _mihomo_set_provider() {
     printf '{"error":"url contains forbidden characters"}'; return 1
   fi
   [ -f "$MIHOMO_CONF" ] || { printf '{"error":"mihomo config missing"}'; return 1; }
-  grep -q "^  $PN:" "$MIHOMO_CONF" || { printf '{"error":"provider %s not found in config"}' "$(json_esc "$PN")"; return 1; }
-  cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_subswitch_$(date +%s)"
-  TMPF="$MIHOMO_CONF.subsw"
-  _hwid=$(grep -A1 'x-hwid' "$MIHOMO_CONF" 2>/dev/null | sed -n 's/^[[:space:]]*-[[:space:]]*"\(.*\)"/\1/p' | head -1)
-  if ! awk -v pn="^  $PN:" -v nu="$URL" -v hwid="$_hwid" '
-    BEGIN { f=0; done=0 }
-    $0 ~ pn { f=1; print; next }
-    f && /^    url:/ { print "    url: \"" nu "\""; done=1; next }
-    f && /^  [A-Za-z0-9_-]+:/ { f=0 }
-    f && /^[A-Za-z]/ { f=0 }
-    { print }
-    END { exit done ? 0 : 1 }
-  ' "$MIHOMO_CONF" > "$TMPF"; then
-    rm -f "$TMPF"
-    printf '{"error":"failed to patch provider url"}'; return 1
+  cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_slot" 2>/dev/null
+  PYF=/tmp/geo-slot-py.$$
+  cat > "$PYF" <<'PYEOF'
+import re, sys
+cfg, group, url = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(cfg, encoding="utf-8").read()
+
+def group_block(grp):
+    return re.search(r"(?m)^  - name: %s\s*\n(?:^(?:    .*|\s*)\n)*" % re.escape(grp), t)
+
+def provider_of(grp):
+    m = group_block(grp)
+    if not m:
+        return None, None
+    u = re.search(r"use:\n((?:\s+-\s+\S+\n?)+)", m.group(0))
+    if u:
+        return re.findall(r"-\s+(\S+)", u.group(1))[0], m
+    return None, m
+
+def first_provider_headers():
+    """Copy the header block from the first provider - new providers need it (e.g. x-hwid)."""
+    pm = re.search(r"(?m)^proxy-providers:\n  (\S+):\n((?:    .*\n?)*)", t)
+    if not pm:
+        return ""
+    hm = re.search(r"    header:\n((?:      .*\n?)*)", pm.group(2))
+    return hm.group(0) if hm else ""
+
+prov, gm = provider_of(group)
+
+if prov:
+    shared = []
+    for other in ("VPN", "VPN-noP2P", "AI"):
+        if other == group:
+            continue
+        op, _ = provider_of(other)
+        if op == prov:
+            shared.append(other)
+    if not shared:
+        n = re.subn(r'(?m)^(  %s:\n(?:.*\n)*?    url: )"[^"]*"' % re.escape(prov),
+                    lambda mm: mm.group(1) + '"' + url + '"', t, count=1)
+        if n[1] == 0:
+            sys.stderr.write("provider %s has no url line\n" % prov)
+            sys.exit(2)
+        print("updated:%s" % prov)
+        sys.exit(0)
+    # shared provider (e.g. AI rides the same sub as VPN): isolate this group on its own provider
+    newp = "slot"
+    while re.search(r"(?m)^  %s:\n" % newp, t):
+        newp = "slot%d" % (int(newp[4:]) + 1 if newp != "slot" else 2)
+    tpl = "  %s:\n    type: http\n    url: \"%s\"\n    interval: 3600\n%s" % (newp, url, first_provider_headers())
+    ppm = re.search(r"(?m)^proxy-providers:\n", t)
+    if not ppm:
+        sys.stderr.write("no proxy-providers section\n")
+        sys.exit(2)
+    t = t[:ppm.end()] + tpl + t[ppm.end():]
+    blk = gm.group(0)
+    newblk = re.sub(r"(?m)^(\s+- )%s(\s*)$" % re.escape(prov), r"\g<1>" + newp + r"\g<2>", blk, count=1)
+    if newblk == blk:
+        sys.stderr.write("failed to repoint group %s use list\n" % group)
+        sys.exit(2)
+    t = t[:gm.start()] + newblk + t[gm.end():]
+    open(cfg, "w", encoding="utf-8", newline="").write(t)
+    print("created:%s" % newp)
+    sys.exit(0)
+
+if gm is not None:
+    sys.stderr.write("group %s exists but is fed by inline proxies, not a provider\n" % group)
+    sys.exit(2)
+
+# group absent (e.g. VPN-noP2P on a fresh install) - create provider + group
+newp = "slot"
+while re.search(r"(?m)^  %s:\n" % newp, t):
+    newp = "slot%d" % (int(newp[4:]) + 1 if newp != "slot" else 2)
+prov = newp
+# v1.21.3: no provider health-check here on purpose - mihomo drops nodes that fail it from the
+# group, which silently empties a lane and turns every rule using it into 502s.
+tpl = "  %s:\n    type: http\n    url: \"%s\"\n    interval: 3600\n%s" % (prov, url, first_provider_headers())
+ppm = re.search(r"(?m)^proxy-providers:\n", t)
+if not ppm:
+    sys.stderr.write("no proxy-providers section\n")
+    sys.exit(2)
+t = t[:ppm.end()] + tpl + t[ppm.end():]
+grp = ("\n  - name: %s\n    type: url-test\n    use:\n      - %s\n"
+       "    url: \"https://www.gstatic.com/generate_204\"\n    interval: 180\n"
+       "    tolerance: 99999\n    lazy: false\n" % (group, prov))
+gm2 = group_block("AI")
+if not gm2:
+    sys.stderr.write("no AI group anchor\n")
+    sys.exit(2)
+t = t[:gm2.end()] + grp + t[gm2.end():]
+if group == "VPN":
+    if "RULE-SET,mtrickle_bulk" not in t:
+        t = t.replace("  - RULE-SET,mtrickle,VPN-noP2P\n",
+                      "  - RULE-SET,mtrickle_bulk,VPN\n  - RULE-SET,mtrickle,VPN-noP2P\n", 1)
+    t = t.replace(",RESERVE\n", ",VPN\n")
+open(cfg, "w", encoding="utf-8", newline="").write(t)
+print("created:%s" % prov)
+PYEOF
+  _res=$(python3 "$PYF" "$MIHOMO_CONF" "$_g" "$URL" 2>&1)
+  _rc=$?
+  rm -f "$PYF"
+  if [ "$_rc" -ne 0 ]; then
+    mv -f "$MIHOMO_CONF.bak_slot" "$MIHOMO_CONF" 2>/dev/null
+    printf '{"ok":false,"error":"%s"}' "$(json_esc "$_res")"; return 1
   fi
-  if [ -n "$_hwid" ]; then
-    awk -v pn="^  $PN:" -v hwid="$_hwid" '
-      BEGIN { f=0; added=0 }
-      $0 ~ pn { f=1; print; next }
-      f && !added && /^    url:/ { print; print "    header:"; print "      x-hwid:"; print "        - \"" hwid "\""; added=1; next }
-      f && /^  [A-Za-z0-9_-]+:/ { f=0 }
-      f && /^[A-Za-z]/ { f=0 }
-      { print }
-    ' "$TMPF" > "$TMPF.hwid" && mv -f "$TMPF.hwid" "$TMPF"
+  if ! /usr/bin/mihomo -t -d "$(dirname "$MIHOMO_CONF")" >/dev/null 2>&1; then
+    mv -f "$MIHOMO_CONF.bak_slot" "$MIHOMO_CONF" 2>/dev/null
+    printf '{"ok":false,"error":"mihomo config test failed - old config kept"}'; return 1
   fi
-  if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
-    mv -f "$TMPF" "$MIHOMO_CONF"
-  else
-    rm -f "$TMPF"
-    printf '{"error":"mihomo config test failed - old config kept"}'; return 1
-  fi
-  # apply to the RUNNING mihomo without restart:
-  # PUT /configs with config path forces re-read of the config file,
-  # which re-fetches the provider subscription (old node list replaced)
-  if controller_curl -s -m15 -f -X PUT "$MIHOMO_API/configs" \
-      -H 'Content-Type: application/json' \
-      -d "{\"path\":\"$MIHOMO_CONF\"}" >/dev/null 2>&1; then
-    WARN=''
-  else
-    WARN='mihomo reload failed - reload via service/restart needed'
-  fi
-  # verify the running provider actually serves nodes after reload
-  sleep 2
-  _n=$(controller_curl -s -m6 "$MIHOMO_API/providers/proxies/$PN" 2>/dev/null \
-       | tr ',' '\n' | grep -c "\"provider-name\":\"$PN\"")
-  case "${_n:-0}" in ''|*[!0-9]*) _n=0 ;; esac
-  if [ "$_n" -eq 0 ]; then
-    WARN='subscription returned no nodes - check the link, mihomo kept previous node list'
-  fi
-  echo "$(date +%FT%T) PROVIDER $PN <- $URL (nodes=$_n)" >> "$LOG"
-  printf '{"ok":true,"provider":"%s","url":"%s","warn":"%s"}' \
-    "$(json_esc "$PN")" "$(json_esc "$URL")" "$(json_esc "$WARN")"
+  rm -f "$MIHOMO_CONF.bak_slot"
+  _mihomo_reload
+  echo "$(date +%FT%T) SLOT $_g <- $URL ($_res)" >> "$LOG"
+  printf '{"ok":true,"slot":"%s","change":"%s","url":"%s","node":"%s"}' \
+    "$_g" "$(json_esc "$_res")" "$(json_esc "$URL")" "$(json_esc "$(_grp_node "$_g")")"
 }
 
 cmd_ai_sub_set() {
-  _mihomo_set_provider de5 "$1"
+  # v1.25.2: AI subscription switch is back - it points the AI group at this URL.
+  # When the AI group shares its provider with VPN/VPN-noP2P, a dedicated provider is
+  # created instead of silently re-pointing the shared one (isolation).
+  _slot_apply AI "$1"
 }
 
 # ---- subscription registry (id|name|url) ----
@@ -895,12 +968,8 @@ _subs_count() { grep -cE '^[^#]' "$SUBS_FILE" 2>/dev/null || echo 0; }
 # import current config providers into the registry (skips urls already present)
 _subs_seed_internal() {
   _subu=$(awk '/^  sub:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
-  _de5u=$(awk '/^  de5:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
   if [ -n "$_subu" ]; then
     _subs_json | grep -Fq "$_subu" || cmd_sub_add "VPN (текущая)" "$_subu" >/dev/null
-  fi
-  if [ -n "$_de5u" ]; then
-    _subs_json | grep -Fq "$_de5u" || cmd_sub_add "AI (текущая)" "$_de5u" >/dev/null
   fi
   echo "$(date +%FT%T) SUB seed (auto)" >> "$LOG"
 }
@@ -945,90 +1014,23 @@ _mihomo_reload() { # re-read the config in the running core (no service restart)
 }
 
 cmd_ai_sub_use() {
-  ID="$1"
-  URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
-  _mihomo_set_provider de5 "$URL"
-  AI_NODE=$(_grp_node AI)
-  printf '{"ok":true,"url":"%s","ai_node":"%s"}' "$(json_esc "$URL")" "$(json_esc "$AI_NODE")"
+  # v1.25.2: the AI slot switch is back - it points the AI group at this registry subscription.
+  # When the AI group shares its provider with VPN/VPN-noP2P, a dedicated provider is created
+  # instead of silently re-pointing the shared one (isolation).
+  _slot_use AI "$1"
 }
 
 # v1.18.2: slots are resolved through the GROUP, not a hardcoded provider name - on a box that was
 # migrated the default tunnel may be fed by "sub", on a fresh install it always is.
 #   slot vpn        -> group VPN         (P2P-tolerant tunnel, the default one)
 #   slot vpn_nop2p  -> group VPN-noP2P   (subscription whose provider forbids P2P; created on demand)
-#   slot ai         -> group AI
-_SLOT_PY='
-import re, sys
-cfg, group, url = sys.argv[1], sys.argv[2], sys.argv[3]
-t = open(cfg, encoding="utf-8").read()
-
-def provider_of(grp):
-    m = re.search(r"(?m)^  - name: %s\s*\n(?:^(?:    .*|\s*)\n)*" % re.escape(grp), t)
-    if not m:
-        return None, None
-    blk = m.group(0)
-    u = re.search(r"use:\n((?:\s+-\s+\S+\n?)+)", blk)
-    if u:
-        return re.findall(r"-\s+(\S+)", u.group(1))[0], m
-    p = re.search(r"proxies:\n((?:\s+-.*\n?)+)", blk)
-    return (None, m) if p else (None, m)
-
-prov, gm = provider_of(group)
-if prov:
-    pm = re.search(r"(?m)^  %s:\n" % re.escape(prov))
-    t2, n = re.subn(r"(?m)^(  %s:\n(?:.*\n)*?    url: )\"[^\"]*\"" % re.escape(prov),
-                    lambda m: m.group(1) + "\\"" + url + "\\"", t, count=1)
-    if n == 0:
-        sys.stderr.write("provider %s has no url line\\n" % prov); sys.exit(2)
-    print("updated:%s" % prov); sys.exit(0)
-
-# no such group (or a group without a provider) - create provider + group, then point the rules
-# that make sense for a P2P-tolerant tunnel at it
-newp = "slot"
-while re.search(r"(?m)^  %s:\n" % newp, t):
-    newp = "slot%d" % (int(newp[4:]) + 1 if newp != "slot" else 2)
-prov = newp
-# v1.21.3: no provider health-check here on purpose - mihomo drops nodes that fail it from the
-# group, which silently empties a lane and turns every rule using it into 502s.
-tpl = ("  %s:\n    type: http\n    url: \\"%s\\"\n    interval: 3600\\n" % (prov, url))
-am = re.search(r"(?m)^  de5:\n", t) or re.search(r"(?m)^  sub:\n", t)
-if not am:
-    sys.stderr.write("no proxy-providers anchor\\n"); sys.exit(2)
-t = t[:am.start()] + tpl + t[am.start():]
-grp = ("\\n  - name: %s\\n    type: url-test\\n    use:\\n      - %s\\n"
-       "    url: \\"https://www.gstatic.com/generate_204\\"\\n    interval: 180\\n"
-       "    tolerance: 99999\\n    lazy: false\\n" % (group, prov))
-gm2 = re.search(r"(?m)^  - name: AI\\s*\\n(?:^(?:    .*|\\s*)\\n)*", t)
-if not gm2:
-    sys.stderr.write("no AI group anchor\\n"); sys.exit(2)
-t = t[:gm2.end()] + grp + t[gm2.end():]
-if group == "VPN":
-    if "RULE-SET,mtrickle_bulk" not in t:
-        t = t.replace("  - RULE-SET,mtrickle,VPN-noP2P\\n",
-                      "  - RULE-SET,mtrickle_bulk,VPN\\n  - RULE-SET,mtrickle,VPN-noP2P\\n", 1)
-    t = t.replace(",RESERVE\\n", ",VPN\\n")
-open(cfg, "w", encoding="utf-8", newline="").write(t)
-print("created:%s" % prov)
-'
+#   slot ai         -> group AI          (v1.25.2: switch restored; a shared provider is isolated,
+#                                          never silently re-pointed - switching AI cannot move VPN)
 
 _slot_use() { # _slot_use <group> <id>  -> assigns the registry subscription to that mihomo group
   _g="$1"; ID="$2"
   URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
-  _c="$(P /etc/mihomo/config.yaml)"
-  cp -p "$_c" "$_c.bak_slot" 2>/dev/null
-  _res=$(python3 -c "$_SLOT_PY" "$_c" "$_g" "$URL" 2>&1)
-  if [ $? -ne 0 ]; then
-    mv -f "$_c.bak_slot" "$_c" 2>/dev/null
-    printf '{"ok":false,"error":"%s"}' "$(json_esc "$_res")"; return 1
-  fi
-  if ! /usr/bin/mihomo -t -d "$(dirname "$_c")" >/dev/null 2>&1; then
-    mv -f "$_c.bak_slot" "$_c" 2>/dev/null
-    printf '{"ok":false,"error":"mihomo config test failed - old config kept"}'; return 1
-  fi
-  rm -f "$_c.bak_slot"
-  _mihomo_reload
-  printf '{"ok":true,"slot":"%s","change":"%s","url":"%s","node":"%s"}' \
-    "$_g" "$(json_esc "$_res")" "$(json_esc "$URL")" "$(json_esc "$(_grp_node "$_g")")"
+  _slot_apply "$_g" "$URL"
 }
 
 cmd_vpn_sub_use()    { _slot_use VPN "$1"; }
@@ -1730,7 +1732,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.25.1';
+var PANEL_VERSION = '1.25.2';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -1962,7 +1964,7 @@ return view.extend({
 		var aiSub = E('div', { 'class': 'gs-sub-card' }, [
 			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
 			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc, st.ai_node), cleanName(st.ai_node) || '—' ]),
-			E('div', { 'class': 'gs-meta' }, 'Подписка de5 · выход ' + ((CCNAME[aiCc] || aiCc) ? (CCNAME[aiCc] || aiCc) : '—') +
+			E('div', { 'class': 'gs-meta' }, 'Слот AI · выход ' + ((CCNAME[aiCc] || aiCc) ? (CCNAME[aiCc] || aiCc) : '—') +
 				(st.google ? ' · Google видит: ' + st.google : '')),
 			E('div', { 'class': 'gs-meta' }, 'DNS AI-устройств: ' + (
 				st.aidns === 1 ? 'через AI-туннель (утечки нет)' :
@@ -2023,11 +2025,14 @@ return view.extend({
 				if (!confirm('Отдать слот VPN-noP2P этой подписке?\n\nНа неё останутся только доменные правила (mtrickle) и STUN. Убедитесь, что провайдер этой подписки разрешает трафик из ваших списков.')) return;
 				view.act(callVpnnpSubUse, { id: s.id }, 'Подписка применена для VPN-noP2P');
 			};
-			// v1.25.1: the "→ AI" slot switch is removed - AI no longer owns a subscription.
-			// Since v1.22.8/v1.23.0 the AI path rides the node-relay (sub) USA nodes, guarded
-			// nightly by geomask-node-scan --ai-guard. The old de5/un1.pro subscription leaked
-			// OpenAI via Helsinki (unsupported_country) and is retired, so cmd_ai_sub_use always
-			// failed with "provider de5 not found". Configure AI's nodes via the node-scan tab.
+			// v1.25.2: the "→ AI" slot switch is back. AI points at this subscription via the AI
+			// group. If AI shares its provider with VPN/VPN-noP2P, the backend creates a dedicated
+			// provider instead of silently re-pointing the shared one - other lanes never move.
+			var bA = { 'class': 'gs-btn gs-btn-use' + (isAi ? ' gs-btn-ai-on' : ''), 'title': isAi ? 'Эта подписка используется для AI-маршрутов' : 'Переключить AI-маршруты на эту подписку' };
+			bA.click = function() {
+				if (!confirm('Отдать слот AI этой подписке?\n\nПути Google/OpenAI/Claude пойдут через её узлы. Если этот провайдер уже питает VPN или VPN-noP2P, для AI будет создан собственный провайдер - чужие полосы не сдвинутся.')) return;
+				view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI');
+			};
 			var bD = { 'class': 'gs-btn gs-btn-warn', 'title': 'Убрать из реестра', 'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } };
 			return E('tr', {}, [
 				E('td', {}, s.name || s.id),
@@ -2035,6 +2040,7 @@ return view.extend({
 				E('td', {}, dest),
 				E('td', { 'class': 'gs-subs-actions' }, [
 					E('button', bV, '→ VPN'),
+					E('button', bA, '→ AI'),
 					E('button', bN, '→ VPN-noP2P'),
 					E('button', bD, 'Удалить')
 				])
@@ -22373,7 +22379,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.25.1"
+GUARD_VERSION="1.25.2"
 
 log() { logger -t geomask-guard "$*"; }
 

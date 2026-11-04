@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.25.0"
+GM_VERSION="1.25.1"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.25.0"
+BACKEND_VERSION="1.25.1"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -1730,7 +1730,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.25.0';
+var PANEL_VERSION = '1.25.1';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -2023,7 +2023,11 @@ return view.extend({
 				if (!confirm('Отдать слот VPN-noP2P этой подписке?\n\nНа неё останутся только доменные правила (mtrickle) и STUN. Убедитесь, что провайдер этой подписки разрешает трафик из ваших списков.')) return;
 				view.act(callVpnnpSubUse, { id: s.id }, 'Подписка применена для VPN-noP2P');
 			};
-			var bA = { 'class': 'gs-btn gs-btn-use' + (isAi ? ' gs-btn-ai-on' : ''), 'title': isAi ? 'Эта подписка используется для AI-маршрутов' : 'Переключить AI-маршруты на эту подписку', 'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } };
+			// v1.25.1: the "→ AI" slot switch is removed - AI no longer owns a subscription.
+			// Since v1.22.8/v1.23.0 the AI path rides the node-relay (sub) USA nodes, guarded
+			// nightly by geomask-node-scan --ai-guard. The old de5/un1.pro subscription leaked
+			// OpenAI via Helsinki (unsupported_country) and is retired, so cmd_ai_sub_use always
+			// failed with "provider de5 not found". Configure AI's nodes via the node-scan tab.
 			var bD = { 'class': 'gs-btn gs-btn-warn', 'title': 'Убрать из реестра', 'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } };
 			return E('tr', {}, [
 				E('td', {}, s.name || s.id),
@@ -2031,7 +2035,6 @@ return view.extend({
 				E('td', {}, dest),
 				E('td', { 'class': 'gs-subs-actions' }, [
 					E('button', bV, '→ VPN'),
-					E('button', bA, '→ AI'),
 					E('button', bN, '→ VPN-noP2P'),
 					E('button', bD, 'Удалить')
 				])
@@ -22370,7 +22373,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.25.0"
+GUARD_VERSION="1.25.1"
 
 log() { logger -t geomask-guard "$*"; }
 

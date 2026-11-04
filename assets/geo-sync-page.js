@@ -336,7 +336,11 @@ return view.extend({
 				if (!confirm('Отдать слот VPN-noP2P этой подписке?\n\nНа неё останутся только доменные правила (mtrickle) и STUN. Убедитесь, что провайдер этой подписки разрешает трафик из ваших списков.')) return;
 				view.act(callVpnnpSubUse, { id: s.id }, 'Подписка применена для VPN-noP2P');
 			};
-			var bA = { 'class': 'gs-btn gs-btn-use' + (isAi ? ' gs-btn-ai-on' : ''), 'title': isAi ? 'Эта подписка используется для AI-маршрутов' : 'Переключить AI-маршруты на эту подписку', 'click': function() { view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI'); } };
+			// v1.25.1: the "→ AI" slot switch is removed - AI no longer owns a subscription.
+			// Since v1.22.8/v1.23.0 the AI path rides the node-relay (sub) USA nodes, guarded
+			// nightly by geomask-node-scan --ai-guard. The old de5/un1.pro subscription leaked
+			// OpenAI via Helsinki (unsupported_country) and is retired, so cmd_ai_sub_use always
+			// failed with "provider de5 not found". Configure AI's nodes via the node-scan tab.
 			var bD = { 'class': 'gs-btn gs-btn-warn', 'title': 'Убрать из реестра', 'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } };
 			return E('tr', {}, [
 				E('td', {}, s.name || s.id),
@@ -344,7 +348,6 @@ return view.extend({
 				E('td', {}, dest),
 				E('td', { 'class': 'gs-subs-actions' }, [
 					E('button', bV, '→ VPN'),
-					E('button', bA, '→ AI'),
 					E('button', bN, '→ VPN-noP2P'),
 					E('button', bD, 'Удалить')
 				])

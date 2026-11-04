@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.25.2"
+GM_VERSION="1.25.3"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -214,7 +214,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.25.2"
+BACKEND_VERSION="1.25.3"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 UPD_CHECK=$UPD_DIR/check.json
@@ -862,6 +862,14 @@ if prov:
         sys.stderr.write("no proxy-providers section\n")
         sys.exit(2)
     t = t[:ppm.end()] + tpl + t[ppm.end():]
+    # v1.25.3: re-match the group block AFTER the insert. The old code reused byte offsets
+    # from the pre-insert text, so the repoint landed len(tpl) bytes early, slicing mid-line
+    # into another group's exclude-filter (unclosed quote) - mihomo -t failed with
+    # "yaml: did not find expected key" and the switch reported "config test failed".
+    gm = group_block(group)
+    if gm is None:
+        sys.stderr.write("group %s block not found after provider insert\n" % group)
+        sys.exit(2)
     blk = gm.group(0)
     newblk = re.sub(r"(?m)^(\s+- )%s(\s*)$" % re.escape(prov), r"\g<1>" + newp + r"\g<2>", blk, count=1)
     if newblk == blk:
@@ -1732,7 +1740,7 @@ var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', ex
 var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
 var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
 var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.25.2';
+var PANEL_VERSION = '1.25.3';
 
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
@@ -22379,7 +22387,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.25.2"
+GUARD_VERSION="1.25.3"
 
 log() { logger -t geomask-guard "$*"; }
 

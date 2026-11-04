@@ -1136,6 +1136,16 @@ if grep -qF 'ZALWAYS' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
   echo "PASS: S46 sync merges always-exclude into zapret exclude"; pass=$((pass+1))
 else echo "FAIL: S46 sync does not merge always-exclude"; failn=$((failn+1)); fi
 
+# v1.25.3: the shared-provider slot patcher must re-match the group block AFTER inserting the
+# new provider. v1.25.2 reused byte offsets captured before the insert, so the use-list repoint
+# landed len(tpl) bytes early and sliced mid-line into another group's exclude-filter (unclosed
+# quote) - mihomo -t failed with "yaml: did not find expected key" and every switch reported
+# "mihomo config test failed - old config kept".
+grep -qF 're-match the group block AFTER the insert' "$HERE/../assets/geo-backend.sh" \
+  && grep -qF 'gm = group_block(group)' "$HERE/../assets/geo-backend.sh" \
+  && { echo "PASS: S47 slot patcher re-matches the group block after the provider insert"; pass=$((pass+1)); } \
+  || { echo "FAIL: S47 slot patcher still repoints with stale pre-insert offsets"; failn=$((failn+1)); }
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

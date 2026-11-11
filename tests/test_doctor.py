@@ -317,6 +317,18 @@ class DoctorRegistryTests(unittest.TestCase):
         self.assertEqual(exit_step['verdict'], 'ok')
         self.assertIn('QUIC', exit_step['detail'])
 
+    def test_domain_trace_names_a_missing_domain(self):
+        self._route_fixture()
+        original = doctor.run
+        self.addCleanup(lambda: setattr(doctor, 'run', original))
+        doctor.run = lambda cmd, timeout=8, stdin=None: (
+            (0, '** server can\'t find nope.example: NXDOMAIN')
+            if cmd[:1] == ['nslookup'] else (127, ''))
+        result = doctor.trace_domain('nope.example')
+        self.assertEqual(result['state'], 'fail')
+        self.assertIn('не существует', result['steps'][0]['detail'])
+        self.assertIn('написание', result['fix'])
+
 
 class DoctorCheckTests(unittest.TestCase):
     """Checks are shell-driven, so the shell answers are injected here."""

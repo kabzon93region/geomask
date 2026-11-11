@@ -479,7 +479,9 @@ def resolve(domain):
             continue
         if re.match(r'^\d+\.\d+\.\d+\.\d+$', value):
             ips.append(value)
-    return {'ips': ips, 'blocked': blocked, 'raw': out}
+    lowered = out.lower()
+    nxdomain = 'nxdomain' in lowered or "can't find" in lowered or 'not found' in lowered
+    return {'ips': ips, 'blocked': blocked, 'nxdomain': nxdomain, 'raw': out}
 
 
 # --------------------------------------------------------------------------- checks
@@ -1122,6 +1124,9 @@ def trace_domain(domain, live=False):
              'Разрешите домен в LuCI → adblock-fast (список разрешённых) или уберите его из hosts.')
     elif probe['ips']:
         step('DNS', 'ok', '→ %s' % ', '.join(probe['ips'][:4]))
+    elif probe.get('nxdomain'):
+        step('DNS', 'fail', 'домен не существует (NXDOMAIN)',
+             'Проверьте написание домена. Если он только что появился — подождите обновления DNS.')
     else:
         step('DNS', 'fail', 'не разрешается через 127.0.0.1',
              'DNS не отвечает: /etc/init.d/dnsmasq restart; upstream — LuCI → Сеть → DHCP/DNS.')

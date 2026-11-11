@@ -13,6 +13,8 @@
 #   sh geomask.sh --restart    allow mihomo/magitrickle restarts where needed (drops VPN ~3s)
 #   sh geomask.sh --vpn-url U --ai-url U    set subscription URLs (kept secret in config only)
 #   sh geomask.sh --seed-lists  restore MagiTrickle domain lists from the bundled template (all groups)
+#   sh geomask.sh --list-modules   what is mandatory and what is optional
+#   sh geomask.sh --modules=core,path_vpn   install only the modules this router needs
 #   sh geomask.sh --help
 #
 # Install (jsDelivr CDN - fast, shows download progress):
@@ -33,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.28.0"
+GM_VERSION="1.29.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -219,6 +221,139 @@ save_stream() { # save_stream <target-path> <mode>  (content on stdin)
   return 0
 }
 
+# ---- optional modules: gates shared by check and apply ---------------------
+# A module the owner did not select is never written, so every check that used to fail
+# the install for its missing piece asks mod_skipped first. Cron entries are the trap:
+# creation lives in step5_apply, verification in step5_check, and verification used to
+# abort the whole run - so both halves go through cron_ensure / cron_verify, which read
+# the same module flag. Never wrap only one half.
+mod_skipped() { # mod_skipped <module> -> 0 (and a note) when the module is not selected
+  module_selected "$1" && return 1
+  info "пропущен: модуль '$1' не выбран"
+  return 0
+}
+
+cron_ensure() { # cron_ensure <module> <marker-ere> <cron-line>
+  mod_skipped "$1" && return 0
+  if crontab -l 2>/dev/null | grep -qE -- "$2"; then info "cron: уже есть ($2)"; return 0; fi
+  ( crontab -l 2>/dev/null; printf '%s\n' "$3" ) | crontab - 2>/dev/null \
+    && info "cron: добавлен ($2)" || warn "cron: не удалось записать ($2)"
+}
+
+cron_verify() { # cron_verify <module> <marker-ere> <label> [soft]
+  mod_skipped "$1" && return 0
+  if crontab -l 2>/dev/null | grep -qE -- "$2"; then info "$3: present"; return 0; fi
+  if [ "${4:-hard}" = soft ]; then warn "$3: отсутствует"
+  else bad "$3: отсутствует"; _need=1; fi
+}
+
+ruleset_stub() { # ruleset_stub <module> <install-path> - keep `mihomo -t` valid without the module
+  mod_skipped "$1" >/dev/null || return 0
+  [ -s "$(P "$2")" ] && return 0
+  mkdir -p "$(dirname "$(P "$2")")" 2>/dev/null
+  printf '%s\n%s\n' "# module '$1' is not selected: ruleset kept empty" 'payload: []' > "$(P "$2")"
+  info "ruleset: $2 kept empty (module '$1' not selected)"
+}
+
+# ---- the selection is remembered on the router ------------------------------
+# /etc/geomask/modules.json is the single source of truth for "which modules does this
+# router carry": the installer writes it, the panel and the per-module updater read it.
+MODULES_STATE=/etc/geomask/modules.json
+
+modules_state_read() { # prints the stored selection; rc=1 when there is none
+  [ -s "$(P $MODULES_STATE)" ] || return 1
+  python3 - "$(P $MODULES_STATE)" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    raise SystemExit(1)
+print(' '.join(str(item) for item in (data.get('selected') or [])))
+PYEOF
+}
+
+modules_state_write() { # modules_state_write <module>...
+  [ $# -gt 0 ] || return 0
+  mkdir -p "$(P /etc/geomask)" 2>/dev/null || true
+  python3 - "$(P $MODULES_STATE)" "$@" <<'PYEOF' 2>/dev/null || warn "modules: не удалось записать $MODULES_STATE"
+import json, sys
+json.dump({'selected': sys.argv[2:]},
+          open(sys.argv[1], 'w', encoding='utf-8', newline='\n'),
+          ensure_ascii=False, indent=2)
+PYEOF
+}
+
+module_effective_list() { # the modules this run installs (all, unless --modules narrowed it)
+  if [ -n "$GM_MODULES" ]; then printf '%s\n' "$GM_MODULES"; else printf '%s\n' "$GM_ALL_MODULES"; fi
+}
+
+modules_state_sync() { # remember the effective selection, only when it changed
+  _want=$(module_effective_list)
+  _have=$(modules_state_read 2>/dev/null || true)
+  [ "$_want" = "$_have" ] && return 0
+  # Narrowing the selection does not delete anything: say it once, with the way out.
+  for _m in $_have; do
+    case " $_want " in
+      *" $_m "*) ;;
+      *) warn "модуль '$_m' снят с выбора, его файлы остались на роутере (удалит --reinstall)" ;;
+    esac
+  done
+  modules_state_write $_want
+}
+
+choose_modules() { # interactive picker; required modules are always installed
+  _cur=$(modules_state_read 2>/dev/null || true)
+  [ -n "$_cur" ] || _cur="$GM_ALL_MODULES"
+  echo
+  printf '%sМодули%s: обязательные ставятся всегда, остальные — по выбору.\n' "$C_Y" "$NC"
+  _i=0
+  for _m in $GM_ALL_MODULES; do
+    _i=$((_i+1))
+    if module_required "$_m"; then _mk="обязательный"; _mc="$C_G"
+    else
+      case " $_cur " in
+        *" $_m "*) _mk="выбран"; _mc="$C_G" ;;
+        *)         _mk="по выбору"; _mc="$C_DIM" ;;
+      esac
+    fi
+    printf '  %s%2d)%s %-18s %s  %s[%s]%s\n' "$C_B" "$_i" "$NC" "$_m" "$(module_label "$_m")" "$_mc" "$_mk" "$NC"
+  done
+  printf 'Номера через запятую [Enter = оставить текущий выбор, all = все]: '
+  read -r _ans || _ans=""
+  case "$_ans" in
+    "") GM_MODULES=$_cur ;;
+    all|ALL|все|ВСЕ|Все) GM_MODULES="$GM_ALL_MODULES" ;;
+    *)
+      _sel=""
+      for _tok in $(printf '%s' "$_ans" | tr ',' ' '); do
+        case "$_tok" in
+          *[!0-9]*) warn "не номер: $_tok"; continue ;;
+        esac
+        _m=$(printf '%s\n' $GM_ALL_MODULES | sed -n "${_tok}p")
+        if [ -z "$_m" ]; then warn "нет модуля с номером $_tok"; continue; fi
+        case " $_sel " in *" $_m "*) ;; *) _sel="$_sel $_m" ;; esac
+      done
+      for _m in $GM_REQUIRED_MODULES; do
+        case " $_sel " in *" $_m "*) ;; *) _sel="$_sel $_m" ;; esac
+      done
+      GM_MODULES=$(printf '%s' "$_sel" | sed 's/^ *//;s/  */ /g')
+      ;;
+  esac
+  info "модули: $GM_MODULES"
+}
+
+modules_maybe_prompt() { # ask at most once per run, and only when the run can install
+  [ -n "$GM_MODULES" ] && return 0
+  [ "${GM_MODULES_ASKED:-0}" = 1 ] && return 0
+  # GM_MODULES_ASK=1 lets the sandbox harness drive the picker without a tty.
+  if [ "${GM_MODULES_ASK:-0}" != 1 ]; then
+    if [ "$GM_YES" = 1 ] || [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then return 0; fi
+    [ -t 0 ] || return 0
+  fi
+  GM_MODULES_ASKED=1
+  choose_modules
+}
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 svc_alive() { pidof "$1" >/dev/null 2>&1; }
@@ -268,9 +403,24 @@ step2_check() {
     if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
   done
   if have ubus && ubus list 2>/dev/null | grep -qx 'geo-sync'; then info "ubus geo-sync: registered"; else bad "ubus geo-sync not registered"; _need=1; fi
-  if [ -e /etc/ksmbd/ksmbd.conf ]; then
-    if grep -qF "[geomask-backups]" /etc/ksmbd/ksmbd.conf; then info "SMB share geomask-backups: present"
-    else bad "SMB share geomask-backups missing"; _need=1; fi
+  # v1.29.0: what this router is supposed to carry, and what the owner left out
+  _sel=$(modules_state_read 2>/dev/null || true)
+  if [ -n "$_sel" ]; then
+    _off=""
+    for _m in $GM_ALL_MODULES; do
+      case " $_sel " in *" $_m "*) ;; *) _off="$_off $_m" ;; esac
+    done
+    info "модули: $_sel${_off:+ (не выбраны:$_off)}"
+  else
+    info "модули: выбор не записан - считаем, что выбраны все"
+  fi
+  if module_selected backup_share; then
+    if [ -e /etc/ksmbd/ksmbd.conf ]; then
+      if grep -qF "[geomask-backups]" /etc/ksmbd/ksmbd.conf; then info "SMB share geomask-backups: present"
+      else bad "SMB share geomask-backups missing"; _need=1; fi
+    fi
+  else
+    info "пропущен: SMB-шар с бэкапами (модуль 'backup_share' не выбран)"
   fi
   return $_need
 }
@@ -4907,7 +5057,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.28.0"
+BACKEND_VERSION="1.29.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6358,7 +6508,7 @@ esac
 
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-module-update.py 755 <<'ASSET_EOF'
-  #!/usr/bin/env python3
+#!/usr/bin/env python3
 """Per-module updater for geomask.
 
 The router has one installer (geomask.sh) and twelve module manifests. Until now the
@@ -6378,6 +6528,10 @@ Commands:
   check [--force]        refresh the cached index and report available updates
   update <id> [--force]  install the module's files from the index
   verify <id>            re-hash installed files against the recorded state
+
+A module the owner did not select at install time (/etc/geomask/modules.json) is
+reported as `not-selected` and never updated here: changing which modules a router
+carries is the installer's job, not the updater's.
 """
 import argparse
 import hashlib
@@ -6392,6 +6546,7 @@ DEFAULT_REPO = 'kabzon93region/geomask'
 DEFAULT_REF = 'master'
 DEFAULT_CONFIG = '/etc/geomask/module-update.json'
 DEFAULT_STATE = '/etc/geomask/modules-state.json'
+DEFAULT_SELECTION = '/etc/geomask/modules.json'
 CACHE = '/tmp/geomask-modules-index.json'
 BACKUP_ROOT = '/tmp/geomask-module-backup'
 RAW = 'https://raw.githubusercontent.com/{repo}/{ref}/{path}'
@@ -6502,6 +6657,27 @@ def load_state(path=DEFAULT_STATE):
     return state if isinstance(modules, dict) else {'schema': 1, 'modules': {}}
 
 
+def load_selection(path=DEFAULT_SELECTION):
+    """Modules this router is supposed to carry, or None when the file is absent.
+
+    None means "no selection was ever recorded" - every module counts as selected, which
+    is how routers installed before the selection existed keep behaving.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    data = read_json(path, None)
+    if not isinstance(data, dict):
+        return None
+    selected = data.get('selected')
+    if not isinstance(selected, list):
+        return None
+    return [str(item) for item in selected]
+
+
+def module_selected(selected, module_id):
+    return True if selected is None else module_id in selected
+
+
 def module_state(state, module_id):
     entry = (state.get('modules') or {}).get(module_id) or {}
     return {
@@ -6510,7 +6686,7 @@ def module_state(state, module_id):
     }
 
 
-def status(index, state, module_id=None):
+def status(index, state, module_id=None, selected=None):
     """Compare the index with what is on disk. Never writes anything."""
     result = []
     for ident, module in sorted((index.get('modules') or {}).items()):
@@ -6519,6 +6695,7 @@ def status(index, state, module_id=None):
         recorded = module_state(state, ident)
         available = module.get('version', '0.0.0')
         installed = recorded['version'] or available
+        chosen = module_selected(selected, ident)
         files = []
         modified = []
         missing = []
@@ -6534,7 +6711,9 @@ def status(index, state, module_id=None):
                 elif not recorded_hash:
                     modified.append(path)
             files.append({'path': path, 'sha256': entry['sha256'], 'installed': actual})
-        if missing:
+        if not chosen:
+            state_name = 'not-selected'
+        elif missing:
             state_name = 'incomplete'
         elif modified:
             state_name = 'modified'
@@ -6546,6 +6725,7 @@ def status(index, state, module_id=None):
             'id': ident,
             'name': module.get('name', ident),
             'type': module.get('type', ''),
+            'selected': chosen,
             'installed_version': installed,
             'available_version': available,
             'state': state_name,
@@ -6678,12 +6858,14 @@ def main(argv=None):
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--state', default=DEFAULT_STATE)
     parser.add_argument('--config', default=DEFAULT_CONFIG)
+    parser.add_argument('--selection', default=DEFAULT_SELECTION)
     parser.add_argument('--index-file', default='')
     args = parser.parse_args(argv)
 
     try:
         config = load_config(args.config)
         state = load_state(args.state)
+        selected = load_selection(args.selection)
         if args.command == 'seed':
             if args.index_file:
                 with open(args.index_file, encoding='utf-8') as handle:
@@ -6698,26 +6880,34 @@ def main(argv=None):
         if args.command == 'status':
             index, source = load_index(config)
             print(json.dumps({'ok': True, 'source': source,
-                              'modules': status(index, state)}, ensure_ascii=False))
+                              'modules': status(index, state, selected=selected)},
+                             ensure_ascii=False))
             return 0
         if args.command == 'check':
             index, source = load_index(config, force=True)
             print(json.dumps({'ok': True, 'source': source,
-                              'modules': status(index, state)}, ensure_ascii=False))
+                              'modules': status(index, state, selected=selected)},
+                             ensure_ascii=False))
             return 0
         if args.command == 'verify':
             index, source = load_index(config)
             if not args.module:
                 raise UpdateError('verify needs a module id')
-            report = status(index, state, args.module)
+            report = status(index, state, args.module, selected=selected)
             if not report:
                 raise UpdateError('unknown module %s' % args.module)
-            print(json.dumps({'ok': report[0]['state'] in ('current', 'update-available'),
+            print(json.dumps({'ok': report[0]['state'] in ('current', 'update-available',
+                                                           'not-selected'),
                               'module': report[0]}, ensure_ascii=False))
             return 0
         if args.command == 'update':
             if not args.module:
                 raise UpdateError('update needs a module id')
+            if not module_selected(selected, args.module):
+                raise UpdateError(
+                    '%s is not part of this install (not selected in %s); '
+                    'change the selection with the installer: sh geomask.sh --modules=%s'
+                    % (args.module, args.selection, args.module))
             index, source = load_index(config)
             module, staged, changed = download_module(index, state, args.module, config,
                                                       force=args.force)
@@ -6740,11 +6930,11 @@ def main(argv=None):
 if __name__ == '__main__':
     sys.exit(main())
 
-  ASSET_EOF
+ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
-  {
+{
   "schema": 1,
-  "core_version": "1.28.0",
+  "core_version": "1.29.0",
   "modules": {
     "admission_service": {
       "version": "1.0.0",
@@ -6940,7 +7130,7 @@ if __name__ == '__main__':
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "e9cde8f8ab865c5ba0429b91636c9bae849c3448e3403a324e7dc19fd282ed5f"
+          "sha256": "11ad407207de5e6327353d05aad455db9a19daa9179790b10c4cc93f861e1511"
         }
       ]
     },
@@ -7086,7 +7276,7 @@ if __name__ == '__main__':
   }
 }
 
-  ASSET_EOF
+ASSET_EOF
   save_stream /usr/libexec/rpcd/geo-sync 755 <<'ASSET_EOF'
 #!/bin/sh
 # rpcd plugin for geo-sync (LuCI "Гео-маскировка и AI")
@@ -7273,6 +7463,8 @@ ASSET_EOF
   [ -f /etc/geomask/modules-index.json ] && \
     python3 /usr/lib/geomask/geomask-module-update.py seed \
       --index-file /etc/geomask/modules-index.json >/dev/null 2>&1 || true
+  # v1.29.0: remember which modules this router carries (panel + per-module updater read it).
+  modules_state_sync
   save_stream /usr/share/luci/menu.d/luci-app-geo-sync.json 644 <<'ASSET_EOF'
 {
 	"admin/services/geo-sync": {
@@ -7353,7 +7545,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.28.0';
+var PANEL_VERSION = '1.29.0';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -8228,7 +8420,8 @@ return view.extend({
 				'current': ['gs-on', 'актуален'],
 				'update-available': ['gs-warn', 'есть обновление'],
 				'modified': ['gs-warn', 'изменён локально'],
-				'incomplete': ['gs-off', 'неполный']
+				'incomplete': ['gs-off', 'неполный'],
+				'not-selected': ['gs-off', 'не выбран']
 			};
 			var it = map[state] || ['gs-off', state || '—'];
 			return E('span', { 'class': 'gs-badge ' + it[0] }, it[1]);
@@ -8238,7 +8431,8 @@ return view.extend({
 			var label = m.state === 'modified' ? 'Перезаписать' : 'Обновить';
 			var btn = E('button', {
 				'class': 'gs-btn gs-btn-ok',
-				'disabled': (m.state === 'current' || m.state === 'incomplete' || !m.files) ? 'disabled' : null,
+				'disabled': (m.state === 'current' || m.state === 'incomplete'
+					|| m.state === 'not-selected' || !m.files) ? 'disabled' : null,
 				'click': function() {
 					view.act(callModUpdate, { module_id: m.id },
 						'Модуль ' + (m.name || m.id) + ' обновлён');
@@ -8258,6 +8452,7 @@ return view.extend({
 		panels.mods.appendChild(E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Модули'),
 			E('div', { 'class': 'gs-hint' }, 'Каждый модуль обновляется отдельно и имеет собственную версию. Файлы проверяются по SHA-256, локальные правки не перезаписываются без подтверждения.'),
+			E('div', { 'class': 'gs-hint' }, 'Модуль «не выбран» не устанавливался на этот роутер — его набор задаётся при установке (sh geomask.sh --list-modules).'),
 			E('div', { 'class': 'gs-row', style: 'margin:8px 0' }, [
 				E('button', { 'class': 'gs-btn', 'click': function() {
 					view.act(callModCheck, {}, 'Индекс обновлений обновлён');
@@ -8910,7 +9105,11 @@ ASSET_EOF
   # the second signal -> geo-sync stays unregistered; re-send until it appears.
   ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
   ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
-  ensure_smb_share
+  if module_selected backup_share; then
+    ensure_smb_share
+  else
+    info "пропущен: SMB-шар с бэкапами (модуль 'backup_share' не выбран)"
+  fi
   return 0
 }
 step2_verify() { step2_check; }
@@ -9544,6 +9743,7 @@ aidns_generate_nft() { # (re)write the nft include from the current ai device li
 
 step4_check() {
   _need=0
+  mod_skipped ai_dns && return 0
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then
     info "AI-DNS: disabled (/etc/geomask-aidns.off present)"
     return 0
@@ -9585,6 +9785,7 @@ step4_check() {
   return $_need
 }
 step4_apply() {
+  mod_skipped ai_dns && return 0
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then info "AI-DNS disabled by flag - nothing to do"; return 0; fi
   _bk=$(ensure_backup) || { bad "no backup - ABORTED"; return 1; }
   info "backup: $_bk"
@@ -26440,20 +26641,27 @@ step5_check() {
       info "VPN lane: ${_vt:-unknown}, subscription nodes only"
     fi
   fi
-  if [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ] && [ -s "$(P /etc/geomask-ytwatch.conf)" ]; then info "ytwatch: installed"
-  else bad "ytwatch missing (script/conf)"; _need=1; fi
-  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch$'; then info "ytwatch cron */5: present"; else bad "ytwatch cron missing"; _need=1; fi
-  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch-reset$'; then info "ytwatch reset cron: present"; else bad "ytwatch reset cron missing"; _need=1; fi
+  # v1.29.0: optional modules. Their pieces are only installed when the module is selected,
+  # so their checks are gated too - otherwise a minimal install fails its own verification.
+  if ! mod_skipped youtube; then
+    if [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ] && [ -s "$(P /etc/geomask-ytwatch.conf)" ]; then info "ytwatch: installed"
+    else bad "ytwatch missing (script/conf)"; _need=1; fi
+  fi
+  cron_verify youtube '# geomask-ytwatch$' 'ytwatch cron */1'
+  cron_verify youtube '# geomask-ytwatch-reset$' 'ytwatch reset cron'
   # v1.15.0: torrent admin
-  if [ -x "$(P /usr/bin/geomask-torrent.sh)" ] && [ -d "$(P /etc/geomask/torrent)" ]; then info "torrent admin: installed"
-  else bad "torrent admin missing (script/dir)"; _need=1; fi
+  if ! mod_skipped torrent; then
+    if [ -x "$(P /usr/bin/geomask-torrent.sh)" ] && [ -d "$(P /etc/geomask/torrent)" ]; then info "torrent admin: installed"
+    else bad "torrent admin missing (script/dir)"; _need=1; fi
+  fi
   # v1.18.0: VPN lane audit
-  if [ -x "$(P /usr/bin/geomask-vpnwatch.sh)" ] && [ -s "$(P /etc/geomask/vpnwatch.conf)" ]; then info "vpnwatch: installed"
-  else bad "vpnwatch missing (script/conf)"; _need=1; fi
-  if crontab -l 2>/dev/null | grep -qE '# geomask-vpnwatch$'; then info "vpnwatch cron */1: present"
-  else warn "vpnwatch cron missing - the lane audit will not run"; fi
-  if [ -x "$(P /usr/bin/geomask-morning-check.sh)" ]; then info "morning check: installed"
-  else bad "morning check script missing"; _need=1; fi
+  if ! mod_skipped diagnostic; then
+    if [ -x "$(P /usr/bin/geomask-vpnwatch.sh)" ] && [ -s "$(P /etc/geomask/vpnwatch.conf)" ]; then info "vpnwatch: installed"
+    else bad "vpnwatch missing (script/conf)"; _need=1; fi
+    if [ -x "$(P /usr/bin/geomask-morning-check.sh)" ]; then info "morning check: installed"
+    else bad "morning check script missing"; _need=1; fi
+  fi
+  cron_verify diagnostic '# geomask-vpnwatch$' 'vpnwatch cron */1' soft
   # the extra lane is optional; report it, never fail because of it
   if [ -e "$(P /sys/class/net/VPN-noP2P)" ]; then
     info "lane VPN-noP2P: netdev present (MagiTrickle can select it)"
@@ -27097,6 +27305,9 @@ payload:
   - DOMAIN-SUFFIX,ytimg.l.google.com
 
 ASSET_EOF
+  # v1.29.0: the core mihomo config always references these rulesets, so a deselected
+  # module must still leave a valid (empty) file behind - otherwise `mihomo -t` fails.
+  ruleset_stub youtube /etc/mihomo/ruleset/ytdirect.yaml
   # v1.13.3: googlevideo -> VPN. Source of truth is the MagiTrickle group "GoogleVideo VPN";
   # sync regenerates ytvpn.yaml from it. Seed the file only if missing so mihomo -t passes before
   # first sync; never clobber an existing one here.
@@ -27112,6 +27323,7 @@ ASSET_EOF
   else
     info "ytvpn list: keeping existing /etc/mihomo/ruleset/ytvpn.yaml (sync-managed)"
   fi
+  ruleset_stub youtube /etc/mihomo/ruleset/ytvpn.yaml
   # v1.17.0: lane split - IP rules must never reach the restricted VPN subscription.
   # mtrickle_bulk.yaml is sync-generated; seed it empty so mihomo -t passes before the first sync.
   if [ ! -s "$(P /etc/mihomo/ruleset/mtrickle_bulk.yaml)" ]; then
@@ -27239,6 +27451,7 @@ ASSET_EOF
   else
     info "torrentdirect list: keeping existing /etc/mihomo/ruleset/torrentdirect.yaml"
   fi
+  ruleset_stub torrent /etc/mihomo/ruleset/torrentdirect.yaml
   # v1.20.4: zapret force-list exceptions (direction B). Owner-edited; never overwritten.
   if [ -s "$(P /etc/geomask/zapret-force-keep.txt)" ]; then
     info "zapret force-keep: keeping existing /etc/geomask/zapret-force-keep.txt"
@@ -27300,7 +27513,7 @@ yandex.ee
 ASSET_EOF
   fi
   # v1.17.0: torrent admin - rebuild the tracker ruleset / toggle the DIRECT listener from the panel
-  mkdir -p "$(P /etc/geomask/torrent)" 2>/dev/null
+  if module_selected torrent; then mkdir -p "$(P /etc/geomask/torrent)" 2>/dev/null; fi
   save_stream /usr/bin/geomask-torrent.sh 755 <<'ASSET_EOF'
 #!/bin/sh
 # geomask-torrent.sh - manage the torrent/tracker DIRECT bypass (geomask v1.15.0+).
@@ -28358,11 +28571,7 @@ do_tick()
 PYEOF
 
 ASSET_EOF
-  if crontab -l 2>/dev/null | grep -qE '# geomask-vpnwatch$'; then
-    info "vpnwatch cron already present"
-  else
-    ( crontab -l 2>/dev/null; echo '* * * * * /usr/bin/geomask-vpnwatch.sh --tick >/dev/null 2>&1 # geomask-vpnwatch' ) | crontab - 2>/dev/null && info "cron added: */1 vpnwatch" || warn "cannot set crontab"
-  fi
+  cron_ensure diagnostic '# geomask-vpnwatch$' '* * * * * /usr/bin/geomask-vpnwatch.sh --tick >/dev/null 2>&1 # geomask-vpnwatch'
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 #!/bin/sh
 # Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
@@ -28460,7 +28669,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.28.0"
+GUARD_VERSION="1.29.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -29842,22 +30051,15 @@ PYEOF
       info "ytwatch conf: keeping existing /etc/geomask-ytwatch.conf"
     fi
   fi
-  # v1.20.4: the scan runs every minute (was */5). An old entry is rewritten in place.
-  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch$'; then
-    if crontab -l 2>/dev/null | grep -qE '^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch\.sh.*# geomask-ytwatch$'; then
-      ( crontab -l 2>/dev/null | sed 's|^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch.sh|*/1 * * * * /usr/bin/geomask-ytwatch.sh|' ) | crontab - 2>/dev/null \
-        && info "ytwatch cron migrated */5 -> */1" || warn "cannot migrate the ytwatch cron"
-    else
-      info "ytwatch cron already present"
-    fi
-  else
-    ( crontab -l 2>/dev/null; echo '*/1 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch' ) | crontab - 2>/dev/null && info "cron added: */1 ytwatch" || warn "cannot set crontab"
+  # v1.20.4: the scan runs every minute (was */5). An old entry is rewritten in place;
+  # v1.29.0: the migration only runs for a selected module, and cron_ensure owns creation.
+  if module_selected youtube \
+     && crontab -l 2>/dev/null | grep -qE '^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch\.sh.*# geomask-ytwatch$'; then
+    ( crontab -l 2>/dev/null | sed 's|^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch.sh|*/1 * * * * /usr/bin/geomask-ytwatch.sh|' ) | crontab - 2>/dev/null \
+      && info "ytwatch cron migrated */5 -> */1" || warn "cannot migrate the ytwatch cron"
   fi
-  if crontab -l 2>/dev/null | grep -qE '# geomask-ytwatch-reset$'; then
-    info "ytwatch reset cron already present"
-  else
-    ( crontab -l 2>/dev/null; echo '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset' ) | crontab - 2>/dev/null && info "cron added: 04:20 ytwatch reset" || warn "cannot set crontab"
-  fi
+  cron_ensure youtube '# geomask-ytwatch$' '*/1 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch'
+  cron_ensure youtube '# geomask-ytwatch-reset$' '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset'
   # v1.10.0: event sync watchdog - magitrickle save -> sync within ~seconds (cron stays as backup)
   if have apk; then apk add inotifywait >/dev/null 2>&1 || true; fi
   save_stream /usr/bin/geomask-syncd.sh 755 <<'ASSET_EOF'
@@ -29931,6 +30133,8 @@ ASSET_EOF
   # v1.13.0: ship the lists template + seeder, and auto-seed MagiTrickle if it is empty (fresh install).
   write_lists_assets
   seed_lists ""
+  # v1.29.0: a run that installs sync can also be the only install step (`--step 5 --modules=...`).
+  modules_state_sync
   return 0
 }
 step5_verify() { step5_check; }
@@ -29955,6 +30159,9 @@ step6_check() {
     if [ -f "$(P /etc/geomask-aidns.off)" ] && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
       info "$s: AI-DNS disabled - skipped"; continue
     fi
+    if ! module_selected ai_dns && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
+      info "$s: модуль ai_dns не выбран - skipped"; continue
+    fi
     case "$s" in
       ai-doh|dnsmasq-ai)
         if aidns_svc_ok "$s"; then info "$s: listening"
@@ -29970,6 +30177,9 @@ step6_apply() {
     _p=$s; [ "$s" = magitrickled ] && _p=magitrickle
     if [ -f "$(P /etc/geomask-aidns.off)" ] && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
       info "$s: AI-DNS disabled - skipped"; continue
+    fi
+    if ! module_selected ai_dns && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
+      info "$s: модуль ai_dns не выбран - skipped"; continue
     fi
     case "$s" in
       ai-doh|dnsmasq-ai)
@@ -30075,6 +30285,8 @@ run_step() { # run_step N  (interactive/auto common logic)
     return 1
   fi
   if [ "$GM_AUTO" = 1 ] || [ "$GM_YES" = 1 ] || ask "Apply step $_n ($_name)?"; then
+    # v1.29.0: an installing step is the right moment to ask which modules to carry.
+    case "$_n" in 2|4|5) modules_maybe_prompt ;; esac
     if step_fn "$_n" apply; then
       info "--- verify ---"
       if step_fn "$_n" verify; then
@@ -30320,6 +30532,7 @@ menu_reinstall() {
   _curv=""
   if [ -s "$_c" ]; then _curv=$(_prov_url "$_c" sub); fi
   ask "Продолжить переустановку?" || { warn "отменено"; return 1; }
+  modules_maybe_prompt
   _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
   hdr "1/6" "удаление geomask"; geomask_uninstall noreload || true
   hdr "2/6" "гео-оверлей LuCI"; step2_apply || true
@@ -30360,7 +30573,7 @@ menu_loop() {
   done
 }
 
-usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---- args ----
 while [ $# -gt 0 ]; do
@@ -30388,6 +30601,18 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# validate --modules: a typo would otherwise install nothing and report success
+if [ -n "$GM_MODULES" ]; then
+  _valid=""
+  for _m in $GM_MODULES; do
+    case " $GM_ALL_MODULES " in
+      *" $_m "*) _valid="$_valid $_m" ;;
+      *) printf 'unknown module: %s (see --list-modules)\n' "$_m" >&2; exit 2 ;;
+    esac
+  done
+  GM_MODULES=$(printf '%s' "$_valid" | sed 's/^ *//;s/  */ /g')
+fi
 
 # hard pin: router owner may forbid restarts permanently via flag file
 if [ "$GM_RESTART" = 1 ] && [ -f "$(P /root/.geomask-norestart)" ]; then

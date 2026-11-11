@@ -6,7 +6,9 @@ on-disk content are kept separate on purpose: several rules only show up when th
 differ (a hand-edited file, a stale checksum).
 """
 import hashlib
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -76,6 +78,23 @@ class ModuleUpdateTests(unittest.TestCase):
     def state(self, version, files=None):
         return {'schema': 1, 'modules': {'core': {'version': version,
                                                   'files': files or {}}}}
+
+    def index_two(self):
+        """core (present on disk) plus a feature module that is not installed."""
+        payload = self.index('1.1.0')
+        payload['modules']['feature'] = {
+            'version': '1.0.0', 'type': 'feature', 'name': 'Feature',
+            'dependencies': ['core'],
+            'files': [{'path': str(self.root / 'opt' / 'feature.sh'),
+                       'source': 'assets/feature.sh', 'mode': 755,
+                       'sha256': sha(b'feature\n')}],
+        }
+        return payload
+
+    def selection(self, selected):
+        path = self.root / 'modules.json'
+        path.write_text(json.dumps({'selected': selected}), encoding='utf-8')
+        return str(path)
 
     # --- status -----------------------------------------------------------
     def test_status_reports_update_available(self):
@@ -169,6 +188,49 @@ class ModuleUpdateTests(unittest.TestCase):
             updater.install_staged('core', staged, self.state('1.0.0'), '1.1.0',
                                    str(self.state_path))
         self.assertTrue(Path(path).is_dir())
+
+    # --- selection --------------------------------------------------------
+    def test_status_marks_a_deselected_module(self):
+        path = self.put(str(self.root / 'bin' / 'tool.sh'), b'body\n')
+        report = updater.status(self.index_two(),
+                                self.state('1.1.0', {path: sha(b'body\n')}),
+                                selected=['core'])
+        by_id = {item['id']: item for item in report}
+        self.assertEqual(by_id['core']['state'], 'current')
+        self.assertTrue(by_id['core']['selected'])
+        # Not selected wins over "missing": the files are absent on purpose.
+        self.assertEqual(by_id['feature']['state'], 'not-selected')
+        self.assertFalse(by_id['feature']['selected'])
+
+    def test_deselected_module_is_reported_not_hidden(self):
+        self.put(str(self.root / 'bin' / 'tool.sh'), b'body\n')
+        report = updater.status(self.index_two(), self.state('1.0.0'), selected=['core'])
+        self.assertEqual([item['id'] for item in report], ['core', 'feature'])
+
+    def test_no_selection_file_means_every_module_is_selected(self):
+        self.put(str(self.root / 'bin' / 'tool.sh'), b'body\n')
+        report = updater.status(self.index_two(), self.state('1.0.0'))
+        self.assertTrue(all(item['selected'] for item in report))
+        self.assertNotIn('not-selected', [item['state'] for item in report])
+
+    def test_load_selection_reads_the_installer_state(self):
+        path = self.selection(['core', 'youtube'])
+        self.assertEqual(updater.load_selection(path), ['core', 'youtube'])
+        self.assertIsNone(updater.load_selection(str(self.root / 'absent.json')))
+        broken = self.root / 'broken.json'
+        broken.write_text('{"selected": "core"}', encoding='utf-8')
+        self.assertIsNone(updater.load_selection(str(broken)))
+
+    def test_update_refuses_a_module_that_is_not_selected(self):
+        selection = self.selection(['core'])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = updater.main(['update', 'feature', '--selection', selection,
+                               '--state', str(self.state_path)])
+        self.assertEqual(rc, 1)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload['ok'])
+        self.assertIn('not part of this install', payload['error'])
 
     # --- guards -----------------------------------------------------------
     def test_dependency_must_be_new_enough(self):

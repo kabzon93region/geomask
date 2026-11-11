@@ -936,7 +936,8 @@ return view.extend({
 				'current': ['gs-on', 'актуален'],
 				'update-available': ['gs-warn', 'есть обновление'],
 				'modified': ['gs-warn', 'изменён локально'],
-				'incomplete': ['gs-off', 'неполный']
+				'incomplete': ['gs-off', 'неполный'],
+				'not-selected': ['gs-off', 'не выбран']
 			};
 			var it = map[state] || ['gs-off', state || '—'];
 			return E('span', { 'class': 'gs-badge ' + it[0] }, it[1]);
@@ -946,7 +947,8 @@ return view.extend({
 			var label = m.state === 'modified' ? 'Перезаписать' : 'Обновить';
 			var btn = E('button', {
 				'class': 'gs-btn gs-btn-ok',
-				'disabled': (m.state === 'current' || m.state === 'incomplete' || !m.files) ? 'disabled' : null,
+				'disabled': (m.state === 'current' || m.state === 'incomplete'
+					|| m.state === 'not-selected' || !m.files) ? 'disabled' : null,
 				'click': function() {
 					view.act(callModUpdate, { module_id: m.id },
 						'Модуль ' + (m.name || m.id) + ' обновлён');
@@ -966,6 +968,7 @@ return view.extend({
 		panels.mods.appendChild(E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Модули'),
 			E('div', { 'class': 'gs-hint' }, 'Каждый модуль обновляется отдельно и имеет собственную версию. Файлы проверяются по SHA-256, локальные правки не перезаписываются без подтверждения.'),
+			E('div', { 'class': 'gs-hint' }, 'Модуль «не выбран» не устанавливался на этот роутер — его набор задаётся при установке (sh geomask.sh --list-modules).'),
 			E('div', { 'class': 'gs-row', style: 'margin:8px 0' }, [
 				E('button', { 'class': 'gs-btn', 'click': function() {
 					view.act(callModCheck, {}, 'Индекс обновлений обновлён');

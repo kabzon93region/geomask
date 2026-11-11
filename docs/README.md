@@ -21,6 +21,7 @@
 | [YOUTUBE.md](YOUTUBE.md) | YouTube: страница/картинки через запрет, сбойные рёбра googlevideo — в VPN (v1.14.0) |
 | [TORRENTS.md](TORRENTS.md) | История торрент-ingress; старое описание v1.15.1 не соответствует позднему fixed-VPN listener и не доказывает защиту AI/P2P |
 | [OPERATIONS.md](OPERATIONS.md) | Режимы запуска, шаги, бэкапы, безопасность |
+| [MODULES.md](MODULES.md) | Модули: выбор при установке, гейты cron/сервисов, отдельное обновление (v1.29.0) |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Диагностика типовых проблем |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Сборка, песочница, тесты |
 | [releases/](releases/) | Release notes по версиям |

@@ -18,6 +18,10 @@ Commands:
   check [--force]        refresh the cached index and report available updates
   update <id> [--force]  install the module's files from the index
   verify <id>            re-hash installed files against the recorded state
+
+A module the owner did not select at install time (/etc/geomask/modules.json) is
+reported as `not-selected` and never updated here: changing which modules a router
+carries is the installer's job, not the updater's.
 """
 import argparse
 import hashlib
@@ -32,6 +36,7 @@ DEFAULT_REPO = 'kabzon93region/geomask'
 DEFAULT_REF = 'master'
 DEFAULT_CONFIG = '/etc/geomask/module-update.json'
 DEFAULT_STATE = '/etc/geomask/modules-state.json'
+DEFAULT_SELECTION = '/etc/geomask/modules.json'
 CACHE = '/tmp/geomask-modules-index.json'
 BACKUP_ROOT = '/tmp/geomask-module-backup'
 RAW = 'https://raw.githubusercontent.com/{repo}/{ref}/{path}'
@@ -142,6 +147,27 @@ def load_state(path=DEFAULT_STATE):
     return state if isinstance(modules, dict) else {'schema': 1, 'modules': {}}
 
 
+def load_selection(path=DEFAULT_SELECTION):
+    """Modules this router is supposed to carry, or None when the file is absent.
+
+    None means "no selection was ever recorded" - every module counts as selected, which
+    is how routers installed before the selection existed keep behaving.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    data = read_json(path, None)
+    if not isinstance(data, dict):
+        return None
+    selected = data.get('selected')
+    if not isinstance(selected, list):
+        return None
+    return [str(item) for item in selected]
+
+
+def module_selected(selected, module_id):
+    return True if selected is None else module_id in selected
+
+
 def module_state(state, module_id):
     entry = (state.get('modules') or {}).get(module_id) or {}
     return {
@@ -150,7 +176,7 @@ def module_state(state, module_id):
     }
 
 
-def status(index, state, module_id=None):
+def status(index, state, module_id=None, selected=None):
     """Compare the index with what is on disk. Never writes anything."""
     result = []
     for ident, module in sorted((index.get('modules') or {}).items()):
@@ -159,6 +185,7 @@ def status(index, state, module_id=None):
         recorded = module_state(state, ident)
         available = module.get('version', '0.0.0')
         installed = recorded['version'] or available
+        chosen = module_selected(selected, ident)
         files = []
         modified = []
         missing = []
@@ -174,7 +201,9 @@ def status(index, state, module_id=None):
                 elif not recorded_hash:
                     modified.append(path)
             files.append({'path': path, 'sha256': entry['sha256'], 'installed': actual})
-        if missing:
+        if not chosen:
+            state_name = 'not-selected'
+        elif missing:
             state_name = 'incomplete'
         elif modified:
             state_name = 'modified'
@@ -186,6 +215,7 @@ def status(index, state, module_id=None):
             'id': ident,
             'name': module.get('name', ident),
             'type': module.get('type', ''),
+            'selected': chosen,
             'installed_version': installed,
             'available_version': available,
             'state': state_name,
@@ -318,12 +348,14 @@ def main(argv=None):
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--state', default=DEFAULT_STATE)
     parser.add_argument('--config', default=DEFAULT_CONFIG)
+    parser.add_argument('--selection', default=DEFAULT_SELECTION)
     parser.add_argument('--index-file', default='')
     args = parser.parse_args(argv)
 
     try:
         config = load_config(args.config)
         state = load_state(args.state)
+        selected = load_selection(args.selection)
         if args.command == 'seed':
             if args.index_file:
                 with open(args.index_file, encoding='utf-8') as handle:
@@ -338,26 +370,34 @@ def main(argv=None):
         if args.command == 'status':
             index, source = load_index(config)
             print(json.dumps({'ok': True, 'source': source,
-                              'modules': status(index, state)}, ensure_ascii=False))
+                              'modules': status(index, state, selected=selected)},
+                             ensure_ascii=False))
             return 0
         if args.command == 'check':
             index, source = load_index(config, force=True)
             print(json.dumps({'ok': True, 'source': source,
-                              'modules': status(index, state)}, ensure_ascii=False))
+                              'modules': status(index, state, selected=selected)},
+                             ensure_ascii=False))
             return 0
         if args.command == 'verify':
             index, source = load_index(config)
             if not args.module:
                 raise UpdateError('verify needs a module id')
-            report = status(index, state, args.module)
+            report = status(index, state, args.module, selected=selected)
             if not report:
                 raise UpdateError('unknown module %s' % args.module)
-            print(json.dumps({'ok': report[0]['state'] in ('current', 'update-available'),
+            print(json.dumps({'ok': report[0]['state'] in ('current', 'update-available',
+                                                           'not-selected'),
                               'module': report[0]}, ensure_ascii=False))
             return 0
         if args.command == 'update':
             if not args.module:
                 raise UpdateError('update needs a module id')
+            if not module_selected(selected, args.module):
+                raise UpdateError(
+                    '%s is not part of this install (not selected in %s); '
+                    'change the selection with the installer: sh geomask.sh --modules=%s'
+                    % (args.module, args.selection, args.module))
             index, source = load_index(config)
             module, staged, changed = download_module(index, state, args.module, config,
                                                       force=args.force)

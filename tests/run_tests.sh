@@ -1313,6 +1313,176 @@ for _m in nodes_audit_schedule_get nodes_audit_schedule_set nodes_audit_events_g
   fi
 done
 
+# ==================== S51: module selection gating (v1.29.0) ====================
+# A router that only wants core+VPN must not carry the optional pieces - and must not
+# fail its own verification because they are absent. Cron entries are the trap: they are
+# created in step5_apply and verified in step5_check, so both halves read the module flag.
+echo "=== S51: minimal install (core+path_vpn) leaves the optional pieces out ==="
+# Start from the healthy fixtures but strip the geomask files themselves, so both step 2
+# and step 5 really apply: a check-only pass would never exercise the gated apply path.
+R="$HERE/root_modules"
+rm -rf "$R"; cp -a "$HERE/root_healthy/." "$R/"
+rm -f "$R/usr/bin/geomask-ytwatch.sh" "$R/usr/bin/geomask-torrent.sh" \
+      "$R/usr/bin/geomask-vpnwatch.sh" "$R/usr/bin/geomask-morning-check.sh" \
+      "$R/etc/geomask-ytwatch.conf" "$R/etc/geomask/vpnwatch.conf"
+rm -rf "$R/etc/geomask/torrent"
+rm -f "$R/etc/mihomo/ruleset/ytvpn.yaml" "$R/etc/mihomo/ruleset/ytdirect.yaml" \
+      "$R/etc/mihomo/ruleset/torrentdirect.yaml"
+rm -f "$R/usr/libexec/rpcd/geo-sync" "$R/root/sync_mtrickle_mihomo.sh" \
+      "$R/etc/geomask/modules.json" "$R/etc/geomask/modules-index.json"
+{
+  echo '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard'
+  echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan'
+} > "$HERE/state/crontab"
+export GM_PREFIX="$R"
+t "S51 minimal install exits zero" 0 sh "$SCRIPT" --auto --yes --modules=core,path_vpn --vpn-url "https://vpn.example/m1"
+lacks "$HERE/last_out.txt" '\[FAIL\] ytwatch' "S51 ytwatch check is gated by its module"
+lacks "$HERE/last_out.txt" '\[FAIL\] vpnwatch' "S51 vpnwatch check is gated"
+lacks "$HERE/last_out.txt" '\[FAIL\] torrent' "S51 torrent check is gated"
+lacks "$HERE/last_out.txt" '\[FAIL\] morning check' "S51 morning check is gated"
+lacks "$HERE/last_out.txt" '\[FAIL\] syncd' "S51 syncd check stays unconditional (core)"
+contains "$HERE/last_out.txt" "пропущен: модуль 'youtube'" "S51 youtube reported as skipped, not missing"
+contains "$HERE/last_out.txt" "пропущен: модуль 'ai_dns'" "S51 ai_dns step reported as skipped"
+lacks "$HERE/state/crontab" 'geomask-ytwatch' "S51 no ytwatch cron for a deselected module"
+lacks "$HERE/state/crontab" 'geomask-vpnwatch' "S51 no vpnwatch cron"
+contains "$HERE/state/crontab" 'sync_mtrickle_mihomo' "S51 core sync cron still created"
+contains "$HERE/state/crontab" 'geomask-guard' "S51 core guard cron still created"
+if [ -x "$R/usr/bin/geomask-ytwatch.sh" ]; then
+  echo "FAIL: S51 ytwatch was installed anyway"; failn=$((failn+1))
+else
+  echo "PASS: S51 ytwatch not installed"; pass=$((pass+1))
+fi
+if grep -qF 'payload: []' "$R/etc/mihomo/ruleset/ytvpn.yaml" 2>/dev/null \
+   && grep -qF 'payload: []' "$R/etc/mihomo/ruleset/ytdirect.yaml" 2>/dev/null \
+   && grep -qF 'payload: []' "$R/etc/mihomo/ruleset/torrentdirect.yaml" 2>/dev/null; then
+  echo "PASS: S51 rulesets of deselected modules stay valid empty stubs (mihomo -t holds)"; pass=$((pass+1))
+else
+  echo "FAIL: S51 ruleset stub missing for a deselected module"; failn=$((failn+1))
+fi
+contains "$R/etc/geomask/modules.json" '"core"' "S51 selection persisted (core)"
+contains "$R/etc/geomask/modules.json" '"path_vpn"' "S51 selection persisted (path_vpn)"
+lacks "$R/etc/geomask/modules.json" '"youtube"' "S51 deselected module is not recorded as selected"
+if grep -qF 'SMB-шар с бэкапами' "$HERE/last_out.txt" && ! grep -qF '[FAIL] SMB share' "$HERE/last_out.txt"; then
+  echo "PASS: S51 backup share check is gated by backup_share"; pass=$((pass+1))
+else
+  echo "FAIL: S51 backup share gating did not report"; failn=$((failn+1))
+fi
+
+echo "=== S51b: a full install still creates every optional piece ==="
+R="$HERE/root_modules_full"
+rm -rf "$R"; cp -a "$HERE/root_apply/." "$R/"
+: > "$HERE/state/crontab"
+export GM_PREFIX="$R"
+t "S51b full install exits zero" 0 sh "$SCRIPT" --auto --yes --vpn-url "https://vpn.example/m2"
+contains "$HERE/state/crontab" 'geomask-ytwatch' "S51b ytwatch cron created"
+contains "$HERE/state/crontab" 'geomask-vpnwatch' "S51b vpnwatch cron created"
+contains "$HERE/state/crontab" 'geomask-ytwatch-reset' "S51b ytwatch reset cron created"
+contains "$R/etc/geomask/modules.json" '"youtube"' "S51b full selection persisted"
+
+echo "=== S51c: selection flags ==="
+t "S51c --list-modules exits zero" 0 sh "$SCRIPT" --list-modules
+contains "$HERE/last_out.txt" 'core.*обязательный' "S51c core marked mandatory"
+contains "$HERE/last_out.txt" 'youtube.*по выбору' "S51c youtube marked optional"
+t "S51c unknown module is rejected" 2 sh "$SCRIPT" --modules=core,nope
+contains "$HERE/last_out.txt" 'unknown module: nope' "S51c unknown module named in the error"
+contains "$SCRIPT" 'mod_skipped()' "S51c the shared gate helper is present"
+contains "$SCRIPT" 'cron_ensure diagnostic' "S51c the vpnwatch cron goes through cron_ensure"
+contains "$SCRIPT" 'cron_verify diagnostic' "S51c the vpnwatch cron is verified through cron_verify"
+_n=$(grep -cE "^  if crontab -l 2>/dev/null \| grep -qE '# geomask-(ytwatch|vpnwatch)" "$SCRIPT")
+if [ "$_n" = "0" ]; then
+  echo "PASS: S51c no raw crontab check left for an optional module's cron"; pass=$((pass+1))
+else
+  echo "FAIL: S51c $_n raw crontab check(s) left (trap: apply/verify drift)"; failn=$((failn+1))
+fi
+
+echo "=== S51d: a fresh install really writes the rpcd wrapper and the module catalogue ==="
+# v1.29.0 regression: an indented ASSET_EOF does not terminate a plain <<'ASSET_EOF' heredoc,
+# so the block swallowed the two save_stream calls after it - a fresh router got no rpcd
+# wrapper and no module catalogue, and only the sandbox fixtures hid it.
+_n=$(grep -cE '^[[:space:]]+ASSET_EOF[[:space:]]*$' "$HERE/../geomask.sh.in")
+if [ "$_n" = "0" ]; then
+  echo "PASS: S51d no indented heredoc terminator (it would swallow the next blocks)"; pass=$((pass+1))
+else
+  echo "FAIL: S51d $_n indented ASSET_EOF terminator(s) in the template"; failn=$((failn+1))
+fi
+R="$HERE/root_fresh"
+rm -rf "$R"; mkdir -p "$R/tmp"
+export GM_PREFIX="$R"
+sh "$SCRIPT" --step 2 --yes >"$HERE/last_out.txt" 2>&1
+_rc=$?
+if [ "$_rc" = 0 ]; then
+  echo "PASS: S51d fresh step 2 exits zero"; pass=$((pass+1))
+else
+  echo "FAIL: S51d fresh step 2 rc=$_rc"; sed 's/^/    | /' "$HERE/last_out.txt" | tail -20; failn=$((failn+1))
+fi
+for _f in usr/libexec/rpcd/geo-sync etc/geomask/modules-index.json \
+          usr/lib/geomask/geomask-module-update.py etc/geomask/modules.json; do
+  if [ -s "$R/$_f" ]; then
+    echo "PASS: S51d fresh install wrote $_f"; pass=$((pass+1))
+  else
+    echo "FAIL: S51d fresh install did not write $_f"; failn=$((failn+1))
+  fi
+done
+if grep -q 'ASSET_EOF' "$R/usr/lib/geomask/geomask-module-update.py" 2>/dev/null; then
+  echo "FAIL: S51d the installed updater carries heredoc junk"; failn=$((failn+1))
+else
+  echo "PASS: S51d the installed updater is clean"; pass=$((pass+1))
+fi
+if grep -qF '"core"' "$R/etc/geomask/modules.json" && grep -qF '"youtube"' "$R/etc/geomask/modules.json"; then
+  echo "PASS: S51d a fresh install records all modules (nothing was narrowed)"; pass=$((pass+1))
+else
+  echo "FAIL: S51d fresh install recorded an unexpected selection"; failn=$((failn+1))
+fi
+
+echo "=== S51e: interactive module picker (no tty, driven by GM_MODULES_ASK) ==="
+# Numbers are positions in GM_ALL_MODULES; required modules are added back whatever is typed.
+R="$HERE/root_picker"
+rm -rf "$R"; mkdir -p "$R/tmp"
+export GM_PREFIX="$R"
+printf '5\n' | GM_MODULES_ASK=1 sh "$SCRIPT" --step 2 --yes >"$HERE/last_out.txt" 2>&1
+if grep -qF '"ai_dns"' "$R/etc/geomask/modules.json" 2>/dev/null; then
+  echo "PASS: S51e the picked module is recorded"; pass=$((pass+1))
+else
+  echo "FAIL: S51e the picked module is not recorded"; sed 's/^/    | /' "$HERE/last_out.txt" | tail -15; failn=$((failn+1))
+fi
+if grep -qF '"core"' "$R/etc/geomask/modules.json" 2>/dev/null \
+   && grep -qF '"path_vpn"' "$R/etc/geomask/modules.json" 2>/dev/null; then
+  echo "PASS: S51e required modules are added back automatically"; pass=$((pass+1))
+else
+  echo "FAIL: S51e required modules were dropped by the picker"; failn=$((failn+1))
+fi
+if grep -qF '"youtube"' "$R/etc/geomask/modules.json" 2>/dev/null; then
+  echo "FAIL: S51e an unpicked module was installed anyway"; failn=$((failn+1))
+else
+  echo "PASS: S51e unpicked modules stay out"; pass=$((pass+1))
+fi
+contains "$HERE/last_out.txt" 'обязательный' "S51e the picker marks required modules"
+# Enter keeps the stored selection; a fresh router has no stored selection, so it is "all".
+R="$HERE/root_picker_all"
+rm -rf "$R"; mkdir -p "$R/tmp"
+export GM_PREFIX="$R"
+printf '\n' | GM_MODULES_ASK=1 sh "$SCRIPT" --step 2 --yes >"$HERE/last_out.txt" 2>&1
+if grep -qF '"youtube"' "$R/etc/geomask/modules.json" 2>/dev/null \
+   && grep -qF '"admission_service"' "$R/etc/geomask/modules.json" 2>/dev/null; then
+  echo "PASS: S51e Enter installs every module"; pass=$((pass+1))
+else
+  echo "FAIL: S51e Enter did not install every module"; failn=$((failn+1))
+fi
+# A second run with Enter must keep the narrowed selection instead of widening it.
+R="$HERE/root_picker"
+export GM_PREFIX="$R"
+printf '\n' | GM_MODULES_ASK=1 sh "$SCRIPT" --step 2 --yes >"$HERE/last_out.txt" 2>&1
+if grep -qF '"youtube"' "$R/etc/geomask/modules.json" 2>/dev/null; then
+  echo "FAIL: S51e Enter widened the stored selection"; failn=$((failn+1))
+else
+  echo "PASS: S51e Enter on a configured router keeps the stored selection"; pass=$((pass+1))
+fi
+# Narrowing the selection cannot delete files, so the installer has to say so out loud.
+rm -f "$R/usr/libexec/rpcd/geo-sync"
+t "S51e narrowing the selection still installs" 0 sh "$SCRIPT" --step 2 --yes --modules=core,path_vpn
+contains "$HERE/last_out.txt" 'снят с выбора' "S51e files of a dropped module are reported as left behind"
+lacks "$R/etc/geomask/modules.json" '"ai_dns"' "S51e the narrowed selection is recorded"
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

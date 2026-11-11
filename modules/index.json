@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "core_version": "1.28.0",
+  "core_version": "1.29.0",
   "modules": {
     "admission_service": {
       "version": "1.0.0",
@@ -196,7 +196,7 @@
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "e9cde8f8ab865c5ba0429b91636c9bae849c3448e3403a324e7dc19fd282ed5f"
+          "sha256": "11ad407207de5e6327353d05aad455db9a19daa9179790b10c4cc93f861e1511"
         }
       ]
     },

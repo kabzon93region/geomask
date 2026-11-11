@@ -116,6 +116,9 @@ def main():
         if path.endswith('/modules-index.json'):
             # The catalogue cannot describe itself: its hash changes with every build.
             continue
+        if path.startswith('/tmp/'):
+            # Transient staging file, not a module artifact.
+            continue
         # Files nobody claims belong to core: the panel, backend and base layout are
         # core infrastructure, and leaving them out would make them un-updatable.
         module_id = owner.get(path, 'core')

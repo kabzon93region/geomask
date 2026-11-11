@@ -79,12 +79,6 @@
           "sha256": "5ac6ec58fd32ed3b24b8949e16b577eedb2e48ab2cc54ea0d5f34695f356cb0b"
         },
         {
-          "path": "/tmp/geomask-ytwatch.conf.new",
-          "source": "assets/geomask-ytwatch.conf",
-          "mode": 644,
-          "sha256": "ff14d9912cc17d3abbeeae006e0bbff1de436ae456e986a397837b9c95c94fd3"
-        },
-        {
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,

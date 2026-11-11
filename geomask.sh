@@ -6812,7 +6812,7 @@ if __name__ == '__main__':
           "path": "/usr/lib/geomask/geomask-module-update.py",
           "source": "assets/geomask-module-update.py",
           "mode": 755,
-          "sha256": "4ae1013719fd2cb326afaa1f3b65697397958e1322444455f2c4b634514a6ca5"
+          "sha256": "1780490acc43c4d1c1a536e1dfaec81c34bf6cb1a5a55de00091137faf2a768d"
         },
         {
           "path": "/usr/lib/geomask/geomask-node-audit.py",

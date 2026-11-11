@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Build zm-setup.sh: inject assets from ./assets into template placeholders.
 # Usage: python build.py   -> writes ../zm-setup.sh (and ./zm-setup.sh)
+import json
 import os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -85,6 +86,18 @@ def main():
     missing = re.findall(r"@@ASSET:[^@]+@@", out)
     if missing:
         raise SystemExit("unreplaced placeholders: %s" % missing)
+
+    # per-module install map, derived from the same catalogue the updater uses, so a
+    # deselected module simply never has its files written by save_stream
+    idx_path = os.path.join(HERE, "modules", "index.json")
+    idx = json.load(open(idx_path, encoding="utf-8"))
+    rows = []
+    for mid, mod in sorted(idx["modules"].items()):
+        for entry in mod.get("files") or []:
+            rows.append('    "%s") GM_PATH_MODULE="%s" ;;' % (entry["path"], mid))
+    out = out.replace("@@MODULE_PATHS@@", "\n".join(rows))
+    if "@@MODULE_PATHS@@" in out:
+        raise SystemExit("module path map was not substituted")
 
     # stamp component versions (panel/backend/guard) from the template GM_VERSION
     gvm = re.search(r'^GM_VERSION="([^"]+)"', out, re.M)

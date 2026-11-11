@@ -118,7 +118,93 @@ _prov_url() {
   awk -v p="^  $2:" '$0 ~ p {f=1;next} f && /^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f && /^  [A-Za-z0-9_-]+:/{f=0} f && /^[A-Za-z]/{f=0}' "$1" 2>/dev/null
 }
 
+# ---- modules: which parts of geomask get installed -------------------------
+# core and path_vpn are mandatory: without the core nothing runs, without the VPN
+# lane the product has no purpose. Everything else is optional and can be left out
+# with --modules=... so a router only carries the features its owner wants.
+GM_REQUIRED_MODULES="core path_vpn"
+GM_ALL_MODULES="core path_vpn path_vpn_nop2p path_ai ai_dns youtube torrent diagnostic device_modes backup_share self_update admission_service"
+GM_MODULES=""
+
+module_required() { case " $GM_REQUIRED_MODULES " in *" $1 "*) return 0 ;; esac; return 1; }
+module_selected() {
+  [ -z "$GM_MODULES" ] && return 0
+  case " $GM_MODULES " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+module_label() {
+  case "$1" in
+    core) echo "ядро, панель, бэкенд, обновления" ;;
+    path_vpn) echo "VPN-лейн (основной туннель)" ;;
+    path_vpn_nop2p) echo "VPN-noP2P (без торрентов)" ;;
+    path_ai) echo "AI-лейн (Google/OpenAI/Claude)" ;;
+    ai_dns) echo "DNS-over-HTTPS для AI-устройств" ;;
+    youtube) echo "YouTube: watchdog и списки доменов" ;;
+    torrent) echo "Торренты: правила и слушатель" ;;
+    diagnostic) echo "Диагностика: dnscheck, vpnwatch, утренняя проверка" ;;
+    device_modes) echo "Режимы устройств (исключения из туннеля)" ;;
+    backup_share) echo "SMB-шар с бэкапами" ;;
+    self_update) echo "Самообновление из GitHub" ;;
+    admission_service) echo "Служба допуска AI-устройств" ;;
+    *) echo "" ;;
+  esac
+}
+module_owns_path() { # echoes the module id that owns an install path, if any
+  GM_PATH_MODULE=""
+  case "$1" in
+    "/etc/geomask-nodes.conf") GM_PATH_MODULE="core" ;;
+    "/etc/geomask/lists/magitrickle-groups.yaml") GM_PATH_MODULE="core" ;;
+    "/etc/geomask/zapret-always-exclude.txt") GM_PATH_MODULE="core" ;;
+    "/etc/geomask/zapret-force-keep.txt") GM_PATH_MODULE="core" ;;
+    "/etc/hotplug.d/iface/99-default-vpn-route") GM_PATH_MODULE="core" ;;
+    "/etc/init.d/geomask-syncd") GM_PATH_MODULE="core" ;;
+    "/root/sync_mtrickle_mihomo.sh") GM_PATH_MODULE="core" ;;
+    "/usr/bin/geo-backend.sh") GM_PATH_MODULE="core" ;;
+    "/usr/bin/geomask-guard.sh") GM_PATH_MODULE="core" ;;
+    "/usr/bin/geomask-lane.sh") GM_PATH_MODULE="core" ;;
+    "/usr/bin/geomask-node-scan.sh") GM_PATH_MODULE="core" ;;
+    "/usr/bin/geomask-seed-lists.py") GM_PATH_MODULE="core" ;;
+    "/usr/bin/geomask-syncd.sh") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-apply.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-audit-scheduler.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-audit-state.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-config-owner.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-config-tx.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-lane-torrent.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-node-audit.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-slot-patch.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-subscription-status.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-sync-youtube.py") GM_PATH_MODULE="core" ;;
+    "/usr/libexec/rpcd/geo-sync") GM_PATH_MODULE="core" ;;
+    "/usr/share/luci/menu.d/luci-app-geo-sync.json") GM_PATH_MODULE="core" ;;
+    "/usr/share/rpcd/acl.d/luci-app-geo-sync.json") GM_PATH_MODULE="core" ;;
+    "/www/luci-static/resources/view/geo-sync/main.js") GM_PATH_MODULE="core" ;;
+    "/etc/geomask/vpnwatch.conf") GM_PATH_MODULE="diagnostic" ;;
+    "/usr/bin/geomask-dnscheck.sh") GM_PATH_MODULE="diagnostic" ;;
+    "/usr/bin/geomask-morning-check.sh") GM_PATH_MODULE="diagnostic" ;;
+    "/usr/bin/geomask-vpnwatch.sh") GM_PATH_MODULE="diagnostic" ;;
+    "/etc/mihomo/ruleset/torrentdirect.yaml") GM_PATH_MODULE="torrent" ;;
+    "/usr/bin/geomask-torrent.sh") GM_PATH_MODULE="torrent" ;;
+    "/etc/geomask-ytwatch.conf") GM_PATH_MODULE="youtube" ;;
+    "/etc/mihomo/ruleset/ytdirect.yaml") GM_PATH_MODULE="youtube" ;;
+    "/etc/mihomo/ruleset/ytvpn.yaml") GM_PATH_MODULE="youtube" ;;
+    "/usr/bin/geomask-ytwatch.sh") GM_PATH_MODULE="youtube" ;;
+  esac
+  [ -n "$GM_PATH_MODULE" ] && echo "$GM_PATH_MODULE"
+}
+module_skip_path() { # true when the path belongs to a module the owner did not select
+  _m=$(module_owns_path "$1")
+  [ -n "$_m" ] || return 1
+  module_selected "$_m" && return 1
+  return 0
+}
+
 save_stream() { # save_stream <target-path> <mode>  (content on stdin)
+  if module_skip_path "$1"; then
+    cat >/dev/null 2>&1 || true
+    info "skip $1: module '$(module_owns_path "$1")' not selected"
+    return 0
+  fi
   _t="$(P "$1")"; _m="$2"
   mkdir -p "$(dirname "$_t")"
   _tmp="$_t.zmnew"
@@ -30288,6 +30374,14 @@ while [ $# -gt 0 ]; do
     --step) shift; GM_STEP="${1:-}" ;;
     --vpn-url) shift; GM_VPN_URL="${1:-}" ;;
     --ai-url) shift; GM_AI_URL="${1:-}" ;;
+    --modules) shift; GM_MODULES=$(printf '%s' "${1:-}" | tr ',' ' ') ;;
+    --modules=*) GM_MODULES=$(printf '%s' "${1#--modules=}" | tr ',' ' ') ;;
+    --list-modules)
+      for _m in $GM_ALL_MODULES; do
+        if module_required "$_m"; then _tag="[обязательный]"; else _tag="[по выбору]   "; fi
+        printf "  %-18s %s %s\n" "$_m" "$_tag" "$(module_label "$_m")"
+      done
+      exit 0 ;;
     --seed-lists) GM_SEED_LISTS=1 ;;
     --help|-h) usage; exit 0 ;;
     *) printf 'unknown option: %s (see --help)\n' "$1"; exit 2 ;;

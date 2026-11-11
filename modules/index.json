@@ -151,12 +151,6 @@
           "sha256": "8fd6eb2acb24f960a02b6439b462f2e82f79577a5d3ffa5c491dd84a5e1bb284"
         },
         {
-          "path": "/usr/lib/geomask/geomask-module-update.py",
-          "source": "assets/geomask-module-update.py",
-          "mode": 755,
-          "sha256": "1780490acc43c4d1c1a536e1dfaec81c34bf6cb1a5a55de00091137faf2a768d"
-        },
-        {
           "path": "/usr/lib/geomask/geomask-node-audit.py",
           "source": "assets/geomask-node-audit.py",
           "mode": 755,

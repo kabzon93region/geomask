@@ -119,6 +119,10 @@ def main():
         if path.startswith('/tmp/'):
             # Transient staging file, not a module artifact.
             continue
+        if path.endswith('/geomask-module-update.py'):
+            # The updater cannot describe itself: it is replaced by the installer, and
+            # a manual redeploy would make core look locally modified forever.
+            continue
         # Files nobody claims belong to core: the panel, backend and base layout are
         # core infrastructure, and leaving them out would make them un-updatable.
         module_id = owner.get(path, 'core')

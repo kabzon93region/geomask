@@ -1483,6 +1483,42 @@ t "S51e narrowing the selection still installs" 0 sh "$SCRIPT" --step 2 --yes --
 contains "$HERE/last_out.txt" 'снят с выбора' "S51e files of a dropped module are reported as left behind"
 lacks "$R/etc/geomask/modules.json" '"ai_dns"' "S51e the narrowed selection is recorded"
 
+echo "=== S52: checks accept the config shapes the panel writes ==="
+# The installer writes block style (`  - name:`), the panel/mihomo rewrite emits flow style
+# (`- name:` at column 0) and turns `ports: [443, 8443, 5228]` into a block list. The checks
+# used to demand one exact spelling and failed a perfectly good config on the live router.
+R="$HERE/root_shapes"
+rm -rf "$R"; cp -a "$HERE/root_healthy/." "$R/"
+awk '
+  /^listeners:/ {print; inl=1; next}
+  inl && /^[A-Za-z]/ {inl=0}
+  inl && /^  / {sub(/^  /, ""); print; next}
+  {print}
+' "$R/etc/mihomo/config.yaml" > "$R/etc/mihomo/config.tmp" \
+  && mv "$R/etc/mihomo/config.tmp" "$R/etc/mihomo/config.yaml"
+sed -i 's/^      ports: \[443, 8443, 5228\]$/      ports:\n      - 443\n      - 8443\n      - 5228/' \
+  "$R/etc/mihomo/config.yaml"
+export GM_PREFIX="$R"
+sh "$SCRIPT" --step 3 --check >"$HERE/last_out.txt" 2>&1 || true
+lacks "$HERE/last_out.txt" 'torrent listener has no fixed policy' "S52 flow-style listener is parsed"
+contains "$HERE/last_out.txt" 'torrent-direct:7894 -> VPN' "S52 the listener policy is read"
+lacks "$HERE/last_out.txt" 'sniffer TLS 5228 missing' "S52 block-style sniffer ports are recognised"
+contains "$HERE/last_out.txt" 'sniffer TLS 5228' "S52 the sniffer check still reports"
+
+echo "=== S52b: the legacy nodescan cron is optional when the scheduler owns the audit ==="
+R="$HERE/root_sched"
+rm -rf "$R"; cp -a "$HERE/root_healthy/." "$R/"
+cat > "$R/usr/lib/geomask/geomask-node-audit.py" <<'PYEOF'
+def load_store():
+    return {'paths': {'vpn': {'schedule': {'enabled': True}}}}, None
+PYEOF
+grep -v 'geomask-node-scan' "$HERE/state/crontab" > "$HERE/state/crontab.new"
+mv "$HERE/state/crontab.new" "$HERE/state/crontab"
+export GM_PREFIX="$R"
+sh "$SCRIPT" --step 5 --check >"$HERE/last_out.txt" 2>&1 || true
+lacks "$HERE/last_out.txt" 'nodescan cron missing' "S52b an active schedule satisfies the cron check"
+contains "$HERE/last_out.txt" 'per-path scheduler is active' "S52b the scheduler is named as the owner"
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

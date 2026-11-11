@@ -9153,7 +9153,13 @@ step3_check() {
     # v1.23.1: the torrent listener is the P2P egress. It MUST be pinned to the P2P-tolerant
     # lane (VPN/sub2) or to DIRECT - NEVER to AI (AI is now node-relay, the provider that banned
     # the sub for BitTorrent) and never rule-based (then peers leak to node-relay via IP marks).
-    _tp=$(awk '/name: torrent-direct/{f=1;next} f&&/^[^ ]/{exit} f&&/^    proxy:/{sub(/^[^:]*:[[:space:]]*/,"");print;exit}' "$_c")
+    # v1.29.0: the panel rewrites the config in flow style (`- name:` at column 0), the
+    # installer writes block style - the parse must accept both, it used to demand 4 spaces.
+    _tp=$(awk '
+      /^[[:space:]]*-[[:space:]]*name:[[:space:]]*torrent-direct[[:space:]]*$/ {f=1; next}
+      f && /^[[:space:]]*proxy:/ {sub(/^[[:space:]]*proxy:[[:space:]]*/,""); sub(/[[:space:]]+#.*/,""); print; exit}
+      f && /^[[:space:]]*-[[:space:]]*name:/ {exit}
+      f && /^[A-Za-z]/ {exit}' "$_c")
     case "$_tp" in
       VPN)    info "listener (torrent-direct:7894 -> VPN, P2P-tolerant): present" ;;
       DIRECT) info "listener (torrent-direct:7894 -> DIRECT): present (off node-relay; add the VPN lane to hide the real IP)" ;;
@@ -9174,7 +9180,15 @@ step3_check() {
     [ "${_nrs:-0}" = "0" ] && info "node-relay groups: no static IP ranges (a torrent peer cannot be fwmarked to the forbidden sub)" \
       || bad "node-relay (VPN-noP2P) has $_nrs static IP range(s) - a torrent peer could match one; remove them (R01)"
   fi
-  grep -q 'ports: \[443, 8443, 5228\]' "$_c" 2>/dev/null && info "sniffer TLS 5228 (Google push): present" || { bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1; }
+  # v1.29.0: ports may be written as a flow list `[443, 8443, 5228]` or as a block list
+  # (`ports:` + `- 5228`); the panel/mihomo rewrite uses the block form. Check the value
+  # inside the sniffer section, not one particular spelling of it.
+  if awk '/^sniffer:/{f=1; next} f && /^[A-Za-z]/{exit} f' "$_c" 2>/dev/null \
+     | grep -qE '(^|[^0-9])5228([^0-9]|$)'; then
+    info "sniffer TLS 5228 (Google push): present"
+  else
+    bad "sniffer TLS 5228 missing (B-017: Google push уходит DIRECT)"; _need=1
+  fi
   grep -q '^ipv6: false' "$_c" 2>/dev/null && info "mihomo ipv6: false" || warn "mihomo ipv6: true — на роутере IPv6 отключён, рекомендуется false"
   grep -q 'DOMAIN-SUFFIX,youtube.com)),REJECT' "$_c" 2>/dev/null && info "QUIC reject (видео -> TCP): present" || warn "QUIC reject rules missing (B-016: тротлинг QUIC-видео)"
   grep -qE 'RULE-SET,ytvpn,(VPN|VPN-noP2P)' "$_c" 2>/dev/null && info "ytvpn rule: present" || warn "ytvpn rule missing (IP-blocked googlevideo edges won't route to a tunnel)"
@@ -26611,6 +26625,24 @@ seed_lists() {
   return "$_rc"
 }
 
+# v1.28.0: the nightly audit can be owned by the per-path scheduler instead of the legacy
+# 03:30 cron. Both halves ask this: step5_apply must not add the legacy cron when a
+# schedule is active, and step5_check must not fail because the legacy cron is absent.
+nodescan_schedule_active() {
+  python3 - "$(P /usr/lib/geomask/geomask-node-audit.py)" <<'PYEOF' 2>/dev/null
+import importlib.util, sys
+try:
+    spec = importlib.util.spec_from_file_location('node_audit', sys.argv[1])
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    data, _ = mod.load_store()
+    print(1 if any((p.get('schedule') or {}).get('enabled')
+                   for p in data.get('paths', {}).values()) else 0)
+except Exception:
+    print(0)
+PYEOF
+}
+
 step5_check() {
   _need=0
   _s="$(P /root/sync_mtrickle_mihomo.sh)"
@@ -26640,7 +26672,9 @@ step5_check() {
   # v1.11.0: node audit plumbing
   if [ -x "$(P /usr/bin/geomask-node-scan.sh)" ] && [ -s "$(P /etc/geomask-nodes.conf)" ]; then info "node-scan: installed"
   else bad "node-scan missing (script/conf)"; _need=1; fi
-  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then info "nodescan cron 03:30: present"; else bad "nodescan cron missing"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then info "nodescan cron 03:30: present"
+  elif [ "$(nodescan_schedule_active)" = "1" ]; then info "nodescan: per-path scheduler is active (legacy cron retired)"
+  else bad "nodescan cron missing"; _need=1; fi
   # v1.14.0: youtube edge watchdog
   # v1.21.5: the VPN lane must contain ONLY subscription nodes. DIRECT as a group member was a
   # workaround for a misdiagnosis (the real cause was provider health-check hiding every node);
@@ -29535,20 +29569,7 @@ PYEOF
   # that the owner migrated is not audited twice every night.
   if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
     info "nodescan cron already present"
-  elif _sched_active=$(python3 - <<'PYEOF' 2>/dev/null
-import sys, importlib.util, json
-try:
-    spec = importlib.util.spec_from_file_location(
-        'node_audit', '/usr/lib/geomask/geomask-node-audit.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    data, _ = mod.load_store()
-    print(1 if any((p.get('schedule') or {}).get('enabled')
-                   for p in data.get('paths', {}).values()) else 0)
-except Exception:
-    print(0)
-PYEOF
-) && [ "${_sched_active:-0}" = "1" ]; then
+  elif [ "$(nodescan_schedule_active)" = "1" ]; then
     info "per-path scheduler is active: not adding the legacy nodescan cron"
   else
     ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"

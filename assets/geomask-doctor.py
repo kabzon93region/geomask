@@ -793,14 +793,59 @@ def check_path(group):
     return probe
 
 
+def parse_listeners(text):
+    """listeners: [{name, listen, port, proxy}] in either YAML style.
+
+    The panel writes them in flow style and the installer in block style; the address is
+    not always loopback (torrent-direct listens on the LAN address), so the probe has to
+    read it instead of assuming 127.0.0.1.
+    """
+    listeners = []
+    section = ''
+    current = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith('#'):
+            continue
+        if not line.startswith(' '):
+            match = re.match(r'^([A-Za-z0-9_-]+):', line)
+            if match:
+                section = match.group(1)
+                current = None
+                continue
+        if section != 'listeners':
+            continue
+        match = re.match(r'^\s*-\s*name:\s*(\S+)\s*$', line)
+        if match:
+            current = {'name': match.group(1), 'listen': '', 'port': '', 'proxy': ''}
+            listeners.append(current)
+            continue
+        if current is None:
+            continue
+        for key in ('listen', 'port', 'proxy'):
+            match = re.match(r'^\s+%s:\s*(\S+)\s*$' % key, line)
+            if match:
+                current[key] = match.group(1).strip('\'"')
+    return listeners
+
+
 def check_path_egress():
     """Live: which country each lane's exit looks like to the internet."""
     details = []
     state = 'ok'
-    probes = [('по умолчанию', None),
-              ('AI', 'http://127.0.0.1:7891'),
-              ('VPN', 'http://127.0.0.1:7894'),
-              ('VPN-noP2P', 'http://127.0.0.1:7892')]
+    probes = [('по умолчанию', None)]
+    for item in parse_listeners(read_text(MIHOMO_CONF)):
+        proxy = item.get('proxy') or ''
+        if not proxy or proxy.upper() == 'DIRECT':
+            continue
+        host = item.get('listen') or '127.0.0.1'
+        if host in ('0.0.0.0', '::', '[::]'):
+            host = '127.0.0.1'
+        port = item.get('port') or ''
+        if port:
+            probes.append((proxy, 'http://%s:%s' % (host, port)))
+    if len(probes) == 1:
+        details.append('в конфиге нет слушателей с фиксированной группой')
     for label, proxy in probes:
         cmd = ['curl', '-m', '8', '-s']
         if proxy:

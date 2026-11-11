@@ -186,6 +186,15 @@ class DoctorParserTests(unittest.TestCase):
         hit = doctor.mihomo_route('rr1.googlevideo.com', [])
         self.assertEqual(hit['policy'], 'REJECT')
 
+    def test_listeners_are_parsed_with_their_real_address(self):
+        text = ('listeners:\n'
+                '- name: ai-devices\n  type: mixed\n  port: 7891\n  listen: 127.0.0.1\n  proxy: AI\n'
+                '- name: torrent-direct\n  type: mixed\n  port: 7894\n  listen: 192.168.0.1\n  proxy: VPN\n')
+        items = doctor.parse_listeners(text)
+        self.assertEqual([i['name'] for i in items], ['ai-devices', 'torrent-direct'])
+        self.assertEqual(items[1]['listen'], '192.168.0.1')
+        self.assertEqual(items[1]['proxy'], 'VPN')
+
     def test_domain_matching_handles_suffixes_and_exact_names(self):
         self.assertTrue(doctor.domain_matches('a.b.example.com', 'example.com'))
         self.assertFalse(doctor.domain_matches('notexample.com', 'example.com'))

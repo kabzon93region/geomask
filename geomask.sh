@@ -8015,7 +8015,12 @@ def trace_domain(domain, live=False):
     policy = (hit or {}).get('policy', 'GLOBAL')
     if policy in ('DIRECT', 'REJECT'):
         if policy == 'REJECT':
-            step('Выход', 'fail', 'REJECT — трафик отбрасывается')
+            # a QUIC reject is the deliberate policy for video hosts: UDP/443 is dropped,
+            # the same page loads fine over TCP, so this is not a broken route
+            if 'UDP' in ((hit or {}).get('rule') or '').upper():
+                step('Выход', 'ok', 'QUIC (UDP/443) отбрасывается — видео идёт по TCP, это штатно')
+            else:
+                step('Выход', 'fail', 'REJECT — трафик отбрасывается')
         else:
             step('Выход', 'ok', 'напрямую через провайдера — страна Россия (RU)')
     elif policy in ('VPN', 'VPN-noP2P', 'AI'):
@@ -8372,7 +8377,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "3e20ff66ea5d33916c43ac51be530d13eeba2feb3e6e28ca5a370d2e0ac08827"
+          "sha256": "fb1e46fe8bdfc7536719c91e162a18d9cb956e55282f344ac8952cce1c0f4a2b"
         }
       ]
     },

@@ -278,15 +278,19 @@ class DoctorRegistryTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertIn('не домен', result['error'])
 
-    def test_domain_trace_renders_the_route(self):
-        doctor.MT_CONF = str(Path(tempfile.mkdtemp()) / 'mt.yaml')
-        Path(doctor.MT_CONF).write_text(MT_CONFIG, encoding='utf-8')
+    def _route_fixture(self):
+        mt = Path(tempfile.mkdtemp()) / 'mt.yaml'
+        mt.write_text(MT_CONFIG, encoding='utf-8')
         ai = Path(tempfile.mkdtemp()) / 'ai.yaml'
         ai.write_text('payload:\n  - DOMAIN-SUFFIX,openai.com\n', encoding='utf-8')
         cfg = Path(tempfile.mkdtemp()) / 'cfg.yaml'
         cfg.write_text(MIHOMO_CONFIG % {'ai': str(ai), 'mt': '/tmp/mt.yaml'}, encoding='utf-8')
+        doctor.MT_CONF = str(mt)
         doctor.MIHOMO_CONF = str(cfg)
         doctor.LOG_DIR = tempfile.mkdtemp()
+
+    def test_domain_trace_renders_the_route(self):
+        self._route_fixture()
         result = doctor.trace_domain('chat.openai.com')
         self.assertTrue(result['ok'])
         stages = [step['stage'] for step in result['steps']]
@@ -294,6 +298,13 @@ class DoctorRegistryTests(unittest.TestCase):
         text = '\n'.join(result['lines'])
         self.assertIn('Правило mihomo', text)
         self.assertIn('AI', text)
+
+    def test_domain_trace_treats_a_quic_reject_as_normal(self):
+        self._route_fixture()
+        result = doctor.trace_domain('rr1---sn-abc.googlevideo.com')
+        exit_step = [step for step in result['steps'] if step['stage'] == 'Выход'][0]
+        self.assertEqual(exit_step['verdict'], 'ok')
+        self.assertIn('QUIC', exit_step['detail'])
 
 
 class DoctorCheckTests(unittest.TestCase):

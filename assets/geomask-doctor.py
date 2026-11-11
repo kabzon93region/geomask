@@ -331,7 +331,11 @@ def magitrickle_route(domain):
 
 
 def parse_mihomo(text):
-    """(rule_providers {name: path}, rules [text]) from the mihomo config."""
+    """(rule_providers {name: path}, rules [text]) from the mihomo config.
+
+    The installer writes block style (`  - RULE,...`); mihomo and the panel rewrite the
+    file in flow style (`- RULE,...` at column 0), so both spellings must be read.
+    """
     providers = {}
     rules = []
     section = ''
@@ -341,21 +345,23 @@ def parse_mihomo(text):
         if not line or line.lstrip().startswith('#'):
             continue
         if not line.startswith(' '):
-            section = line.split(':', 1)[0]
-            provider = None
-            continue
-        if section == 'rule-providers':
-            match = re.match(r'^  ([A-Za-z0-9_-]+):\s*$', line)
+            match = re.match(r'^([A-Za-z0-9_-]+):', line)
             if match:
-                provider = match.group(1)
+                section = match.group(1)
+                provider = None
+                continue
+        if section == 'rule-providers':
+            match = re.match(r'^(\s+)([A-Za-z0-9_-]+):\s*$', line)
+            if match:
+                provider = match.group(2)
                 providers[provider] = ''
                 continue
-            match = re.match(r'^    path:\s*(\S+)\s*$', line)
+            match = re.match(r'^\s+path:\s*(\S+)\s*$', line)
             if match and provider:
                 providers[provider] = match.group(1).strip('\'"')
             continue
         if section == 'rules':
-            match = re.match(r'^  - (.+)$', line)
+            match = re.match(r'^\s*- (.+)$', line)
             if match:
                 rules.append(match.group(1).strip())
     return providers, rules
@@ -607,26 +613,43 @@ def check_router_services():
 
 
 def check_router_netfilter():
+    """Firewall and routing as they actually are, not as one particular version wrote them."""
     details = []
     state = 'ok'
     rc, tables = run(['nft', 'list', 'tables'])
     if rc == 127:
         return 'warn', 'nft недоступен', ['команда nft не найдена']
     has_fw4 = 'inet fw4' in tables
-    has_mt = 'magitrickle' in tables or 'mt_' in tables
     details.append('таблица inet fw4: %s' % ('есть' if has_fw4 else 'НЕТ'))
-    details.append('таблицы MagiTrickle: %s' % ('есть' if has_mt else 'НЕТ'))
-    if not has_fw4 or not has_mt:
+    if not has_fw4:
         state = 'fail'
+    # MagiTrickle lives in table ip mangle as MT_<group> chains plus geomask-excl bypasses
+    rc, mangle = run(['nft', 'list', 'table', 'ip', 'mangle'])
+    chains = len(re.findall(r'jump MT_[0-9a-f]+', mangle)) if rc == 0 else 0
+    bypass = len(re.findall(r'geomask-excl', mangle)) if rc == 0 else 0
+    if chains:
+        details.append('MagiTrickle: %d цепочек MT_ в table ip mangle' % chains)
+    else:
+        details.append('MagiTrickle: цепочек MT_ нет (mangle)')
+        if state == 'ok':
+            state = 'fail'
+    if bypass:
+        details.append('исключения устройств (geomask-excl): %d' % bypass)
     rc, rules = run(['ip', '-4', 'rule', 'show'])
-    if rc == 0:
-        for line in rules.splitlines():
-            if 'lookup 100' in line or 'lookup 101' in line or 'fwmark' in line:
-                details.append('ip rule: %s' % line.strip())
-        if 'lookup 100' not in rules and 'lookup 101' not in rules:
-            details.append('правила маршрутизации путей не найдены')
-            state = 'fail' if state == 'ok' else state
-    summary = 'фильтрация и маршрутизация на месте' if state == 'ok' else 'в netfilter не хватает таблиц'
+    if rc != 0:
+        details.append('ip rule недоступен')
+        if state == 'ok':
+            state = 'fail'
+    else:
+        lookups = sorted({int(m) for m in re.findall(r'lookup (\d+)', rules)})
+        marks = len(re.findall(r'fwmark', rules))
+        details.append('таблиц в ip rule: %s' % (', '.join(str(x) for x in lookups) or 'нет'))
+        details.append('правил по метке: %d' % marks)
+        if not lookups:
+            if state == 'ok':
+                state = 'fail'
+    summary = ('фильтрация и маршрутизация на месте' if state == 'ok'
+               else 'в netfilter не хватает таблиц')
     return state, summary, details
 
 

@@ -166,6 +166,20 @@ class DoctorParserTests(unittest.TestCase):
         hit = doctor.mihomo_route('unlisted.example', [])
         self.assertEqual(hit['policy'], 'GLOBAL')
 
+    def test_flow_style_rules_are_parsed(self):
+        # the panel/mihomo rewrite emits `- RULE,...` at column 0; the installer writes
+        # `  - RULE,...`. Both must be read, or every domain "falls through" to MATCH.
+        flow = ('mixed-port: 7890\nrule-providers:\n  ai:\n    type: file\n'
+                '    path: %s\nrules:\n- DOMAIN-SUFFIX,example.com,VPN\n'
+                '- RULE-SET,ai,AI\n- MATCH,GLOBAL\n') % '/tmp/ai.yaml'
+        cfg = self.write('flow.yaml', flow)
+        providers, rules = doctor.parse_mihomo(Path(cfg).read_text(encoding='utf-8'))
+        self.assertEqual(len(rules), 3)
+        self.assertEqual(providers['ai'], '/tmp/ai.yaml')
+        doctor.MIHOMO_CONF = cfg
+        self.assertEqual(doctor.mihomo_route('www.example.com', [])['policy'], 'VPN')
+        self.assertEqual(doctor.mihomo_route('other.example', [])['policy'], 'GLOBAL')
+
     def test_quic_reject_rule_is_recognised_for_a_video_domain(self):
         cfg = self.write('cfg.yaml', MIHOMO_CONFIG % {'ai': '/tmp/ai.yaml', 'mt': '/tmp/mt.yaml'})
         doctor.MIHOMO_CONF = cfg
@@ -280,6 +294,48 @@ class DoctorRegistryTests(unittest.TestCase):
         text = '\n'.join(result['lines'])
         self.assertIn('Правило mihomo', text)
         self.assertIn('AI', text)
+
+
+class DoctorCheckTests(unittest.TestCase):
+    """Checks are shell-driven, so the shell answers are injected here."""
+
+    def setUp(self):
+        self._run = doctor.run
+        self.addCleanup(lambda: setattr(doctor, 'run', self._run))
+
+    def fake(self, answers):
+        def call(cmd, timeout=8, stdin=None):
+            for prefix, value in answers:
+                if cmd[:len(prefix)] == prefix:
+                    return value
+            return 127, ''
+        doctor.run = call
+
+    def test_netfilter_accepts_the_live_magitrickle_shape(self):
+        # MagiTrickle lives in table ip mangle as MT_<group> chains - not in its own table
+        self.fake([
+            (['nft', 'list', 'tables'], (0, 'table inet fw4\ntable ip mangle')),
+            (['nft', 'list', 'table'], (0, 'jump MT_d5fb0e47\ncomment "geomask-excl"')),
+            (['ip', '-4'], (0, '17840: from 192.168.0.125 lookup 101\n'
+                               '17940: from all fwmark 0x4d616780 lookup 1298229120')),
+        ])
+        state, summary, details = doctor.check_router_netfilter()
+        self.assertEqual(state, 'ok', details)
+        self.assertIn('MagiTrickle: 1 цепочек', ' '.join(details))
+
+    def test_netfilter_fails_without_magitrickle_chains(self):
+        self.fake([
+            (['nft', 'list', 'tables'], (0, 'table inet fw4')),
+            (['nft', 'list', 'table'], (0, '')),
+            (['ip', '-4'], (0, '0: from all lookup local')),
+        ])
+        state, _, details = doctor.check_router_netfilter()
+        self.assertEqual(state, 'fail')
+
+    def test_netfilter_fails_without_fw4(self):
+        self.fake([(['nft', 'list', 'tables'], (0, 'table ip filter'))])
+        state, _, _ = doctor.check_router_netfilter()
+        self.assertEqual(state, 'fail')
 
 
 if __name__ == '__main__':

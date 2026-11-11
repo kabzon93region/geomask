@@ -125,7 +125,7 @@ _prov_url() {
 # lane the product has no purpose. Everything else is optional and can be left out
 # with --modules=... so a router only carries the features its owner wants.
 GM_REQUIRED_MODULES="core path_vpn"
-GM_ALL_MODULES="core path_vpn path_vpn_nop2p path_ai ai_dns youtube torrent diagnostic device_modes backup_share self_update admission_service"
+GM_ALL_MODULES="core path_vpn path_vpn_nop2p path_ai ai_dns youtube torrent diagnostic doctor device_modes backup_share self_update admission_service"
 GM_MODULES=""
 
 module_required() { case " $GM_REQUIRED_MODULES " in *" $1 "*) return 0 ;; esac; return 1; }
@@ -143,7 +143,8 @@ module_label() {
     ai_dns) echo "DNS-over-HTTPS для AI-устройств" ;;
     youtube) echo "YouTube: watchdog и списки доменов" ;;
     torrent) echo "Торренты: правила и слушатель" ;;
-    diagnostic) echo "Диагностика: dnscheck, vpnwatch, утренняя проверка" ;;
+    diagnostic) echo "Старые проверки: dnscheck, vpnwatch, утренняя проверка" ;;
+    doctor) echo "Центр диагностики: проверки, маршруты, логи" ;;
     device_modes) echo "Режимы устройств (исключения из туннеля)" ;;
     backup_share) echo "SMB-шар с бэкапами" ;;
     self_update) echo "Самообновление из GitHub" ;;
@@ -424,6 +425,10 @@ ASSET_EOF
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-module-update.py 755 <<'ASSET_EOF'
 @@ASSET:geomask-module-update.py@@
+ASSET_EOF
+  # v1.29.1: the diagnostics engine behind the "Диагностика" tab - checks, route trace, logs.
+  save_stream /usr/lib/geomask/geomask-doctor.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-doctor.py@@
 ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 @@ASSET:module-index.json@@
@@ -1356,6 +1361,7 @@ step5_check() {
     else bad "morning check script missing"; _need=1; fi
   fi
   cron_verify diagnostic '# geomask-vpnwatch$' 'vpnwatch cron */1' soft
+  cron_verify doctor '# geomask-doctor-prune$' 'doctor prune cron' soft
   # the extra lane is optional; report it, never fail because of it
   if [ -e "$(P /sys/class/net/VPN-noP2P)" ]; then
     info "lane VPN-noP2P: netdev present (MagiTrickle can select it)"
@@ -1583,6 +1589,8 @@ PYEOF
   fi
   cron_ensure youtube '# geomask-ytwatch$' '*/1 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch'
   cron_ensure youtube '# geomask-ytwatch-reset$' '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset'
+  # v1.29.1: diagnostics logs keep 7 days (each run prunes its own file; this catches idle ones)
+  cron_ensure doctor '# geomask-doctor-prune$' '40 4 * * * /usr/lib/geomask/geomask-doctor.py prune >/dev/null 2>&1 # geomask-doctor-prune'
   # v1.10.0: event sync watchdog - magitrickle save -> sync within ~seconds (cron stays as backup)
   if have apk; then apk add inotifywait >/dev/null 2>&1 || true; fi
   save_stream /usr/bin/geomask-syncd.sh 755 <<'ASSET_EOF'

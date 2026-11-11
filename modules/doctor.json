@@ -1,0 +1,52 @@
+{
+  "id": "doctor",
+  "name": "Diagnostics Center",
+  "version": "1.0.0",
+  "schema_version": 1,
+  "type": "diagnostic",
+  "description": "Self-service checks for every module, the router, the network, the paths and a single domain; one log file per check with 7-day retention",
+  "author": "geomask",
+  "license": "MIT",
+  "dependencies": [
+    {
+      "module_id": "core",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": ""
+    }
+  ],
+  "provides": [
+    "rpc:diag_list",
+    "rpc:diag_run",
+    "rpc:diag_log",
+    "rpc:diag_domain"
+  ],
+  "owned_resources": [
+    {
+      "type": "file",
+      "path": "/usr/lib/geomask/geomask-doctor.py",
+      "description": "diagnostics engine: checks, route trace, logs"
+    },
+    {
+      "type": "cron",
+      "path": "geomask-doctor-prune",
+      "description": "daily log retention"
+    }
+  ],
+  "config_files": [],
+  "config_schema": {},
+  "services": [],
+  "cron_jobs": [
+    "geomask-doctor-prune"
+  ],
+  "rpc_methods": [
+    "diag_list",
+    "diag_run",
+    "diag_log",
+    "diag_domain"
+  ],
+  "state": "enabled",
+  "enabled": true,
+  "created_at": "2026-11-11T21:00:00.000000Z",
+  "updated_at": "2026-11-11T21:00:00.000000Z"
+}

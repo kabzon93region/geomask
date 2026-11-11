@@ -82,7 +82,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "56d65734e8e24382578610883e53916935b290a0f2872da19226883c694110c0"
+          "sha256": "3939e35e5a53721f338f98b85e4203bda137ca32b207a5d80ba7a3c8ba7c1832"
         },
         {
           "path": "/usr/bin/geomask-guard.sh",
@@ -178,7 +178,7 @@
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
           "mode": 755,
-          "sha256": "e4d71442cdfaee15a8bd757df8658aff86b160c7bdcc31304c73a658a417ada8"
+          "sha256": "4ae46bc291b39815ccd5054a6dc65e3d9a379debec9e363d232b3d691353f395"
         },
         {
           "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
@@ -190,13 +190,13 @@
           "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
           "source": "assets/acl-geo-sync.json",
           "mode": 644,
-          "sha256": "5f3d71f1e7217dd0ab2ed1638f275da914a6aea93f0d8ec7d9fecd1eb7dd5b96"
+          "sha256": "091ca0d7251664ae2a972aa86ecd2608b4efb85e27f17f7deebd6a70381020b3"
         },
         {
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "deb8c8387e346d915f2099b71e496f47a15d60aba2772bb51eeec4249cdcef02"
+          "sha256": "f64400abe6d04ae02abbae19c59f620a3157e4fc74c226f084b5369ef87dfd50"
         }
       ]
     },
@@ -240,6 +240,22 @@
           "source": "assets/geomask-vpnwatch.sh",
           "mode": 755,
           "sha256": "6068ec5d08d91b65e53aabe4ae879cac9cd50175fa5b3c1e3d3cfd441f531014"
+        }
+      ]
+    },
+    "doctor": {
+      "version": "1.0.0",
+      "type": "diagnostic",
+      "name": "Diagnostics Center",
+      "dependencies": [
+        "core"
+      ],
+      "files": [
+        {
+          "path": "/usr/lib/geomask/geomask-doctor.py",
+          "source": "assets/geomask-doctor.py",
+          "mode": 755,
+          "sha256": "b9f08df0c5cc317b2eff70c094c164eea1e6c19560f7efbca698846ecd0157fd"
         }
       ]
     },

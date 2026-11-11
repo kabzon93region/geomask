@@ -1519,6 +1519,44 @@ sh "$SCRIPT" --step 5 --check >"$HERE/last_out.txt" 2>&1 || true
 lacks "$HERE/last_out.txt" 'nodescan cron missing' "S52b an active schedule satisfies the cron check"
 contains "$HERE/last_out.txt" 'per-path scheduler is active' "S52b the scheduler is named as the owner"
 
+echo "=== S53: the diagnostics engine ships with its module and nowhere else ==="
+grep -qF '"id": "doctor"' "$HERE/../modules/doctor.json" \
+  && { echo "PASS: S53 doctor module manifest present"; pass=$((pass+1)); } \
+  || { echo "FAIL: S53 doctor manifest missing"; failn=$((failn+1)); }
+grep -qF 'geomask-doctor.py' "$HERE/../build.py" \
+  && { echo "PASS: S53 build MAP carries the doctor"; pass=$((pass+1)); } \
+  || { echo "FAIL: S53 build MAP lacks the doctor"; failn=$((failn+1)); }
+if [ -f "$HERE/root_modules/usr/lib/geomask/geomask-doctor.py" ]; then
+  echo "FAIL: S53 the minimal install carries the diagnostics engine"; failn=$((failn+1))
+else
+  echo "PASS: S53 the minimal install leaves the diagnostics engine out"; pass=$((pass+1))
+fi
+if [ -s "$HERE/root_modules_full/usr/lib/geomask/geomask-doctor.py" ]; then
+  echo "PASS: S53 the full install writes the diagnostics engine"; pass=$((pass+1))
+else
+  echo "FAIL: S53 the full install did not write the engine"; failn=$((failn+1))
+fi
+contains "$HERE/state/crontab" 'geomask-doctor-prune' "S53 the full install adds the log prune cron"
+sh "$HERE/../assets/geo-backend.sh" diag_list >"$HERE/last_out.txt" 2>&1 || true
+contains "$HERE/last_out.txt" 'doctor не установлен' "S53 the backend reports a missing module"
+grep -qF "['diag', 'Диагностика']" "$HERE/../assets/geo-sync-page.js" \
+  && { echo "PASS: S53 the panel has the diagnostics tab"; pass=$((pass+1)); } \
+  || { echo "FAIL: S53 the panel tab is missing"; failn=$((failn+1)); }
+for _m in callDiagList callDiagRun callDiagLog callDiagDomain; do
+  grep -qF "var $_m" "$HERE/../assets/geo-sync-page.js" \
+    && { echo "PASS: S53 the panel declares $_m"; pass=$((pass+1)); } \
+    || { echo "FAIL: S53 the panel lacks $_m"; failn=$((failn+1)); }
+done
+if [ -n "$_PYC" ]; then
+  if "$_PYC" -m py_compile "$HERE/../assets/geomask-doctor.py" >/dev/null 2>&1; then
+    echo "PASS: S53 the doctor compiles"; pass=$((pass+1))
+  else
+    echo "FAIL: S53 the doctor has a syntax error"; failn=$((failn+1))
+  fi
+else
+  echo "SKIP: S53 doctor compile check (no runnable python)"
+fi
+
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

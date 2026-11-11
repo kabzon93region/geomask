@@ -51,6 +51,7 @@ MAP = {
     "geomask-morning-check.sh": "geomask-morning-check.sh",
     "geomask-lane.sh":       "geomask-lane.sh",
     "geomask-module-update.py": "geomask-module-update.py",
+    "geomask-doctor.py":     "geomask-doctor.py",
     "module-index.json":     "../modules/index.json",
     "geomask-dnscheck.sh":   "geomask-dnscheck.sh",
 }

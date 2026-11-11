@@ -54,6 +54,10 @@ list_methods() {
 	json_add_object "mod_list";                 json_close_object
 	json_add_object "mod_check";                json_close_object
 	json_add_object "mod_update";               json_add_string "module_id" "string"; json_add_string "force" "string"; json_close_object
+	json_add_object "diag_list";                json_close_object
+	json_add_object "diag_run";                 json_add_string "check" "string"; json_close_object
+	json_add_object "diag_log";                 json_add_string "check" "string"; json_close_object
+	json_add_object "diag_domain";              json_add_string "domain" "string"; json_add_string "live" "string"; json_close_object
 	json_add_object "upd_check";                json_add_string "force" "string"; json_close_object
 	json_add_object "upd_status";               json_close_object
 	json_add_object "upd_apply";                json_close_object
@@ -127,6 +131,10 @@ call_method() {
 		mod_list)                 "$BACKEND" mod_list ;;
 		mod_check)                "$BACKEND" mod_check ;;
 		mod_update)               json_get_var module_id module_id; json_get_var force force; "$BACKEND" mod_update "$module_id" "$force" ;;
+		diag_list)                "$BACKEND" diag_list ;;
+		diag_run)                 json_get_var check check; "$BACKEND" diag_run "$check" ;;
+		diag_log)                 json_get_var check check; "$BACKEND" diag_log "$check" ;;
+		diag_domain)              json_get_var domain domain; json_get_var live live; "$BACKEND" diag_domain "$domain" "$live" ;;
 		upd_check)                json_get_var force force; "$BACKEND" upd_check "$force" ;;
 		upd_status)               "$BACKEND" upd_status ;;
 		upd_apply)                "$BACKEND" upd_apply ;;

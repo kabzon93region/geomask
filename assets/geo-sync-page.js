@@ -50,6 +50,10 @@ var callVpnnpSubUse           = rpc.declare({ object: 'geo-sync', method: 'vpnnp
 var callModList               = rpc.declare({ object: 'geo-sync', method: 'mod_list', expect: {} });
 var callModCheck              = rpc.declare({ object: 'geo-sync', method: 'mod_check', expect: {} });
 var callModUpdate             = rpc.declare({ object: 'geo-sync', method: 'mod_update', params: [ 'module_id', 'force' ], expect: {} });
+var callDiagList              = rpc.declare({ object: 'geo-sync', method: 'diag_list', expect: {} });
+var callDiagRun               = rpc.declare({ object: 'geo-sync', method: 'diag_run', params: [ 'check' ], expect: {} });
+var callDiagLog               = rpc.declare({ object: 'geo-sync', method: 'diag_log', params: [ 'check' ], expect: {} });
+var callDiagDomain            = rpc.declare({ object: 'geo-sync', method: 'diag_domain', params: [ 'domain', 'live' ], expect: {} });
 var callUpdCheck              = rpc.declare({ object: 'geo-sync', method: 'upd_check', params: { force: null }, expect: {} });
 var callUpdStatus             = rpc.declare({ object: 'geo-sync', method: 'upd_status', expect: {} });
 var callUpdApply              = rpc.declare({ object: 'geo-sync', method: 'upd_apply', expect: {} });
@@ -243,7 +247,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList(), callDiagList() ]);
 	},
 
 	render: function(all) {
@@ -260,6 +264,7 @@ return view.extend({
 		var tor = all[12] || {};
 		var pathAudit = all[13] || {};
 		var mods = all[14] || {};
+		var diag = all[15] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -268,6 +273,7 @@ return view.extend({
 		var TABS = [
 			['obzor', 'Обзор'], ['dev', 'Устройства'], ['subs', 'Подписки'],
 			['lists', 'Списки и синк'], ['nodes', 'Узлы подписки'],
+			['diag', 'Диагностика'],
 			['bk', 'Бэкапы'], ['upd', 'Обновление'], ['mods', 'Модули'], ['set', 'Настройки']
 		];
 		var curTab = 'obzor';
@@ -977,6 +983,137 @@ return view.extend({
 			E('div', {}, modRows)
 		]));
 
+		/* ===================== ДИАГНОСТИКА (v1.29.1) ===================== */
+		var diagData = (diag.checks || []).slice();
+		var diagSummary = E('span', { 'class': 'gs-meta' }, '');
+		var diagRowsBox = E('div', {});
+		var diagLogBox = E('pre', { 'class': 'gs-log', style: 'display:none' });
+		var domInput = E('input', { 'class': 'gs-input', 'placeholder': 'example.com', style: 'min-width:240px' });
+		var domLive = E('input', { 'type': 'checkbox', style: 'margin:0 6px 0 12px' });
+		var domOut = E('pre', { 'class': 'gs-console', style: 'display:none' });
+		var domLog = E('span', { 'class': 'gs-meta' }, '');
+
+		function diagBadge(state) {
+			var map = {
+				'ok': ['gs-on', 'в порядке'],
+				'warn': ['gs-warn', 'внимание'],
+				'fail': ['gs-off', 'проблема']
+			};
+			var it = map[state] || ['gs-off', 'не проверялось'];
+			return E('span', { 'class': 'gs-badge ' + it[0] }, it[1]);
+		}
+
+		function diagMerge(checks) {
+			(checks || []).forEach(function(r) {
+				var found = false;
+				for (var i = 0; i < diagData.length; i++) {
+					if (diagData[i].id === r.id) {
+						diagData[i].last_state = r.state;
+						diagData[i].last_summary = r.summary;
+						diagData[i]._details = r.details || [];
+						found = true;
+						break;
+					}
+				}
+				if (!found) diagData.push({ id: r.id, area: r.area, title: r.title, live: r.live,
+					last_state: r.state, last_summary: r.summary, _details: r.details || [] });
+			});
+			diagRender();
+		}
+
+		function diagRender() {
+			while (diagRowsBox.firstChild) diagRowsBox.removeChild(diagRowsBox.firstChild);
+			if (!diagData.length) {
+				diagRowsBox.appendChild(E('div', { 'class': 'gs-hint' },
+					diag.error ? ('Диагностика недоступна: ' + diag.error) : 'Список проверок пуст.'));
+				return;
+			}
+			[['modules', 'Модули'], ['router', 'Роутер'], ['network', 'Сеть'], ['paths', 'Пути']].forEach(function(area) {
+				var items = diagData.filter(function(c) { return c.area === area[0]; });
+				if (!items.length) return;
+				diagRowsBox.appendChild(E('div', { 'class': 'gs-hint', style: 'margin-top:12px' }, area[1]));
+				items.forEach(function(c) {
+					diagRowsBox.appendChild(E('div', { 'class': 'gs-row', style: 'flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border-color,#30363d)' }, [
+						E('span', { 'style': 'flex:1' }, c.title + (c.live ? ' · живая' : '')),
+						E('span', { 'class': 'gs-meta' }, c.last_summary || ''),
+						diagBadge(c.last_state),
+						E('button', { 'class': 'gs-btn', 'click': function(ev) { diagRun(c.id, ev.target); } }, 'Проверить'),
+						E('button', { 'class': 'gs-btn', 'click': function() { diagShowLog(c.id, c.title); } }, 'Лог'),
+						E('div', { 'class': 'gs-meta', style: 'flex-basis:100%;color:#8b949e' },
+							(c._details && c._details.length) ? c._details.join(' · ') : '')
+					]));
+				});
+			});
+		}
+
+		function diagRun(id, btn) {
+			if (btn) btn.disabled = true;
+			diagSummary.textContent = 'идёт проверка…';
+			return callDiagRun(id).then(function(res) {
+				if (res && res.error) {
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error');
+					return;
+				}
+				diagMerge(res && res.checks);
+			}).catch(function(e) {
+				ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+			}).then(function() {
+				if (btn) btn.disabled = false;
+				diagSummary.textContent = '';
+			});
+		}
+
+		function diagShowLog(id, title) {
+			callDiagLog(id).then(function(res) {
+				diagLogBox.style.display = '';
+				diagLogBox.textContent = (title ? ('# ' + title + '\n') : '') + ((res && res.text) || 'лог пока пуст');
+			}).catch(function(e) {
+				diagLogBox.style.display = '';
+				diagLogBox.textContent = 'Ошибка чтения лога: ' + e;
+			});
+		}
+
+		function domRun() {
+			var name = (domInput.value || '').trim();
+			if (!name) return;
+			domOut.style.display = '';
+			domOut.textContent = 'проверяю ' + name + '…';
+			domLog.textContent = '';
+			callDiagDomain(name, domLive.checked ? 'live' : '').then(function(res) {
+				if (!res || res.ok === false) {
+					domOut.textContent = 'Ошибка: ' + ((res || {}).error || 'нет ответа');
+					return;
+				}
+				domOut.textContent = (res.lines || []).join('\n');
+				domLog.textContent = 'лог: ' + (res.log || '');
+			}).catch(function(e) {
+				domOut.textContent = 'Ошибка: ' + e;
+			});
+		}
+
+		panels.diag.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Диагностика'),
+			E('div', { 'class': 'gs-hint' }, 'Проверки выполняются на роутере. У каждой свой лог, логи хранятся 7 дней.'),
+			E('div', { 'class': 'gs-row', style: 'margin:8px 0;gap:10px;align-items:center' }, [
+				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function(ev) { diagRun('all', ev.target); } }, 'Проверить всё'),
+				diagSummary
+			]),
+			diagRowsBox,
+			diagLogBox
+		]));
+		panels.diag.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Маршрут домена'),
+			E('div', { 'class': 'gs-hint' }, 'Введите домен — покажу DNS, группу MagiTrickle, правило mihomo, узел и страну выхода. Без ИИ и без экспериментов.'),
+			E('div', { 'class': 'gs-row', style: 'margin:8px 0;gap:8px;align-items:center;flex-wrap:wrap' }, [
+				domInput,
+				E('label', { 'class': 'gs-meta' }, [domLive, 'живая проверка (реальный запрос)']),
+				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': domRun }, 'Проверить маршрут')
+			]),
+			domOut,
+			domLog
+		]));
+		diagRender();
+
 		panels.bk.appendChild(E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Резервные копии'),
 			bkBox
@@ -1531,7 +1668,7 @@ return view.extend({
 		var calls = [
 			callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
 			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(),
-			callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList()
+			callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList(), callDiagList()
 		];
 		return Promise.all(calls).then(function(all) {
 			var newView = view.render(all);

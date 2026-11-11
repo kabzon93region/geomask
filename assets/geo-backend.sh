@@ -1020,6 +1020,48 @@ cmd_backups() {
 }
 
 MODULE_UPDATER=/usr/lib/geomask/geomask-module-update.py
+DOCTOR=/usr/lib/geomask/geomask-doctor.py
+
+# The diagnostics engine ships as its own optional module: without it the tab must say so
+# instead of failing with an empty answer.
+_diag_missing() {
+  printf '{"ok":false,"error":"модуль doctor не установлен"}\n'
+  return 1
+}
+
+cmd_diag_list() {
+  # Registry plus the results of the last run; never runs a check, so the tab paints fast.
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  python3 "$DOCTOR" list 2>&1
+}
+
+cmd_diag_run() { # $1 = check id or "all"
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  case "$1" in
+    ''|*[!A-Za-z0-9_]*) printf '{"ok":false,"error":"bad check id"}\n'; return 1 ;;
+  esac
+  python3 "$DOCTOR" run "$1" 2>&1
+}
+
+cmd_diag_log() { # $1 = check id
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  case "$1" in
+    ''|*[!A-Za-z0-9_]*) printf '{"ok":false,"error":"bad check id"}\n'; return 1 ;;
+  esac
+  python3 "$DOCTOR" log "$1" 2>&1
+}
+
+cmd_diag_domain() { # $1 = domain, $2 = "live" to make a real request
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) printf '{"ok":false,"error":"bad domain"}\n'; return 1 ;;
+  esac
+  if [ "$2" = "live" ] || [ "$2" = "1" ]; then
+    python3 "$DOCTOR" domain "$1" --live 2>&1
+  else
+    python3 "$DOCTOR" domain "$1" 2>&1
+  fi
+}
 
 cmd_mod_list() {
   # Installed modules and what the cached index says about them. Read-only: never
@@ -1467,6 +1509,10 @@ case "$1" in
   mod_check)                cmd_mod_check ;;
   mod_update)   # install one module's files from modules/index.json
     cmd_mod_update "$2" "$3" ;;
+  diag_list)                cmd_diag_list ;;
+  diag_run)                 cmd_diag_run "$2" ;;
+  diag_log)                 cmd_diag_log "$2" ;;
+  diag_domain)              cmd_diag_domain "$2" "$3" ;;
   upd_check)                cmd_upd_check "$2" ;;
   upd_status)               cmd_upd_status ;;
   upd_apply)                cmd_upd_apply ;;

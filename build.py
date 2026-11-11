@@ -49,6 +49,8 @@ MAP = {
     "zapret-always-exclude.txt": "zapret-always-exclude.txt",
     "geomask-morning-check.sh": "geomask-morning-check.sh",
     "geomask-lane.sh":       "geomask-lane.sh",
+    "geomask-module-update.py": "geomask-module-update.py",
+    "module-index.json":     "../modules/index.json",
     "geomask-dnscheck.sh":   "geomask-dnscheck.sh",
 }
 

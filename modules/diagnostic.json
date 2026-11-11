@@ -22,21 +22,6 @@
   ],
   "owned_resources": [
     {
-      "type": "file",
-      "path": "/usr/lib/geomask/diag_status.py",
-      "description": ""
-    },
-    {
-      "type": "file",
-      "path": "/usr/lib/geomask/admission_service.py",
-      "description": ""
-    },
-    {
-      "type": "file",
-      "path": "/usr/lib/geomask/policy_preview.py",
-      "description": ""
-    },
-    {
       "type": "cron",
       "path": "morning-check",
       "description": ""
@@ -50,6 +35,26 @@
       "type": "cron",
       "path": "vpnwatch",
       "description": ""
+    },
+    {
+      "type": "file",
+      "path": "/usr/bin/geomask-dnscheck.sh",
+      "description": "DNS safety audit"
+    },
+    {
+      "type": "file",
+      "path": "/usr/bin/geomask-morning-check.sh",
+      "description": "pre-torrent check"
+    },
+    {
+      "type": "file",
+      "path": "/usr/bin/geomask-vpnwatch.sh",
+      "description": "P2P attempt watcher"
+    },
+    {
+      "type": "file",
+      "path": "/etc/geomask/vpnwatch.conf",
+      "description": "watcher configuration"
     }
   ],
   "config_files": [

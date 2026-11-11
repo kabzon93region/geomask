@@ -27,16 +27,6 @@
   ],
   "owned_resources": [
     {
-      "type": "file",
-      "path": "/usr/bin/geomask-ytwatch.sh",
-      "description": ""
-    },
-    {
-      "type": "file",
-      "path": "/usr/lib/geomask/geomask-ytwatch.conf",
-      "description": ""
-    },
-    {
       "type": "cron",
       "path": "ytwatch",
       "description": ""
@@ -45,6 +35,26 @@
       "type": "filter",
       "path": "/etc/mihomo/ruleset/ytvpn.yaml",
       "description": ""
+    },
+    {
+      "type": "file",
+      "path": "/usr/bin/geomask-ytwatch.sh",
+      "description": "stalled-edge watchdog"
+    },
+    {
+      "type": "file",
+      "path": "/etc/geomask-ytwatch.conf",
+      "description": "watchdog configuration"
+    },
+    {
+      "type": "file",
+      "path": "/etc/mihomo/ruleset/ytvpn.yaml",
+      "description": "domains pinned to the VPN lane"
+    },
+    {
+      "type": "file",
+      "path": "/etc/mihomo/ruleset/ytdirect.yaml",
+      "description": "domains served directly"
     }
   ],
   "config_files": [

@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.27.10"
+GM_VERSION="1.28.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -4821,7 +4821,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.27.10"
+BACKEND_VERSION="1.28.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -5808,6 +5808,39 @@ cmd_backups() {
     "$DIR" "$_unc" "$_smbu" "$_sh" "$_files"
 }
 
+MODULE_UPDATER=/usr/lib/geomask/geomask-module-update.py
+
+cmd_mod_list() {
+  # Installed modules and what the cached index says about them. Read-only: never
+  # touches the network, so the panel can paint the list instantly.
+  if [ ! -f "$MODULE_UPDATER" ]; then
+    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
+  fi
+  python3 "$MODULE_UPDATER" status 2>&1
+}
+
+cmd_mod_check() {
+  # Force a fresh index fetch; falls back to the cache when the network is down.
+  if [ ! -f "$MODULE_UPDATER" ]; then
+    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
+  fi
+  python3 "$MODULE_UPDATER" check 2>&1
+}
+
+cmd_mod_update() { # $1 = module id, $2 = "force" to overwrite local edits
+  if [ ! -f "$MODULE_UPDATER" ]; then
+    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
+  fi
+  case "$1" in
+    ''|*[!A-Za-z0-9_]*) printf '{"ok":false,"error":"bad module id"}\n'; return 1 ;;
+  esac
+  if [ "$2" = "force" ]; then
+    python3 "$MODULE_UPDATER" update "$1" --force 2>&1
+  else
+    python3 "$MODULE_UPDATER" update "$1" 2>&1
+  fi
+}
+
 cmd_upd_status() {
   mkdir -p "$UPD_DIR" 2>/dev/null
   if [ -s "$UPD_STATUS" ]; then _b=$(cat "$UPD_STATUS"); else _b='{"phase":"idle"}'; fi
@@ -6219,6 +6252,10 @@ case "$1" in
   ai_sub_use)               cmd_ai_sub_use "$2" ;;
   vpn_sub_use)              cmd_vpn_sub_use "$2" ;;
   vpnnp_sub_use)            cmd_vpnnp_sub_use "$2" ;;
+  mod_list)                 cmd_mod_list ;;
+  mod_check)                cmd_mod_check ;;
+  mod_update)   # install one module's files from modules/index.json
+    cmd_mod_update "$2" "$3" ;;
   upd_check)                cmd_upd_check "$2" ;;
   upd_status)               cmd_upd_status ;;
   upd_apply)                cmd_upd_apply ;;
@@ -6234,6 +6271,745 @@ case "$1" in
 esac
 
 ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-module-update.py 755 <<'ASSET_EOF'
+  #!/usr/bin/env python3
+"""Per-module updater for geomask.
+
+The router has one installer (geomask.sh) and twelve module manifests. Until now the
+only update path replaced everything at once, so a one-line fix in the YouTube
+watchdog forced a full reinstall. This helper updates a single module: it reads
+modules/index.json from the repository, compares the SHA-256 of every file the module
+owns, downloads only those files, verifies them and writes them atomically.
+
+Safety rules, in order:
+  * a file edited locally is never overwritten without --force;
+  * every download is verified against the index before anything is written;
+  * all files are staged first, so a failed download leaves the box untouched;
+  * originals are copied to a backup directory, and a write failure restores them.
+
+Commands:
+  status                 what is installed, and what differs from the index
+  check [--force]        refresh the cached index and report available updates
+  update <id> [--force]  install the module's files from the index
+  verify <id>            re-hash installed files against the recorded state
+"""
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+import urllib.request
+
+DEFAULT_REPO = 'kabzon93region/geomask'
+DEFAULT_REF = 'master'
+DEFAULT_CONFIG = '/etc/geomask/module-update.json'
+DEFAULT_STATE = '/etc/geomask/modules-state.json'
+CACHE = '/tmp/geomask-modules-index.json'
+BACKUP_ROOT = '/tmp/geomask-module-backup'
+RAW = 'https://raw.githubusercontent.com/{repo}/{ref}/{path}'
+INDEX_PATH = 'modules/index.json'
+TTL = 3600
+
+
+class UpdateError(Exception):
+    """A refusal or a failure that the caller must report, not swallow."""
+
+
+def digest_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def digest_file(path):
+    try:
+        with open(path, 'rb') as handle:
+            return digest_bytes(handle.read())
+    except OSError:
+        return None
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, payload):
+    tmp = path + '.tmp'
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=True)
+        handle.write('\n')
+    os.replace(tmp, path)
+
+
+def version_tuple(text):
+    parts = []
+    for piece in str(text or '0').split('.'):
+        digits = ''.join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+def load_config(path=DEFAULT_CONFIG):
+    config = read_json(path, {}) or {}
+    return {
+        'repo': config.get('repo') or DEFAULT_REPO,
+        'ref': config.get('ref') or DEFAULT_REF,
+        'ttl': int(config.get('ttl') or TTL),
+    }
+
+
+def fetch(url, timeout=20, max_bytes=4_000_000):
+    request = urllib.request.Request(url, headers={'User-Agent': 'geomask-updater'})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise UpdateError('response too large')
+    return data
+
+
+def index_url(config):
+    return RAW.format(repo=config['repo'], ref=config['ref'], path=INDEX_PATH)
+
+
+def load_index(config, force=False, fetcher=None):
+    """Return (index, source). Cached for ttl seconds unless force."""
+    fetcher = fetcher or fetch
+    age = None
+    if os.path.exists(CACHE):
+        age = time.time() - os.path.getmtime(CACHE)
+    if not force and age is not None and age < config['ttl']:
+        cached = read_json(CACHE)
+        if isinstance(cached, dict) and cached.get('schema') == 1:
+            return cached, 'cache'
+    try:
+        raw = fetcher(index_url(config))
+        index = json.loads(raw.decode('utf-8'))
+    except Exception as exc:
+        cached = read_json(CACHE)
+        if isinstance(cached, dict) and cached.get('schema') == 1:
+            return cached, 'stale-cache'
+        raise UpdateError('index unavailable (%s)' % type(exc).__name__) from None
+    if not isinstance(index, dict) or index.get('schema') != 1:
+        raise UpdateError('index has an unexpected schema')
+    try:
+        with open(CACHE + '.tmp', 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(index, handle, ensure_ascii=False, sort_keys=True)
+        os.replace(CACHE + '.tmp', CACHE)
+    except OSError:
+        pass
+    return index, 'network'
+
+
+def load_state(path=DEFAULT_STATE):
+    state = read_json(path, {}) or {}
+    modules = state.get('modules')
+    return state if isinstance(modules, dict) else {'schema': 1, 'modules': {}}
+
+
+def module_state(state, module_id):
+    entry = (state.get('modules') or {}).get(module_id) or {}
+    return {
+        'version': entry.get('version', ''),
+        'files': entry.get('files') if isinstance(entry.get('files'), dict) else {},
+    }
+
+
+def status(index, state, module_id=None):
+    """Compare the index with what is on disk. Never writes anything."""
+    result = []
+    for ident, module in sorted((index.get('modules') or {}).items()):
+        if module_id and ident != module_id:
+            continue
+        recorded = module_state(state, ident)
+        available = module.get('version', '0.0.0')
+        installed = recorded['version'] or available
+        files = []
+        modified = []
+        missing = []
+        for entry in module.get('files') or []:
+            path = entry['path']
+            actual = digest_file(path)
+            if actual is None:
+                missing.append(path)
+            elif actual != entry['sha256']:
+                recorded_hash = recorded['files'].get(path)
+                if recorded_hash and actual != recorded_hash:
+                    modified.append(path)
+                elif not recorded_hash:
+                    modified.append(path)
+            files.append({'path': path, 'sha256': entry['sha256'], 'installed': actual})
+        if missing:
+            state_name = 'incomplete'
+        elif modified:
+            state_name = 'modified'
+        elif version_tuple(available) > version_tuple(installed):
+            state_name = 'update-available'
+        else:
+            state_name = 'current'
+        result.append({
+            'id': ident,
+            'name': module.get('name', ident),
+            'type': module.get('type', ''),
+            'installed_version': installed,
+            'available_version': available,
+            'state': state_name,
+            'files': len(files),
+            'modified': modified,
+            'missing': missing,
+            'dependencies': module.get('dependencies') or [],
+        })
+    return result
+
+
+def dependencies_ready(index, state, module_id):
+    module = (index.get('modules') or {}).get(module_id) or {}
+    problems = []
+    for dependency in module.get('dependencies') or []:
+        other = (index.get('modules') or {}).get(dependency)
+        if other is None:
+            problems.append('%s is not in the index' % dependency)
+            continue
+        installed = module_state(state, dependency)['version']
+        if installed and version_tuple(installed) < version_tuple(other.get('version', '0')):
+            problems.append('%s %s is older than %s'
+                            % (dependency, installed, other.get('version')))
+    return problems
+
+
+def download_module(index, state, module_id, config, force=False, fetcher=None):
+    """Stage every file in memory. Returns (files, changed) without writing."""
+    fetcher = fetcher or fetch
+    module = (index.get('modules') or {}).get(module_id)
+    if module is None:
+        raise UpdateError('module %s is not in the index' % module_id)
+    problems = dependencies_ready(index, state, module_id)
+    if problems:
+        raise UpdateError('dependencies not ready: ' + '; '.join(problems))
+
+    recorded = module_state(state, module_id)
+    staged = []
+    changed = False
+    for entry in module.get('files') or []:
+        path = entry['path']
+        current = digest_file(path)
+        if current is not None and current != entry['sha256']:
+            known = recorded['files'].get(path)
+            if not force and current != known:
+                raise UpdateError('%s was modified locally; use --force to overwrite' % path)
+        url = RAW.format(repo=config['repo'], ref=config['ref'], path=entry['source'])
+        data = fetcher(url)
+        actual = digest_bytes(data)
+        if actual != entry['sha256']:
+            raise UpdateError('%s: checksum mismatch (index %s, download %s)'
+                              % (path, entry['sha256'][:12], actual[:12]))
+        if current != actual:
+            changed = True
+        staged.append({'path': path, 'mode': entry.get('mode', 644),
+                       'data': data, 'sha256': actual})
+    return module, staged, changed
+
+
+def backup_name(path):
+    """Flatten an install path into one backup file name, on any platform."""
+    return path.replace('\\', '/').lstrip('/').replace('/', '_').replace(':', '')
+
+
+def install_staged(module_id, staged, state, version, state_path=DEFAULT_STATE):
+    """Write staged files atomically, restoring originals if any write fails."""
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    backup = os.path.join(BACKUP_ROOT, '%s-%s' % (module_id, stamp))
+    os.makedirs(backup, exist_ok=True)
+    written = []
+    try:
+        for item in staged:
+            path = item['path']
+            if os.path.exists(path):
+                keep = os.path.join(backup, backup_name(path))
+                shutil.copy2(path, keep)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + '.geomask-new'
+            with open(tmp, 'wb') as handle:
+                handle.write(item['data'])
+            os.chmod(tmp, item['mode'])
+            os.replace(tmp, path)
+            written.append(path)
+    except OSError as exc:
+        for path in written:
+            keep = os.path.join(backup, backup_name(path))
+            if os.path.exists(keep):
+                try:
+                    shutil.copy2(keep, path)
+                except OSError:
+                    pass
+        raise UpdateError('write failed (%s); originals restored' % type(exc).__name__) from None
+
+    modules = state.setdefault('modules', {})
+    entry = modules.setdefault(module_id, {})
+    entry['version'] = version or entry.get('version', '')
+    entry['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    entry['files'] = {item['path']: item['sha256'] for item in staged}
+    write_json(state_path, state)
+    return backup
+
+
+def seed_state(index, state, state_path=DEFAULT_STATE):
+    """Record what is on disk right now, so later edits are detectable.
+
+    The installer calls this once with the index it shipped: without a baseline every
+    untouched file would look locally modified on the first update.
+    """
+    modules = state.setdefault('modules', {})
+    seeded = 0
+    for ident, module in (index.get('modules') or {}).items():
+        hashes = {}
+        for entry in module.get('files') or []:
+            actual = digest_file(entry['path'])
+            if actual is not None:
+                hashes[entry['path']] = actual
+        record = modules.setdefault(ident, {})
+        if hashes:
+            record['files'] = hashes
+            record.setdefault('version', module.get('version', '0.0.0'))
+            seeded += 1
+    write_json(state_path, state)
+    return seeded
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='geomask-module-update')
+    parser.add_argument('command', choices=['status', 'check', 'update', 'verify', 'seed'])
+    parser.add_argument('module', nargs='?')
+    parser.add_argument('--force', action='store_true')
+    parser.add_argument('--state', default=DEFAULT_STATE)
+    parser.add_argument('--config', default=DEFAULT_CONFIG)
+    parser.add_argument('--index-file', default='')
+    args = parser.parse_args(argv)
+
+    try:
+        config = load_config(args.config)
+        state = load_state(args.state)
+        if args.command == 'seed':
+            if args.index_file:
+                with open(args.index_file, encoding='utf-8') as handle:
+                    index = json.load(handle)
+                source = 'file'
+            else:
+                index, source = load_index(config)
+            seeded = seed_state(index, state, args.state)
+            print(json.dumps({'ok': True, 'seeded': seeded, 'source': source},
+                             ensure_ascii=False))
+            return 0
+        if args.command == 'status':
+            index, source = load_index(config)
+            print(json.dumps({'ok': True, 'source': source,
+                              'modules': status(index, state)}, ensure_ascii=False))
+            return 0
+        if args.command == 'check':
+            index, source = load_index(config, force=True)
+            print(json.dumps({'ok': True, 'source': source,
+                              'modules': status(index, state)}, ensure_ascii=False))
+            return 0
+        if args.command == 'verify':
+            index, source = load_index(config)
+            if not args.module:
+                raise UpdateError('verify needs a module id')
+            report = status(index, state, args.module)
+            if not report:
+                raise UpdateError('unknown module %s' % args.module)
+            print(json.dumps({'ok': report[0]['state'] in ('current', 'update-available'),
+                              'module': report[0]}, ensure_ascii=False))
+            return 0
+        if args.command == 'update':
+            if not args.module:
+                raise UpdateError('update needs a module id')
+            index, source = load_index(config)
+            module, staged, changed = download_module(index, state, args.module, config,
+                                                      force=args.force)
+            if not changed:
+                print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
+                                  'version': module.get('version'), 'source': source},
+                                 ensure_ascii=False))
+                return 0
+            backup = install_staged(args.module, staged, state, module.get('version', ''), args.state)
+            print(json.dumps({'ok': True, 'module': args.module, 'changed': True,
+                              'version': module.get('version'), 'files': len(staged),
+                              'backup': backup, 'source': source}, ensure_ascii=False))
+            return 0
+    except UpdateError as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))
+        return 1
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+
+  ASSET_EOF
+  save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
+  {
+  "schema": 1,
+  "core_version": "1.28.0",
+  "modules": {
+    "admission_service": {
+      "version": "1.0.0",
+      "type": "service",
+      "name": "AI Admission Service",
+      "dependencies": [
+        "core"
+      ],
+      "files": []
+    },
+    "ai_dns": {
+      "version": "1.0.0",
+      "type": "feature",
+      "name": "AI DNS-over-HTTPS",
+      "dependencies": [
+        "core",
+        "path_ai"
+      ],
+      "files": []
+    },
+    "backup_share": {
+      "version": "1.0.0",
+      "type": "service",
+      "name": "Backup SMB Share",
+      "dependencies": [
+        "core"
+      ],
+      "files": []
+    },
+    "core": {
+      "version": "1.0.0",
+      "type": "core",
+      "name": "Geomask Core",
+      "dependencies": [],
+      "files": [
+        {
+          "path": "/etc/geomask-nodes.conf",
+          "source": "assets/geomask-nodes.conf",
+          "mode": 644,
+          "sha256": "d6d3175d1471eea9d9f04ea40aa00c455662e43135f5012948deb059d4e0bf2b"
+        },
+        {
+          "path": "/etc/geomask/lists/magitrickle-groups.yaml",
+          "source": "assets/magitrickle-groups.yaml",
+          "mode": 644,
+          "sha256": "83930270200598d330da330108d51f213f057be52d85187913ce2712a02ac415"
+        },
+        {
+          "path": "/etc/geomask/zapret-always-exclude.txt",
+          "source": "assets/zapret-always-exclude.txt",
+          "mode": 644,
+          "sha256": "3d604dcf252b70c9470d7b727e46d05a43d08dde7909bfce0f53d1198523f77a"
+        },
+        {
+          "path": "/etc/geomask/zapret-force-keep.txt",
+          "source": "assets/zapret-force-keep.txt",
+          "mode": 644,
+          "sha256": "3501ef5760ebb95f68c4dc0432f0275e086572fa48446ac8d9ff49fa3fb97034"
+        },
+        {
+          "path": "/etc/hotplug.d/iface/99-default-vpn-route",
+          "source": "assets/99-default-vpn-route",
+          "mode": 755,
+          "sha256": "4a3cf3e0acb010ddcc550ddd6f0d2eca8bf193d915dbfcf3c1516b86ff3f3e74"
+        },
+        {
+          "path": "/etc/init.d/geomask-syncd",
+          "source": "assets/geomask-syncd.init",
+          "mode": 755,
+          "sha256": "35ea7b468fd1fa11a3050fa1ce10233c94ecec7c415ac85f73ac98067784a8fa"
+        },
+        {
+          "path": "/root/sync_mtrickle_mihomo.sh",
+          "source": "assets/sync_mtrickle_mihomo.sh",
+          "mode": 755,
+          "sha256": "5ac6ec58fd32ed3b24b8949e16b577eedb2e48ab2cc54ea0d5f34695f356cb0b"
+        },
+        {
+          "path": "/tmp/geomask-ytwatch.conf.new",
+          "source": "assets/geomask-ytwatch.conf",
+          "mode": 644,
+          "sha256": "ff14d9912cc17d3abbeeae006e0bbff1de436ae456e986a397837b9c95c94fd3"
+        },
+        {
+          "path": "/usr/bin/geo-backend.sh",
+          "source": "assets/geo-backend.sh",
+          "mode": 755,
+          "sha256": "5ea6910acdaa9cd19cada40f15db066a38beee79bccbe74cd37fca2b3f12f4b6"
+        },
+        {
+          "path": "/usr/bin/geomask-guard.sh",
+          "source": "assets/geomask-guard.sh",
+          "mode": 755,
+          "sha256": "c213974511e6c4dfe8cf9a76b71c785cddabd21804f9d71d6d0c5a1eca68dbff"
+        },
+        {
+          "path": "/usr/bin/geomask-lane.sh",
+          "source": "assets/geomask-lane.sh",
+          "mode": 755,
+          "sha256": "2661cfe575a0431aeb92520dd8fbcabadee557d3fce84a9e476d22cf3840012d"
+        },
+        {
+          "path": "/usr/bin/geomask-node-scan.sh",
+          "source": "assets/geomask-node-scan.sh",
+          "mode": 755,
+          "sha256": "6e15ca7d85f9e4ff1c844c866ad08ae2a4d21874d2bc09c52a97839842f2a5b6"
+        },
+        {
+          "path": "/usr/bin/geomask-seed-lists.py",
+          "source": "assets/geomask-seed-lists.py",
+          "mode": 755,
+          "sha256": "7f1a197235893e45de978b21a38fd31cad7dd4c1d50239e154f9e0e6b2f70b31"
+        },
+        {
+          "path": "/usr/bin/geomask-syncd.sh",
+          "source": "assets/geomask-syncd.sh",
+          "mode": 755,
+          "sha256": "74632f8406412a18bdc9b63979d2f7efd2a6874269795d23f3fafa973ad0a882"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-apply.py",
+          "source": "assets/geomask-apply.py",
+          "mode": 755,
+          "sha256": "81059ce99d7d8835d5c2f83efef4389073518608c10a08c69a857b41211c3f02"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-audit-scheduler.py",
+          "source": "assets/geomask-audit-scheduler.py",
+          "mode": 755,
+          "sha256": "a0ebf8a335e8d5bfb9cbb47dcef776b4f941546364567989d47589c794577726"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-audit-state.py",
+          "source": "assets/geomask-audit-state.py",
+          "mode": 755,
+          "sha256": "de34fadc2deebc3f2e66c956c9643bf0c193ee0f0adc94a678937d49ff418af5"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-config-owner.py",
+          "source": "assets/geomask-config-owner.py",
+          "mode": 755,
+          "sha256": "e71903c705829852b94e7dacc08db1891cd862bf8cc840d139384796378d06b3"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-config-tx.py",
+          "source": "assets/geomask-config-tx.py",
+          "mode": 755,
+          "sha256": "0306dcebc4c2ac5ee8bed09e6335c276160c6d69af88809a3c55bffd028c4bae"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-lane-torrent.py",
+          "source": "assets/geomask-lane-torrent.py",
+          "mode": 755,
+          "sha256": "8fd6eb2acb24f960a02b6439b462f2e82f79577a5d3ffa5c491dd84a5e1bb284"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-module-update.py",
+          "source": "assets/geomask-module-update.py",
+          "mode": 755,
+          "sha256": "4ae1013719fd2cb326afaa1f3b65697397958e1322444455f2c4b634514a6ca5"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-node-audit.py",
+          "source": "assets/geomask-node-audit.py",
+          "mode": 755,
+          "sha256": "2bc9a49b34b3995b511b55f2985f900fc53ec7c947a3dbaf323ad1050e0f3e3e"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-slot-patch.py",
+          "source": "assets/geomask-slot-patch.py",
+          "mode": 755,
+          "sha256": "7ba5225b0b7973699379842d5012b61528618bb1e22f5fa9bda68e7719e31e6d"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-subscription-status.py",
+          "source": "assets/geomask-subscription-status.py",
+          "mode": 755,
+          "sha256": "d67de5d7d38d3c1d032d1591f4b09341cf42d30a3749dc6b818dcfc9bb834f23"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-sync-youtube.py",
+          "source": "assets/geomask-sync-youtube.py",
+          "mode": 755,
+          "sha256": "15d0cd4e7135d46cf2c465191d2708b01df790899306fe8a1e6eeb45b011307b"
+        },
+        {
+          "path": "/usr/libexec/rpcd/geo-sync",
+          "source": "assets/geo-sync",
+          "mode": 755,
+          "sha256": "e4d71442cdfaee15a8bd757df8658aff86b160c7bdcc31304c73a658a417ada8"
+        },
+        {
+          "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
+          "source": "assets/menu-geo-sync.json",
+          "mode": 644,
+          "sha256": "6cc1c916cfd9e03403ece2d7c98924836404c24631e8d553b77466fd6f4aa8dd"
+        },
+        {
+          "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
+          "source": "assets/acl-geo-sync.json",
+          "mode": 644,
+          "sha256": "5f3d71f1e7217dd0ab2ed1638f275da914a6aea93f0d8ec7d9fecd1eb7dd5b96"
+        },
+        {
+          "path": "/www/luci-static/resources/view/geo-sync/main.js",
+          "source": "assets/geo-sync-page.js",
+          "mode": 644,
+          "sha256": "e9cde8f8ab865c5ba0429b91636c9bae849c3448e3403a324e7dc19fd282ed5f"
+        }
+      ]
+    },
+    "device_modes": {
+      "version": "1.0.0",
+      "type": "feature",
+      "name": "Device Modes",
+      "dependencies": [
+        "core"
+      ],
+      "files": []
+    },
+    "diagnostic": {
+      "version": "1.0.0",
+      "type": "diagnostic",
+      "name": "Diagnostic Services",
+      "dependencies": [
+        "core"
+      ],
+      "files": [
+        {
+          "path": "/etc/geomask/vpnwatch.conf",
+          "source": "assets/geomask-vpnwatch.conf",
+          "mode": 644,
+          "sha256": "dc5f9c5ebbe5153a4b7115c95133cfd8431f1381870cf677ccec6961025540e8"
+        },
+        {
+          "path": "/usr/bin/geomask-dnscheck.sh",
+          "source": "assets/geomask-dnscheck.sh",
+          "mode": 755,
+          "sha256": "ed78c6663368aa1d7154a8ce2afbbceb29cd8d863f03623738a4b32e707d1b70"
+        },
+        {
+          "path": "/usr/bin/geomask-morning-check.sh",
+          "source": "assets/geomask-morning-check.sh",
+          "mode": 755,
+          "sha256": "73f986b6b2ca91fa2f4f4c9b1a73446a6efe1adf8c909587650f9761ac2d6f06"
+        },
+        {
+          "path": "/usr/bin/geomask-vpnwatch.sh",
+          "source": "assets/geomask-vpnwatch.sh",
+          "mode": 755,
+          "sha256": "6068ec5d08d91b65e53aabe4ae879cac9cd50175fa5b3c1e3d3cfd441f531014"
+        }
+      ]
+    },
+    "path_ai": {
+      "version": "1.0.0",
+      "type": "path",
+      "name": "AI Path",
+      "dependencies": [
+        "core",
+        "subscription:sub",
+        "admission_service"
+      ],
+      "files": []
+    },
+    "path_vpn": {
+      "version": "1.0.0",
+      "type": "path",
+      "name": "VPN Path",
+      "dependencies": [
+        "core",
+        "subscription:sub"
+      ],
+      "files": []
+    },
+    "path_vpn_nop2p": {
+      "version": "1.0.0",
+      "type": "path",
+      "name": "VPN-noP2P Path",
+      "dependencies": [
+        "core",
+        "subscription:de5"
+      ],
+      "files": []
+    },
+    "self_update": {
+      "version": "1.0.0",
+      "type": "service",
+      "name": "Self Update",
+      "dependencies": [
+        "core"
+      ],
+      "files": []
+    },
+    "torrent": {
+      "version": "1.0.0",
+      "type": "feature",
+      "name": "Torrent Admin",
+      "dependencies": [
+        "core"
+      ],
+      "files": [
+        {
+          "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
+          "source": "assets/torrentdirect.yaml",
+          "mode": 644,
+          "sha256": "d241713f5947370412d97b3657d370d1cff87892c4e2dcb1fbcaf9557ff37c0e"
+        },
+        {
+          "path": "/usr/bin/geomask-torrent.sh",
+          "source": "assets/geomask-torrent.sh",
+          "mode": 755,
+          "sha256": "999b54d99c27e70c34497b69d20b8ef2de414a5f2eeb34ed0af71829021c3ef9"
+        }
+      ]
+    },
+    "youtube": {
+      "version": "1.0.0",
+      "type": "feature",
+      "name": "YouTube Edge Watchdog",
+      "dependencies": [
+        "core"
+      ],
+      "files": [
+        {
+          "path": "/etc/geomask-ytwatch.conf",
+          "source": "assets/geomask-ytwatch.conf",
+          "mode": 644,
+          "sha256": "ff14d9912cc17d3abbeeae006e0bbff1de436ae456e986a397837b9c95c94fd3"
+        },
+        {
+          "path": "/etc/mihomo/ruleset/ytdirect.yaml",
+          "source": "assets/ytdirect.yaml",
+          "mode": 644,
+          "sha256": "736a8256a8773c226acef4520f5299b3a98b5ee84c3a66767061ecacdb2fc986"
+        },
+        {
+          "path": "/etc/mihomo/ruleset/ytvpn.yaml",
+          "source": "assets/ytvpn.yaml",
+          "mode": 644,
+          "sha256": "0eeb40254c0fb429776711a0acee828667c6d11d6a7cf342440489e988315494"
+        },
+        {
+          "path": "/usr/bin/geomask-ytwatch.sh",
+          "source": "assets/geomask-ytwatch.sh",
+          "mode": 755,
+          "sha256": "3a42d78f10a6c26b1c0da984bc1506b9bae2d7b49299782b3b613f37695887c9"
+        }
+      ]
+    }
+  }
+}
+
+  ASSET_EOF
   save_stream /usr/libexec/rpcd/geo-sync 755 <<'ASSET_EOF'
 #!/bin/sh
 # rpcd plugin for geo-sync (LuCI "Гео-маскировка и AI")
@@ -6288,6 +7064,9 @@ list_methods() {
 	json_add_object "ai_sub_use";               json_add_string "id" "string"; json_close_object
 	json_add_object "vpn_sub_use";              json_add_string "id" "string"; json_close_object
 	json_add_object "vpnnp_sub_use";            json_add_string "id" "string"; json_close_object
+	json_add_object "mod_list";                 json_close_object
+	json_add_object "mod_check";                json_close_object
+	json_add_object "mod_update";               json_add_string "module_id" "string"; json_add_string "force" "string"; json_close_object
 	json_add_object "upd_check";                json_add_string "force" "string"; json_close_object
 	json_add_object "upd_status";               json_close_object
 	json_add_object "upd_apply";                json_close_object
@@ -6358,6 +7137,9 @@ call_method() {
 		ai_sub_use)               json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;
 		vpn_sub_use)              json_get_var id id; "$BACKEND" vpn_sub_use "$id" ;;
 		vpnnp_sub_use)            json_get_var id id; "$BACKEND" vpnnp_sub_use "$id" ;;
+		mod_list)                 "$BACKEND" mod_list ;;
+		mod_check)                "$BACKEND" mod_check ;;
+		mod_update)               json_get_var module_id module_id; json_get_var force force; "$BACKEND" mod_update "$module_id" "$force" ;;
 		upd_check)                json_get_var force force; "$BACKEND" upd_check "$force" ;;
 		upd_status)               "$BACKEND" upd_status ;;
 		upd_apply)                "$BACKEND" upd_apply ;;
@@ -6396,19 +7178,24 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "ai_sub_get", "subs_list", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "ai_sub_get", "subs_list", "mod_list", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
 				"system": [ "info" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "nodescan", "nodes_path_save", "nodes_path_check", "nodes_audit_cancel", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra", "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "subs_seed", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "upd_apply", "nodes_path_preview", "nodes_path_apply", "nodes_path_revoke", "mtrickle_sync", "nodes_audit_schedule_set" ]
+				"geo-sync": [ "nodescan", "nodes_path_save", "nodes_path_check", "nodes_audit_cancel", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra", "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "subs_seed", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "mod_check", "mod_update", "upd_apply", "nodes_path_preview", "nodes_path_apply", "nodes_path_revoke", "mtrickle_sync", "nodes_audit_schedule_set" ]
 			}
 		}
 	}
 }
 
 ASSET_EOF
+
+  # Baseline for per-module updates: record the hashes we just installed.
+  [ -f /etc/geomask/modules-index.json ] && \
+    python3 /usr/lib/geomask/geomask-module-update.py seed \
+      --index-file /etc/geomask/modules-index.json >/dev/null 2>&1 || true
   save_stream /usr/share/luci/menu.d/luci-app-geo-sync.json 644 <<'ASSET_EOF'
 {
 	"admin/services/geo-sync": {
@@ -6475,6 +7262,9 @@ var callSubDel                = rpc.declare({ object: 'geo-sync', method: 'sub_d
 var callAiSubUse              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use', params: { id: null }, expect: {} });
 var callVpnSubUse             = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use', params: { id: null }, expect: {} });
 var callVpnnpSubUse           = rpc.declare({ object: 'geo-sync', method: 'vpnnp_sub_use', params: { id: null }, expect: {} });
+var callModList               = rpc.declare({ object: 'geo-sync', method: 'mod_list', expect: {} });
+var callModCheck              = rpc.declare({ object: 'geo-sync', method: 'mod_check', expect: {} });
+var callModUpdate             = rpc.declare({ object: 'geo-sync', method: 'mod_update', params: [ 'module_id', 'force' ], expect: {} });
 var callUpdCheck              = rpc.declare({ object: 'geo-sync', method: 'upd_check', params: { force: null }, expect: {} });
 var callUpdStatus             = rpc.declare({ object: 'geo-sync', method: 'upd_status', expect: {} });
 var callUpdApply              = rpc.declare({ object: 'geo-sync', method: 'upd_apply', expect: {} });
@@ -6486,7 +7276,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.27.10';
+var PANEL_VERSION = '1.28.0';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -6668,7 +7458,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList() ]);
 	},
 
 	render: function(all) {
@@ -6684,6 +7474,7 @@ return view.extend({
 		var yt = all[11] || {};
 		var tor = all[12] || {};
 		var pathAudit = all[13] || {};
+		var mods = all[14] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -6692,7 +7483,7 @@ return view.extend({
 		var TABS = [
 			['obzor', 'Обзор'], ['dev', 'Устройства'], ['subs', 'Подписки'],
 			['lists', 'Списки и синк'], ['nodes', 'Узлы подписки'],
-			['bk', 'Бэкапы'], ['upd', 'Обновление'], ['set', 'Настройки']
+			['bk', 'Бэкапы'], ['upd', 'Обновление'], ['mods', 'Модули'], ['set', 'Настройки']
 		];
 		var curTab = 'obzor';
 		try { curTab = localStorage.getItem('gs-tab') || 'obzor'; } catch (e) {}
@@ -7353,6 +8144,51 @@ return view.extend({
 		}
 
 		/* ===================== Backups as own tab card (v1.12.0) ===================== */
+
+		/* ===================== МОДУЛИ: отдельное обновление (v1.28.0) ===================== */
+		function modState(state) {
+			var map = {
+				'current': ['gs-on', 'актуален'],
+				'update-available': ['gs-warn', 'есть обновление'],
+				'modified': ['gs-warn', 'изменён локально'],
+				'incomplete': ['gs-off', 'неполный']
+			};
+			var it = map[state] || ['gs-off', state || '—'];
+			return E('span', { 'class': 'gs-badge ' + it[0] }, it[1]);
+		}
+		var modRows = (mods.modules || []).map(function(m) {
+			var same = !m.available_version || m.available_version === m.installed_version;
+			var label = m.state === 'modified' ? 'Перезаписать' : 'Обновить';
+			var btn = E('button', {
+				'class': 'gs-btn gs-btn-ok',
+				'disabled': (m.state === 'current' || m.state === 'incomplete' || !m.files) ? 'disabled' : null,
+				'click': function() {
+					view.act(callModUpdate, { module_id: m.id },
+						'Модуль ' + (m.name || m.id) + ' обновлён');
+				}
+			}, label);
+			return E('div', { 'class': 'gs-row', style: 'align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-color,#30363d)' }, [
+				E('span', { 'class': 'gs-cc' }, m.id),
+				E('span', { 'style': 'flex:1' }, m.name || ''),
+				E('span', { 'class': 'gs-meta' }, same ? (m.installed_version || '—')
+					: (m.installed_version || '—') + ' → ' + m.available_version),
+				modState(m.state),
+				E('span', { 'class': 'gs-meta' }, (m.files || 0) + ' ф.'),
+				btn
+			]);
+		});
+		if (!modRows.length) modRows = [E('div', { 'class': 'gs-hint' }, 'Список модулей пуст — нажмите «Проверить обновления».')];
+		panels.mods.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Модули'),
+			E('div', { 'class': 'gs-hint' }, 'Каждый модуль обновляется отдельно и имеет собственную версию. Файлы проверяются по SHA-256, локальные правки не перезаписываются без подтверждения.'),
+			E('div', { 'class': 'gs-row', style: 'margin:8px 0' }, [
+				E('button', { 'class': 'gs-btn', 'click': function() {
+					view.act(callModCheck, {}, 'Индекс обновлений обновлён');
+				} }, 'Проверить обновления')
+			]),
+			E('div', {}, modRows)
+		]));
+
 		panels.bk.appendChild(E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Резервные копии'),
 			bkBox
@@ -7907,7 +8743,7 @@ return view.extend({
 		var calls = [
 			callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
 			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(),
-			callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet()
+			callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList()
 		];
 		return Promise.all(calls).then(function(all) {
 			var newView = view.render(all);
@@ -27547,7 +28383,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.27.10"
+GUARD_VERSION="1.28.0"
 
 log() { logger -t geomask-guard "$*"; }
 

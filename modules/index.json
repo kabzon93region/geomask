@@ -1,0 +1,355 @@
+{
+  "schema": 1,
+  "core_version": "1.28.0",
+  "modules": {
+    "admission_service": {
+      "version": "1.0.0",
+      "type": "service",
+      "name": "AI Admission Service",
+      "dependencies": [
+        "core"
+      ],
+      "files": []
+    },
+    "ai_dns": {
+      "version": "1.0.0",
+      "type": "feature",
+      "name": "AI DNS-over-HTTPS",
+      "dependencies": [
+        "core",
+        "path_ai"
+      ],
+      "files": []
+    },
+    "backup_share": {
+      "version": "1.0.0",
+      "type": "service",
+      "name": "Backup SMB Share",
+      "dependencies": [
+        "core"
+      ],
+      "files": []
+    },
+    "core": {
+      "version": "1.0.0",
+      "type": "core",
+      "name": "Geomask Core",
+      "dependencies": [],
+      "files": [
+        {
+          "path": "/etc/geomask-nodes.conf",
+          "source": "assets/geomask-nodes.conf",
+          "mode": 644,
+          "sha256": "d6d3175d1471eea9d9f04ea40aa00c455662e43135f5012948deb059d4e0bf2b"
+        },
+        {
+          "path": "/etc/geomask/lists/magitrickle-groups.yaml",
+          "source": "assets/magitrickle-groups.yaml",
+          "mode": 644,
+          "sha256": "83930270200598d330da330108d51f213f057be52d85187913ce2712a02ac415"
+        },
+        {
+          "path": "/etc/geomask/zapret-always-exclude.txt",
+          "source": "assets/zapret-always-exclude.txt",
+          "mode": 644,
+          "sha256": "3d604dcf252b70c9470d7b727e46d05a43d08dde7909bfce0f53d1198523f77a"
+        },
+        {
+          "path": "/etc/geomask/zapret-force-keep.txt",
+          "source": "assets/zapret-force-keep.txt",
+          "mode": 644,
+          "sha256": "3501ef5760ebb95f68c4dc0432f0275e086572fa48446ac8d9ff49fa3fb97034"
+        },
+        {
+          "path": "/etc/hotplug.d/iface/99-default-vpn-route",
+          "source": "assets/99-default-vpn-route",
+          "mode": 755,
+          "sha256": "4a3cf3e0acb010ddcc550ddd6f0d2eca8bf193d915dbfcf3c1516b86ff3f3e74"
+        },
+        {
+          "path": "/etc/init.d/geomask-syncd",
+          "source": "assets/geomask-syncd.init",
+          "mode": 755,
+          "sha256": "35ea7b468fd1fa11a3050fa1ce10233c94ecec7c415ac85f73ac98067784a8fa"
+        },
+        {
+          "path": "/root/sync_mtrickle_mihomo.sh",
+          "source": "assets/sync_mtrickle_mihomo.sh",
+          "mode": 755,
+          "sha256": "5ac6ec58fd32ed3b24b8949e16b577eedb2e48ab2cc54ea0d5f34695f356cb0b"
+        },
+        {
+          "path": "/tmp/geomask-ytwatch.conf.new",
+          "source": "assets/geomask-ytwatch.conf",
+          "mode": 644,
+          "sha256": "ff14d9912cc17d3abbeeae006e0bbff1de436ae456e986a397837b9c95c94fd3"
+        },
+        {
+          "path": "/usr/bin/geo-backend.sh",
+          "source": "assets/geo-backend.sh",
+          "mode": 755,
+          "sha256": "5ea6910acdaa9cd19cada40f15db066a38beee79bccbe74cd37fca2b3f12f4b6"
+        },
+        {
+          "path": "/usr/bin/geomask-guard.sh",
+          "source": "assets/geomask-guard.sh",
+          "mode": 755,
+          "sha256": "c213974511e6c4dfe8cf9a76b71c785cddabd21804f9d71d6d0c5a1eca68dbff"
+        },
+        {
+          "path": "/usr/bin/geomask-lane.sh",
+          "source": "assets/geomask-lane.sh",
+          "mode": 755,
+          "sha256": "2661cfe575a0431aeb92520dd8fbcabadee557d3fce84a9e476d22cf3840012d"
+        },
+        {
+          "path": "/usr/bin/geomask-node-scan.sh",
+          "source": "assets/geomask-node-scan.sh",
+          "mode": 755,
+          "sha256": "6e15ca7d85f9e4ff1c844c866ad08ae2a4d21874d2bc09c52a97839842f2a5b6"
+        },
+        {
+          "path": "/usr/bin/geomask-seed-lists.py",
+          "source": "assets/geomask-seed-lists.py",
+          "mode": 755,
+          "sha256": "7f1a197235893e45de978b21a38fd31cad7dd4c1d50239e154f9e0e6b2f70b31"
+        },
+        {
+          "path": "/usr/bin/geomask-syncd.sh",
+          "source": "assets/geomask-syncd.sh",
+          "mode": 755,
+          "sha256": "74632f8406412a18bdc9b63979d2f7efd2a6874269795d23f3fafa973ad0a882"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-apply.py",
+          "source": "assets/geomask-apply.py",
+          "mode": 755,
+          "sha256": "81059ce99d7d8835d5c2f83efef4389073518608c10a08c69a857b41211c3f02"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-audit-scheduler.py",
+          "source": "assets/geomask-audit-scheduler.py",
+          "mode": 755,
+          "sha256": "a0ebf8a335e8d5bfb9cbb47dcef776b4f941546364567989d47589c794577726"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-audit-state.py",
+          "source": "assets/geomask-audit-state.py",
+          "mode": 755,
+          "sha256": "de34fadc2deebc3f2e66c956c9643bf0c193ee0f0adc94a678937d49ff418af5"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-config-owner.py",
+          "source": "assets/geomask-config-owner.py",
+          "mode": 755,
+          "sha256": "e71903c705829852b94e7dacc08db1891cd862bf8cc840d139384796378d06b3"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-config-tx.py",
+          "source": "assets/geomask-config-tx.py",
+          "mode": 755,
+          "sha256": "0306dcebc4c2ac5ee8bed09e6335c276160c6d69af88809a3c55bffd028c4bae"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-lane-torrent.py",
+          "source": "assets/geomask-lane-torrent.py",
+          "mode": 755,
+          "sha256": "8fd6eb2acb24f960a02b6439b462f2e82f79577a5d3ffa5c491dd84a5e1bb284"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-module-update.py",
+          "source": "assets/geomask-module-update.py",
+          "mode": 755,
+          "sha256": "4ae1013719fd2cb326afaa1f3b65697397958e1322444455f2c4b634514a6ca5"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-node-audit.py",
+          "source": "assets/geomask-node-audit.py",
+          "mode": 755,
+          "sha256": "2bc9a49b34b3995b511b55f2985f900fc53ec7c947a3dbaf323ad1050e0f3e3e"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-slot-patch.py",
+          "source": "assets/geomask-slot-patch.py",
+          "mode": 755,
+          "sha256": "7ba5225b0b7973699379842d5012b61528618bb1e22f5fa9bda68e7719e31e6d"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-subscription-status.py",
+          "source": "assets/geomask-subscription-status.py",
+          "mode": 755,
+          "sha256": "d67de5d7d38d3c1d032d1591f4b09341cf42d30a3749dc6b818dcfc9bb834f23"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-sync-youtube.py",
+          "source": "assets/geomask-sync-youtube.py",
+          "mode": 755,
+          "sha256": "15d0cd4e7135d46cf2c465191d2708b01df790899306fe8a1e6eeb45b011307b"
+        },
+        {
+          "path": "/usr/libexec/rpcd/geo-sync",
+          "source": "assets/geo-sync",
+          "mode": 755,
+          "sha256": "e4d71442cdfaee15a8bd757df8658aff86b160c7bdcc31304c73a658a417ada8"
+        },
+        {
+          "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
+          "source": "assets/menu-geo-sync.json",
+          "mode": 644,
+          "sha256": "6cc1c916cfd9e03403ece2d7c98924836404c24631e8d553b77466fd6f4aa8dd"
+        },
+        {
+          "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
+          "source": "assets/acl-geo-sync.json",
+          "mode": 644,
+          "sha256": "5f3d71f1e7217dd0ab2ed1638f275da914a6aea93f0d8ec7d9fecd1eb7dd5b96"
+        },
+        {
+          "path": "/www/luci-static/resources/view/geo-sync/main.js",
+          "source": "assets/geo-sync-page.js",
+          "mode": 644,
+          "sha256": "e9cde8f8ab865c5ba0429b91636c9bae849c3448e3403a324e7dc19fd282ed5f"
+        }
+      ]
+    },
+    "device_modes": {
+      "version": "1.0.0",
+      "type": "feature",
+      "name": "Device Modes",
+      "dependencies": [
+        "core"
+      ],
+      "files": []
+    },
+    "diagnostic": {
+      "version": "1.0.0",
+      "type": "diagnostic",
+      "name": "Diagnostic Services",
+      "dependencies": [
+        "core"
+      ],
+      "files": [
+        {
+          "path": "/etc/geomask/vpnwatch.conf",
+          "source": "assets/geomask-vpnwatch.conf",
+          "mode": 644,
+          "sha256": "dc5f9c5ebbe5153a4b7115c95133cfd8431f1381870cf677ccec6961025540e8"
+        },
+        {
+          "path": "/usr/bin/geomask-dnscheck.sh",
+          "source": "assets/geomask-dnscheck.sh",
+          "mode": 755,
+          "sha256": "ed78c6663368aa1d7154a8ce2afbbceb29cd8d863f03623738a4b32e707d1b70"
+        },
+        {
+          "path": "/usr/bin/geomask-morning-check.sh",
+          "source": "assets/geomask-morning-check.sh",
+          "mode": 755,
+          "sha256": "73f986b6b2ca91fa2f4f4c9b1a73446a6efe1adf8c909587650f9761ac2d6f06"
+        },
+        {
+          "path": "/usr/bin/geomask-vpnwatch.sh",
+          "source": "assets/geomask-vpnwatch.sh",
+          "mode": 755,
+          "sha256": "6068ec5d08d91b65e53aabe4ae879cac9cd50175fa5b3c1e3d3cfd441f531014"
+        }
+      ]
+    },
+    "path_ai": {
+      "version": "1.0.0",
+      "type": "path",
+      "name": "AI Path",
+      "dependencies": [
+        "core",
+        "subscription:sub",
+        "admission_service"
+      ],
+      "files": []
+    },
+    "path_vpn": {
+      "version": "1.0.0",
+      "type": "path",
+      "name": "VPN Path",
+      "dependencies": [
+        "core",
+        "subscription:sub"
+      ],
+      "files": []
+    },
+    "path_vpn_nop2p": {
+      "version": "1.0.0",
+      "type": "path",
+      "name": "VPN-noP2P Path",
+      "dependencies": [
+        "core",
+        "subscription:de5"
+      ],
+      "files": []
+    },
+    "self_update": {
+      "version": "1.0.0",
+      "type": "service",
+      "name": "Self Update",
+      "dependencies": [
+        "core"
+      ],
+      "files": []
+    },
+    "torrent": {
+      "version": "1.0.0",
+      "type": "feature",
+      "name": "Torrent Admin",
+      "dependencies": [
+        "core"
+      ],
+      "files": [
+        {
+          "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
+          "source": "assets/torrentdirect.yaml",
+          "mode": 644,
+          "sha256": "d241713f5947370412d97b3657d370d1cff87892c4e2dcb1fbcaf9557ff37c0e"
+        },
+        {
+          "path": "/usr/bin/geomask-torrent.sh",
+          "source": "assets/geomask-torrent.sh",
+          "mode": 755,
+          "sha256": "999b54d99c27e70c34497b69d20b8ef2de414a5f2eeb34ed0af71829021c3ef9"
+        }
+      ]
+    },
+    "youtube": {
+      "version": "1.0.0",
+      "type": "feature",
+      "name": "YouTube Edge Watchdog",
+      "dependencies": [
+        "core"
+      ],
+      "files": [
+        {
+          "path": "/etc/geomask-ytwatch.conf",
+          "source": "assets/geomask-ytwatch.conf",
+          "mode": 644,
+          "sha256": "ff14d9912cc17d3abbeeae006e0bbff1de436ae456e986a397837b9c95c94fd3"
+        },
+        {
+          "path": "/etc/mihomo/ruleset/ytdirect.yaml",
+          "source": "assets/ytdirect.yaml",
+          "mode": 644,
+          "sha256": "736a8256a8773c226acef4520f5299b3a98b5ee84c3a66767061ecacdb2fc986"
+        },
+        {
+          "path": "/etc/mihomo/ruleset/ytvpn.yaml",
+          "source": "assets/ytvpn.yaml",
+          "mode": 644,
+          "sha256": "0eeb40254c0fb429776711a0acee828667c6d11d6a7cf342440489e988315494"
+        },
+        {
+          "path": "/usr/bin/geomask-ytwatch.sh",
+          "source": "assets/geomask-ytwatch.sh",
+          "mode": 755,
+          "sha256": "3a42d78f10a6c26b1c0da984bc1506b9bae2d7b49299782b3b613f37695887c9"
+        }
+      ]
+    }
+  }
+}

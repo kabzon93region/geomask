@@ -1019,6 +1019,39 @@ cmd_backups() {
     "$DIR" "$_unc" "$_smbu" "$_sh" "$_files"
 }
 
+MODULE_UPDATER=/usr/lib/geomask/geomask-module-update.py
+
+cmd_mod_list() {
+  # Installed modules and what the cached index says about them. Read-only: never
+  # touches the network, so the panel can paint the list instantly.
+  if [ ! -f "$MODULE_UPDATER" ]; then
+    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
+  fi
+  python3 "$MODULE_UPDATER" status 2>&1
+}
+
+cmd_mod_check() {
+  # Force a fresh index fetch; falls back to the cache when the network is down.
+  if [ ! -f "$MODULE_UPDATER" ]; then
+    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
+  fi
+  python3 "$MODULE_UPDATER" check 2>&1
+}
+
+cmd_mod_update() { # $1 = module id, $2 = "force" to overwrite local edits
+  if [ ! -f "$MODULE_UPDATER" ]; then
+    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
+  fi
+  case "$1" in
+    ''|*[!A-Za-z0-9_]*) printf '{"ok":false,"error":"bad module id"}\n'; return 1 ;;
+  esac
+  if [ "$2" = "force" ]; then
+    python3 "$MODULE_UPDATER" update "$1" --force 2>&1
+  else
+    python3 "$MODULE_UPDATER" update "$1" 2>&1
+  fi
+}
+
 cmd_upd_status() {
   mkdir -p "$UPD_DIR" 2>/dev/null
   if [ -s "$UPD_STATUS" ]; then _b=$(cat "$UPD_STATUS"); else _b='{"phase":"idle"}'; fi
@@ -1430,6 +1463,10 @@ case "$1" in
   ai_sub_use)               cmd_ai_sub_use "$2" ;;
   vpn_sub_use)              cmd_vpn_sub_use "$2" ;;
   vpnnp_sub_use)            cmd_vpnnp_sub_use "$2" ;;
+  mod_list)                 cmd_mod_list ;;
+  mod_check)                cmd_mod_check ;;
+  mod_update)   # install one module's files from modules/index.json
+    cmd_mod_update "$2" "$3" ;;
   upd_check)                cmd_upd_check "$2" ;;
   upd_status)               cmd_upd_status ;;
   upd_apply)                cmd_upd_apply ;;

@@ -47,6 +47,9 @@ var callSubDel                = rpc.declare({ object: 'geo-sync', method: 'sub_d
 var callAiSubUse              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use', params: { id: null }, expect: {} });
 var callVpnSubUse             = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use', params: { id: null }, expect: {} });
 var callVpnnpSubUse           = rpc.declare({ object: 'geo-sync', method: 'vpnnp_sub_use', params: { id: null }, expect: {} });
+var callModList               = rpc.declare({ object: 'geo-sync', method: 'mod_list', expect: {} });
+var callModCheck              = rpc.declare({ object: 'geo-sync', method: 'mod_check', expect: {} });
+var callModUpdate             = rpc.declare({ object: 'geo-sync', method: 'mod_update', params: [ 'module_id', 'force' ], expect: {} });
 var callUpdCheck              = rpc.declare({ object: 'geo-sync', method: 'upd_check', params: { force: null }, expect: {} });
 var callUpdStatus             = rpc.declare({ object: 'geo-sync', method: 'upd_status', expect: {} });
 var callUpdApply              = rpc.declare({ object: 'geo-sync', method: 'upd_apply', expect: {} });
@@ -240,7 +243,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList() ]);
 	},
 
 	render: function(all) {
@@ -256,6 +259,7 @@ return view.extend({
 		var yt = all[11] || {};
 		var tor = all[12] || {};
 		var pathAudit = all[13] || {};
+		var mods = all[14] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -264,7 +268,7 @@ return view.extend({
 		var TABS = [
 			['obzor', 'Обзор'], ['dev', 'Устройства'], ['subs', 'Подписки'],
 			['lists', 'Списки и синк'], ['nodes', 'Узлы подписки'],
-			['bk', 'Бэкапы'], ['upd', 'Обновление'], ['set', 'Настройки']
+			['bk', 'Бэкапы'], ['upd', 'Обновление'], ['mods', 'Модули'], ['set', 'Настройки']
 		];
 		var curTab = 'obzor';
 		try { curTab = localStorage.getItem('gs-tab') || 'obzor'; } catch (e) {}
@@ -925,6 +929,51 @@ return view.extend({
 		}
 
 		/* ===================== Backups as own tab card (v1.12.0) ===================== */
+
+		/* ===================== МОДУЛИ: отдельное обновление (v1.28.0) ===================== */
+		function modState(state) {
+			var map = {
+				'current': ['gs-on', 'актуален'],
+				'update-available': ['gs-warn', 'есть обновление'],
+				'modified': ['gs-warn', 'изменён локально'],
+				'incomplete': ['gs-off', 'неполный']
+			};
+			var it = map[state] || ['gs-off', state || '—'];
+			return E('span', { 'class': 'gs-badge ' + it[0] }, it[1]);
+		}
+		var modRows = (mods.modules || []).map(function(m) {
+			var same = !m.available_version || m.available_version === m.installed_version;
+			var label = m.state === 'modified' ? 'Перезаписать' : 'Обновить';
+			var btn = E('button', {
+				'class': 'gs-btn gs-btn-ok',
+				'disabled': (m.state === 'current' || m.state === 'incomplete' || !m.files) ? 'disabled' : null,
+				'click': function() {
+					view.act(callModUpdate, { module_id: m.id },
+						'Модуль ' + (m.name || m.id) + ' обновлён');
+				}
+			}, label);
+			return E('div', { 'class': 'gs-row', style: 'align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-color,#30363d)' }, [
+				E('span', { 'class': 'gs-cc' }, m.id),
+				E('span', { 'style': 'flex:1' }, m.name || ''),
+				E('span', { 'class': 'gs-meta' }, same ? (m.installed_version || '—')
+					: (m.installed_version || '—') + ' → ' + m.available_version),
+				modState(m.state),
+				E('span', { 'class': 'gs-meta' }, (m.files || 0) + ' ф.'),
+				btn
+			]);
+		});
+		if (!modRows.length) modRows = [E('div', { 'class': 'gs-hint' }, 'Список модулей пуст — нажмите «Проверить обновления».')];
+		panels.mods.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Модули'),
+			E('div', { 'class': 'gs-hint' }, 'Каждый модуль обновляется отдельно и имеет собственную версию. Файлы проверяются по SHA-256, локальные правки не перезаписываются без подтверждения.'),
+			E('div', { 'class': 'gs-row', style: 'margin:8px 0' }, [
+				E('button', { 'class': 'gs-btn', 'click': function() {
+					view.act(callModCheck, {}, 'Индекс обновлений обновлён');
+				} }, 'Проверить обновления')
+			]),
+			E('div', {}, modRows)
+		]));
+
 		panels.bk.appendChild(E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Резервные копии'),
 			bkBox
@@ -1479,7 +1528,7 @@ return view.extend({
 		var calls = [
 			callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
 			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(),
-			callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet()
+			callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList()
 		];
 		return Promise.all(calls).then(function(all) {
 			var newView = view.render(all);

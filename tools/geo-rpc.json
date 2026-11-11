@@ -56,7 +56,12 @@
 		{ "name": "ai_sub_use", "acl": "write", "args": ["id"], "js": "callAiSubUse" },
 		{ "name": "vpn_sub_use", "acl": "write", "args": ["id"], "js": "callVpnSubUse" },
 		{ "name": "vpnnp_sub_use", "acl": "write", "args": ["id"], "js": "callVpnnpSubUse" },
-		{ "name": "upd_check", "acl": "read", "args": ["force"], "js": "callUpdCheck" },
+		{ "name": "mod_list", "acl": "read", "args": [], "js": "callModList" },
+		{ "name": "mod_check", "acl": "write", "args": [], "js": "callModCheck" },
+		{ "name": "mod_update", "acl": "write", "args": ["module_id", "force"], "js": "callModUpdate", "js_positional": true, "backend_body": [
+			"  mod_update)   # install one module's files from modules/index.json",
+			"    cmd_mod_update \"$2\" \"$3\" ;;"
+		] },		{ "name": "upd_check", "acl": "read", "args": ["force"], "js": "callUpdCheck" },
 		{ "name": "upd_status", "acl": "read", "args": [], "js": "callUpdStatus" },
 		{ "name": "upd_apply", "acl": "write", "args": [], "js": "callUpdApply" },
 		{ "name": "nodes_path_preview", "acl": "write", "args": ["path_id", "report_id", "expected_path_revision", "expected_source_revision"], "js": "callNodesPathPreview", "js_positional": true },

@@ -27,11 +27,6 @@
   ],
   "owned_resources": [
     {
-      "type": "file",
-      "path": "/usr/bin/geomask-torrent.sh",
-      "description": ""
-    },
-    {
       "type": "filter",
       "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
       "description": ""
@@ -40,6 +35,16 @@
       "type": "filter",
       "path": "/etc/mihomo/ruleset/torrentsites.yaml",
       "description": ""
+    },
+    {
+      "type": "file",
+      "path": "/usr/bin/geomask-torrent.sh",
+      "description": "listener and ruleset manager"
+    },
+    {
+      "type": "file",
+      "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
+      "description": "tracker and peer ruleset"
     }
   ],
   "config_files": [

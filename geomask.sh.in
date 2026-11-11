@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.27.10"
+GM_VERSION="1.28.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -222,12 +222,23 @@ ASSET_EOF
   save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
 @@ASSET:geo-backend.sh@@
 ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-module-update.py 755 <<'ASSET_EOF'
+  @@ASSET:geomask-module-update.py@@
+  ASSET_EOF
+  save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
+  @@ASSET:module-index.json@@
+  ASSET_EOF
   save_stream /usr/libexec/rpcd/geo-sync 755 <<'ASSET_EOF'
 @@ASSET:geo-sync@@
 ASSET_EOF
   save_stream /usr/share/rpcd/acl.d/luci-app-geo-sync.json 644 <<'ASSET_EOF'
 @@ASSET:acl.json@@
 ASSET_EOF
+
+  # Baseline for per-module updates: record the hashes we just installed.
+  [ -f /etc/geomask/modules-index.json ] && \
+    python3 /usr/lib/geomask/geomask-module-update.py seed \
+      --index-file /etc/geomask/modules-index.json >/dev/null 2>&1 || true
   save_stream /usr/share/luci/menu.d/luci-app-geo-sync.json 644 <<'ASSET_EOF'
 @@ASSET:menu.json@@
 ASSET_EOF

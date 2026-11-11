@@ -3,13 +3,13 @@
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "ai_sub_get", "subs_list", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "ai_sub_get", "subs_list", "mod_list", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
 				"system": [ "info" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "nodescan", "nodes_path_save", "nodes_path_check", "nodes_audit_cancel", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra", "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "subs_seed", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "upd_apply", "nodes_path_preview", "nodes_path_apply", "nodes_path_revoke", "mtrickle_sync", "nodes_audit_schedule_set" ]
+				"geo-sync": [ "nodescan", "nodes_path_save", "nodes_path_check", "nodes_audit_cancel", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra", "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "subs_seed", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "mod_check", "mod_update", "upd_apply", "nodes_path_preview", "nodes_path_apply", "nodes_path_revoke", "mtrickle_sync", "nodes_audit_schedule_set" ]
 			}
 		}
 	}

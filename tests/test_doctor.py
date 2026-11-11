@@ -328,6 +328,9 @@ class DoctorCheckTests(unittest.TestCase):
             for prefix, value in answers:
                 if cmd[:len(prefix)] == prefix:
                     return value
+                # a probe with --proxy has the same first and last element as without it
+                if prefix and cmd[0] == prefix[0] and cmd[-1] == prefix[-1]:
+                    return value
             return 127, ''
         doctor.run = call
 
@@ -356,6 +359,26 @@ class DoctorCheckTests(unittest.TestCase):
         self.fake([(['nft', 'list', 'tables'], (0, 'table ip filter'))])
         state, _, _ = doctor.check_router_netfilter()
         self.assertEqual(state, 'fail')
+
+    def test_egress_country_survives_a_blocking_geo_service(self):
+        # the AI lane's exit gets 403 from ipinfo.io; the next service must answer
+        answers = [
+            (['curl', '-m', '8', '-s', 'https://ipinfo.io/json'],
+             (0, '<html><h1>Error: Forbidden</h1>')),
+            (['curl', '-m', '8', '-s', 'https://api.myip.com'],
+             (0, '{"ip":"1.2.3.4","country":"NL","cc":"NL"}')),
+        ]
+        self.fake(answers)
+        self.assertEqual(doctor.fetch_country(None), 'NL')
+
+    def test_egress_country_reads_iso_names(self):
+        self.fake([(['curl', '-m', '8', '-s', 'https://ipinfo.io/json'],
+                    (0, '{"country":"US"}'))])
+        self.assertEqual(doctor.fetch_country('http://127.0.0.1:7891'), 'US')
+
+    def test_egress_country_gives_up_cleanly(self):
+        self.fake([(['curl', '-m', '8', '-s', 'https://ipinfo.io/json'], (0, 'nonsense'))])
+        self.assertEqual(doctor.fetch_country(None), '')
 
 
 if __name__ == '__main__':

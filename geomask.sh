@@ -7826,6 +7826,46 @@ def parse_listeners(text):
     return listeners
 
 
+EGRESS_ENDPOINTS = (
+    ('https://ipinfo.io/json', ('country',)),
+    ('https://api.myip.com', ('country', 'cc')),
+    ('https://ifconfig.co/json', ('country_iso', 'country')),
+)
+
+
+def country_from_payload(payload, keys):
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and re.match(r'^[A-Za-z]{2}$', value):
+            return value.upper()
+    return ''
+
+
+def fetch_country(proxy):
+    """Country of the exit behind this proxy, from whichever geo service answers.
+
+    One service is not enough: a lane's exit IP is often a datacenter range and the
+    service answers 403 (observed on the AI lane), which says nothing about the route.
+    """
+    for url, keys in EGRESS_ENDPOINTS:
+        cmd = ['curl', '-m', '8', '-s']
+        if proxy:
+            cmd += ['--proxy', proxy]
+        cmd.append(url)
+        rc, out = run(cmd, timeout=12)
+        if rc != 0 or not out:
+            continue
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            code = country_from_payload(payload, keys)
+            if code:
+                return code
+    return ''
+
+
 def check_path_egress():
     """Live: which country each lane's exit looks like to the internet."""
     details = []
@@ -7844,17 +7884,7 @@ def check_path_egress():
     if len(probes) == 1:
         details.append('в конфиге нет слушателей с фиксированной группой')
     for label, proxy in probes:
-        cmd = ['curl', '-m', '8', '-s']
-        if proxy:
-            cmd += ['--proxy', proxy]
-        cmd.append('https://ipinfo.io/json')
-        rc, out = run(cmd, timeout=12)
-        country = ''
-        if rc == 0 and out:
-            try:
-                country = (json.loads(out) or {}).get('country') or ''
-            except ValueError:
-                country = ''
+        country = fetch_country(proxy)
         if country:
             details.append('%s: выход %s (%s)' % (label, COUNTRIES.get(country, country), country))
         else:
@@ -8422,7 +8452,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "57780b79d1460c0768716fd4f3bdfedb129dffa9114e41eaeee876ec4250d1a3"
+          "sha256": "53a9c2b8fac871b228c3df78224522ad169b1868ea91e391b9ab8a33ba7d9696"
         }
       ]
     },

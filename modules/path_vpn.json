@@ -1,0 +1,53 @@
+{
+  "id": "path_vpn",
+  "name": "VPN Path",
+  "version": "1.0.0",
+  "schema_version": 1,
+  "type": "path",
+  "description": "Standard VPN path with NL/DE/FR/SE countries",
+  "author": "geomask",
+  "license": "MIT",
+  "dependencies": [
+    {
+      "module_id": "core",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": "Core infrastructure required"
+    },
+    {
+      "module_id": "subscription:sub",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": "Main subscription"
+    }
+  ],
+  "provides": [
+    "path:vpn",
+    "filter:base_filter"
+  ],
+  "owned_resources": [
+    {
+      "type": "config",
+      "path": "/etc/geomask/policies.yaml#path:vpn",
+      "description": ""
+    },
+    {
+      "type": "filter",
+      "path": "/etc/mihomo/ruleset/vpn.yaml",
+      "description": ""
+    }
+  ],
+  "config_files": [
+    "/etc/geomask/policies.yaml"
+  ],
+  "config_schema": {},
+  "services": [
+    "mihomo"
+  ],
+  "cron_jobs": [],
+  "rpc_methods": [],
+  "state": "enabled",
+  "enabled": true,
+  "created_at": "2026-11-07T19:08:47.715937Z",
+  "updated_at": "2026-11-07T19:08:47.715937Z"
+}

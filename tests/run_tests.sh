@@ -97,6 +97,14 @@ printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-vpnwatch.sh"; chmod +x "$R/us
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-morning-check.sh"; chmod +x "$R/usr/bin/geomask-morning-check.sh"
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-lane.sh"; chmod +x "$R/usr/bin/geomask-lane.sh"
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-dnscheck.sh"; chmod +x "$R/usr/bin/geomask-dnscheck.sh"
+# v1.28.0: node-audit subsystem modules live in /usr/lib/geomask
+mkdir -p "$R/usr/lib/geomask"
+for m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
+         geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
+         geomask-sync-youtube.py geomask-audit-scheduler.py \
+         geomask-subscription-status.py geomask-slot-patch.py; do
+  printf '#!/usr/bin/env python3\n' > "$R/usr/lib/geomask/$m"
+done
 printf 'group=VPN-noP2P\nlogfile=/root/geomask-vpn-audit.log\n' > "$R/etc/geomask/vpnwatch.conf"
 mkdir -p "$R/etc/geomask/torrent"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytvpn.yaml"
@@ -517,6 +525,18 @@ if grep -qF '"lists_get"' "$HERE/../assets/acl-geo-sync.json" && grep -qF '"list
    && grep -qF '"lists_get"' "$HERE/../assets/geo-sync" && grep -qF '"lists_seed"' "$HERE/../assets/geo-sync"; then
   echo "PASS: S19 lists_get/lists_seed in ACL + wrapper"; pass=$((pass+1))
 else echo "FAIL: S19 lists_* not in ACL/wrapper"; failn=$((failn+1)); fi
+
+# ---------- scenario 48: generated glue stays in sync with tools/geo-rpc.json ----------
+echo "=== S48: gen-geo-rpc --check (single-source manifest) ==="
+if python3 -c 'pass' >/dev/null 2>&1; then
+  if python3 "$HERE/../tools/gen-geo-rpc.py" --check >/dev/null 2>&1; then
+    echo "PASS: S48 all four integration points match tools/geo-rpc.json"; pass=$((pass+1))
+  else
+    echo "FAIL: S48 generated regions drifted (run: python tools/gen-geo-rpc.py)"; failn=$((failn+1))
+  fi
+else
+  echo "SKIP: S48 manifest check (python3 not runnable)"
+fi
 
 # ---------- scenario 20: youtube edges watchdog (v1.14.0) ----------
 echo "=== S20: ytwatch (googlevideo auto-pin) ==="
@@ -1114,7 +1134,7 @@ grep -qF 'retired de5 provider removed' "$HERE/../geomask.sh.in" \
 if grep -qF '    tolerance: 99999' "$HERE/../geomask.sh.in" && grep -qF "    type: url-test" "$HERE/../geomask.sh.in"; then
   echo "PASS: S45 template lane groups are url-test + huge tolerance (auto-test, no switch)"; pass=$((pass+1))
 else echo "FAIL: S45 template lane groups not url-test+tolerance (metacubexd shows them empty)"; failn=$((failn+1)); fi
-if grep -qF 'tolerance: 99999' "$HERE/../assets/geo-backend.sh"; then
+if grep -qF "'tolerance': 99999" "$HERE/../assets/geomask-slot-patch.py"; then
   echo "PASS: S45 panel slot-creator makes url-test+tolerance groups"; pass=$((pass+1))
 else echo "FAIL: S45 panel slot-creator missing url-test+tolerance"; failn=$((failn+1)); fi
 
@@ -1137,14 +1157,161 @@ if grep -qF 'ZALWAYS' "$HERE/../assets/sync_mtrickle_mihomo.sh" \
 else echo "FAIL: S46 sync does not merge always-exclude"; failn=$((failn+1)); fi
 
 # v1.25.3: the shared-provider slot patcher must re-match the group block AFTER inserting the
-# new provider. v1.25.2 reused byte offsets captured before the insert, so the use-list repoint
-# landed len(tpl) bytes early and sliced mid-line into another group's exclude-filter (unclosed
-# quote) - mihomo -t failed with "yaml: did not find expected key" and every switch reported
-# "mihomo config test failed - old config kept".
-grep -qF 're-match the group block AFTER the insert' "$HERE/../assets/geo-backend.sh" \
-  && grep -qF 'gm = group_block(group)' "$HERE/../assets/geo-backend.sh" \
-  && { echo "PASS: S47 slot patcher re-matches the group block after the provider insert"; pass=$((pass+1)); } \
-  || { echo "FAIL: S47 slot patcher still repoints with stale pre-insert offsets"; failn=$((failn+1)); }
+# v1.27.9: the slot patcher no longer rewrites config TEXT. A regex could not survive the
+# config being re-serialised by an apply (`- name:` at column 0), which is exactly why the
+# AI switch answered "no AI group anchor". The structural module must be used instead.
+grep -qF 'SLOT_PATCH_PY=/usr/lib/geomask/geomask-slot-patch.py' "$HERE/../assets/geo-backend.sh" \
+  && ! grep -qF 'no AI group anchor' "$HERE/../assets/geo-backend.sh" \
+  && { echo "PASS: S47 slot switching uses the structural patcher, not text regex"; pass=$((pass+1)); } \
+  || { echo "FAIL: S47 slot switching still depends on YAML text formatting"; failn=$((failn+1)); }
+grep -qF 'geomask-slot-patch.py' "$HERE/../build.py" \
+  && grep -qF 'geomask-slot-patch.py' "$HERE/../geomask.sh.in" \
+  && { echo "PASS: S47 slot patcher is shipped by build and installer"; pass=$((pass+1)); } \
+  || { echo "FAIL: S47 slot patcher not shipped"; failn=$((failn+1)); }
+
+# Run the REAL slot patcher (all three switch buttons go through it) on a config in the
+# shape an apply produces. AI on a shared provider must get an isolated provider while VPN
+# keeps the shared one; a later VPN switch re-points only the shared provider; VPN-noP2P
+# (group absent) must create its own provider and group after the AI anchor.
+if [ -n "$_PYC" ]; then
+  _s49cfg="$HERE/state/slot_cfg.yaml"
+  "$_PYC" - "$_s49cfg" <<'S49GEN'
+import sys, yaml
+doc = {
+    'mixed-port': 7890,
+    'external-controller': '127.0.0.1:9090',
+    'secret': 's49secret',
+    'proxy-providers': {
+        'sub': {'type': 'http', 'url': 'https://sub.example/base', 'interval': 3600,
+                'header': {'x-hwid': 'HWTEST'}},
+    },
+    'proxy-groups': [
+        {'name': 'VPN', 'type': 'url-test', 'use': ['sub'],
+         'url': 'https://www.gstatic.com/generate_204', 'interval': 180},
+        {'name': 'AI', 'type': 'url-test', 'use': ['sub'],
+         'url': 'https://www.gstatic.com/generate_204', 'interval': 180},
+    ],
+    'rules': ['RULE-SET,mtrickle,VPN-noP2P', 'IP-CIDR,10.0.0.0/8,RESERVE'],
+}
+open(sys.argv[1], 'w', encoding='utf-8').write(
+    yaml.safe_dump(doc, allow_unicode=True, sort_keys=False))
+S49GEN
+  grep -qE '^- name: AI$' "$_s49cfg" \
+    && { echo "PASS: S49 fixture uses the post-apply YAML shape that used to break switches"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 fixture is not the post-apply shape"; failn=$((failn+1)); }
+  _S49P="$HERE/../assets/geomask-slot-patch.py"
+  "$_PYC" -B "$_S49P" "$_s49cfg" AI "https://ai-swap.example/v2" >"$HERE/state/s49.out" 2>&1
+  _s49rc=$?
+  if [ "$_s49rc" -eq 0 ] && grep -qF 'created:slot' "$HERE/state/s49.out"; then
+    echo "PASS: S49 AI switch on a shared provider creates an isolated provider"; pass=$((pass+1))
+  else
+    echo "FAIL: S49 AI switch on a shared provider (rc=$_s49rc)"; sed 's/^/    | /' "$HERE/state/s49.out"; failn=$((failn+1))
+  fi
+  grep -qF 'https://ai-swap.example/v2' "$_s49cfg" \
+    && { echo "PASS: S49 the new slot provider carries the AI url"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 slot provider url missing"; failn=$((failn+1)); }
+  grep -qE '^  - slot$' "$_s49cfg" && grep -qE '^  - sub$' "$_s49cfg" \
+    && { echo "PASS: S49 AI rides the slot while VPN still rides sub"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 use lists wrong after the AI switch"; failn=$((failn+1)); }
+  grep -qF 'https://sub.example/base' "$_s49cfg" \
+    && { echo "PASS: S49 the shared provider url stays untouched by the AI switch"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 AI switch moved the shared provider url"; failn=$((failn+1)); }
+  [ "$(grep -cF 'x-hwid: HWTEST' "$_s49cfg")" -ge 2 ] \
+    && { echo "PASS: S49 provider header block copied to the slot provider"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 header block not copied to the slot provider"; failn=$((failn+1)); }
+  "$_PYC" -B "$_S49P" "$_s49cfg" VPN "https://vpn-swap.example/v3" >"$HERE/state/s49.out" 2>&1
+  _s49rc=$?
+  if [ "$_s49rc" -eq 0 ] && grep -qF 'updated:sub' "$HERE/state/s49.out"; then
+    echo "PASS: S49 VPN switch re-points its own (now unshared) provider"; pass=$((pass+1))
+  else
+    echo "FAIL: S49 VPN switch (rc=$_s49rc)"; sed 's/^/    | /' "$HERE/state/s49.out"; failn=$((failn+1))
+  fi
+  grep -qF 'https://vpn-swap.example/v3' "$_s49cfg" && ! grep -qF 'https://sub.example/base' "$_s49cfg" \
+    && { echo "PASS: S49 shared provider url replaced, old url gone"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 provider url not replaced by the VPN switch"; failn=$((failn+1)); }
+  grep -qF 'https://ai-swap.example/v2' "$_s49cfg" && grep -qE '^  - slot$' "$_s49cfg" \
+    && { echo "PASS: S49 AI keeps its isolated slot after the VPN switch"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 VPN switch disturbed the AI isolation"; failn=$((failn+1)); }
+  "$_PYC" -B "$_S49P" "$_s49cfg" VPN-noP2P "https://np-swap.example/v4" >"$HERE/state/s49.out" 2>&1
+  _s49rc=$?
+  if [ "$_s49rc" -eq 0 ] && grep -qF 'created:slot2' "$HERE/state/s49.out"; then
+    echo "PASS: S49 VPN-noP2P switch creates its own provider and group"; pass=$((pass+1))
+  else
+    echo "FAIL: S49 VPN-noP2P switch (rc=$_s49rc)"; sed 's/^/    | /' "$HERE/state/s49.out"; failn=$((failn+1))
+  fi
+  grep -qF 'https://np-swap.example/v4' "$_s49cfg" \
+    && { echo "PASS: S49 the slot2 provider carries the VPN-noP2P url"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 slot2 provider url missing"; failn=$((failn+1)); }
+  _s49np=$(grep -nE '^- name: VPN-noP2P$' "$_s49cfg" | head -1 | cut -d: -f1)
+  [ -n "$_s49np" ] && sed -n "${_s49np},$((_s49np+12))p" "$_s49cfg" | grep -qF 'tolerance: 99999' \
+    && sed -n "${_s49np},$((_s49np+8))p" "$_s49cfg" | grep -qF 'slot2' \
+    && { echo "PASS: S49 the new group rides slot2 with the no-health-check tolerance"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 VPN-noP2P group template wrong"; failn=$((failn+1)); }
+  _s49ai=$(grep -nE '^- name: AI$' "$_s49cfg" | head -1 | cut -d: -f1)
+  [ -n "$_s49ai" ] && [ -n "$_s49np" ] && [ "$_s49np" -gt "$_s49ai" ] \
+    && { echo "PASS: S49 the new group is anchored after the AI group"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 VPN-noP2P group anchor position wrong"; failn=$((failn+1)); }
+  grep -qF 'RULE-SET,mtrickle,VPN-noP2P' "$_s49cfg" && grep -qF ',RESERVE' "$_s49cfg" && ! grep -qF 'mtrickle_bulk' "$_s49cfg" \
+    && { echo "PASS: S49 VPN-noP2P creation leaves the rule table alone"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 VPN-noP2P creation touched the rule table"; failn=$((failn+1)); }
+  "$_PYC" -c "import sys,yaml; yaml.safe_load(open(sys.argv[1],encoding='utf-8'))" "$_s49cfg" 2>/dev/null \
+    && { echo "PASS: S49 the rewritten config is still valid YAML"; pass=$((pass+1)); } \
+    || { echo "FAIL: S49 the rewritten config is not valid YAML"; failn=$((failn+1)); }
+else
+  echo "SKIP: S49 slot patcher functional run (no runnable python)"
+fi
+
+# ==================== S50: node-audit subsystem wiring (v1.28.0) ====================
+echo "=== S50: node-audit subsystem modules, install check and removal ==="
+for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
+          geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
+          geomask-sync-youtube.py geomask-audit-scheduler.py geomask-slot-patch.py; do
+  grep -qF "\"$_m\":" "$HERE/../build.py" \
+    && { echo "PASS: S50 build MAP has: $_m"; pass=$((pass+1)); } \
+    || { echo "FAIL: S50 build MAP missing: $_m"; failn=$((failn+1)); }
+  grep -qF "/usr/lib/geomask/$_m" "$SCRIPT" \
+    && { echo "PASS: S50 installer ships: $_m"; pass=$((pass+1)); } \
+    || { echo "FAIL: S50 installer does not ship: $_m"; failn=$((failn+1)); }
+done
+grep -qF 'rm -f "$(P /usr/lib/geomask/$_m)"' "$SCRIPT" \
+  && { echo "PASS: S50 uninstall removes the audit modules"; pass=$((pass+1)); } \
+  || { echo "FAIL: S50 uninstall leaves the audit modules"; failn=$((failn+1)); }
+grep -qF 'step2_check' "$SCRIPT" && grep -qF '/usr/lib/geomask/geomask-audit-state.py' "$SCRIPT" \
+  && { echo "PASS: S50 step2_check verifies the audit modules"; pass=$((pass+1)); } \
+  || { echo "FAIL: S50 step2_check does not verify the audit modules"; failn=$((failn+1)); }
+grep -qF 'event log and the immutable report/pool directories are deliberately KEPT' "$SCRIPT" \
+  && { echo "PASS: S50 uninstall documents that settings and evidence survive"; pass=$((pass+1)); } \
+  || { echo "FAIL: S50 uninstall does not document retained state"; failn=$((failn+1)); }
+# every shipped module must be syntactically valid python
+if [ -n "$_PYC" ]; then
+  for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
+            geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
+            geomask-sync-youtube.py geomask-audit-scheduler.py geomask-slot-patch.py; do
+    if "$_PYC" -m py_compile "$HERE/../assets/$_m" >/dev/null 2>&1; then
+      echo "PASS: S50 compiles: $_m"; pass=$((pass+1))
+    else
+      echo "FAIL: S50 syntax error in: $_m"; failn=$((failn+1))
+    fi
+  done
+else
+  echo "SKIP: S50 module compile check (no runnable python)"
+fi
+# the legacy scanner must no longer own the managed 'exclude-filter' write path unconditionally
+grep -qF 'apply_filter_all' "$HERE/../assets/geomask-node-scan.sh" \
+  && { echo "PASS: S50 legacy scanner still isolated behind its own flag"; pass=$((pass+1)); } \
+  || { echo "FAIL: S50 legacy scanner changed unexpectedly"; failn=$((failn+1)); }
+# the new scheduler RPCs must be wired in all four generated points
+for _m in nodes_audit_schedule_get nodes_audit_schedule_set nodes_audit_events_get \
+          nodes_path_preview nodes_path_apply; do
+  if grep -qF -- "$_m" "$HERE/../assets/geo-backend.sh" \
+     && grep -qF -- "$_m" "$HERE/../assets/geo-sync" \
+     && grep -qF -- "$_m" "$HERE/../assets/acl-geo-sync.json" \
+     && grep -qF -- "$_m" "$HERE/../assets/geo-sync-page.js"; then
+    echo "PASS: S50 $_m wired in backend+wrapper+acl+panel"; pass=$((pass+1))
+  else
+    echo "FAIL: S50 $_m not wired in all four points"; failn=$((failn+1))
+  fi
+done
 
 echo ""
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="

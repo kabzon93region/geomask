@@ -61,11 +61,14 @@ _provision_netfw() {
   fi
   # A /32 tun subnet means the lan->lane forwarding alone does NOT emit an accept rule
   # (fw4 leaves accept_to_<zone> empty). Add the explicit accept, same as the AI lane does.
+  # WireGuard peers need the same line: MagiTrickle can route a phone into this lane too,
+  # and without it fw4 answers the peer with a TCP reset (found on the AI lane, 10.11).
   mkdir -p /usr/share/nftables.d/ruleset-post
   cat > "$NFT" <<EOF
 table inet fw4 {
     chain accept_to_$LANE_NAME {
         iifname "br-lan" oifname "$LANE_NAME" counter accept comment "geomask-lane: LAN clients to $LANE_NAME tunnel"
+        iifname "Wireguard" oifname "$LANE_NAME" counter accept comment "geomask-lane: WG peers to $LANE_NAME tunnel"
     }
 }
 EOF

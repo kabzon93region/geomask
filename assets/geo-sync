@@ -8,45 +8,60 @@ BACKEND="/usr/bin/geo-backend.sh"
 
 list_methods() {
 	json_init
-	json_add_object "status";     json_close_object
-	json_add_object "leases";     json_close_object
-	json_add_object "log";        json_close_object
-	json_add_object "backups";    json_close_object
-	json_add_object "stack";      json_close_object
-	json_add_object "nodescan";   json_close_object
-	json_add_object "nodes_get";  json_close_object
-	json_add_object "nodes_set";  json_add_string "enabled" "string"; json_add_string "schedule" "string"; json_add_string "countries" "string"; json_add_string "asns" "string"; json_add_string "base" "string"; json_add_string "provider" "string"; json_close_object
-	json_add_object "sync_set";   json_add_string "interval" "string"; json_close_object
-	json_add_object "syncd_set";  json_add_string "state" "string"; json_close_object
-	json_add_object "pin_set";    json_add_string "state" "string"; json_close_object
-	json_add_object "lists_get";  json_close_object
-	json_add_object "lists_seed"; json_close_object
-	json_add_object "yt_get";     json_close_object
-	json_add_object "yt_mode";    json_add_string "mode" "string"; json_close_object
-	json_add_object "yt_reset";   json_close_object
-	json_add_object "torrent_get"; json_close_object
-	json_add_object "torrent_refresh"; json_close_object
-	json_add_object "torrent_listener"; json_add_string "state" "string"; json_close_object
-	json_add_object "torrent_extra"; json_add_string "hosts" "string"; json_close_object
-	json_add_object "sync_lists"; json_close_object
-	json_add_object "aidns";      json_close_object
-	json_add_object "google";     json_close_object
-	json_add_object "global";     json_add_string "mode" "string"; json_close_object
-	json_add_object "ipv6";       json_add_string "state" "string"; json_close_object
-	json_add_object "dev_add";    json_add_string "ip" "string"; json_add_string "mode" "string"; json_add_string "mac" "string"; json_add_string "name" "string"; json_close_object
-	json_add_object "dev_del";    json_add_string "ip" "string"; json_close_object
-	json_add_object "ai_sub_get"; json_close_object
-	json_add_object "ai_sub_set"; json_add_string "url" "string"; json_close_object
-	json_add_object "subs_list";  json_close_object
-	json_add_object "subs_seed"; json_close_object
-	json_add_object "sub_add";    json_add_string "name" "string"; json_add_string "url" "string"; json_close_object
-	json_add_object "sub_del";    json_add_string "id" "string"; json_close_object
-	json_add_object "ai_sub_use";   json_add_string "id" "string"; json_close_object
-	json_add_object "vpn_sub_use";  json_add_string "id" "string"; json_close_object
-	json_add_object "vpnnp_sub_use"; json_add_string "id" "string"; json_close_object
-	json_add_object "upd_check";    json_add_string "force" "string"; json_close_object
-	json_add_object "upd_status";   json_close_object
-	json_add_object "upd_apply";    json_close_object
+	# >>> geo-rpc generated:list (tools/geo-rpc.json) >>>
+	json_add_object "status";                   json_close_object
+	json_add_object "leases";                   json_close_object
+	json_add_object "log";                      json_close_object
+	json_add_object "backups";                  json_close_object
+	json_add_object "stack";                    json_close_object
+	json_add_object "nodescan";                 json_close_object
+	json_add_object "nodes_get";                json_close_object
+	json_add_object "nodes_paths_get";          json_close_object
+	json_add_object "nodes_path_save";          json_add_string "path_id" "string"; json_add_string "countries" "string"; json_add_string "expected_revision" "string"; json_close_object
+	json_add_object "nodes_path_check";         json_add_string "path_id" "string"; json_close_object
+	json_add_object "nodes_audit_events_get";   json_add_string "path_id" "string"; json_add_string "before" "string"; json_add_string "limit" "string"; json_close_object
+	json_add_object "nodes_audit_job_get";      json_add_string "job_id" "string"; json_close_object
+	json_add_object "nodes_audit_cancel";       json_add_string "job_id" "string"; json_close_object
+	json_add_object "nodes_set";                json_add_string "enabled" "string"; json_add_string "schedule" "string"; json_add_string "countries" "string"; json_add_string "asns" "string"; json_add_string "base" "string"; json_add_string "provider" "string"; json_close_object
+	json_add_object "sync_set";                 json_add_string "interval" "string"; json_close_object
+	json_add_object "syncd_set";                json_add_string "state" "string"; json_close_object
+	json_add_object "pin_set";                  json_add_string "state" "string"; json_close_object
+	json_add_object "lists_get";                json_close_object
+	json_add_object "lists_seed";               json_close_object
+	json_add_object "yt_get";                   json_close_object
+	json_add_object "yt_mode";                  json_add_string "mode" "string"; json_close_object
+	json_add_object "yt_reset";                 json_close_object
+	json_add_object "torrent_get";              json_close_object
+	json_add_object "torrent_refresh";          json_close_object
+	json_add_object "torrent_listener";         json_add_string "state" "string"; json_close_object
+	json_add_object "torrent_extra";            json_add_string "hosts" "string"; json_close_object
+	json_add_object "sync_lists";               json_close_object
+	json_add_object "aidns";                    json_close_object
+	json_add_object "google";                   json_close_object
+	json_add_object "global";                   json_add_string "mode" "string"; json_close_object
+	json_add_object "ipv6";                     json_add_string "state" "string"; json_close_object
+	json_add_object "dev_add";                  json_add_string "ip" "string"; json_add_string "mode" "string"; json_add_string "mac" "string"; json_add_string "name" "string"; json_close_object
+	json_add_object "dev_del";                  json_add_string "ip" "string"; json_close_object
+	json_add_object "ai_sub_get";               json_close_object
+	json_add_object "ai_sub_set";               json_add_string "url" "string"; json_close_object
+	json_add_object "subs_list";                json_close_object
+	json_add_object "subs_seed";                json_close_object
+	json_add_object "sub_add";                  json_add_string "name" "string"; json_add_string "url" "string"; json_close_object
+	json_add_object "sub_del";                  json_add_string "id" "string"; json_close_object
+	json_add_object "ai_sub_use";               json_add_string "id" "string"; json_close_object
+	json_add_object "vpn_sub_use";              json_add_string "id" "string"; json_close_object
+	json_add_object "vpnnp_sub_use";            json_add_string "id" "string"; json_close_object
+	json_add_object "upd_check";                json_add_string "force" "string"; json_close_object
+	json_add_object "upd_status";               json_close_object
+	json_add_object "upd_apply";                json_close_object
+	json_add_object "nodes_path_preview";       json_add_string "path_id" "string"; json_add_string "report_id" "string"; json_add_string "expected_path_revision" "string"; json_add_string "expected_source_revision" "string"; json_close_object
+	json_add_object "nodes_path_apply";         json_add_string "path_id" "string"; json_add_string "preview_id" "string"; json_add_string "expected_path_revision" "string"; json_close_object
+	json_add_object "nodes_path_revoke";        json_add_string "path_id" "string"; json_close_object
+	json_add_object "nodes_path_apply_status";  json_add_string "path_id" "string"; json_close_object
+	json_add_object "mtrickle_sync";            json_close_object
+	json_add_object "nodes_audit_schedule_get"; json_add_string "path_id" "string"; json_close_object
+	json_add_object "nodes_audit_schedule_set"; json_add_string "path_id" "string"; json_add_string "enabled" "string"; json_add_string "time" "string"; json_add_string "mode" "string"; json_close_object
+	# <<< geo-rpc generated:list <<<
 	json_dump
 }
 
@@ -54,47 +69,69 @@ call_method() {
 	local input method
 	method="$1"
 	input="$(cat)"
+	case "$method" in
+		nodes_paths_get|nodes_path_save|nodes_path_check)
+			# Validate raw types/control characters before jshn can coerce/drop them.
+			_guard=$(printf '%s' "$input" | python3 "${GM_NODE_AUDIT:-/usr/lib/geomask/geomask-node-audit.py}" validate-rpc "$method")
+			[ "$?" = 0 ] || { printf '%s\n' "$_guard"; return 1; }
+			;;
+	esac
 	json_load "$input" 2>/dev/null
 	case "$method" in
-		status)     "$BACKEND" status ;;
-		leases)     "$BACKEND" leases ;;
-		log)        "$BACKEND" log ;;
-		backups)    "$BACKEND" backups ;;
-		stack)      "$BACKEND" stack ;;
-		nodescan)   "$BACKEND" nodescan ;;
-		nodes_get)  "$BACKEND" nodes_get ;;
-		nodes_set)  json_get_var enabled enabled; json_get_var schedule schedule; json_get_var countries countries; json_get_var asns asns; json_get_var base base; json_get_var provider provider; "$BACKEND" nodes_set "$enabled" "$schedule" "$countries" "$asns" "$base" "$provider" ;;
-		sync_set)   json_get_var interval interval; "$BACKEND" sync_set "$interval" ;;
-		syncd_set)  json_get_var state state; "$BACKEND" syncd_set "$state" ;;
-		pin_set)    json_get_var state state; "$BACKEND" pin_set "$state" ;;
-		lists_get)  "$BACKEND" lists_get ;;
-		lists_seed) "$BACKEND" lists_seed ;;
-		yt_get)     "$BACKEND" yt_get ;;
-		yt_mode)    json_get_var mode mode; "$BACKEND" yt_mode "$mode" ;;
-		yt_reset)   "$BACKEND" yt_reset ;;
-		torrent_get)      "$BACKEND" torrent_get ;;
-		torrent_refresh)  "$BACKEND" torrent_refresh ;;
-		torrent_listener) json_get_var state state; "$BACKEND" torrent_listener "$state" ;;
-		torrent_extra)    json_get_var hosts hosts; "$BACKEND" torrent_extra "$hosts" ;;
-		sync_lists) "$BACKEND" sync_lists ;;
-		aidns)      "$BACKEND" aidns ;;
-		google)     "$BACKEND" google ;;
-		global)     json_get_var mode mode;   "$BACKEND" global "$mode" ;;
-		ipv6)       json_get_var state state; "$BACKEND" ipv6 "$state" ;;
-		dev_add)    json_get_var ip ip; json_get_var mode mode; json_get_var mac mac; json_get_var name name; "$BACKEND" dev_add "$ip" "$mode" "$mac" "$name" ;;
-		dev_del)    json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;
-		ai_sub_get) "$BACKEND" ai_sub_get ;;
-		ai_sub_set) json_get_var url url; "$BACKEND" ai_sub_set "$url" ;;
-		subs_list)  "$BACKEND" subs_list ;;
-		subs_seed)  "$BACKEND" subs_seed ;;
-		sub_add)    json_get_var name name; json_get_var url url; "$BACKEND" sub_add "$name" "$url" ;;
-		sub_del)    json_get_var id id; "$BACKEND" sub_del "$id" ;;
-		ai_sub_use)   json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;
-		vpn_sub_use)  json_get_var id id; "$BACKEND" vpn_sub_use "$id" ;;
-		vpnnp_sub_use) json_get_var id id; "$BACKEND" vpnnp_sub_use "$id" ;;
-		upd_check)    json_get_var force force; "$BACKEND" upd_check "$force" ;;
-		upd_status)   "$BACKEND" upd_status ;;
-		upd_apply)    "$BACKEND" upd_apply ;;
+		# >>> geo-rpc generated:call (tools/geo-rpc.json) >>>
+		status)                   "$BACKEND" status ;;
+		leases)                   "$BACKEND" leases ;;
+		log)                      "$BACKEND" log ;;
+		backups)                  "$BACKEND" backups ;;
+		stack)                    "$BACKEND" stack ;;
+		nodescan)                 "$BACKEND" nodescan ;;
+		nodes_get)                "$BACKEND" nodes_get ;;
+		nodes_paths_get)          "$BACKEND" nodes_paths_get ;;
+		nodes_path_save)          json_get_var path_id path_id; json_get_var countries countries; json_get_var expected_revision expected_revision; "$BACKEND" nodes_path_save "$path_id" "$countries" "$expected_revision" ;;
+		nodes_path_check)         json_get_var path_id path_id; "$BACKEND" nodes_path_check "$path_id" ;;
+		nodes_audit_events_get)   json_get_var path_id path_id; json_get_var before before; json_get_var limit limit; "$BACKEND" nodes_audit_events_get "$path_id" "$before" "$limit" ;;
+		nodes_audit_job_get)      json_get_var job_id job_id; "$BACKEND" nodes_audit_job_get "$job_id" ;;
+		nodes_audit_cancel)       json_get_var job_id job_id; "$BACKEND" nodes_audit_cancel "$job_id" ;;
+		nodes_set)                json_get_var enabled enabled; json_get_var schedule schedule; json_get_var countries countries; json_get_var asns asns; json_get_var base base; json_get_var provider provider; "$BACKEND" nodes_set "$enabled" "$schedule" "$countries" "$asns" "$base" "$provider" ;;
+		sync_set)                 json_get_var interval interval; "$BACKEND" sync_set "$interval" ;;
+		syncd_set)                json_get_var state state; "$BACKEND" syncd_set "$state" ;;
+		pin_set)                  json_get_var state state; "$BACKEND" pin_set "$state" ;;
+		lists_get)                "$BACKEND" lists_get ;;
+		lists_seed)               "$BACKEND" lists_seed ;;
+		yt_get)                   "$BACKEND" yt_get ;;
+		yt_mode)                  json_get_var mode mode; "$BACKEND" yt_mode "$mode" ;;
+		yt_reset)                 "$BACKEND" yt_reset ;;
+		torrent_get)              "$BACKEND" torrent_get ;;
+		torrent_refresh)          "$BACKEND" torrent_refresh ;;
+		torrent_listener)         json_get_var state state; "$BACKEND" torrent_listener "$state" ;;
+		torrent_extra)            json_get_var hosts hosts; "$BACKEND" torrent_extra "$hosts" ;;
+		sync_lists)               "$BACKEND" sync_lists ;;
+		aidns)                    "$BACKEND" aidns ;;
+		google)                   "$BACKEND" google ;;
+		global)                   json_get_var mode mode; "$BACKEND" global "$mode" ;;
+		ipv6)                     json_get_var state state; "$BACKEND" ipv6 "$state" ;;
+		dev_add)                  json_get_var ip ip; json_get_var mode mode; json_get_var mac mac; json_get_var name name; "$BACKEND" dev_add "$ip" "$mode" "$mac" "$name" ;;
+		dev_del)                  json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;
+		ai_sub_get)               "$BACKEND" ai_sub_get ;;
+		ai_sub_set)               json_get_var url url; "$BACKEND" ai_sub_set "$url" ;;
+		subs_list)                "$BACKEND" subs_list ;;
+		subs_seed)                "$BACKEND" subs_seed ;;
+		sub_add)                  json_get_var name name; json_get_var url url; "$BACKEND" sub_add "$name" "$url" ;;
+		sub_del)                  json_get_var id id; "$BACKEND" sub_del "$id" ;;
+		ai_sub_use)               json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;
+		vpn_sub_use)              json_get_var id id; "$BACKEND" vpn_sub_use "$id" ;;
+		vpnnp_sub_use)            json_get_var id id; "$BACKEND" vpnnp_sub_use "$id" ;;
+		upd_check)                json_get_var force force; "$BACKEND" upd_check "$force" ;;
+		upd_status)               "$BACKEND" upd_status ;;
+		upd_apply)                "$BACKEND" upd_apply ;;
+		nodes_path_preview)       json_get_var path_id path_id; json_get_var report_id report_id; json_get_var expected_path_revision expected_path_revision; json_get_var expected_source_revision expected_source_revision; "$BACKEND" nodes_path_preview "$path_id" "$report_id" "$expected_path_revision" "$expected_source_revision" ;;
+		nodes_path_apply)         json_get_var path_id path_id; json_get_var preview_id preview_id; json_get_var expected_path_revision expected_path_revision; "$BACKEND" nodes_path_apply "$path_id" "$preview_id" "$expected_path_revision" ;;
+		nodes_path_revoke)        json_get_var path_id path_id; "$BACKEND" nodes_path_revoke "$path_id" ;;
+		nodes_path_apply_status)  json_get_var path_id path_id; "$BACKEND" nodes_path_apply_status "$path_id" ;;
+		mtrickle_sync)            "$BACKEND" mtrickle_sync ;;
+		nodes_audit_schedule_get) json_get_var path_id path_id; "$BACKEND" nodes_audit_schedule_get "$path_id" ;;
+		nodes_audit_schedule_set) json_get_var path_id path_id; json_get_var enabled enabled; json_get_var time time; json_get_var mode mode; "$BACKEND" nodes_audit_schedule_set "$path_id" "$enabled" "$time" "$mode" ;;
+		# <<< geo-rpc generated:call <<<
 		*) echo '{"error":"unknown method"}'; return 1 ;;
 	esac
 }

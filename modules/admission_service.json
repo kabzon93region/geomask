@@ -1,0 +1,45 @@
+{
+  "id": "admission_service",
+  "name": "AI Admission Service",
+  "version": "1.0.0",
+  "schema_version": 1,
+  "type": "service",
+  "description": "AI node admission proof via multi-service verification",
+  "author": "geomask",
+  "license": "MIT",
+  "dependencies": [
+    {
+      "module_id": "core",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": ""
+    }
+  ],
+  "provides": [
+    "admission_proof",
+    "admission_cache"
+  ],
+  "owned_resources": [
+    {
+      "type": "file",
+      "path": "/usr/lib/geomask/admission_service.py",
+      "description": ""
+    },
+    {
+      "type": "cache",
+      "path": "/tmp/geomask-admission-cache.json",
+      "description": ""
+    }
+  ],
+  "config_files": [],
+  "config_schema": {},
+  "services": [],
+  "cron_jobs": [],
+  "rpc_methods": [
+    "admission_cache_get"
+  ],
+  "state": "enabled",
+  "enabled": true,
+  "created_at": "2026-11-07T19:08:47.715990Z",
+  "updated_at": "2026-11-07T19:08:47.715990Z"
+}

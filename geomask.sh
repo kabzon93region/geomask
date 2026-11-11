@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.25.3"
+GM_VERSION="1.27.10"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -166,6 +166,16 @@ step1_verify() { step1_check; }
 step2_check() {
   _need=0
   for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
+           /usr/lib/geomask/geomask-node-audit.py \
+           /usr/lib/geomask/geomask-audit-state.py \
+           /usr/lib/geomask/geomask-config-tx.py \
+           /usr/lib/geomask/geomask-config-owner.py \
+           /usr/lib/geomask/geomask-apply.py \
+           /usr/lib/geomask/geomask-lane-torrent.py \
+           /usr/lib/geomask/geomask-sync-youtube.py \
+           /usr/lib/geomask/geomask-audit-scheduler.py \
+           /usr/lib/geomask/geomask-subscription-status.py \
+           /usr/lib/geomask/geomask-slot-patch.py \
            /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
            /usr/share/luci/menu.d/luci-app-geo-sync.json \
            /www/luci-static/resources/view/geo-sync/main.js; do
@@ -179,6 +189,4603 @@ step2_check() {
   return $_need
 }
 step2_apply() {
+  save_stream /usr/lib/geomask/geomask-node-audit.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Independent desired country filters and isolated service-egress observations.
+Schema v2: independent path revisions, source bindings, events, immutable pools.
+Never applies filters to production. Unknown service geography is not admission.
+"""
+import argparse
+import contextlib
+import datetime
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+# Load state module
+import importlib.util
+STATE_MODULE_PATH = Path(__file__).with_name('geomask-audit-state.py')
+_state_spec = importlib.util.spec_from_file_location('audit_state', STATE_MODULE_PATH)
+_state = importlib.util.module_from_spec(_state_spec)
+_state_spec.loader.exec_module(_state)
+
+# Path constants (can be patched by tests)
+STORE = Path(os.environ.get('GM_AUDIT_STORE', '/etc/geomask/node-audit.json'))
+STATE = Path(os.environ.get('GM_AUDIT_STATE', '/etc/geomask/node-audit/state'))
+STATE = STATE  # alias for backward compat
+CONFIG = Path(os.environ.get('GM_AUDIT_CONFIG', '/etc/mihomo/config.yaml'))
+RECEIPT = Path(os.environ.get('GM_AUDIT_RECEIPT', '/tmp/geomask-node-audit-receipt.json'))
+EVENTS = Path(os.environ.get('GM_AUDIT_EVENTS', '/etc/geomask/node-audit/events.jsonl'))
+POOLS_DIR = Path(os.environ.get('GM_AUDIT_POOLS', '/etc/geomask/node-audit/pools'))
+MAX_NODES = _state.MAX_NODES
+REGISTRY = Path(os.environ.get('GM_AUDIT_REGISTRY', '/etc/geomask-subs.list'))
+
+# Re-export from state module
+PATHS = _state.PATHS
+
+# Backward compat: atomic function
+atomic = _state.atomic_write
+
+AuditError = _state.AuditError
+stamp = _state.stamp
+_save_node_snapshot = _state.save_node_snapshot
+load_node_snapshot = _state.load_node_snapshot
+digest = _state.digest
+encode = _state.encode
+canonical_json = _state.canonical_json
+strict_json = _state.strict_json
+path_id = _state.path_id
+countries = _state.countries
+locked = _state.locked
+atomic_write = _state.atomic_write
+
+# State module functions with explicit path parameters
+def _load_store():
+    return _state.load_store(STORE)
+
+def _save_store(data):
+    return _state.save_store(data, STORE)
+
+def _append_event(event):
+    return _state.append_event(event, EVENTS)
+
+def _get_events(path=None, before=None, limit=50):
+    return _state.get_events(path, before, limit, EVENTS)
+
+def _load_pool(path_id, generation):
+    return _state.load_pool(path_id, generation, POOLS_DIR)
+
+def _save_pool(path_id, generation, pool_data):
+    return _state.save_pool(path_id, generation, pool_data, POOLS_DIR)
+
+def _resolve_source_binding(config, ident, providers=None):
+    return _state.resolve_source_binding(config, ident, providers)
+
+def _compute_path_revision(path_data):
+    return _state.compute_path_revision(path_data)
+
+# Backward compat: expose load_store
+load_store = _load_store
+
+# Reports directory
+REPORTS_DIR = Path(os.environ.get('GM_AUDIT_REPORTS', '/etc/geomask/node-audit/reports'))
+
+# State module functions with explicit path parameters
+def _save_report(report):
+    return _state.save_report(report, REPORTS_DIR)
+
+def _list_reports(path_id=None, limit=50):
+    return _state.list_reports(path_id, limit, REPORTS_DIR)
+
+# Legacy constants for backward compatibility
+REVISION_KEY = 'revision'  # whole-store digest for legacy RPC
+
+def boot_id():
+    return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+def render_save(data, ident, allow):
+    """Legacy render for backward compatibility with prepare-save."""
+    result = json.loads(json.dumps(data))
+    result['paths'].setdefault(ident, {})['countries_allow'] = allow
+    result['generation'] = result.get('generation', 0) + 1
+    return encode(result)
+
+def prepare_save(ident, value, expected):
+    """Legacy prepare-save: validates countries, returns candidate info using path_revision."""
+    ident, allow = path_id(ident), countries(value)
+    data, original_raw = _load_store()
+    # Legacy: expected is whole-store revision, but we now use path_revision
+    # Compute current whole-store digest for backward compat
+    current_revision = digest(original_raw) if original_raw else digest(encode(data))
+    if expected != current_revision:
+        raise AuditError('STALE: reload settings before saving')
+    # Check if change would actually modify anything
+    current_allow = data['paths'].get(ident, {}).get('countries_allow', PATHS[ident][1])
+    changed = current_allow != allow
+    candidate = render_save(data, ident, allow) if changed else None
+    return {'ok': True, 'before_sha256': current_revision,
+            'candidate_sha256': digest(candidate) if candidate else '',
+            'boot_id': boot_id(), 'path_id': ident, 'changed': changed}
+
+def save(ident, value, expected):
+    """Save countries for a path using path_revision (v2) or whole-store revision (legacy)."""
+    ident, allow = path_id(ident), countries(value)
+    with locked('settings'):
+        data, original_raw = _load_store()
+        # Check revision: try path_revision first, fall back to whole-store for legacy
+        current_revision = digest(original_raw) if original_raw else digest(encode(data))
+        path_rev = data['paths'].get(ident, {}).get('path_revision', '')
+        
+        revision_ok = False
+        if expected == path_rev:
+            revision_ok = True
+        elif expected == current_revision:
+            # Legacy whole-store revision
+            revision_ok = True
+        if not revision_ok:
+            raise AuditError('STALE: reload settings before saving')
+        
+        # No-op check
+        current_allow = data['paths'].get(ident, {}).get('countries_allow', PATHS[ident][1])
+        if current_allow == allow:
+            return {'ok': True, 'changed': False, 'revision': path_rev or current_revision, 'applied': False}
+        
+        # Update path data
+        data['paths'][ident]['countries_allow'] = allow
+        data['paths'][ident]['path_revision'] = _compute_path_revision(data['paths'][ident])
+        data['paths'][ident]['path_generation'] = data['paths'][ident].get('path_generation', 0) + 1
+        data['paths'][ident]['configured'] = True
+        
+        _save_store(data)
+        _append_event({
+            'path': ident,
+            'actor': 'luci',
+            'action': 'save',
+            'old_countries': current_allow,
+            'new_countries': allow,
+            'path_revision': data['paths'][ident]['path_revision'],
+            'path_generation': data['paths'][ident]['path_generation'],
+            'result': 'success'
+        })
+        return {'ok': True, 'changed': True, 'revision': data['paths'][ident]['path_revision'], 'applied': False}
+
+def yaml_load(raw):
+    import yaml
+    try:
+        value = _state.yaml12_load(raw)
+        if not isinstance(value, dict):
+            raise AuditError('expected YAML mapping')
+        return value
+    except yaml.YAMLError:
+        raise AuditError('invalid YAML source') from None
+
+def resolve_source(config, ident):
+    """Legacy: returns group_name and provider_ids."""
+    group_name = PATHS[path_id(ident)][0]
+    matches = [g for g in config.get('proxy-groups', []) if g.get('name') == group_name]
+    if len(matches) != 1:
+        raise AuditError('missing or duplicate target group')
+    providers = matches[0].get('use')
+    if not isinstance(providers, list) or not 1 <= len(providers) <= 3 or any(not isinstance(p, str) for p in providers):
+        raise AuditError('target group requires provider use list')
+    registry = config.get('proxy-providers') or {}
+    if any(p not in registry for p in providers):
+        raise AuditError('target provider missing')
+    return group_name, list(dict.fromkeys(providers))
+
+MANAGED_PREFIX = 'audit-'
+
+def resolve_audit_source(config, ident, path_data=None, previous_report=None):
+    """Resolve the subscription this path audits, even while it is applied.
+
+    An apply replaces the group's source with a managed file provider. Resolving naively
+    would then point the next check at our own frozen pool, so an applied path could never
+    be audited again -- and the nightly run would fail on it forever. The original
+    providers are recorded at apply time and in the last report; use those.
+    """
+    group_name, providers = resolve_source(config, ident)
+    managed = [p for p in providers if p.startswith(MANAGED_PREFIX)]
+    if not managed:
+        return group_name, providers
+
+    recorded = ((path_data or {}).get('applied') or {}).get('previous_use') or []
+    if not recorded and previous_report:
+        recorded = [p for p in (previous_report.get('providers') or [])
+                    if not str(p).startswith(MANAGED_PREFIX)]
+    registry = config.get('proxy-providers') or {}
+    usable = [p for p in recorded if p in registry]
+    if not usable:
+        raise AuditError('path is applied to a managed pool and its original source is not '
+                         'recorded in the mihomo config; refusing to audit the frozen pool')
+    return group_name, list(dict.fromkeys(usable))
+
+def get():
+    """Get all paths with v2 state: path_revision, source_binding, schedule, applied."""
+    data, original_raw = _load_store()
+    current_source = None
+    config = {}
+    try:
+        current_raw = CONFIG.read_bytes()
+        current_source = digest(current_raw)
+        config = yaml_load(current_raw)
+    except (OSError, AuditError):
+        pass
+
+    # The revision handed to the UI must be the same value save() compares against,
+    # otherwise an un-migrated store can never be written.
+    revision = digest(original_raw) if original_raw else digest(encode(data))
+
+    result = []
+    for ident, (label, defaults) in PATHS.items():
+        path_data = data['paths'].get(ident, {})
+        configured = path_data.get('configured', False)
+
+        report = None
+        state_file = STATE / (ident + '.json')
+        if state_file.exists():
+            try:
+                report = strict_json(state_file.read_bytes())
+            except (AuditError, OSError):
+                report = {'status': 'error', 'error': 'unreadable report'}
+
+        try:
+            # Resolve the subscription this path audits, not our own frozen pool.
+            _, providers = resolve_audit_source(config, ident, path_data, report)
+            binding = _resolve_source_binding(config, ident, providers)
+            source_revision = binding.get('source_fingerprint') if binding else None
+        except AuditError:
+            providers = []
+            binding = None
+            source_revision = None
+
+        if report and report.get('status') != 'error':
+            stale = False
+            if report.get('settings_revision') != path_data.get('path_revision', ''):
+                stale = True
+            if current_source and report.get('source_revision') != current_source:
+                stale = True
+            if stale:
+                report = dict(report, stale=True)
+
+        applied = path_data.get('applied', {})
+        applied_bool = applied.get('status') in ('applied', 'applying')
+        result.append({
+            'id': ident,
+            'label': label,
+            'providers': providers,
+            'source_binding': binding,
+            'source_revision': source_revision,
+            'configured': configured,
+            'countries_allow': path_data.get('countries_allow', defaults),
+            'path_revision': path_data.get('path_revision', ''),
+            'path_generation': path_data.get('path_generation', 0),
+            'schedule': path_data.get('schedule', {'enabled': False, 'time': '03:30',
+                                                   'mode': 'check-only'}),
+            'applied': applied_bool,
+            'applied_detail': {
+                'generation': applied.get('generation', 0),
+                'path_revision': applied.get('path_revision', ''),
+                'runtime_verified': applied.get('runtime_verified', False),
+                'status': applied.get('status', 'never'),
+                'applied_at': applied.get('applied_at', ''),
+                'node_count': applied.get('node_count', 0),
+                'pool_digest': applied.get('pool_digest', ''),
+                'acting_countries': applied.get('acting_countries') or [],
+                'provider_id': applied.get('provider_id', ''),
+            },
+            'report': report,
+        })
+
+    return {
+        'ok': True,
+        'api_schema': 2,
+        'revision': revision,
+        'paths': result,
+        'apply_supported': True,
+        'scope': 'desired filters, isolated observations, and explicit per-path apply',
+    }
+
+def fetch_nodes(provider):
+    url = provider.get('url', '')
+    if not isinstance(url, str) or urllib.parse.urlsplit(url).scheme != 'https':
+        raise AuditError('provider must use HTTPS for the isolated audit')
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise AuditError('invalid provider endpoint')
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+            raise AuditError('non-public subscription endpoint is not supported')
+    except OSError:
+        raise AuditError('subscription hostname could not be resolved') from None
+    headers = {'User-Agent': 'clash-meta'}
+    for key, value in (provider.get('header') or {}).items():
+        headers[key] = str(value[0] if isinstance(value, list) else value)
+    headers['User-Agent'] = 'clash-meta'
+    try:
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+                raise AuditError('subscription redirect refused; no credentials forwarded')
+        opener = urllib.request.build_opener(NoRedirect)
+        with opener.open(urllib.request.Request(url, headers=headers), timeout=30) as response:
+            raw = response.read(2_000_001)
+        if len(raw) > 2_000_000:
+            raise AuditError('subscription too large')
+        nodes = yaml_load(raw).get('proxies')
+    except Exception as exc:
+        if isinstance(exc, AuditError):
+            raise
+        raise AuditError('subscription request failed (' + type(exc).__name__ + ')') from None
+    if not isinstance(nodes, list) or not 3 <= len(nodes) <= MAX_NODES:
+        raise AuditError('unexpected subscription node count (expected 3..100)')
+    names = set()
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get('name'), str) or not node.get('server'):
+            raise AuditError('malformed subscription node')
+        name = node['name']
+        if name in names or any(ord(char) < 32 for char in name):
+            raise AuditError('duplicate or invalid node name')
+        names.add(name)
+    return nodes, digest(raw)
+
+# AI admission criterion, decided by the owner on 09.11.2026: a node is judged by the
+# services whose geography it can actually report. Google does not disclose a country in any
+# machine-readable form -- a real SERP fetched through a verified node carried no uule, no
+# region/countryCode/country/gl field, no data-country and no "Google offered in" -- so
+# requiring it would block every node forever while proving nothing about where it exits.
+AI_REQUIRED_SERVICES = ['cloudflare', 'chatgpt']
+# Probed and recorded, never used as a gate. The report says "unmeasurable", not "failed".
+AI_INFORMATIONAL_SERVICES = ['google']
+
+# Bumped when the measuring method changes; a report carries it so a later reader can tell
+# which findings were produced by which method instead of comparing unlike numbers.
+PROBE_VERSION = 'service-egress-2'
+
+def classify(ident, allow, probes):
+    required = AI_REQUIRED_SERVICES if ident == 'ai' else ['cloudflare']
+    reasons = []
+    unknown = False
+    failed = False
+    for service in required:
+        probe = probes.get(service, {})
+        country = probe.get('country')
+        if probe.get('status') != 'ok' or not country:
+            unknown = True
+            reasons.append(service + ': geography unknown or probe failed')
+        elif country not in allow:
+            failed = True
+            reasons.append(service + ': ' + country + ' not allowed')
+    status = 'excluded' if failed else 'unknown' if unknown else 'eligible'
+    result = {'status': status, 'reasons': reasons, 'admitted': status == 'eligible'}
+    if ident == 'ai':
+        # Recorded so the panel can say what is known and what simply cannot be measured.
+        informational = {}
+        for service in AI_INFORMATIONAL_SERVICES:
+            probe = probes.get(service) or {}
+            country = probe.get('country')
+            informational[service] = {
+                'measured': bool(country),
+                'country': country or None,
+                'policy': 'not-required',
+            }
+        result['informational'] = informational
+    return result
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+class IsolatedProbe:
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.work = None
+        self.process = None
+        self.watchdog = None
+        self.port = free_port()
+        self.api_port = free_port()
+        self.secret = secrets.token_hex(24)
+
+    def api(self, path, value=None):
+        headers = {'Authorization': 'Bearer ' + self.secret}
+        if value is not None:
+            headers['Content-Type'] = 'application/json'
+        request = urllib.request.Request('http://127.0.0.1:' + str(self.api_port) + path,
+            data=json.dumps(value).encode() if value is not None else None,
+            method='PUT' if value is not None else 'GET', headers=headers)
+        with urllib.request.urlopen(request, timeout=8) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else {}
+
+    def __enter__(self):
+        import yaml
+        self.work = Path(tempfile.mkdtemp(prefix='geomask-egress-', dir=str(STATE)))
+        try:
+            os.chmod(self.work, 0o700)
+            config = {'mixed-port': 0, 'allow-lan': False, 'bind-address': '127.0.0.1',
+                'external-controller': '127.0.0.1:' + str(self.api_port), 'secret': self.secret,
+                'mode': 'rule', 'log-level': 'silent', 'ipv6': False,
+                'listeners': [{'name': 'isolated-audit', 'type': 'mixed', 'listen': '127.0.0.1',
+                               'port': self.port, 'proxy': 'AUDIT'}],
+                'proxies': self.nodes,
+                'proxy-groups': [{'name': 'AUDIT', 'type': 'select', 'proxies': [n['name'] for n in self.nodes]}],
+                'rules': ['MATCH,AUDIT']}
+            candidate = self.work / 'config.yaml'
+            candidate.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding='utf-8')
+            os.chmod(candidate, 0o600)
+            checked = subprocess.run(['mihomo', '-d', str(self.work), '-f', str(candidate), '-t'],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+            if checked.returncode:
+                raise AuditError('isolated candidate validation failed')
+            self.process = subprocess.Popen(['mihomo', '-d', str(self.work), '-f', str(candidate)],
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._watch()
+            for _ in range(40):
+                if self.process.poll() is not None:
+                    break
+                try:
+                    self.api('/version')
+                    return self
+                except Exception:
+                    time.sleep(0.2)
+            raise AuditError('isolated controller did not start')
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+
+    def _watch(self):
+        pid = self.process.pid
+        proc = Path('/proc') / str(pid)
+        identity = (proc / 'stat').read_text().split(') ', 1)[1].split()[19]
+        work = str(self.work)
+        child = os.fork()
+        if child == 0:
+            try:
+                time.sleep(900)
+                current = (proc / 'stat').read_text().split(') ', 1)[1].split()[19]
+                command = (proc / 'cmdline').read_bytes()
+                if current == identity and work.encode() in command and b'mihomo' in command:
+                    os.kill(pid, 15)
+                    time.sleep(5)
+                    current = (proc / 'stat').read_text().split(') ', 1)[1].split()[19]
+                    command = (proc / 'cmdline').read_bytes()
+                    if current == identity and work.encode() in command and b'mihomo' in command:
+                        os.kill(pid, 9)
+            except (OSError, ValueError):
+                pass
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            os._exit(0)
+        self.watchdog = child
+
+    def probe(self, node, service):
+        endpoints = {'cloudflare': 'https://www.cloudflare.com/cdn-cgi/trace',
+                     'chatgpt': 'https://chatgpt.com/cdn-cgi/trace',
+                     'google': 'https://www.google.com/generate_204'}
+        self.api('/proxies/AUDIT', {'name': node})
+        args = ['curl', '--disable', '--silent', '--show-error', '--noproxy', '', '--connect-timeout', '6',
+                '--max-time', '12', '--max-filesize', '16000', '--proxy',
+                'socks5h://127.0.0.1:' + str(self.port), '--write-out', '\nhttp_code=%{http_code}\n',
+                endpoints[service] + '?_=' + secrets.token_hex(6)]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=15)
+        fields = dict(re.findall(r'(?m)^(ip|loc|colo|http_code)=([^\r\n]+)', result.stdout))
+        code = fields.get('http_code')
+        if service == 'google':
+            return {'status': 'unknown', 'availability': result.returncode == 0 and code == '204',
+                    'country': None, 'http_code': code, 'reason': 'HTTP 204 does not prove Google geography',
+                    'dns_context': 'remote SOCKS5h', 'time': stamp()}
+        country = fields.get('loc')
+        if result.returncode or code != '200' or not re.fullmatch(r'[A-Z]{2}', country or ''):
+            return {'status': 'unknown', 'country': None, 'http_code': code,
+                    'reason': 'trace unavailable or malformed', 'time': stamp()}
+        try:
+            ipaddress.ip_address(fields.get('ip', ''))
+        except ValueError:
+            return {'status': 'unknown', 'country': None, 'reason': 'invalid observed exit IP'}
+        return {'status': 'ok', 'country': country, 'ip': fields['ip'], 'colo': fields.get('colo'),
+                'http_code': code, 'dns_context': 'remote SOCKS5h', 'time': stamp(), 'tls_verified': True}
+
+    def __exit__(self, *unused):
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        if self.watchdog:
+            try:
+                os.kill(self.watchdog, 15)
+                os.waitpid(self.watchdog, 0)
+            except ProcessLookupError:
+                pass
+        if self.work:
+            shutil.rmtree(self.work, ignore_errors=True)
+
+@contextlib.contextmanager
+def job_budget(seconds):
+    import signal
+    deadline = time.monotonic() + seconds
+    if not hasattr(signal, 'SIGALRM'):
+        yield deadline
+        return
+    def expired(signum, frame):
+        raise AuditError('whole-job time budget exceeded; partial results are not a pass')
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(seconds)
+    try:
+        yield deadline
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+@contextlib.contextmanager
+def audit_locks(ident):
+    with locked('runtime', nonblocking=True), locked('job-' + ident, nonblocking=True):
+        yield
+
+def check(ident, owns_lock=False, job_id=None, actor='cli'):
+    path_id(ident)
+    lock = contextlib.nullcontext() if owns_lock else audit_locks(ident)
+    with lock, job_budget(720) as deadline:
+        data, _ = _load_store()
+        path_data = data['paths'].get(ident, {})
+        raw = CONFIG.read_bytes()
+        config = yaml_load(raw)
+        target = STATE / (ident + '.json')
+        previous_report = None
+        try:
+            previous_report = strict_json(target.read_bytes()) if target.exists() else None
+        except (OSError, AuditError):
+            previous_report = None
+        group, providers = resolve_audit_source(config, ident, path_data, previous_report)
+        allow = path_data.get('countries_allow', PATHS[ident][1])
+        path_rev = path_data.get('path_revision', '')
+        binding = _resolve_source_binding(config, ident, providers)
+        source_fingerprint = binding.get('source_fingerprint') if binding else None
+        # Use whole config digest for staleness (matches original behavior and tests)
+        config_digest = digest(raw)
+        
+        report = {'job_id': job_id or secrets.token_hex(12), 'path_id': ident, 'group': group, 'providers': providers, 
+                  'settings_revision': path_rev, 'source_revision': config_digest, 'countries_allow': allow, 'started': stamp(),
+                  'status': 'running', 'applied': False, 'nodes': [],
+                  'configured': ident in data['paths'],
+                  'probe_version': PROBE_VERSION,
+                  'probe_context': {'dns': 'remote SOCKS5h', 'services': (
+                      AI_REQUIRED_SERVICES + AI_INFORMATIONAL_SERVICES if ident == 'ai'
+                      else ['cloudflare']),
+                      'admission': ('chatgpt+cloudflare' if ident == 'ai' else 'cloudflare')},
+                  'scope': 'observed service egress with remote DNS; not actual client/hosts route',
+                  'limit': 'No automatic apply. Google geography is not measurable and is not '
+                           'used for admission; AI is judged by ChatGPT and Cloudflare. '
+                           'No claim for untested services.'}
+        atomic_write(target, encode(report))
+        audited_definitions = {}
+        try:
+            for provider_name in providers:
+                nodes, source = fetch_nodes(config['proxy-providers'][provider_name])
+                with IsolatedProbe(nodes) as probe:
+                    for node in nodes:
+                        if time.monotonic() > deadline:
+                            raise AuditError('audit time budget exceeded; partial results are not a pass')
+                        # Check for cancellation request
+                        try:
+                            current_report = strict_json(target.read_bytes())
+                            if current_report.get('status') == 'cancelled':
+                                report['status'] = 'cancelled'
+                                report['ok'] = False
+                                report['error'] = 'cancelled by user'
+                                report['finished'] = stamp()
+                                atomic_write(target, encode(report))
+                                _append_event({
+                                    'path': ident,
+                                    'actor': actor,
+                                    'action': 'cancel',
+                                    'job_id': report['job_id'],
+                                    'result': 'success'
+                                })
+                                return report
+                        except (OSError, AuditError):
+                            pass
+                        services = (AI_REQUIRED_SERVICES + AI_INFORMATIONAL_SERVICES
+                                    if ident == 'ai' else ['cloudflare'])
+                        observations = {}
+                        for service in services:
+                            try:
+                                observations[service] = probe.probe(node['name'], service)
+                            except Exception as exc:
+                                observations[service] = {'status': 'unknown', 'country': None,
+                                                         'reason': 'probe error (' + type(exc).__name__ + ')'}
+                        # Compute node identity fingerprint. The whole definition is covered:
+                        # a hand-picked subset would let a rewritten credential keep the
+                        # fingerprint of the node that was actually measured.
+                        node_identity = {
+                            'definition': node,
+                            'provider_id': provider_name,
+                        }
+                        node_fingerprint = digest(canonical_json(node_identity))
+                        audited_definitions[node['name']] = {
+                            'provider': provider_name,
+                            'node_fingerprint': node_fingerprint[:16],
+                            'definition': node,
+                        }
+                        report['nodes'].append({'name': node['name'], 'provider': provider_name,
+                            'node_fingerprint': node_fingerprint[:16], 'source_digest': source, 'probes': observations, **classify(ident, allow, observations)})
+                        atomic_write(target, encode(report))
+            # Check staleness using path_revision and config digest (matches original behavior)
+            current_data, _ = _load_store()
+            current_path_rev = current_data['paths'].get(ident, {}).get('path_revision', '')
+            current_config_raw = CONFIG.read_bytes()
+            current_config_digest = digest(current_config_raw)
+            stale = current_path_rev != path_rev or current_config_digest != config_digest
+            report['stale'] = stale
+            report['status'] = 'stale' if stale else 'complete'
+            report['counts'] = {key: sum(n['status'] == key for n in report['nodes'])
+                                for key in ('eligible', 'excluded', 'unknown')}
+            present = {p.get('country') for n in report['nodes'] for p in n['probes'].values()}
+            report['missing_countries'] = sorted(set(allow) - present)
+            report['ok'] = not stale
+        except Exception as exc:
+            report['status'] = 'error'
+            report['ok'] = False
+            report['error'] = str(exc) if isinstance(exc, AuditError) else type(exc).__name__
+        report['finished'] = stamp()
+        atomic_write(target, encode(report))
+        # Save immutable report
+        _save_report(report)
+        # Persist the exact definitions that were probed, so an apply can build a managed
+        # provider from what was actually measured instead of re-reading a moving source.
+        if report.get('status') in ('complete', 'stale') and audited_definitions:
+            # Keep the snapshots an applied manifest or the previous report still refer to;
+            # retention must not delete material a pending preview or a pool depends on.
+            protected = [path_data.get('applied', {}).get('job_id', '')]
+            if previous_report:
+                protected.append(previous_report.get('job_id', ''))
+            _save_node_snapshot(ident, report['job_id'], audited_definitions,
+                                protect=protected)
+        # Append event
+        _append_event({
+            'path': ident,
+            'actor': actor,
+            'action': 'check',
+            'job_id': report['job_id'],
+            'status': report['status'],
+            'counts': report.get('counts', {}),
+            'stale': report.get('stale', False),
+            'result': 'success' if report.get('ok') else 'failed'
+        })
+        return report
+
+def start(ident, actor='luci'):
+    path_id(ident)
+    with audit_locks(ident):
+        data, _ = _load_store()
+        path_data = data['paths'].get(ident, {})
+        raw = CONFIG.read_bytes()
+        config = yaml_load(raw)
+        resolve_source(config, ident)
+        job_id = secrets.token_hex(12)
+        queued = {'job_id': job_id, 'path_id': ident, 'status': 'queued', 'started': stamp(),
+                  'settings_revision': path_data.get('path_revision', ''), 'source_revision': digest(raw), 'applied': False}
+        atomic_write(STATE / (ident + '.json'), encode(queued))
+        try:
+            child = os.fork()
+        except OSError:
+            queued.update(status='error', ok=False, finished=stamp(), error='worker fork failed')
+            atomic_write(STATE / (ident + '.json'), encode(queued))
+            raise AuditError('worker fork failed') from None
+        if child == 0:
+            try:
+                os.setsid()
+                with open(os.devnull, 'r+b', buffering=0) as null:
+                    for descriptor in (0, 1, 2):
+                        os.dup2(null.fileno(), descriptor)
+                # The parent releases its reservation when start() returns, so the worker
+                # waits for it rather than racing it, then owns the slot for its own run.
+                with locked('runtime'), locked('job-' + ident):
+                    check(ident, owns_lock=True, job_id=job_id, actor=actor)
+            except Exception as exc:
+                queued.update(status='error', ok=False, finished=stamp(),
+                              error=str(exc) if isinstance(exc, AuditError) else type(exc).__name__)
+                atomic_write(STATE / (ident + '.json'), encode(queued))
+            finally:
+                os._exit(0)
+        return {'ok': True, 'started': True, 'job_id': job_id, 'path_id': ident, 'applied': False}
+
+def source_in_use(url):
+    """Report whether a subscription URL backs a provider some group actually uses.
+
+    Deleting a registry entry that a path still depends on would leave the group pointing
+    at a provider whose source is gone. The caller refuses the delete on a hit.
+    """
+    if not isinstance(url, str) or not url:
+        raise AuditError('source url required')
+    try:
+        config = yaml_load(CONFIG.read_bytes())
+    except OSError:
+        raise AuditError('mihomo config is unreadable') from None
+    providers = config.get('proxy-providers') or {}
+    used = set()
+    for group in config.get('proxy-groups') or []:
+        for provider_id in group.get('use') or []:
+            used.add(provider_id)
+    hits = sorted(pid for pid, spec in providers.items()
+                  if isinstance(spec, dict) and spec.get('url') == url and pid in used)
+    return {'ok': True, 'in_use': bool(hits), 'providers': hits}
+
+
+def audit_events_get(path_id=None, before=None, limit=50):
+    """Get paginated audit events."""
+    events = _get_events(path_id, before, min(int(limit), 100))
+    return {'ok': True, 'events': events}
+
+def audit_job_get(job_id):
+    """Get job status by job_id. Searches all path state files."""
+    try:
+        for state_file in STATE.glob('*.json'):
+            report = strict_json(state_file.read_bytes())
+            if report.get('job_id') == job_id:
+                return {'ok': True, 'job': report}
+        return {'ok': False, 'error': 'job not found'}
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+
+def audit_cancel(job_id, actor='luci'):
+    """Cancel a running job by job_id. Only works for queued/running jobs."""
+    try:
+        for state_file in STATE.glob('*.json'):
+            report = strict_json(state_file.read_bytes())
+            if report.get('job_id') == job_id:
+                status = report.get('status', '')
+                if status in ('queued', 'running'):
+                    report['status'] = 'cancelled'
+                    report['ok'] = False
+                    report['finished'] = stamp()
+                    report['error'] = 'cancelled by user'
+                    atomic_write(state_file, encode(report))
+                    _append_event({
+                        'path': report.get('path_id', ''),
+                        'actor': actor,
+                        'action': 'cancel',
+                        'job_id': job_id,
+                        'result': 'success'
+                    })
+                    return {'ok': True, 'cancelled': True}
+                else:
+                    return {'ok': False, 'error': f'job not cancellable (status: {status})'}
+        return {'ok': False, 'error': 'job not found'}
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+
+def schedule_get(pid):
+    """Get schedule configuration for a path."""
+    try:
+        path_id(pid)
+    except AuditError as e:
+        return {'ok': False, 'error': str(e)}
+    data, _ = load_store()
+    path_data = data['paths'].get(pid, {})
+    schedule = path_data.get('schedule', {'enabled': False, 'time': '03:30', 'mode': 'check-only'})
+    return {'ok': True, 'schedule': schedule}
+
+def schedule_set(pid, enabled, time, mode):
+    """Set schedule configuration for a path."""
+    path_id(pid)
+    if enabled not in ('true', 'false'):
+        raise AuditError('enabled must be true or false')
+    if not re.fullmatch(r'([01]?[0-9]|2[0-3]):[0-5][0-9]', time):
+        raise AuditError('time must be HH:MM format')
+    if mode not in ('check-only', 'check-and-apply'):
+        raise AuditError('mode must be check-only or check-and-apply')
+    
+    with locked('settings'):
+        data, _ = load_store()
+        path_data = data['paths'].get(pid, {})
+        path_data['schedule'] = {
+            'enabled': enabled == 'true',
+            'time': time,
+            'mode': mode,
+        }
+        _save_store(data)
+        _append_event({
+            'path': pid,
+            'actor': 'luci',
+            'action': 'schedule-set',
+            'enabled': enabled == 'true',
+            'time': time,
+            'mode': mode,
+            'result': 'success'
+        })
+        return {'ok': True, 'schedule': path_data['schedule']}
+
+def audit_cancel(job_id, actor='luci'):
+    """Cancel a running job by job_id. Only works for queued/running jobs."""
+    try:
+        for state_file in STATE.glob('*.json'):
+            report = strict_json(state_file.read_bytes())
+            if report.get('job_id') == job_id:
+                status = report.get('status', '')
+                if status in ('queued', 'running'):
+                    report['status'] = 'cancelled'
+                    report['ok'] = False
+                    report['finished'] = stamp()
+                    report['error'] = 'cancelled by user'
+                    atomic_write(state_file, encode(report))
+                    _append_event({
+                        'path': report.get('path_id', ''),
+                        'actor': actor,
+                        'action': 'cancel',
+                        'job_id': job_id,
+                        'result': 'success'
+                    })
+                    return {'ok': True, 'cancelled': True}
+                else:
+                    return {'ok': False, 'error': f'job not cancellable (status: {status})'}
+        return {'ok': False, 'error': 'job not found'}
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+
+def validate_rpc(method, raw):
+    if len(raw.encode('utf-8')) > 16384:
+        raise AuditError('RPC request too large')
+    fields = {'nodes_paths_get': set(), 'nodes_path_check': {'path_id'},
+              'nodes_path_save': {'path_id', 'countries', 'expected_revision'},
+              'nodes_audit_job_get': {'job_id'},
+              'nodes_audit_cancel': {'job_id'},
+              'nodes_audit_events_get': {'path_id', 'before', 'limit'},
+              'nodes_audit_schedule_get': {'path_id'},
+              'nodes_audit_schedule_set': {'path_id', 'enabled', 'time', 'mode'}}
+    if method not in fields:
+        raise AuditError('unknown audit RPC')
+    request = strict_json(raw)
+    if not isinstance(request, dict):
+        raise AuditError('invalid RPC object')
+    has_session = 'ubus_rpc_session' in request
+    session = request.pop('ubus_rpc_session', None)
+    if has_session and (not isinstance(session, str) or not re.fullmatch(r'[a-f0-9]{32}', session)):
+        raise AuditError('invalid RPC session metadata')
+    if set(request) != fields[method]:
+        raise AuditError('invalid RPC fields')
+    for value in request.values():
+        if not isinstance(value, str) or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+            raise AuditError('RPC values must be strings without controls')
+    if 'path_id' in request:
+        path_id(request['path_id'])
+    if 'countries' in request:
+        countries(request['countries'])
+        if not re.fullmatch(r'[a-f0-9]{64}', request['expected_revision']):
+            raise AuditError('invalid revision')
+    if 'job_id' in request and not re.fullmatch(r'[a-f0-9]{24}', request['job_id']):
+        raise AuditError('invalid job_id')
+    if 'enabled' in request and request['enabled'] not in ('true', 'false'):
+        return {'ok': False, 'error': 'enabled must be true or false'}
+    if 'time' in request and not re.fullmatch(r'([01]?[0-9]|2[0-3]):[0-5][0-9]', request['time']):
+        return {'ok': False, 'error': 'time must be HH:MM format'}
+    if 'mode' in request and request['mode'] not in ('check-only', 'check-and-apply'):
+        return {'ok': False, 'error': 'mode must be check-only or check-and-apply'}
+    return {'ok': True}
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=['get', 'save', 'check', 'start', 'validate-rpc', 'prepare-save', 'audit-events', 'audit-job', 'audit-cancel', 'schedule-get', 'schedule-set', 'source-in-use'])
+    parser.add_argument('args', nargs='*')
+    args = parser.parse_args(argv)
+    try:
+        if args.command == 'validate-rpc' and len(args.args) == 1:
+            value = validate_rpc(args.args[0], sys.stdin.read(16385))
+        elif args.command == 'get' and not args.args:
+            value = get()
+        elif args.command == 'prepare-save' and len(args.args) == 3:
+            value = prepare_save(*args.args)
+        elif args.command == 'save' and len(args.args) == 3:
+            value = save(*args.args)
+        elif args.command == 'start' and len(args.args) == 1:
+            value = start(args.args[0], actor='cli')
+        elif args.command == 'check' and len(args.args) == 1:
+            value = check(args.args[0], actor='cli')
+        elif args.command == 'audit-events' and len(args.args) <= 3:
+            path_id = args.args[0] if len(args.args) > 0 else None
+            before = args.args[1] if len(args.args) > 1 else None
+            limit = args.args[2] if len(args.args) > 2 else '50'
+            value = audit_events_get(path_id, before, limit)
+        elif args.command == 'audit-job' and len(args.args) == 1:
+            value = audit_job_get(args.args[0])
+        elif args.command == 'audit-cancel' and len(args.args) == 1:
+            value = audit_cancel(args.args[0], actor='cli')
+        elif args.command == 'schedule-get' and len(args.args) == 1:
+            value = schedule_get(args.args[0])
+        elif args.command == 'schedule-set' and len(args.args) == 4:
+            value = schedule_set(*args.args)
+        elif args.command == 'source-in-use' and len(args.args) == 1:
+            value = source_in_use(args.args[0])
+        else:
+            raise AuditError('invalid command arguments')
+        print(json.dumps(value, ensure_ascii=False))
+        return 0 if value.get('ok', True) else 1
+    except Exception as exc:
+        error = str(exc) if isinstance(exc, AuditError) else type(exc).__name__
+        print(json.dumps({'ok': False, 'error': error, 'applied': False}))
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-audit-state.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Schema v2 state module for node-audit: independent path revisions, source bindings, events."""
+import contextlib
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+import threading
+
+# Canonical paths (defaults, can be overridden by passing explicit paths to functions)
+DEFAULT_STORE = Path(os.environ.get('GM_AUDIT_STORE', '/etc/geomask/node-audit.json'))
+DEFAULT_EVENTS = Path(os.environ.get('GM_AUDIT_EVENTS', '/etc/geomask/node-audit/events.jsonl'))
+DEFAULT_STATE_DIR = Path(os.environ.get('GM_AUDIT_STATE', '/etc/geomask/node-audit/state'))
+DEFAULT_POOLS_DIR = Path(os.environ.get('GM_AUDIT_POOLS', '/etc/geomask/node-audit/pools'))
+DEFAULT_REPORTS_DIR = Path(os.environ.get('GM_AUDIT_REPORTS', '/etc/geomask/node-audit/reports'))
+DEFAULT_SNAPSHOTS_DIR = Path(os.environ.get('GM_AUDIT_SNAPSHOTS', '/etc/geomask/node-snapshots'))
+DEFAULT_CONFIG = Path(os.environ.get('GM_AUDIT_CONFIG', '/etc/mihomo/config.yaml'))
+DEFAULT_REGISTRY = Path(os.environ.get('GM_AUDIT_REGISTRY', '/etc/geomask-subs.list'))
+
+# Retention limits
+MAX_EVENTS_PER_PATH = 20
+MAX_EVENTS_TOTAL = 200
+MAX_EVENTS_SIZE = 2 * 1024 * 1024  # 2 MiB
+
+# Immutable report retention
+MAX_REPORTS_PER_PATH = 20
+MAX_REPORTS_TOTAL = 100
+MAX_REPORTS_SIZE = 10 * 1024 * 1024  # 10 MiB
+
+# Audited node definitions are private material: root-only, one file per job, pruned.
+MAX_SNAPSHOTS_PER_PATH = 4
+# Node definitions carry endpoint credentials, so they share one bounded budget. Exhausting
+# it must fail the new operation rather than delete material an apply may still need.
+MAX_SNAPSHOTS_BYTES = int(os.environ.get('GM_AUDIT_SNAPSHOT_BUDGET', 8 * 1024 * 1024))
+
+
+SAFE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
+
+def _job_token(job_id):
+    """Validate a job id before it becomes part of a file name."""
+    if not isinstance(job_id, str) or not SAFE_ID.fullmatch(job_id):
+        raise AuditError('invalid job id')
+    return job_id
+
+def save_node_snapshot(ident, job_id, definitions, snapshots_dir=None, protect=()):
+    """Persist exactly the node definitions a job measured.
+
+    An apply must build its managed pool from measured definitions, not from a source
+    that may have moved since. Keeping this separate from the report also keeps
+    subscription payloads out of anything the panel or an export would read.
+
+    The snapshots share one byte budget. When it is exhausted the new snapshot is refused
+    and the caller fails loudly: silently deleting an older snapshot could pull the
+    definitions out from under a pending preview or an applied pool.
+    """
+    if not job_id or not definitions:
+        return None
+    job_id = _job_token(job_id)
+    directory = Path(snapshots_dir) if snapshots_dir else DEFAULT_SNAPSHOTS_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {'path_id': ident, 'job_id': job_id, 'created': stamp(), 'nodes': definitions}
+    target = directory / ('%s-%s.json' % (ident, job_id))
+    body = encode(payload)
+    used = 0
+    for existing in directory.glob('*.json'):
+        if existing.name != target.name:
+            try:
+                used += existing.stat().st_size
+            except OSError:
+                pass
+    if used + len(body) > MAX_SNAPSHOTS_BYTES:
+        raise AuditError('node snapshot budget exhausted (%d of %d bytes); '
+                         'delete an old job or raise GM_AUDIT_SNAPSHOT_BUDGET'
+                         % (used, MAX_SNAPSHOTS_BYTES))
+    atomic_write(target, body)
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    # Retention must not pull the definitions out from under a record that still points at
+    # them: an applied manifest or a report a preview can still use keeps its snapshot.
+    protected = {str(job) for job in (protect or ()) if job}
+    kept = sorted(directory.glob(ident + '-*.json'), key=lambda p: p.stat().st_mtime)
+    for old in kept[:-MAX_SNAPSHOTS_PER_PATH]:
+        if old.stem in {('%s-%s' % (ident, job)) for job in protected}:
+            continue
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return target
+
+
+def load_node_snapshot(ident, job_id, snapshots_dir=None):
+    """Read a job's audited definitions, or None when there is no snapshot."""
+    job_id = _job_token(job_id)
+    directory = Path(snapshots_dir) if snapshots_dir else DEFAULT_SNAPSHOTS_DIR
+    target = directory / ('%s-%s.json' % (ident, job_id))
+    if not target.is_file():
+        return None
+    data = strict_json(target.read_bytes())
+    if data.get('path_id') != ident or data.get('job_id') != job_id:
+        raise AuditError('snapshot does not belong to this job')
+    nodes = data.get('nodes')
+    if not isinstance(nodes, dict):
+        raise AuditError('malformed node snapshot')
+    return nodes
+
+# Node limits (from original module)
+MAX_NODES = 100
+
+PATHS = {
+    'vpn': ('VPN', ['NL', 'DE', 'FR', 'SE']),
+    'vpn_nop2p': ('VPN-noP2P', ['DE', 'PL']),
+    'ai': ('AI', ['US'])
+}
+
+_lock = threading.Lock()
+
+class AuditError(Exception):
+    pass
+
+def stamp():
+    return datetime.datetime.now().astimezone().isoformat()
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def canonical_json(obj) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+
+def encode(value) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + '\n').encode()
+
+def strict_json(data: bytes):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise AuditError('duplicate JSON key')
+            result[key] = value
+        return result
+    try:
+        return json.loads(data, object_pairs_hook=pairs)
+    except (ValueError, UnicodeError):
+        raise AuditError('invalid JSON') from None
+
+def path_id(value: str) -> str:
+    if value not in PATHS:
+        raise AuditError('invalid path')
+    return value
+
+
+class _Yaml12Loader:
+    """Marker type; the real class is built lazily by yaml12_loader()."""
+
+
+_YAML12 = None
+
+def yaml12_loader():
+    """A PyYAML loader that follows YAML 1.2 booleans, which is what mihomo uses.
+
+    PyYAML implements YAML 1.1, where `off`, `on`, `yes` and `no` are booleans. mihomo
+    writes `find-process-mode: off` and reads it as the string "off". Loading that with
+    the default resolver turns it into False, and dumping the config back produces
+    `false`, which mihomo rejects with "invalid find process mode" -- a round-trip through
+    the config silently broke it. This loader keeps only true/false as booleans.
+    """
+    global _YAML12
+    if _YAML12 is not None:
+        return _YAML12
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    resolutions = {}
+    for first, rules in yaml.SafeLoader.yaml_implicit_resolvers.items():
+        kept = [(tag, regexp) for tag, regexp in rules
+                if tag not in ('tag:yaml.org,2002:bool', 'tag:yaml.org,2002:timestamp')]
+        if kept:
+            resolutions[first] = kept
+    Loader.yaml_implicit_resolvers = resolutions
+    bool_re = re.compile(r'^(?:true|True|TRUE|false|False|FALSE)$')
+    for first in 'tTfF':
+        Loader.add_implicit_resolver('tag:yaml.org,2002:bool', bool_re, [first])
+    _YAML12 = Loader
+    return Loader
+
+def yaml12_load(raw):
+    """Parse YAML with YAML 1.2 boolean semantics."""
+    import yaml
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode('utf-8')
+    return yaml.load(raw, Loader=yaml12_loader())
+
+def countries(value: str) -> list:
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Z]{2}(?:,[A-Z]{2})*', value):
+        raise AuditError('countries must be nonempty ISO-2 codes: NL,DE')
+    values = value.split(',')
+    if len(values) != len(set(values)):
+        raise AuditError('duplicate country')
+    iso = set('AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW'.split())
+    if not set(values) <= iso:
+        raise AuditError('unknown ISO country')
+    return sorted(values)
+
+@contextlib.contextmanager
+def locked(name: str, state_dir: Path = None, nonblocking: bool = False):
+    """Advisory lock.
+
+    Unix uses flock on a persistent inode, so a killed holder releases the lock
+    automatically and a slow writer cannot block a reader by leaving a file behind.
+    Where flock is unavailable the lock degrades to an O_EXCL file, which is the best
+    that platform offers; that path is only used on non-routers (tests, Windows).
+    """
+    if state_dir is None:
+        state_dir = DEFAULT_STATE_DIR
+    lock_path = state_dir / f'.lock-{name}'
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+
+    if fcntl is not None:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+            except BlockingIOError:
+                raise AuditError(f'busy: {name} lock held') from None
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+        return
+
+    fd = None
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        yield
+    except FileExistsError:
+        raise AuditError(f'busy: {name} lock held')
+    finally:
+        if fd is not None:
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
+
+def atomic_write(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent, prefix=f'.{path.name}-', delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_name = tmp.name
+    try:
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+def ensure_dirs(store: Path = None, events: Path = None, state_dir: Path = None, pools_dir: Path = None):
+    if store: store.parent.mkdir(parents=True, exist_ok=True)
+    if events: events.parent.mkdir(parents=True, exist_ok=True)
+    if state_dir: state_dir.mkdir(parents=True, exist_ok=True)
+    if pools_dir: pools_dir.mkdir(parents=True, exist_ok=True)
+
+def load_store(store: Path = None):
+    """Load v2 store; migrate from v1 if needed. Returns (data, original_raw_for_revision)."""
+    store = store or DEFAULT_STORE
+    ensure_dirs(store=store)
+    raw = store.read_bytes() if store.exists() else b''
+    if not raw:
+        if store.exists():
+            raise AuditError('empty settings; refusing defaults reset')
+        return create_default_v2(), b''
+    data = strict_json(raw)
+    if not isinstance(data, dict):
+        raise AuditError('unsupported settings schema')
+    schema = data.get('schema')
+    # Explicitly reject boolean schema (True == 1 in Python but bool is not int)
+    if type(schema) is not int:
+        raise AuditError('schema must be integer')
+    if schema == 1:
+        # Validate v1 structure before migration
+        if not isinstance(data.get('generation'), int):
+            raise AuditError('invalid generation')
+        paths_v1 = data.get('paths')
+        if not isinstance(paths_v1, dict):
+            raise AuditError('invalid paths structure')
+        for ident, path_data in paths_v1.items():
+            if not isinstance(path_data, dict):
+                raise AuditError('invalid path data')
+            countries_allow = path_data.get('countries_allow')
+            if countries_allow is not None:
+                if not isinstance(countries_allow, list):
+                    raise AuditError('countries_allow must be a list')
+                for c in countries_allow:
+                    if not isinstance(c, str):
+                        raise AuditError('country entries must be strings')
+        # Migrate but don't auto-write; return migrated data and original raw for revision
+        migrated = migrate_v1_to_v2(data)
+        return migrated, raw
+    if schema != 2:
+        raise AuditError('unsupported settings schema')
+    # Ensure all paths exist with v2 structure
+    for ident, (label, defaults) in PATHS.items():
+        if ident not in data.get('paths', {}):
+            data.setdefault('paths', {})[ident] = create_path_v2(ident, defaults)
+    return data, raw
+
+def create_default_v2():
+    return {
+        'schema': 2,
+        'generation': 1,
+        'paths': {ident: create_path_v2(ident, defaults, configured=False) for ident, (label, defaults) in PATHS.items()},
+        'events': [],
+        'event_index': {'next_id': 1, 'truncated_before': None}
+    }
+
+def create_path_v2(ident: str, defaults: list, configured: bool = False) -> dict:
+    path_data = {
+        'countries_allow': list(defaults),
+        'path_generation': 1,
+        'path_revision': '',
+        'source_binding': None,
+        'configured': configured,
+        'schedule': {'enabled': False, 'time': '03:30', 'mode': 'check-only'},
+        'applied': {
+            'generation': 0,
+            'path_revision': '',
+            'preview_id': '',
+            'job_id': '',
+            'applied_at': '',
+            'runtime_verified': False,
+            'pool_digest': '',
+            'status': 'never'
+        }
+    }
+    path_data['path_revision'] = compute_path_revision(path_data)
+    return path_data
+
+def compute_path_revision(path_data: dict) -> str:
+    """Compute revision from semantic content only: countries + source_binding."""
+    content = {
+        'countries_allow': path_data.get('countries_allow', []),
+        'source_binding': path_data.get('source_binding')
+    }
+    # Only include source_binding if it's not None to avoid hashing null
+    if content['source_binding'] is None:
+        content.pop('source_binding')
+    return digest(canonical_json(content))
+
+def migrate_v1_to_v2(v1_data: dict) -> dict:
+    """Migrate schema v1 to v2, preserving user's chosen countries."""
+    paths_v1 = v1_data.get('paths', {})
+    v2 = {
+        'schema': 2,
+        'generation': 1,
+        'paths': {},
+        'events': [],
+        'event_index': {'next_id': 1, 'truncated_before': None}
+    }
+    max_gen = 0
+    for ident, (label, defaults) in PATHS.items():
+        v1_path = paths_v1.get(ident, {})
+        countries_allow = v1_path.get('countries_allow', defaults)
+        # Ensure consistent sorted order
+        countries_allow = sorted(countries_allow)
+        # Path is configured if it was explicitly in v1 data
+        configured = ident in paths_v1
+        path_data = create_path_v2(ident, countries_allow, configured=configured)
+        path_data['path_revision'] = compute_path_revision(path_data)
+        path_data['path_generation'] = 1
+        v2['paths'][ident] = path_data
+        max_gen = max(max_gen, 1)
+    # Preserve original generation from v1, or start at 1
+    original_gen = v1_data.get('generation', 1)
+    if isinstance(original_gen, int) and original_gen > 0:
+        v2['generation'] = original_gen
+    else:
+        v2['generation'] = max_gen + 1
+    # Do NOT auto-write; caller (save_store) will persist when appropriate
+    return v2
+
+def save_store(data: dict, store: Path = None):
+    """Atomic write of entire store under lock."""
+    store = store or DEFAULT_STORE
+    with locked('store', store.parent / 'state' if store else None):
+        # Re-read and recompute only changed path_revision
+        current, _ = load_store(store)
+        for ident in PATHS:
+            if ident in data.get('paths', {}):
+                path_data = data['paths'][ident]
+                # Only recompute revision if countries or source_binding changed
+                current_path = current['paths'].get(ident, {})
+                if (path_data.get('countries_allow') != current_path.get('countries_allow') or
+                    path_data.get('source_binding') != current_path.get('source_binding')):
+                    path_data['path_revision'] = compute_path_revision(path_data)
+                    path_data['path_generation'] = current_path.get('path_generation', 0) + 1
+                else:
+                    path_data['path_revision'] = current_path.get('path_revision', '')
+                    path_data['path_generation'] = current_path.get('path_generation', 1)
+        # Increment global generation on each save (legacy behavior)
+        current_gen = data.get('generation', 0)
+        data['generation'] = current_gen + 1 if current_gen > 0 else 1
+        atomic_write(store, encode(data))
+
+def append_event(event: dict, events: Path = None):
+    """Append sanitized event to JSONL; maintain bounded retention."""
+    events = events or DEFAULT_EVENTS
+    with locked('events', events.parent / 'state' if events else None):
+        ensure_dirs(events=events)
+        ts = stamp()
+        event['timestamp'] = ts
+        event['event_id'] = f"{ts}-{hashlib.md5(canonical_json(event)).hexdigest()[:8]}"
+        line = json.dumps(event, ensure_ascii=False, separators=(',', ':')) + '\n'
+        # Append
+        with open(events, 'ab') as f:
+            f.write(line.encode('utf-8'))
+            f.flush()
+            os.fsync(f.fileno())
+        # Trim if needed
+        trim_events(events)
+
+def trim_events(events: Path = None):
+    """Keep last MAX_EVENTS_PER_PATH per path and MAX_EVENTS_TOTAL / MAX_EVENTS_SIZE."""
+    events = events or DEFAULT_EVENTS
+    if not events.exists():
+        return
+    lines = events.read_text(encoding='utf-8').splitlines()
+    # Always apply per-path retention
+    by_path = {}
+    for line in lines:
+        try:
+            ev = json.loads(line)
+            p = ev.get('path', '_')
+            by_path.setdefault(p, []).append(line)
+        except Exception:
+            by_path.setdefault('_', []).append(line)
+    kept = []
+    for p, ev_lines in by_path.items():
+        kept.extend(ev_lines[-MAX_EVENTS_PER_PATH:])
+    # Grouping by path reorders the file; restore chronological order, because the reader
+    # walks the file backwards and treats it as newest-last.
+    def sort_key(line):
+        try:
+            event = json.loads(line)
+        except Exception:
+            return ''
+        return str(event.get('timestamp') or event.get('event_id') or '')
+    kept.sort(key=sort_key)
+    # Global count cap
+    if len(kept) > MAX_EVENTS_TOTAL:
+        kept = kept[-MAX_EVENTS_TOTAL:]
+    # Size cap
+    total = sum(len(l.encode('utf-8')) for l in kept)
+    while total > MAX_EVENTS_SIZE and kept:
+        removed = kept.pop(0)
+        total -= len(removed.encode('utf-8'))
+    atomic_write(events, '\n'.join(kept).encode('utf-8') + (b'\n' if kept else b''))
+
+def get_events(path: str = None, before: str = None, limit: int = 50, events: Path = None) -> list:
+    """Paginated event query."""
+    events = events or DEFAULT_EVENTS
+    if not events.exists():
+        return []
+    lines = events.read_text(encoding='utf-8').splitlines()
+    result = []
+    for line in reversed(lines):
+        try:
+            ev = json.loads(line)
+            if path and ev.get('path') != path:
+                continue
+            if before and ev.get('event_id') >= before:
+                continue
+            # Normalize timestamp for legacy events without timestamp field
+            if 'timestamp' not in ev and ev.get('event_id'):
+                # event_id format: 2026-11-09T14:16:28.149342+03:00-xxx
+                m = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)', ev['event_id'])
+                if m:
+                    ev = dict(ev, timestamp=m.group(1))
+            result.append(ev)
+            if len(result) >= limit:
+                break
+        except Exception:
+            continue
+    return result
+
+def load_pool(path_id: str, generation: int, pools_dir: Path = None) -> dict:
+    """Load immutable verified pool for path/generation."""
+    pools_dir = pools_dir or DEFAULT_POOLS_DIR
+    pool_file = pools_dir / f'{path_id}-gen{generation}.json'
+    if not pool_file.exists():
+        raise AuditError('pool not found')
+    return strict_json(pool_file.read_bytes())
+
+def save_pool(path_id: str, generation: int, pool_data: dict, pools_dir: Path = None):
+    """Save immutable pool (0600)."""
+    pools_dir = pools_dir or DEFAULT_POOLS_DIR
+    pools_dir.mkdir(parents=True, exist_ok=True)
+    pool_file = pools_dir / f'{path_id}-gen{generation}.json'
+    atomic_write(pool_file, encode(pool_data))
+    os.chmod(pool_file, 0o600)
+
+def save_report(report: dict, reports_dir: Path = None):
+    """Save immutable audit report keyed by job_id and path."""
+    reports_dir = reports_dir or DEFAULT_REPORTS_DIR
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    job_id = report.get('job_id', 'unknown')
+    path_id = report.get('path_id', 'unknown')
+    ts = report.get('started', stamp().replace(':', '-'))
+    safe_ts = ts.replace(':', '-').replace('T', '_')
+    filename = f'{path_id}-{safe_ts}-{job_id}.json'
+    report_file = reports_dir / filename
+    atomic_write(report_file, encode(report))
+    os.chmod(report_file, 0o600)
+    # Apply retention
+    trim_reports(reports_dir)
+
+def trim_reports(reports_dir: Path = None):
+    """Keep last MAX_REPORTS_PER_PATH per path and MAX_REPORTS_TOTAL / MAX_REPORTS_SIZE."""
+    reports_dir = reports_dir or DEFAULT_REPORTS_DIR
+    if not reports_dir.exists():
+        return
+    files = list(reports_dir.glob('*.json'))
+    # Per-path retention
+    by_path = {}
+    for f in files:
+        parts = f.stem.split('-', 1)
+        path_key = parts[0] if parts else '_'
+        by_path.setdefault(path_key, []).append(f)
+    kept = []
+    for path_key, path_files in by_path.items():
+        # Sort by modification time (newest last)
+        path_files.sort(key=lambda x: x.stat().st_mtime)
+        kept.extend(path_files[-MAX_REPORTS_PER_PATH:])
+    # Global count cap
+    if len(kept) > MAX_REPORTS_TOTAL:
+        kept.sort(key=lambda x: x.stat().st_mtime)
+        kept = kept[-MAX_REPORTS_TOTAL:]
+    # Size cap
+    total = sum(f.stat().st_size for f in kept)
+    kept.sort(key=lambda x: x.stat().st_mtime)
+    while total > MAX_REPORTS_SIZE and kept:
+        removed = kept.pop(0)
+        total -= removed.stat().st_size
+        removed.unlink(missing_ok=True)
+    # Delete unkept files
+    kept_set = set(kept)
+    for f in files:
+        if f not in kept_set:
+            f.unlink(missing_ok=True)
+
+def list_reports(path_id: str = None, limit: int = 50, reports_dir: Path = None) -> list:
+    """List immutable reports, newest first."""
+    reports_dir = reports_dir or DEFAULT_REPORTS_DIR
+    if not reports_dir.exists():
+        return []
+    files = list(reports_dir.glob('*.json'))
+    if path_id:
+        files = [f for f in files if f.stem.startswith(path_id + '-')]
+    # Sort by mtime newest first
+    files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    result = []
+    for f in files[:limit]:
+        try:
+            data = strict_json(f.read_bytes())
+            data['_report_file'] = str(f)
+            data['_report_mtime'] = datetime.datetime.fromtimestamp(f.stat().st_mtime).astimezone().isoformat()
+            result.append(data)
+        except Exception:
+            continue
+    return result
+
+def resolve_source_binding(config: dict, ident: str, providers=None):
+    """Compute source binding fingerprint from mihomo config.
+
+    ``providers`` lets the caller name the subscription explicitly. That matters once a
+    path is applied: the group then points at a managed file provider, and binding to it
+    would describe our frozen pool instead of the subscription that feeds the audit.
+    """
+    group_name = PATHS[ident][0]
+    groups = config.get('proxy-groups', [])
+    matches = [g for g in groups if g.get('name') == group_name]
+    if len(matches) != 1:
+        return None
+    if providers is None:
+        providers = matches[0].get('use', [])
+    if not isinstance(providers, list):
+        return None
+    registry = config.get('proxy-providers', {})
+    specs = []
+    for pid in providers:
+        prov = registry.get(pid)
+        if not isinstance(prov, dict):
+            continue
+        spec = {
+            'id': pid,
+            'url': prov.get('url', ''),
+            'header': prov.get('header', {}),
+            'transport': {k: v for k, v in prov.items() if k not in ('url', 'header', 'name')}
+        }
+        specs.append(spec)
+    if not specs:
+        return None
+    return {
+        'provider_ids': providers,
+        'source_fingerprint': digest(canonical_json(specs)),
+        'subscription_url_digest': digest(specs[0].get('url', '').encode()) if specs else '',
+        'bound_at': stamp()
+    }
+
+
+if __name__ == '__main__':
+    # Quick self-test
+    import sys
+    print('State module loaded OK')
+    print(f'DEFAULT_STORE={DEFAULT_STORE}')
+    print(f'DEFAULT_EVENTS={DEFAULT_EVENTS}')
+    print(f'DEFAULT_STATE_DIR={DEFAULT_STATE_DIR}')
+    print(f'DEFAULT_POOLS_DIR={DEFAULT_POOLS_DIR}')
+    print('Run with: python3 -c "import geomask_audit_state; print(geomask_audit_state.load_store())"')
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-config-tx.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Config transaction manager for mihomo: single writer, CAS, trial, rollback, recovery."""
+import contextlib
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+# Load state module for paths
+import importlib.util
+STATE_MODULE_PATH = Path(__file__).with_name('geomask-audit-state.py')
+_state_spec = importlib.util.spec_from_file_location('audit_state', STATE_MODULE_PATH)
+_state = importlib.util.module_from_spec(_state_spec)
+_state_spec.loader.exec_module(_state)
+
+# Paths from state module
+DEFAULT_CONFIG = _state.DEFAULT_CONFIG
+DEFAULT_STATE_DIR = _state.DEFAULT_STATE_DIR
+DEFAULT_STORE = _state.DEFAULT_STORE
+DEFAULT_REPORTS_DIR = _state.DEFAULT_REPORTS_DIR
+DEFAULT_POOLS_DIR = _state.DEFAULT_POOLS_DIR
+
+# Transaction journal
+TX_JOURNAL = DEFAULT_STATE_DIR / 'config-tx-journal.jsonl'
+TX_LOCK = DEFAULT_STATE_DIR / '.config-tx.lock'
+TX_STATE_DIR = DEFAULT_STATE_DIR / 'tx-work'
+TX_PREIMAGES_DIR = DEFAULT_STATE_DIR / 'tx-preimages'
+
+class TxError(Exception):
+    pass
+
+# A provider-backed group can be absent or empty for a moment after a reload; the
+# runtime check polls up to this long before declaring the reload unsuccessful.
+RUNTIME_VERIFY_SECONDS = 20.0
+
+def stamp():
+    return datetime.datetime.now().astimezone().isoformat()
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def canonical_json(obj) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+
+def encode(value) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + '\n').encode()
+
+def strict_json(data: bytes):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise TxError('duplicate JSON key')
+            result[key] = value
+        return result
+    try:
+        return json.loads(data, object_pairs_hook=pairs)
+    except (ValueError, UnicodeError):
+        raise TxError('invalid JSON') from None
+
+@contextlib.contextmanager
+def tx_lock():
+    """Process-wide transaction lock using flock (Unix) or file-based lock (Windows)."""
+    TX_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    
+    if hasattr(os, 'O_NOFOLLOW'):  # Unix
+        import fcntl
+        fd = None
+        try:
+            fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                os.close(fd)
+    else:  # Windows - use file-based lock
+        lock_acquired = False
+        try:
+            # Try to create lock file exclusively
+            fd = os.open(TX_LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            os.close(fd)
+            lock_acquired = True
+            yield
+        finally:
+            if lock_acquired:
+                try:
+                    os.unlink(TX_LOCK)
+                except OSError:
+                    pass
+
+@contextlib.contextmanager
+def job_budget(seconds):
+    deadline = time.monotonic() + seconds
+    if not hasattr(signal, 'SIGALRM'):
+        yield deadline
+        return
+    def expired(signum, frame):
+        raise TxError('transaction time budget exceeded')
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(seconds)
+    try:
+        yield deadline
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+def atomic_write(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent, prefix=f'.{path.name}-', delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_name = tmp.name
+    try:
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+def fsync_dir(path: Path):
+    """Force directory metadata to disk."""
+    try:
+        # O_DIRECTORY is Unix-only; skip on Windows
+        if hasattr(os, 'O_DIRECTORY'):
+            fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except (AttributeError, OSError):
+        pass  # Skip on platforms without O_DIRECTORY
+
+# The journal is append-only during a transaction, but it must not grow without bound on a
+# router with a small overlay. Entries of a transaction that never reached a terminal stage
+# are never dropped: recovery still needs them.
+MAX_TX_JOURNAL_ENTRIES = 400
+MAX_TX_JOURNAL_BYTES = 256 * 1024
+TERMINAL_STAGES = ('committed', 'rollback_complete', 'rollback_partial',
+                   'recovery_complete', 'recovery_failed')
+
+def append_tx_journal(entry: dict):
+    """Append transaction journal entry (append-only during a transaction)."""
+    entry['timestamp'] = stamp()
+    line = json.dumps(entry, ensure_ascii=False, separators=(',', ':')) + '\n'
+    TX_JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+    with open(TX_JOURNAL, 'ab') as f:
+        f.write(line.encode('utf-8'))
+        f.flush()
+        os.fsync(f.fileno())
+    fsync_dir(TX_JOURNAL.parent)
+    trim_tx_journal()
+
+
+def trim_tx_journal():
+    """Bound the journal, but keep every transaction that is still unfinished."""
+    try:
+        if not TX_JOURNAL.exists():
+            return 0
+        raw = TX_JOURNAL.read_text(encoding='utf-8')
+    except OSError:
+        return 0
+    if len(raw.encode('utf-8')) <= MAX_TX_JOURNAL_BYTES:
+        lines = raw.splitlines()
+        if len(lines) <= MAX_TX_JOURNAL_ENTRIES:
+            return 0
+        lines = raw.splitlines()
+    else:
+        lines = raw.splitlines()
+
+    parsed = []
+    for line in lines:
+        try:
+            parsed.append((line, json.loads(line)))
+        except Exception:
+            parsed.append((line, None))
+
+    finished = {}
+    for _, entry in parsed:
+        if isinstance(entry, dict):
+            tx_id = entry.get('tx_id')
+            if tx_id and entry.get('stage') in TERMINAL_STAGES:
+                finished[tx_id] = True
+    unfinished = {entry.get('tx_id') for _, entry in parsed
+                  if isinstance(entry, dict) and entry.get('tx_id')
+                  and entry.get('tx_id') not in finished}
+
+    keep = []
+    for index, (line, entry) in enumerate(parsed):
+        tx_id = entry.get('tx_id') if isinstance(entry, dict) else None
+        is_unfinished = tx_id in unfinished
+        remaining = len(parsed) - index
+        if is_unfinished or remaining <= MAX_TX_JOURNAL_ENTRIES:
+            keep.append(line)
+    if len(keep) == len(parsed):
+        return 0
+
+    body = '\n'.join(keep) + ('\n' if keep else '')
+    while len(body.encode('utf-8')) > MAX_TX_JOURNAL_BYTES and keep:
+        # Dropping from the front is safe here: unfinished transactions were all kept and
+        # they are the newest entries in practice.
+        keep.pop(0)
+        body = '\n'.join(keep) + ('\n' if keep else '')
+    tmp = TX_JOURNAL.with_suffix('.tmp')
+    tmp.write_text(body, encoding='utf-8')
+    os.replace(tmp, TX_JOURNAL)
+    return len(parsed) - len(keep)
+
+def read_tx_journal() -> list:
+    if not TX_JOURNAL.exists():
+        return []
+    lines = TX_JOURNAL.read_text(encoding='utf-8').splitlines()
+    result = []
+    for line in lines:
+        try:
+            result.append(json.loads(line))
+        except Exception:
+            continue
+    return result
+
+class ConfigTransaction:
+    """Manages a single config transaction with full rollback/recovery."""
+    
+    def __init__(self, tx_id: str = None):
+        self.tx_id = tx_id or secrets.token_hex(12)
+        self.stage = 'initialized'
+        self.preimages = {}  # path -> original bytes
+        self.staged_files = {}  # path -> new bytes
+        self.config_digest_before = None
+        self.config_digest_after = None
+        self.mihomo_pid_before = None
+        self.applied = False
+    
+    def __enter__(self):
+        # Journal tx start
+        append_tx_journal({
+            'tx_id': self.tx_id,
+            'stage': 'start',
+            'timestamp': stamp(),
+        })
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            # Error during transaction - attempt rollback
+            self.rollback()
+            append_tx_journal({
+                'tx_id': self.tx_id,
+                'stage': 'failed',
+                'error': str(exc_val),
+                'timestamp': stamp(),
+            })
+        return False  # Don't suppress exception
+    
+    def _preimage_path(self, path: Path) -> Path:
+        """Durable location for this file's preimage, keyed by tx and path."""
+        return TX_PREIMAGES_DIR / self.tx_id / path.name
+
+    def capture_preimage(self, path: Path):
+        """Persist the exact current bytes of a file before it is modified.
+
+        The preimage is written to disk (not kept only in memory) so that recovery
+        after a crash, a reboot or a killed worker can restore it without the process.
+        """
+        data = path.read_bytes() if path.exists() else None
+        self.preimages[str(path)] = data
+
+        stored = self._preimage_path(path)
+        stored.parent.mkdir(parents=True, exist_ok=True)
+        if data is None:
+            if stored.exists():
+                stored.unlink()
+        else:
+            atomic_write(stored, data)
+
+        append_tx_journal({
+            'tx_id': self.tx_id,
+            'stage': 'preimage',
+            'path': str(path),
+            'preimage_file': None if data is None else str(stored),
+            'existed': data is not None,
+            'digest': None if data is None else digest(data),
+            'timestamp': stamp(),
+        })
+    
+    def _make_work_path(self, path: Path) -> Path:
+        """Map an absolute target path to a location strictly inside the tx work dir.
+
+        The result must never equal (or escape to) the live path: staging writes there,
+        and a cleanup that resolved back onto the live file would delete it.
+        """
+        parts = [p for p in path.parts if p not in ('/', '\\', '')]
+        if parts and (parts[0].endswith(':') or parts[0].endswith(':\\')):
+            parts = parts[1:]
+        parts = [p for p in parts if p not in ('/', '\\')]
+        if not parts:
+            raise TxError('cannot map an empty path into the transaction work dir')
+        work = (TX_STATE_DIR / self.tx_id).joinpath(*parts)
+        base = (TX_STATE_DIR / self.tx_id).resolve()
+        if base != work.resolve() and base not in work.resolve().parents:
+            raise TxError('refusing to stage outside the transaction work dir: %s' % path)
+        return work
+    
+    def stage_file(self, path: Path, data: bytes):
+        """Stage a new file content (written to tx work dir first)."""
+        work_path = self._make_work_path(path)
+        work_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(work_path, data)
+        fsync_dir(work_path.parent)
+        self.staged_files[str(path)] = work_path
+        append_tx_journal({
+            'tx_id': self.tx_id,
+            'stage': 'staged',
+            'path': str(path),
+            'digest': digest(data),
+            'timestamp': stamp(),
+        })
+    
+    def validate_candidate(self, config_path: Path = None) -> bool:
+        """Run mihomo -t on the candidate, shaped the way the trial will run it.
+
+        Validating the raw staged file would fail on any file provider, because mihomo only
+        accepts provider paths inside its -d home and the staged file points at the live
+        home. So the check runs against the trial shape, with providers copied in.
+        """
+        config_path = config_path or DEFAULT_CONFIG
+        work_config = self._make_work_path(config_path)
+        if not work_config.exists():
+            raise TxError('staged config not found')
+        work_dir = work_config.parent
+        trial_config = self._build_trial_config(work_config, None)
+        check_path = work_dir / 'validate-config.yaml'
+        atomic_write(check_path, encode(trial_config))
+        result = subprocess.run(
+            ['mihomo', '-d', str(work_dir), '-f', str(check_path), '-t'],
+            capture_output=True, timeout=45
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).decode('utf-8', 'replace').strip()
+            raise TxError('mihomo validation failed: %s' % (detail[-400:] or 'no output'))
+        try:
+            check_path.unlink()
+        except OSError:
+            pass
+        return True
+    
+    def run_isolated_trial(self, config_path: Path = None, extra_listeners: list = None) -> bool:
+        """Run full isolated mihomo trial with all listeners."""
+        config_path = config_path or DEFAULT_CONFIG
+        work_config = self._make_work_path(config_path)
+        work_dir = work_config.parent
+        
+        # Create trial config with isolated ports
+        trial_config = self._build_trial_config(work_config, extra_listeners)
+        trial_config_path = work_dir / 'trial-config.yaml'
+        atomic_write(trial_config_path, encode(trial_config))
+        
+        # Validate
+        result = subprocess.run(
+            ['mihomo', '-d', str(work_dir), '-f', str(trial_config_path), '-t'],
+            capture_output=True, timeout=45
+        )
+        if result.returncode != 0:
+            raise TxError(f'trial config validation failed: {result.stderr.decode(errors="replace")[:500]}')
+        
+        # Start trial process
+        proc = subprocess.Popen(
+            ['mihomo', '-d', str(work_dir), '-f', str(trial_config_path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        
+        # Wait for controller
+        controller_port = trial_config.get('external-controller', '127.0.0.1:0').split(':')[-1]
+        if controller_port == '0':
+            controller_port = '9090'  # default
+        
+        secret = trial_config.get('secret', '')
+        headers = {'Authorization': 'Bearer ' + secret} if secret else {}
+        
+        for _ in range(40):
+            if proc.poll() is not None:
+                break
+            try:
+                req = urllib.request.Request(
+                    f'http://127.0.0.1:{controller_port}/version',
+                    headers=headers
+                )
+                urllib.request.urlopen(req, timeout=2).read()
+                # Success - trial running
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return True
+            except Exception:
+                time.sleep(0.2)
+        
+        # Failed to start
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        raise TxError('isolated trial mihomo did not start')
+    
+    def _build_trial_config(self, work_config_path: Path, extra_listeners: list) -> dict:
+        """Trial config with every inbound port moved and every kernel-side effect off.
+
+        Anything that binds a fixed port or touches the host network must be neutralised,
+        otherwise the trial either cannot start beside the live mihomo or would hijack it.
+        """
+        import socket
+        import yaml
+        with open(work_config_path, encoding='utf-8') as f:
+            config = _state.yaml12_load(f.read())
+
+        used = set()
+
+        def free_port():
+            for _ in range(200):
+                with socket.socket() as s:
+                    s.bind(('127.0.0.1', 0))
+                    port = s.getsockname()[1]
+                if port not in used:
+                    used.add(port)
+                    return port
+            raise TxError('could not allocate an isolated trial port')
+
+        # Every fixed inbound port mihomo knows about.
+        for key in ('port', 'socks-port', 'redir-port', 'tproxy-port', 'mixed-port'):
+            if isinstance(config.get(key), int) and config[key]:
+                config[key] = 0
+        # An explicit zero disables each of those, but the trial still needs one place
+        # to talk through, and the probe uses the listener list.
+        for listener in config.get('listeners') or []:
+            listener['port'] = free_port()
+            if 'listen' in listener:
+                listener['listen'] = '127.0.0.1'
+
+        addr = config.get('external-controller')
+        if isinstance(addr, str) and ':' in addr:
+            host = addr.rsplit(':', 1)[0]
+            config['external-controller'] = '%s:%d' % (host or '127.0.0.1', free_port())
+
+        # No kernel tunnels, no DNS hijack, no transparent interception during a trial.
+        tun = config.get('tun')
+        if isinstance(tun, dict):
+            tun['enable'] = False
+        for key in ('dns', 'sniffer', 'tproxy-port', 'redir-port'):
+            if key == 'dns' and isinstance(config.get('dns'), dict):
+                config['dns']['enable'] = False
+        config['allow-lan'] = False
+        config['bind-address'] = '127.0.0.1'
+
+        # The trial runs with its own -d, and mihomo only accepts file paths inside that
+        # home. Copy every file-backed provider into the trial tree and repoint it there,
+        # so the trial validates the real content without writing into the live home.
+        trial_home = work_config_path.parent
+        for section in ('proxy-providers', 'rule-providers'):
+            entries = config.get(section) or {}
+            for name, entry in entries.items():
+                if not isinstance(entry, dict) or entry.get('type') != 'file':
+                    continue
+                source = entry.get('path')
+                if not isinstance(source, str) or not source:
+                    continue
+                src = Path(source)
+                if not src.is_file():
+                    raise TxError('%s %s points at a missing path: %s' % (section, name, source))
+                target_dir = trial_home / 'providers'
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target = target_dir / ('%s-%s%s' % (section, name, src.suffix or '.yaml'))
+                target.write_bytes(src.read_bytes())
+                entry['path'] = str(target)
+
+        if extra_listeners:
+            for listener in extra_listeners:
+                item = dict(listener)
+                item['port'] = free_port()
+                item.setdefault('listen', '127.0.0.1')
+                config.setdefault('listeners', []).append(item)
+
+        config['secret'] = secrets.token_hex(24)
+        config['log-level'] = 'silent'
+        config['ipv6'] = False
+        return config
+    
+    def commit(self, config_path: Path = None, require_nonempty=None, require_exactly=None):
+        """Atomically write every staged file, reload mihomo and prove the result."""
+        config_path = config_path or DEFAULT_CONFIG
+
+        append_tx_journal({'tx_id': self.tx_id, 'stage': 'committing', 'timestamp': stamp()})
+
+        for final_path_str, work_path in self.staged_files.items():
+            final_path = Path(final_path_str)
+            if final_path_str not in self.preimages:
+                self.capture_preimage(final_path)
+            atomic_write(final_path, work_path.read_bytes())
+            fsync_dir(final_path.parent)
+
+        self.config_digest_after = digest(config_path.read_bytes())
+
+        self.reload_mihomo(config_path)
+        self.verify_runtime(config_path, require_nonempty, require_exactly)
+
+        self.applied = True
+        append_tx_journal({'tx_id': self.tx_id, 'stage': 'committed',
+                           'config_digest': self.config_digest_after, 'timestamp': stamp()})
+        self.cleanup_work()
+    
+    def reload_mihomo(self, config_path: Path):
+        """Reload mihomo via controller API."""
+        # Read secret from new config
+        with open(config_path, encoding='utf-8') as f:
+            config = _state.yaml12_load(f.read())
+        secret = config.get('secret', '')
+        
+        url = 'http://127.0.0.1:9090/configs?force=true'
+        data = json.dumps({'path': str(config_path)}).encode()
+        req = urllib.request.Request(url, data=data, method='PUT',
+            headers={'Content-Type': 'application/json'})
+        if secret:
+            req.add_header('Authorization', 'Bearer ' + secret)
+        
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except Exception as e:
+            raise TxError(f'mihomo reload failed: {e}')
+        
+        # Give time for reload
+        time.sleep(0.5)
+    
+    def verify_runtime(self, config_path: Path, require_nonempty=None, require_exactly=None):
+        """Prove the live controller reflects the committed file.
+
+        Three independent facts are checked: the API answers, every proxy-group the
+        committed config declares is actually present, and the groups we just narrowed
+        have a non-empty membership. Provider loading is asynchronous on this build --
+        a group can be absent for a moment after a reload -- so presence is polled to a
+        deadline instead of sampled once, and an empty pinned group is a hard failure
+        rather than a silent success.
+        """
+        with open(config_path, encoding='utf-8') as f:
+            config = _state.yaml12_load(f.read())
+
+        secret = config.get('secret', '')
+        headers = {'Authorization': 'Bearer ' + secret} if secret else {}
+        require_nonempty = set(require_nonempty or ())
+        require_exactly = {name: list(names) for name, names in (require_exactly or {}).items()}
+
+        declared = [g.get('name') for g in (config.get('proxy-groups') or []) if g.get('name')]
+        if not declared:
+            raise TxError('committed config declares no proxy-groups')
+
+        def fetch(name):
+            req = urllib.request.Request(
+                'http://127.0.0.1:9090/proxies/' + urllib.parse.quote(name), headers=headers)
+            return json.loads(urllib.request.urlopen(req, timeout=5).read())
+
+        deadline = time.monotonic() + RUNTIME_VERIFY_SECONDS
+        missing = list(declared)
+        empty = []
+        wrong = []
+        last_error = None
+        while True:
+            missing = []
+            empty = []
+            wrong = []
+            for group_name in declared:
+                try:
+                    live = fetch(group_name)
+                except Exception as exc:
+                    last_error = exc
+                    missing.append(group_name)
+                    continue
+                members = live.get('all')
+                if not isinstance(members, list):
+                    missing.append(group_name)
+                    continue
+                if group_name in require_nonempty and not members:
+                    empty.append(group_name)
+                elif group_name in require_exactly:
+                    want = set(require_exactly[group_name])
+                    got = set(members)
+                    if got != want:
+                        wrong.append('%s: missing %s, unexpected %s'
+                                     % (group_name, sorted(want - got)[:3], sorted(got - want)[:3]))
+            if not missing and not empty and not wrong:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
+
+        if missing:
+            raise TxError('group(s) missing from the live runtime after %.0fs: %s (%s)'
+                          % (RUNTIME_VERIFY_SECONDS, ', '.join(missing), last_error))
+        if empty:
+            raise TxError('pinned group(s) ended up with an empty pool: %s'
+                          % ', '.join(empty))
+        if wrong:
+            raise TxError('runtime pool does not match the applied set: %s'
+                          % '; '.join(wrong))
+
+        # The file on disk must still be exactly what we committed.
+        current_digest = digest(config_path.read_bytes())
+        if current_digest != self.config_digest_after:
+            raise TxError('config file changed after commit: expected %s, got %s'
+                          % (self.config_digest_after[:12], current_digest[:12]))
+    
+    def rollback(self):
+        """Rollback all staged files to preimages."""
+        append_tx_journal({
+            'tx_id': self.tx_id,
+            'stage': 'rollback_start',
+            'timestamp': stamp(),
+        })
+        
+        success = True
+        for final_path_str, preimage in self.preimages.items():
+            final_path = Path(final_path_str)
+            try:
+                if preimage is None:
+                    # File didn't exist before - remove it
+                    if final_path.exists():
+                        final_path.unlink()
+                else:
+                    atomic_write(final_path, preimage)
+                fsync_dir(final_path.parent)
+            except Exception as e:
+                append_tx_journal({
+                    'tx_id': self.tx_id,
+                    'stage': 'rollback_failed',
+                    'path': final_path_str,
+                    'error': str(e),
+                    'timestamp': stamp(),
+                })
+                success = False
+        
+        # Also rollback staged files in work dir (cleanup)
+        for final_path_str, work_path in self.staged_files.items():
+            try:
+                if work_path.exists():
+                    work_path.unlink()
+            except Exception:
+                pass
+        
+        # Reload mihomo to apply rollback
+        try:
+            self.reload_mihomo(DEFAULT_CONFIG)
+        except Exception as e:
+            append_tx_journal({
+                'tx_id': self.tx_id,
+                'stage': 'rollback_reload_failed',
+                'error': str(e),
+                'timestamp': stamp(),
+            })
+            success = False
+        
+        append_tx_journal({
+            'tx_id': self.tx_id,
+            'stage': 'rollback_complete' if success else 'rollback_partial',
+            'success': success,
+            'timestamp': stamp(),
+        })
+        
+        if not success:
+            raise TxError('Rollback partially failed - manual intervention required')
+        
+        self.cleanup_work()
+    
+    def cleanup_work(self):
+        """Clean up transaction work directory."""
+        work_dir = TX_STATE_DIR / self.tx_id
+        if work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+def start_transaction(files: dict, trial_paths: list = None, require_nonempty=None,
+                      require_exactly=None):
+    """Commit one whole file atomically.
+
+    ``files`` maps an absolute path (str or Path) to the exact bytes that must land
+    there. This is deliberately a file-content API: a caller that means "write this
+    YAML" must not be able to accidentally request "merge this as a config field".
+    Exactly one target is accepted; several files would not be one atomic commit.
+
+    ``trial_paths`` lists which of those files are mihomo configs to validate and
+    trial-run; it defaults to the primary mihomo config.
+    """
+    if not isinstance(files, dict) or not files:
+        raise TxError('start_transaction requires a non-empty {path: bytes} mapping')
+    if len(files) > 1:
+        # Each file is replaced atomically, but several files are not one atomic commit:
+        # a crash between them can leave half the set applied. Say so instead of implying
+        # a guarantee this code does not provide. Every current caller writes one file.
+        raise TxError('start_transaction commits one file at a time; '
+                      'multi-file atomic commit is not implemented')
+    # Repair a previous run that died mid-commit before stacking another mutation on top of
+    # it. Nothing used to call the recovery routine, so an interrupted transaction stayed
+    # interrupted until a human noticed.
+    try:
+        recover_interrupted_transactions()
+    except Exception as exc:
+        raise TxError('an earlier interrupted transaction could not be recovered: %s'
+                      % str(exc)[:160]) from None
+
+    normalised = {}
+    for path, content in files.items():
+        p = Path(path)
+        # A relative key silently resolves against the caller's working directory, which
+        # once wrote a candidate into "/" while reporting success. Refuse it outright.
+        if not p.is_absolute():
+            raise TxError('transaction target must be an absolute path: %r' % str(path))
+        if not isinstance(content, (bytes, bytearray)):
+            raise TxError('file content for %s must be bytes, got %s' % (p, type(content).__name__))
+        normalised[p] = bytes(content)
+
+    if trial_paths is None:
+        trial_paths = [DEFAULT_CONFIG] if DEFAULT_CONFIG in normalised else []
+    trials = [Path(p) for p in trial_paths]
+    for t in trials:
+        if t not in normalised:
+            raise TxError('trial path %s is not part of this transaction' % t)
+
+    tx_id = secrets.token_hex(12)
+
+    with tx_lock(), job_budget(300), ConfigTransaction(tx_id) as tx:
+        for path in normalised:
+            tx.capture_preimage(path)
+        for path, content in normalised.items():
+            tx.stage_file(path, content)
+
+        for path in trials:
+            tx.validate_candidate(path)
+            tx.run_isolated_trial(path)
+
+        # Record the intent (including preimage locations) before the first mutation,
+        # so a crash between commit and the caller's own bookkeeping stays recoverable.
+        with open(TX_JOURNAL, 'ab') as f:
+            f.write((json.dumps({
+                'tx_id': tx.tx_id,
+                'stage': 'prepare',
+                'files': [str(p) for p in normalised],
+                'preimages': {str(p): (digest(b) if b is not None else None)
+                              for p, b in tx.preimages.items()},
+                'timestamp': stamp(),
+            }, ensure_ascii=False) + '\n').encode('utf-8'))
+            f.flush()
+            os.fsync(f.fileno())
+
+        tx.commit(next(iter(trials), None), require_nonempty, require_exactly)
+        return {'ok': True, 'tx_id': tx.tx_id, 'config_digest': tx.config_digest_after,
+                'files': [str(p) for p in normalised]}
+
+def recover_interrupted_transactions():
+    """Scan for incomplete transactions and rollback/recover."""
+    if not TX_JOURNAL.exists():
+        return
+    
+    journal = read_tx_journal()
+    # Find latest incomplete tx per tx_id
+    tx_states = {}
+    for entry in journal:
+        tx_id = entry.get('tx_id')
+        stage = entry.get('stage')
+        if tx_id:
+            tx_states.setdefault(tx_id, []).append(stage)
+
+    for tx_id, stages in tx_states.items():
+        if 'committed' in stages or 'rollback_complete' in stages or 'rollback_partial' in stages:
+            continue
+        if not any(s in stages for s in ('prepare', 'committing', 'staged')):
+            continue
+
+        recovered = _restore_preimages(tx_id, journal)
+        append_tx_journal({
+            'tx_id': 'recovery',
+            'stage': 'recovery_complete' if recovered else 'recovery_failed',
+            'original_tx_id': tx_id,
+            'stages': stages,
+            'timestamp': stamp(),
+        })
+        if recovered:
+            try:
+                ConfigTransaction(tx_id).reload_mihomo(DEFAULT_CONFIG)
+            except Exception as exc:
+                append_tx_journal({'tx_id': 'recovery', 'stage': 'recovery_reload_failed',
+                                   'original_tx_id': tx_id, 'error': str(exc),
+                                   'timestamp': stamp()})
+
+def _restore_preimages(tx_id, journal):
+    """Put every file of an interrupted transaction back to its recorded preimage."""
+    entries = [entry for entry in journal
+               if entry.get('tx_id') == tx_id and entry.get('stage') == 'preimage']
+    if not entries:
+        # Without preimage records nothing can be restored, and claiming success would leave
+        # a half-applied config reported as recovered.
+        return False
+    ok = True
+    for entry in entries:
+        target = Path(entry.get('path') or '')
+        if not entry.get('path'):
+            continue
+        if not entry.get('existed'):
+            try:
+                if target.exists():
+                    target.unlink()
+            except OSError:
+                ok = False
+            continue
+        source = Path(entry.get('preimage_file') or '')
+        if not source.is_file():
+            ok = False
+            continue
+        data = source.read_bytes()
+        if digest(data) != entry.get('digest'):
+            ok = False
+            continue
+        try:
+            atomic_write(target, data)
+            fsync_dir(target.parent)
+        except OSError:
+            ok = False
+    return ok
+
+if __name__ == '__main__':
+    # Quick self-test
+    print('Config transaction module loaded OK')
+    print(f'DEFAULT_CONFIG={DEFAULT_CONFIG}')
+    print(f'TX_JOURNAL={TX_JOURNAL}')
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-config-owner.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Config ownership tracker: coordinates slot setter, legacy scanner, audit, and tx ownership."""
+import contextlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+
+# Load state module
+import importlib.util
+STATE_MODULE_PATH = Path(__file__).with_name('geomask-audit-state.py')
+_state_spec = importlib.util.spec_from_file_location('audit_state', STATE_MODULE_PATH)
+_state = importlib.util.module_from_spec(_state_spec)
+_state_spec.loader.exec_module(_state)
+
+# Load config-tx module
+TX_MODULE_PATH = Path(__file__).with_name('geomask-config-tx.py')
+_tx_spec = importlib.util.spec_from_file_location('config_tx', TX_MODULE_PATH)
+_tx = importlib.util.module_from_spec(_tx_spec)
+_tx_spec.loader.exec_module(_tx)
+
+# Paths from state module
+DEFAULT_CONFIG = _state.DEFAULT_CONFIG
+DEFAULT_STATE_DIR = _state.DEFAULT_STATE_DIR
+
+OWNERSHIP_FILE = DEFAULT_STATE_DIR / 'config-ownership.json'
+_lock = threading.Lock()
+
+class OwnershipError(Exception):
+    pass
+
+def stamp():
+    return _state.stamp()
+
+def digest(data: bytes) -> str:
+    return _state.digest(data)
+
+def canonical_json(obj) -> bytes:
+    return _state.canonical_json(obj)
+
+def encode(value) -> bytes:
+    return _state.encode(value)
+
+def strict_json(data: bytes):
+    return _state.strict_json(data)
+
+def atomic_write(path: Path, data: bytes):
+    _state.atomic_write(path, data)
+
+@contextlib.contextmanager
+def ownership_lock():
+    """File-based lock for ownership operations."""
+    lock_path = DEFAULT_STATE_DIR / '.ownership.lock'
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_acquired = False
+    try:
+        # Windows-compatible lock using O_EXCL for atomic creation
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.close(fd)
+        lock_acquired = True
+        try:
+            yield
+        finally:
+            # Release lock by deleting the file
+            if lock_acquired:
+                try:
+                    os.unlink(lock_path)
+                except Exception:
+                    pass
+    except FileExistsError:
+        raise OwnershipError('ownership lock held')
+    except Exception:
+        if lock_acquired:
+            try:
+                os.unlink(lock_path)
+            except Exception:
+                pass
+        raise
+
+def load_ownership():
+    """Load ownership state."""
+    if not OWNERSHIP_FILE.exists():
+        return {'schema': 1, 'groups': {}}
+    try:
+        return _state.strict_json(OWNERSHIP_FILE.read_bytes())
+    except Exception:
+        return {'schema': 1, 'groups': {}}
+
+def save_ownership(data: dict):
+    """Save ownership state atomically."""
+    atomic_write(OWNERSHIP_FILE, encode(data))
+
+def _register_unlocked(data: dict, group_name: str, owner: str, provider_ids: list) -> dict:
+    """Record ownership in an already-loaded store. Caller holds the lock."""
+    entry = data.setdefault('groups', {}).get(group_name, {})
+    data['groups'][group_name] = {
+        'owner': owner,  # 'slot', 'scanner', 'audit', 'manual'
+        'provider_ids': provider_ids,
+        'registered_at': _state.stamp(),
+        'version': int(entry.get('version', 0)) + 1,
+    }
+    return data
+
+def register_owner(group_name: str, owner: str, provider_ids: list):
+    """Register that a group is owned by a specific component."""
+    with ownership_lock():
+        save_ownership(_register_unlocked(load_ownership(), group_name, owner, provider_ids))
+
+def unregister_owner(group_name: str, expected_owner: str = None):
+    """Unregister ownership (when group is deleted or transferred)."""
+    with ownership_lock():
+        data = load_ownership()
+        if group_name in data.get('groups', {}):
+            current = data['groups'][group_name].get('owner')
+            if expected_owner and current != expected_owner:
+                raise OwnershipError(
+                    f'group {group_name} owned by {current}, not {expected_owner}')
+            del data['groups'][group_name]
+            save_ownership(data)
+
+def get_owner(group_name: str):
+    """Get current owner of a group."""
+    data = load_ownership()
+    return data.get('groups', {}).get(group_name, {}).get('owner')
+
+def can_modify_group(group_name: str, requester: str) -> bool:
+    """Check if requester can modify the group."""
+    owner = get_owner(group_name)
+    return owner is None or owner == requester
+
+def claim_group(group_name: str, requester: str, provider_ids: list) -> bool:
+    """Claim ownership, or confirm the caller already owns it.
+
+    Uses one lock acquisition and one write: calling register_owner() here would try to
+    take the same lock again and deadlock.
+    """
+    with ownership_lock():
+        data = load_ownership()
+        current = data.get('groups', {}).get(group_name, {}).get('owner')
+        if current is not None and current != requester:
+            return False
+        save_ownership(_register_unlocked(data, group_name, requester, provider_ids))
+        return True
+
+def check_group_ownership_before_write(group_name: str, requester: str):
+    """Validate that requester owns the group before allowing config write."""
+    owner = get_owner(group_name)
+    if owner is not None and owner != requester:
+        raise OwnershipError(f'group {group_name} is owned by {owner}, not {requester}')
+
+def get_group_provider_ids(config: dict, group_name: str) -> list:
+    """Get provider IDs used by a group."""
+    groups = config.get('proxy-groups', [])
+    for g in groups:
+        if g.get('name') == group_name:
+            return g.get('use', [])
+    return []
+
+def sync_ownership_with_config(config: dict):
+    """Sync ownership registry with current config state."""
+    with ownership_lock():
+        data = load_ownership()
+        # Find all groups in config
+        config_groups = set()
+        for g in config.get('proxy-groups', []):
+            name = g.get('name')
+            if name:
+                config_groups.add(name)
+        
+        # Remove ownership for groups that no longer exist
+        to_delete = [name for name in data.get('groups', {}) if name not in config_groups]
+        for name in to_delete:
+            del data['groups'][name]
+        
+        # Register ownership for new groups if unowned
+        for g in config.get('proxy-groups', []):
+            name = g.get('name')
+            if name and name not in data.get('groups', {}):
+                _register_unlocked(data, name, 'manual', g.get('use', []))
+
+        save_ownership(data)
+
+# CLI for testing
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=['claim', 'check', 'sync', 'list', 'unregister'])
+    parser.add_argument('--group', help='Group name')
+    parser.add_argument('--owner', help='Owner name (slot, scanner, audit, manual)')
+    parser.add_argument('--providers', help='Comma-separated provider IDs')
+    args = parser.parse_args()
+    
+    if args.command == 'claim':
+        if not args.group or not args.owner:
+            print('ERROR: --group and --owner required for claim')
+            sys.exit(1)
+        providers = args.providers.split(',') if args.providers else []
+        result = claim_group(args.group, args.owner, providers)
+        print(json.dumps({'ok': True, 'claimed': result}))
+    elif args.command == 'check':
+        if not args.group:
+            print('ERROR: --group required for check')
+            sys.exit(1)
+        owner = get_owner(args.group)
+        print(json.dumps({'ok': True, 'group': args.group, 'owner': owner}))
+    elif args.command == 'sync':
+        config_path = _state.DEFAULT_CONFIG
+        if config_path.exists():
+            import yaml
+            config = yaml.safe_load(config_path.read_text())
+            sync_ownership_with_config(config)
+        print(json.dumps({'ok': True, 'synced': True}))
+    elif args.command == 'list':
+        data = load_ownership()
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+    elif args.command == 'unregister':
+        if not args.group:
+            print('ERROR: --group required for unregister')
+            sys.exit(1)
+        try:
+            unregister_owner(args.group, args.owner)
+            print(json.dumps({'ok': True, 'unregistered': True}))
+        except OwnershipError as e:
+            print(json.dumps({'ok': False, 'error': str(e)}))
+            sys.exit(1)
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-apply.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Apply module: managed pool compiler, preview, and apply orchestration."""
+import contextlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:          # the panel reports a missing PyYAML instead of crashing
+    yaml = None
+
+# Load state module
+STATE_MODULE_PATH = Path(__file__).with_name('geomask-audit-state.py')
+_state_spec = importlib.util.spec_from_file_location('audit_state', STATE_MODULE_PATH)
+_state = importlib.util.module_from_spec(_state_spec)
+_state_spec.loader.exec_module(_state)
+
+# Load config-tx module
+TX_MODULE_PATH = Path(__file__).with_name('geomask-config-tx.py')
+_tx_spec = importlib.util.spec_from_file_location('config_tx', TX_MODULE_PATH)
+_tx = importlib.util.module_from_spec(_tx_spec)
+_tx_spec.loader.exec_module(_tx)
+
+# Paths from state module
+DEFAULT_CONFIG = _state.DEFAULT_CONFIG
+DEFAULT_STATE_DIR = _state.DEFAULT_STATE_DIR
+DEFAULT_POOLS_DIR = _state.DEFAULT_POOLS_DIR
+DEFAULT_REPORTS_DIR = _state.DEFAULT_REPORTS_DIR
+DEFAULT_CONFIG = _state.DEFAULT_CONFIG
+
+# Re-export from state module
+PATHS = _state.PATHS
+AuditError = _state.AuditError
+stamp = _state.stamp
+digest = _state.digest
+encode = _state.encode
+canonical_json = _state.canonical_json
+strict_json = _state.strict_json
+normalize_path = _state.path_id
+countries = _state.countries
+locked = _state.locked
+atomic_write = _state.atomic_write
+load_store = _state.load_store
+save_store = _state.save_store
+append_event = _state.append_event
+get_events = _state.get_events
+load_pool = _state.load_pool
+save_pool = _state.save_pool
+resolve_source_binding = _state.resolve_source_binding
+compute_path_revision = _state.compute_path_revision
+
+# Config-tx
+start_transaction = _tx.start_transaction
+load_node_snapshot = _state.load_node_snapshot
+
+class ApplyError(Exception):
+    pass
+
+# Managed pool files must live inside the home directory mihomo is started with: the live
+# daemon runs `-d /etc/mihomo`, and a provider path outside that root is rejected at parse
+# time. Probed on the router: `/etc/mihomo/...` passes, `/root/.config/mihomo/...` does not.
+POOL_DIR = Path(os.environ.get('GM_POOL_DIR', '/etc/mihomo/geomask-pools'))
+
+def _require_path(value):
+    """Validate a path id, reporting the failure as an ApplyError for this module."""
+    try:
+        return normalize_path(value)
+    except AuditError as exc:
+        raise ApplyError(str(exc)) from None
+
+def _provider_id(path_id, generation):
+    return 'audit-%s-g%d' % (path_id, generation)
+
+def _fingerprint_of(definition, provider_name):
+    """Recompute the audit fingerprint the same way the check did.
+
+    The whole definition is covered, not a hand-picked subset of transport keys: a node
+    whose credentials changed while its name, server and port stayed the same would
+    otherwise keep the approved fingerprint.
+    """
+    identity = {
+        'definition': definition,
+        'provider_id': provider_name,
+    }
+    return digest(canonical_json(identity))[:16]
+
+def _build_managed_proxies(path_id, report, eligible):
+    """Return the verified definitions for the eligible nodes, refusing anything unproven.
+
+    The snapshot holds exactly what the check measured. Every definition is re-fingerprinted
+    and compared with the report, so a rewritten source cannot smuggle a different endpoint
+    under an approved name.
+    """
+    snapshot = load_node_snapshot(path_id, report.get('job_id', ''))
+    if not snapshot:
+        raise ApplyError('node snapshot for this job is missing; run a fresh check')
+
+    proxies = []
+    for node in eligible:
+        name = node['name']
+        entry = snapshot.get(name)
+        if not entry:
+            raise ApplyError('node %r was not measured in this job; run a fresh check' % name)
+        definition = entry.get('definition')
+        provider_name = entry.get('provider')
+        if not isinstance(definition, dict) or definition.get('name') != name:
+            raise ApplyError('snapshot entry for %r is malformed' % name)
+        expected = entry.get('node_fingerprint')
+        if expected != _fingerprint_of(definition, provider_name):
+            raise ApplyError('snapshot entry for %r does not match its fingerprint' % name)
+        if node.get('node_fingerprint') and node['node_fingerprint'] != expected:
+            raise ApplyError('node %r changed between the report and its snapshot' % name)
+        proxies.append(definition)
+    return proxies
+
+def _unique_pool_names(proxies, generation):
+    """Give every pooled node a name of its own.
+
+    mihomo keys proxies by name across the whole process, so a pooled copy of a node that
+    still exists in its source subscription is the same name twice. The dashboard then
+    resolves the group's child to the wrong copy and renders nothing, and a delay test or a
+    selection can hit a node the group does not actually use. The suffix keeps the original
+    name recognisable while making the pooled instance unambiguous.
+    """
+    used = set()
+    renamed = []
+    mapping = {}
+    for definition in proxies:
+        original = str(definition.get('name') or '')
+        candidate = '%s · g%d' % (original, generation)
+        index = 2
+        while candidate in used:
+            candidate = '%s · g%d #%d' % (original, generation, index)
+            index += 1
+        used.add(candidate)
+        clone = dict(definition)
+        clone['name'] = candidate
+        renamed.append(clone)
+        mapping[original] = candidate
+    return renamed, mapping
+
+
+def _write_pool_file(path_id, generation, proxies):
+    """Write the managed provider file; 0600 because it carries endpoint credentials."""
+    POOL_DIR.mkdir(parents=True, exist_ok=True)
+    target = POOL_DIR / ('%s-g%d.yaml' % (path_id, generation))
+    body = yaml.safe_dump({'proxies': proxies}, allow_unicode=True, sort_keys=False)
+    atomic_write(target, body.encode('utf-8'))
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    return target
+
+def _acting_countries(eligible):
+    """The countries the applied pool actually reaches, from what the check measured."""
+    found = set()
+    for node in eligible or []:
+        for probe in (node.get('probes') or {}).values():
+            country = probe.get('country')
+            if isinstance(country, str) and len(country) == 2 and country.isalpha():
+                found.add(country.upper())
+    return sorted(found)
+
+
+def _managed_provider_of(config, provider_id):
+    """True when this provider id was created by this module."""
+    return isinstance(provider_id, str) and provider_id.startswith('audit-') \
+        and provider_id in (config.get('proxy-providers') or {})
+
+
+def _original_source(applied, current_use):
+    """Which source a revoke must restore.
+
+    Applying again while a managed pool is already in force must not record the managed
+    provider as the thing to go back to: its generation file is pruned by that very apply,
+    so a later revoke would point the group at a provider whose file no longer exists. The
+    original subscription from the first apply is carried forward instead.
+    """
+    inherited = (applied or {}).get('previous_use') or []
+    if inherited and any(str(p).startswith('audit-') for p in current_use):
+        return list(inherited)
+    return list(current_use)
+
+
+def _prune_pool_files(path_id, keep_generation, also_keep=()):
+    keep = {'%s-g%d.yaml' % (path_id, keep_generation)}
+    for name in also_keep:
+        keep.add(str(name))
+    for old in sorted(POOL_DIR.glob(path_id + '-g*.yaml')):
+        if old.name not in keep:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+# An applied pool is only trusted for this long after its audit.
+POOL_MAX_AGE_HOURS = 24
+
+def _read_config():
+    """Read mihomo config."""
+    with open(DEFAULT_CONFIG, encoding='utf-8') as f:
+        return f.read()
+
+def _write_config(text):
+    """Write mihomo config atomically."""
+    _tx.atomic_write(DEFAULT_CONFIG, text.encode('utf-8'))
+
+def _reload_mihomo():
+    """Reload mihomo via controller API."""
+    text = open(DEFAULT_CONFIG, encoding='utf-8').read()
+    secret = ''
+    for line in text.splitlines():
+        m = re.match(r'^secret:\s*["\']?([^"\'\s]+)', line)
+        if m:
+            secret = m.group(1)
+            break
+    
+    url = 'http://127.0.0.1:9090/configs?force=true'
+    req = urllib.request.Request(url,
+                                data=json.dumps({'path': '/etc/mihomo/config.yaml'}).encode(),
+                                method='PUT',
+                                headers={'Content-Type': 'application/json'})
+    if secret:
+        req.add_header('Authorization', 'Bearer ' + secret)
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        return True
+    except Exception as e:
+        raise ApplyError(f'mihomo reload failed: {e}')
+
+# ============================================================================
+# POOL COMPILER
+# ============================================================================
+
+def _compile_eligible_pool(path_id, report, countries_allow):
+    """Compile eligible pool from report based on countries_allow."""
+    eligible_nodes = []
+    excluded_nodes = []
+    unknown_nodes = []
+    
+    for node in report.get('nodes', []):
+        node_name = node.get('name', '')
+        node_status = node.get('status', 'unknown')
+        provider = node.get('provider', '')
+        node_fp = node.get('node_fingerprint', '')
+        
+        if node_status == 'eligible':
+            eligible_nodes.append({
+                'name': node_name,
+                'provider': provider,
+                'node_fingerprint': node_fp,
+                # The measurements travel with the entry: the applied record reports the
+                # countries the pool actually reaches, and that is derived from these.
+                'probes': node.get('probes') or {},
+            })
+        elif node_status == 'excluded':
+            excluded_nodes.append({
+                'name': node_name,
+                'provider': provider,
+                'reason': node.get('reasons', []),
+            })
+        else:
+            unknown_nodes.append({
+                'name': node_name,
+                'provider': provider,
+                'reason': node.get('reasons', []),
+            })
+    
+    return {
+        'eligible': eligible_nodes,
+        'excluded': excluded_nodes,
+        'unknown': unknown_nodes,
+        'countries_allow': countries_allow,
+        'total_eligible': len(eligible_nodes),
+        'total_excluded': len(excluded_nodes),
+        'total_unknown': len(unknown_nodes),
+    }
+
+
+def _preview_token(path_id, report, pool, countries_allow):
+    """Deterministic identity of one exact preview: path + audited job + approved set."""
+    material = {
+        'path_id': path_id,
+        'job_id': report.get('job_id', ''),
+        'source_revision': report.get('source_revision', ''),
+        'countries_allow': countries_allow,
+        'eligible': sorted(n['name'] for n in pool['eligible']),
+        'fingerprints': sorted(n.get('node_fingerprint', '') for n in pool['eligible']),
+    }
+    return digest(canonical_json(material))
+
+def _hosts_regex(names):
+    """Anchored alternation matching exactly these node names, nothing else."""
+    return '^(' + '|'.join(re.escape(n) for n in names) + ')$'
+
+def preview_apply(path_id, report_id, expected_path_revision, expected_source_revision):
+    """Generate preview of what apply would do."""
+    path_id = _require_path(path_id)
+    data, _ = load_store()
+    path_data = data['paths'].get(path_id, {})
+
+    if path_data.get('path_revision') != expected_path_revision:
+        raise ApplyError('STALE: path revision changed; reload before previewing')
+
+    report_path = DEFAULT_STATE_DIR / f'{path_id}.json'
+    if not report_path.exists():
+        raise ApplyError('Report not found; run a check first')
+
+    report = strict_json(report_path.read_bytes())
+
+    if report.get('status') != 'complete':
+        raise ApplyError('Report not complete; run a fresh check')
+    if report.get('stale'):
+        raise ApplyError('Report is stale; run a fresh check')
+
+    # Staleness must be derived here, not trusted from the caller: a caller that echoes
+    # the report's own revisions back would otherwise make a dead report look current.
+    if report.get('settings_revision') != path_data.get('path_revision'):
+        raise ApplyError('STALE: path settings changed since the check; check again')
+    live_raw = DEFAULT_CONFIG.read_bytes()
+    live_config_text = live_raw.decode('utf-8')
+    if report.get('source_revision') != digest(live_raw):
+        raise ApplyError('STALE: mihomo config changed since the check; check again')
+
+    if report.get('job_id') != report_id:
+        raise ApplyError('Report ID mismatch; run a fresh check')
+    if report.get('source_revision') != expected_source_revision:
+        raise ApplyError('STALE: subscription changed since the check')
+
+    config = yaml_load(live_config_text)
+    group_name = PATHS[path_id][0]
+    current_group = None
+    for g in config.get('proxy-groups', []):
+        if g.get('name') == group_name:
+            current_group = g
+            break
+    if current_group is None:
+        raise ApplyError(f'group {group_name} not found in mihomo config')
+
+    countries_allow = path_data.get('countries_allow', PATHS[path_id][1])
+    pool = _compile_eligible_pool(path_id, report, countries_allow)
+
+    if not pool['eligible']:
+        raise ApplyError('No eligible nodes: refusing to apply an empty pool (no DIRECT fallback)')
+
+    # Current effective membership is whatever the provider + filter already yields.
+    current_nodes = set(current_group.get('proxies') or [])
+    eligible_names = {n['name'] for n in pool['eligible']}
+    excluded_names = {n['name'] for n in pool['excluded']}
+    unknown_names = {n['name'] for n in pool['unknown']}
+
+    warnings = []
+    mechanism = 'managed-file-provider'
+    snapshot_ready = False
+    try:
+        snapshot_ready = bool(load_node_snapshot(path_id, report.get('job_id', '')))
+    except AuditError:
+        snapshot_ready = False
+    if not snapshot_ready:
+        mechanism = 'unavailable-no-snapshot'
+        warnings.append('нет снимка измеренных узлов для этой проверки: нужна новая проверка, '
+                        'иначе пул нельзя собрать из подтверждённых определений')
+    else:
+        # Verify the snapshot here as well, not only inside apply: a snapshot that no longer
+        # matches the report makes apply refuse, and preview must not promise a pool that
+        # apply will then reject.
+        try:
+            _build_managed_proxies(path_id, report, pool['eligible'])
+        except ApplyError as exc:
+            raise ApplyError('снимок узлов не совпадает с отчётом (%s); нужна новая проверка'
+                             % exc) from None
+    if not current_group.get('use'):
+        warnings.append('группа не привязана к провайдеру: применение будет отклонено, пока это не исправлено')
+    if unknown_names:
+        warnings.append('%d узл(ов) с неизвестной географией будут исключены' % len(unknown_names))
+    restrictions = []
+    if current_group.get('filter'):
+        restrictions.append('filter')
+    if current_group.get('exclude-filter'):
+        restrictions.append('exclude-filter')
+    if restrictions:
+        warnings.append('в группе есть унаследованный %s; на время действия управляемого пула он '
+                        'приостанавливается (пул уже содержит только одобренные узлы) и '
+                        'восстанавливается при отзыве' % ' и '.join(restrictions))
+    warnings.append('применение заменяет источник группы управляемым файл-провайдером только с '
+                    'проверенными определениями; исходная подписка не меняется и снова '
+                    'используется при следующей проверке')
+
+    return {
+        'ok': True,
+        'preview_id': _preview_token(path_id, report, pool, countries_allow),
+        'path_id': path_id,
+        'group': group_name,
+        'mechanism': mechanism,
+        'current_nodes': sorted(current_nodes),
+        'proposed_nodes': sorted(eligible_names),
+        'to_add': sorted(eligible_names - current_nodes),
+        'to_remove': sorted(current_nodes & (excluded_names | unknown_names)),
+        'excluded_from_pool': sorted(excluded_names | unknown_names),
+        'eligible_count': len(pool['eligible']),
+        'excluded_count': len(pool['excluded']),
+        'unknown_count': len(pool['unknown']),
+        'current_node': current_group.get('now'),
+        'previous_filter': current_group.get('filter', ''),
+        'previous_exclude_filter': current_group.get('exclude-filter', ''),
+        'previous_use': list(current_group.get('use') or []),
+        'warnings': warnings,
+    }
+
+def _restore_applied_record(path_id, previous):
+    """Put the applied record back after a refused transaction."""
+    try:
+        data, _ = load_store()
+        if previous:
+            data.setdefault('paths', {}).setdefault(path_id, {})['applied'] = previous
+        else:
+            data.setdefault('paths', {}).setdefault(path_id, {}).pop('applied', None)
+        save_store(data)
+    except Exception:
+        # A failure to restore the bookkeeping must not mask the original error.
+        pass
+
+
+def apply_preview(path_id, preview_id, expected_path_revision):
+    """Apply a previewed pool by pinning the target group to exactly those nodes."""
+    path_id = _require_path(path_id)
+    data, _ = load_store()
+    path_data = data['paths'].get(path_id, {})
+    previous_applied = path_data.get('applied')
+
+    if path_data.get('path_revision') != expected_path_revision:
+        raise ApplyError('STALE: path revision changed; reload before applying')
+    report_path = DEFAULT_STATE_DIR / f'{path_id}.json'
+    if not report_path.exists():
+        raise ApplyError('Report not found; run a check first')
+    report = strict_json(report_path.read_bytes())
+
+    if report.get('status') != 'complete' or report.get('stale'):
+        raise ApplyError('Report is stale or incomplete; run a fresh check')
+
+    # Settings and config can both move after the check; derive, do not trust.
+    if report.get('settings_revision') != path_data.get('path_revision'):
+        raise ApplyError('STALE: path settings changed since the check; check again')
+    live_raw = DEFAULT_CONFIG.read_bytes()
+    live_config = live_raw.decode('utf-8')
+    if report.get('source_revision') != digest(live_raw):
+        raise ApplyError('STALE: mihomo config changed since the check; check again')
+
+    countries_allow = path_data.get('countries_allow', PATHS[path_id][1])
+    pool = _compile_eligible_pool(path_id, report, countries_allow)
+
+    if not pool['eligible']:
+        raise ApplyError('No eligible nodes: refusing to apply an empty pool (no DIRECT fallback)')
+    if _preview_token(path_id, report, pool, countries_allow) != preview_id:
+        raise ApplyError('STALE: preview no longer matches the audited result; preview again')
+
+    config = yaml_load(live_config)
+    group_name = PATHS[path_id][0]
+    target = None
+    for g in config.get('proxy-groups', []):
+        if g.get('name') == group_name:
+            target = g
+            break
+    if target is None:
+        raise ApplyError(f'group {group_name} not found in mihomo config')
+
+    applied_before = path_data.get('applied') or {}
+    previous_filter = target.get('filter', '')
+    previous_use = _original_source(applied_before, list(target.get('use') or []))
+    if not previous_use:
+        raise ApplyError('group %s is not provider-backed; refusing to guess its source'
+                         % group_name)
+    # An already-managed generation is replaced, not chained: its provider entry and file
+    # are dropped once the new one is verified, otherwise the group would collect dead
+    # providers and revoke could point at a pruned file.
+    stale_provider = applied_before.get('provider_id') or ''
+
+    generation = int(path_data.get('applied', {}).get('generation', 0)) + 1
+    provider_id = _provider_id(path_id, generation)
+    proxies = _build_managed_proxies(path_id, report, pool['eligible'])
+    # Unique names: the same node also exists in its source subscription, and mihomo keys
+    # proxies by name process-wide (see _unique_pool_names).
+    proxies, renames = _unique_pool_names(proxies, generation)
+    eligible_names = [p['name'] for p in proxies]
+
+    # The pool file is written before the transaction so `mihomo -t` can actually load it;
+    # it is removed again if the transaction refuses the candidate.
+    pool_path = _write_pool_file(path_id, generation, proxies)
+
+    config.setdefault('proxy-providers', {})[provider_id] = {
+        'type': 'file',
+        'path': str(pool_path),
+    }
+    if stale_provider and stale_provider != provider_id:
+        (config.get('proxy-providers') or {}).pop(stale_provider, None)
+    target['use'] = [provider_id]
+    target.pop('filter', None)
+    previous_exclude = target.pop('exclude-filter', '')
+
+    audit = {
+        'generation': generation,
+        'path_revision': expected_path_revision,
+        'preview_id': preview_id,
+        'job_id': report.get('job_id', ''),
+        'source_revision': report.get('source_revision', ''),
+        'applied_at': stamp(),
+        'runtime_verified': False,
+        'pool_digest': digest(canonical_json(sorted(
+            (n['name'], n.get('node_fingerprint', '')) for n in pool['eligible']))),
+        'status': 'applying',
+        'node_count': len(eligible_names),
+        # What the pool really reaches, so the panel can show desired against acting.
+        'acting_countries': _acting_countries(pool['eligible']),
+        'previous_filter': previous_filter,
+        'previous_exclude_filter': previous_exclude,
+        'previous_use': previous_use,
+        'provider_id': provider_id,
+        'pool_file': str(pool_path),
+        'group': group_name,
+        # original report name -> pooled name, so the panel and later readers can map back
+        'renames': renames,
+    }
+
+    try:
+        # Record the in-flight apply before the transaction starts. A crash between the
+        # commit and the bookkeeping used to leave no trace that the group might already be
+        # pinned to a managed provider, so nobody could tell a clean group from a half-done
+        # apply. Everything needed for a manual restore is in this record.
+        intent_data, _ = load_store()
+        intent_data.setdefault('paths', {}).setdefault(path_id, {})['applied'] = audit
+        save_store(intent_data)
+
+        result = start_transaction(
+            {str(DEFAULT_CONFIG): yaml.safe_dump(config, allow_unicode=True,
+                                                 sort_keys=False).encode('utf-8')},
+            require_exactly={group_name: eligible_names})
+    except Exception:
+        _restore_applied_record(path_id, previous_applied)
+        try:
+            pool_path.unlink()
+        except OSError:
+            pass
+        raise
+    if not result.get('ok'):
+        _restore_applied_record(path_id, previous_applied)
+        try:
+            pool_path.unlink()
+        except OSError:
+            pass
+        raise ApplyError('transaction rejected the candidate; config left unchanged')
+
+    # Nothing points at the replaced generation any more: previous_use carries the original
+    # subscription forward, so its file and provider entry are dropped here.
+    _prune_pool_files(path_id, generation)
+
+    data, _ = load_store()
+    data['paths'][path_id]['applied'] = dict(audit, status='applied', runtime_verified=True,
+                                             applied_at=stamp())
+    save_store(data)
+    append_event({
+        'path': path_id, 'actor': 'luci', 'action': 'apply',
+        'preview_id': preview_id, 'job_id': audit['job_id'],
+        'node_count': len(eligible_names), 'result': 'success',
+    })
+    return {
+        'ok': True, 'applied': True, 'path_id': path_id,
+        'tx_id': result.get('tx_id'), 'config_digest': result.get('config_digest'),
+        'node_count': len(eligible_names), 'pool_digest': audit['pool_digest'],
+    }
+
+def apply_status(path_id):
+    """Report the applied state honestly, including staleness of the evidence."""
+    path_id = _require_path(path_id)
+    data, _ = load_store()
+    applied = data['paths'].get(path_id, {}).get('applied', {})
+
+    status = applied.get('status', 'never')
+    if status == 'applying':
+        # The record is written before the transaction, so this state means either an apply
+        # in flight or one that died between commit and bookkeeping. The group may already
+        # point at the managed provider, so never claim the path is unrestricted here.
+        return {
+            'ok': True,
+            'path_id': path_id,
+            'applied': False,
+            'filter_in_force': True,
+            'evidence_age_hours': None,
+            'applied_detail': dict(applied, status='applying',
+                                   warning='применение не завершено; проверьте пул и при '
+                                           'необходимости отзовите фильтр'),
+        }
+    if status in ('applied', 'expired'):
+        applied_at = applied.get('applied_at', '')
+        age_hours = None
+        if applied_at:
+            try:
+                applied_time = datetime.fromisoformat(applied_at.replace('Z', '+00:00'))
+                age_hours = (datetime.now(applied_time.tzinfo) - applied_time).total_seconds() / 3600.0
+            except ValueError:
+                pass
+        stale = age_hours is not None and age_hours > POOL_MAX_AGE_HOURS
+        # A stale pool is still in force: the filter was never removed. Say so.
+        in_force = status == 'applied' and not stale
+        detail = dict(applied)
+        if stale:
+            detail['status'] = 'expired'
+            detail['warning'] = ('Filter is still in force but its evidence is older than %dh; '
+                                 'run a fresh check and re-apply. The pool was not widened.'
+                                 % POOL_MAX_AGE_HOURS)
+        return {
+            'ok': True,
+            'path_id': path_id,
+            'applied': in_force,
+            'filter_in_force': status in ('applied', 'expired'),
+            'evidence_age_hours': None if age_hours is None else round(age_hours, 1),
+            'applied_detail': detail,
+        }
+
+    return {
+        'ok': True,
+        'path_id': path_id,
+        'applied': False,
+        'filter_in_force': False,
+        'evidence_age_hours': None,
+        'applied_detail': applied,
+    }
+
+def revoke_applied_pool(path_id):
+    """Drop our applied pool filter and restore the group's previous filter."""
+    path_id = _require_path(path_id)
+    data, _ = load_store()
+    applied = data['paths'].get(path_id, {}).get('applied', {})
+
+    if applied.get('status') not in ('applied', 'expired'):
+        return {'ok': True, 'revoked': False, 'message': 'No applied pool to revoke'}
+
+    config = yaml_load(open(DEFAULT_CONFIG, encoding='utf-8').read())
+    group_name = PATHS[path_id][0]
+    target = None
+    for g in config.get('proxy-groups', []):
+        if g.get('name') == group_name:
+            target = g
+            break
+    if target is None:
+        raise ApplyError(f'group {group_name} not found in mihomo config')
+
+    # Restore the group's original source and filter, and drop the managed provider.
+    previous_use = applied.get('previous_use') or []
+    provider_id = applied.get('provider_id') or ''
+    if previous_use:
+        target['use'] = list(previous_use)
+    elif provider_id:
+        target.pop('use', None)
+    previous = applied.get('previous_filter') or ''
+    if previous:
+        target['filter'] = previous
+    else:
+        target.pop('filter', None)
+    previous_exclude = applied.get('previous_exclude_filter') or ''
+    if previous_exclude:
+        target['exclude-filter'] = previous_exclude
+    else:
+        target.pop('exclude-filter', None)
+    providers = config.get('proxy-providers') or {}
+    if provider_id and provider_id in providers:
+        providers.pop(provider_id)
+    pool_file = applied.get('pool_file')
+
+    # Widening is the point of a revoke, so an empty result here is not a failure mode
+    # to guard against: the previous source and filter are restored as recorded.
+    result = start_transaction({str(DEFAULT_CONFIG): yaml.safe_dump(
+        config, allow_unicode=True, sort_keys=False).encode('utf-8')})
+    if not result.get('ok'):
+        raise ApplyError('transaction rejected the candidate; group left as it was')
+
+    if pool_file:
+        try:
+            Path(pool_file).unlink()
+        except OSError:
+            pass
+
+    data, _ = load_store()
+    data['paths'][path_id]['applied'] = {
+        'generation': int(applied.get('generation', 0)) + 1,
+        'path_revision': data['paths'][path_id].get('path_revision', ''),
+        'preview_id': '',
+        'job_id': '',
+        'source_revision': '',
+        'applied_at': stamp(),
+        'runtime_verified': False,
+        'pool_digest': '',
+        'status': 'revoked',
+        'group': group_name,
+    }
+    save_store(data)
+    append_event({'path': path_id, 'actor': 'luci', 'action': 'revoke', 'result': 'success'})
+    return {'ok': True, 'revoked': True, 'path_id': path_id,
+            'restored_filter': previous, 'tx_id': result.get('tx_id')}
+
+def handle_expired_pools():
+    """Mark stale pools as expired without widening them.
+
+    Expiry means the evidence is old, not that the exclusion is void. Dropping the pinned
+    filter here would return the group to the full provider pool, including nodes proven
+    to sit in a disallowed country -- a fail-open. So expiry only records the state and
+    raises the flag; widening stays an explicit human action through revoke.
+    """
+    data, _ = load_store()
+    expired_any = False
+    changed = False
+    for ident, path_data in data.get('paths', {}).items():
+        applied = path_data.get('applied', {})
+        if applied.get('status') != 'applied':
+            continue
+        applied_at = applied.get('applied_at', '')
+        if not applied_at:
+            continue
+        try:
+            applied_time = datetime.fromisoformat(applied_at.replace('Z', '+00:00'))
+        except ValueError:
+            continue
+        if datetime.now(applied_time.tzinfo) - applied_time <= timedelta(hours=POOL_MAX_AGE_HOURS):
+            continue
+        data['paths'][ident]['applied'] = dict(
+            applied, status='expired',
+            expired_at=stamp(),
+            width_preserved=True)
+        changed = True
+        expired_any = True
+        append_event({'path': ident, 'actor': 'system', 'action': 'expire',
+                      'result': 'success',
+                      'detail': 'filter kept; pool not widened, re-check required'})
+    if changed:
+        save_store(data)
+    return {'ok': True, 'expired_any': expired_any, 'widened': False}
+
+
+def yaml_load(raw):
+    if yaml is None:
+        raise ApplyError('PyYAML is not installed on the router')
+    try:
+        value = _state.yaml12_load(raw)
+        if not isinstance(value, dict):
+            raise ApplyError('expected YAML mapping')
+        return value
+    except yaml.YAMLError:
+        raise ApplyError('invalid YAML source') from None
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=['preview', 'apply', 'revoke', 'status', 'expire'])
+    parser.add_argument('args', nargs='*')
+    parsed = parser.parse_args()
+    try:
+        if parsed.command == 'preview' and len(parsed.args) == 4:
+            value = preview_apply(parsed.args[0], parsed.args[1], parsed.args[2], parsed.args[3])
+        elif parsed.command == 'apply' and len(parsed.args) == 3:
+            value = apply_preview(parsed.args[0], parsed.args[1], parsed.args[2])
+        elif parsed.command == 'revoke' and len(parsed.args) == 1:
+            value = revoke_applied_pool(parsed.args[0])
+        elif parsed.command == 'status' and len(parsed.args) == 1:
+            value = apply_status(parsed.args[0])
+        elif parsed.command == 'expire' and not parsed.args:
+            value = handle_expired_pools()
+        else:
+            raise ApplyError('invalid command arguments')
+    except Exception as exc:
+        value = {'ok': False, 'applied': False,
+                 'error': str(exc) if isinstance(exc, (ApplyError, AuditError)) else type(exc).__name__}
+    print(json.dumps(value, ensure_ascii=False))
+    raise SystemExit(0 if value.get('ok') else 1)
+
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-lane-torrent.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Lane and Torrent operations using config transaction system."""
+import contextlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+from pathlib import Path
+
+# Load config-tx module
+TX_MODULE_PATH = Path(__file__).with_name('geomask-config-tx.py')
+_tx_spec = importlib.util.spec_from_file_location('config_tx', TX_MODULE_PATH)
+_tx = importlib.util.module_from_spec(_tx_spec)
+_tx_spec.loader.exec_module(_tx)
+
+# Paths
+CFG = Path('/etc/mihomo/config.yaml')
+
+class LaneTorrentError(Exception):
+    pass
+
+def _read_config():
+    """Read and parse mihomo config."""
+    with open(CFG, encoding='utf-8') as f:
+        return f.read()
+
+def _validate_config(text=None):
+    """Validate mihomo config."""
+    if text is None:
+        result = subprocess.run(['mihomo', '-t', '-d', '/etc/mihomo'],
+                               capture_output=True, timeout=60)
+    else:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(text)
+            tmp = f.name
+        try:
+            result = subprocess.run(['mihomo', '-t', '-d', '/etc/mihomo', '-f', tmp],
+                                   capture_output=True, timeout=60)
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    return result.returncode == 0
+
+def _reload_mihomo():
+    """Reload mihomo via controller API."""
+    text = _read_config()
+    secret = ''
+    for line in text.splitlines():
+        m = re.match(r'^secret:\s*["\']?([^"\'\s]+)', line)
+        if m:
+            secret = m.group(1)
+            break
+    
+    url = 'http://127.0.0.1:9090/configs?force=true'
+    req = urllib.request.Request(url,
+                                data=json.dumps({'path': '/etc/mihomo/config.yaml'}).encode(),
+                                method='PUT',
+                                headers={'Content-Type': 'application/json'})
+    if secret:
+        req.add_header('Authorization', 'Bearer ' + secret)
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        return True
+    except Exception as e:
+        raise LaneTorrentError(f'mihomo reload failed: {e}')
+
+# ============================================================================
+# LANE OPERATIONS
+# ============================================================================
+
+def _lane_install_changes(lane_name='VPN-noP2P', lane_ip='198.20.0.1', lane_port=7892, lane_group='VPN-noP2P'):
+    """Build config changes for lane install."""
+    config = _read_config()
+    
+    # Check group exists
+    if f'name: {lane_group}' not in config:
+        raise LaneTorrentError(f'mihomo group {lane_group} not found')
+    
+    # Check if listener already exists
+    listener_name = f'lane-{lane_name}'
+    if f'name: {listener_name}' in config:
+        return {}  # Already exists
+    
+    # Build listener block
+    listener_block = f'''  - name: {listener_name}
+    type: mixed
+    port: {lane_port}
+    listen: 127.0.0.1
+    proxy: {lane_group}'''
+    
+    # Insert into listeners block
+    if 'listeners:' in config:
+        # Insert at end of listeners block
+        import re
+        m = re.search(r'(?m)^listeners:\s*$(.*?)(?=^(?=[a-z]))', config, re.M | re.S)
+        if m:
+            body = m.group(1)
+            tail = len(body) - len(body.rstrip('\n'))
+            new_body = body.rstrip('\n') + '\n' + listener_block + '\n' + '\n' * (1 if tail else 0)
+            new_config = config[:m.start(1)] + new_body + config[m.end(1):]
+            return {'config.yaml': new_config.encode('utf-8')}
+    
+    raise LaneTorrentError('Could not find listeners block in config')
+
+def _tx_files(payload):
+    """Wrap a config payload for the transaction, keyed by its absolute path.
+
+    The transaction refuses relative keys, and a bare 'config.yaml' used to be resolved
+    against the caller's working directory.
+    """
+    return {str(CFG): payload}
+
+def lane_install(lane_name='VPN-noP2P', lane_ip='198.20.0.1', lane_port=7892, lane_group='VPN-noP2P'):
+    """Install a new lane using transaction."""
+    changes = _lane_install_changes(lane_name, lane_ip, lane_port, lane_group)
+    if not changes:
+        return {'ok': True, 'message': 'Lane already installed'}
+
+    return _tx.start_transaction(_tx_files(changes['config.yaml']))
+
+def lane_remove(lane_name='VPN-noP2P'):
+    """Remove a lane using transaction."""
+    config = _read_config()
+    listener_name = f'lane-{lane_name}'
+    
+    if f'name: {listener_name}' not in config:
+        return {'ok': True, 'message': 'Lane not installed'}
+    
+    # Remove listener block
+    import re
+    pattern = rf'(?m)^  - name: {re.escape(listener_name)}\n(?:[ ]{{4}}.*\n)+'
+    new_config = re.sub(pattern, '', config, count=1)
+    
+    if new_config == config:
+        return {'ok': True, 'message': 'Lane not found in config'}
+    
+    return _tx.start_transaction(_tx_files(new_config.encode('utf-8')))
+
+def lane_status(lane_name='VPN-noP2P'):
+    """Get lane status."""
+    config = _read_config()
+    listener_name = f'lane-{lane_name}'
+    listener_present = f'name: {listener_name}' in config
+    netdev_present = os.path.exists(f'/sys/class/net/{lane_name}')
+    service_exists = os.path.exists(f'/etc/init.d/hev-{lane_name}')
+    
+    return {
+        'ok': True,
+        'lane_name': lane_name,
+        'listener_present': listener_present,
+        'netdev_present': netdev_present,
+        'service_exists': service_exists,
+    }
+
+# ============================================================================
+# TORRENT OPERATIONS
+# ============================================================================
+
+def torrent_status():
+    """Get torrent status."""
+    config = _read_config()
+    ruleset_path = Path('/etc/mihomo/ruleset/torrentdirect.yaml')
+    
+    listener_present = 'torrent-direct' in config
+    listener_policy = ''
+    if listener_present:
+        m = re.search(r'(?m)^  - name: torrent-direct\n(?:[ ]{4}.*\n)*?[ ]{4}proxy:\s*(\S+)', config)
+        if m:
+            listener_policy = m.group(1)
+    
+    ruleset_text = ''
+    if Path('/etc/mihomo/ruleset/torrentdirect.yaml').exists():
+        ruleset_text = Path('/etc/mihomo/ruleset/torrentdirect.yaml').read_text()
+    
+    return {
+        'ok': True,
+        'listener_present': listener_present,
+        'listener_policy': listener_policy,
+        'listener_port': 7894,
+        'ruleset_present': Path('/etc/mihomo/ruleset/torrentdirect.yaml').exists(),
+        'domains': len(re.findall(r'DOMAIN-SUFFIX,', ruleset_text)),
+        'raw_ips': len(re.findall(r'IP-CIDR,', ruleset_text)),
+    }
+
+def _torrent_listener_changes(enable):
+    """Build config changes for torrent listener enable/disable."""
+    config = _read_config()
+    
+    if enable:
+        if 'torrent-direct' in config:
+            # Already present, check if policy needs update
+            m = re.search(r'(?m)^  - name: torrent-direct\n(?:[ ]{4}.*\n)*?[ ]{4}proxy:\s*(\S+)', config)
+            current_policy = m.group(1) if m else ''
+            # Should be VPN or DIRECT, never AI
+            if current_policy in ('VPN', 'DIRECT'):
+                return {}  # Already correct
+            # Update policy
+            new_config = re.sub(
+                r'(?m)^(\s{4}proxy:\s*)\S+\s*$',
+                rf'\1VPN',
+                config
+            )
+            if new_config != config:
+                return {'config.yaml': new_config.encode('utf-8')}
+            return {}
+        else:
+            # Add listener before ai-devices
+            listener_block = f'''  - name: torrent-direct
+    type: mixed
+    port: 7894
+    listen: 192.168.0.1
+    proxy: VPN'''
+            if 'ai-devices' in config:
+                # Insert before ai-devices
+                idx = config.index('ai-devices')
+                # Find the line start
+                lines = config.splitlines(True)
+                for i, line in enumerate(lines):
+                    if 'ai-devices' in line and line.strip().startswith('- name:'):
+                        lines.insert(i, listener_block + '\n')
+                        return {str(DEFAULT_CONFIG if 'DEFAULT_CONFIG' in dir() else _tx.DEFAULT_CONFIG): ''.join(lines).encode('utf-8')}
+            return {}
+    else:
+        # Disable listener
+        if 'torrent-direct' not in config:
+            return {}
+        # Remove torrent-direct block
+        new_config = re.sub(
+            r'(?m)^  - name: torrent-direct\n(?:[ ]{4}.*\n)+',
+            '',
+            config
+        )
+        if new_config != config:
+            return {'config.yaml': new_config.encode('utf-8')}
+        return {}
+
+def torrent_set_listener(enable):
+    """Enable/disable torrent listener using transaction."""
+    changes = _torrent_listener_changes(enable)
+    if not changes:
+        return {'ok': True, 'message': 'No change needed'}
+    
+    return _tx.start_transaction(_tx_files(changes['config.yaml']))
+
+def torrent_refresh():
+    """Refresh torrent ruleset."""
+    # This is a complex operation - use the existing script for now
+    # TODO: Implement in transaction system
+    raise LaneTorrentError('Torrent refresh not yet implemented in transaction system')
+
+def torrent_set_extra(hosts):
+    """Set extra hosts for torrent ruleset."""
+    raise LaneTorrentError('Torrent extra hosts not yet implemented in transaction system')
+
+# ============================================================================
+# MTRICKLE SYNC OPERATIONS
+# ============================================================================
+
+def mtrickle_sync_changes():
+    """Build config changes for mtrickle sync."""
+    # This is a complex operation that modifies rulesets, not the main config
+    # For now, we just need to trigger reload if rulesets changed
+    # The actual sync is done by the shell script
+    return {}
+
+def mtrickle_sync():
+    """Trigger mtrickle sync and reload if needed."""
+    # Run the sync script
+    result = subprocess.run(['/root/sync_mtrickle_mihomo.sh'], capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise LaneTorrentError(f'mtrickle sync failed: {result.stderr}')
+    
+    # Check if reload is needed (look for "reload needed" in output)
+    if 'reload needed' in result.stdout or 'reload' in result.stdout.lower():
+        _reload_mihomo()
+    
+    return {'ok': True, 'output': result.stdout}
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=['lane-status', 'torrent-status', 'lane-install', 'lane-remove', 'torrent-enable', 'torrent-disable', 'mtrickle-sync'])
+    parser.add_argument('--lane', help='Lane name')
+    parser.add_argument('--enable', help='Enable/disable')
+    args = parser.parse_args()
+    
+    if args.command == 'lane-status':
+        result = lane_status(args.lane or 'VPN-noP2P')
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == 'torrent-status':
+        result = torrent_status()
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == 'lane-install':
+        result = lane_install(args.lane or 'VPN-noP2P')
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == 'lane-remove':
+        result = lane_remove(args.lane or 'VPN-noP2P')
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == 'torrent-enable':
+        result = torrent_set_listener(True)
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == 'torrent-disable':
+        result = torrent_set_listener(False)
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == 'mtrickle-sync':
+        result = mtrickle_sync()
+        print(json.dumps(result, ensure_ascii=False))
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-sync-youtube.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Youtube watch and sync operations using config transaction system."""
+import contextlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+from pathlib import Path
+
+# Load config-tx module
+TX_MODULE_PATH = Path(__file__).with_name('geomask-config-tx.py')
+_tx_spec = importlib.util.spec_from_file_location('config_tx', TX_MODULE_PATH)
+_tx = importlib.util.module_from_spec(_tx_spec)
+_tx_spec.loader.exec_module(_tx)
+
+# Paths
+CFG = Path('/etc/mihomo/config.yaml')
+
+class SyncYoutubeError(Exception):
+    pass
+
+def _read_config():
+    """Read and parse mihomo config."""
+    with open(CFG, encoding='utf-8') as f:
+        return f.read()
+
+def _validate_config(text=None):
+    """Validate mihomo config."""
+    if text is None:
+        result = subprocess.run(['mihomo', '-t', '-d', '/etc/mihomo'],
+                               capture_output=True, timeout=60)
+    else:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            f.write(text)
+            tmp = f.name
+        try:
+            result = subprocess.run(['mihomo', '-t', '-d', '/etc/mihomo', '-f', tmp],
+                                   capture_output=True, timeout=60)
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    return result.returncode == 0
+
+def _reload_mihomo():
+    """Reload mihomo via controller API."""
+    text = open(CFG, encoding='utf-8').read()
+    secret = ''
+    for line in text.splitlines():
+        m = re.match(r'^secret:\s*["\']?([^"\'\s]+)', line)
+        if m:
+            secret = m.group(1)
+            break
+    
+    url = 'http://127.0.0.1:9090/configs?force=true'
+    req = urllib.request.Request(url,
+                                data=json.dumps({'path': '/etc/mihomo/config.yaml'}).encode(),
+                                method='PUT',
+                                headers={'Content-Type': 'application/json'})
+    if secret:
+        req.add_header('Authorization', 'Bearer ' + secret)
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        return True
+    except Exception as e:
+        raise SyncYoutubeError(f'mihomo reload failed: {e}')
+
+# ============================================================================
+# YOUTUBE WATCH OPERATIONS
+# ============================================================================
+
+def yt_status():
+    """Get youtube watch status."""
+    config = open(CFG, encoding='utf-8').read()
+    
+    # Check for ytwatch mode
+    mode = 'off'
+    if 'ytwatch' in config:
+        m = re.search(r'(?m)^\s*ytwatch:\s*(\S+)', config)
+        if m:
+            mode = m.group(1)
+    
+    return {
+        'ok': True,
+        'mode': mode,
+    }
+
+def yt_mode_changes(mode):
+    """Build config changes for ytwatch mode."""
+    config = open(CFG, encoding='utf-8').read()
+    
+    if mode == 'off':
+        # Remove ytwatch section
+        if 'ytwatch:' in config:
+            import re
+            new_config = re.sub(r'(?m)^\s*ytwatch:.*\n(?:[ ]{2,4}.*\n)*', '', config, count=1)
+            if new_config != config:
+                return {str(DEFAULT_CONFIG if 'DEFAULT_CONFIG' in dir() else _tx.DEFAULT_CONFIG): new_config.encode('utf-8')}
+        return {}
+    else:
+        # Add or update ytwatch section
+        ytwatch_block = f'ytwatch: {mode}'
+        if 'ytwatch:' in config:
+            import re
+            new_config = re.sub(r'(?m)^\s*ytwatch:.*', ytwatch_block, config, count=1)
+            if new_config != config:
+                return {str(DEFAULT_CONFIG if 'DEFAULT_CONFIG' in dir() else _tx.DEFAULT_CONFIG): new_config.encode('utf-8')}
+        else:
+            # Add after rules section
+            if 'rules:' in config:
+                lines = config.splitlines(True)
+                for i, line in enumerate(lines):
+                    if line.strip() == 'rules:':
+                        # Find end of rules block
+                        j = i + 1
+                        while j < len(lines) and (lines[j].startswith('  ') or lines[j].strip() == ''):
+                            j += 1
+                        lines.insert(j, f'ytwatch: {mode}\n')
+                        return {str(DEFAULT_CONFIG if 'DEFAULT_CONFIG' in dir() else _tx.DEFAULT_CONFIG): ''.join(lines).encode('utf-8')}
+        return {}
+
+def yt_mode(mode):
+    """Set ytwatch mode."""
+    if mode not in ('off', 'yt-dlp', 'yt-dlp-live', 'yt-dlp-audio'):
+        raise SyncYoutubeError(f'Invalid yt mode: {mode}')
+    
+    changes = yt_mode_changes(mode)
+    if not changes:
+        return {'ok': True, 'message': f'ytwatch already set to {mode}'}
+
+    # Absolute key: the transaction refuses relative targets.
+    return _tx.start_transaction({str(CFG): changes['config.yaml']})
+
+def yt_reset():
+    """Reset ytwatch to off."""
+    return yt_mode('off')
+
+# ============================================================================
+# SYNC OPERATIONS
+# ============================================================================
+
+def sync_mtrickle_changes():
+    """Build config changes for mtrickle sync."""
+    # This operation primarily modifies rulesets, not main config
+    # It triggers reload if rulesets changed
+    return {}
+
+def sync_mtrickle():
+    """Run mtrickle sync and reload if needed."""
+    # Run the sync script
+    result = subprocess.run(['/root/sync_mtrickle_mihomo.sh'], capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise SyncYoutubeError(f'mtrickle sync failed: {result.stderr}')
+    
+    # Check if reload is needed
+    if 'reload needed' in result.stdout or 'reload' in result.stdout.lower():
+        _reload_mihomo()
+    
+    return {'ok': True, 'output': result.stdout}
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=['yt-status', 'yt-mode', 'yt-reset', 'mtrickle-sync'])
+    parser.add_argument('--mode', help='ytwatch mode')
+    args = parser.parse_args()
+    
+    if args.command == 'yt-status':
+        result = yt_status()
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == 'yt-mode':
+        if not args.mode:
+            print(json.dumps({'ok': False, 'error': 'mode required'}))
+            sys.exit(1)
+        result = yt_mode(args.mode)
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == 'yt-reset':
+        result = yt_reset()
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.command == 'mtrickle-sync':
+        result = sync_mtrickle()
+        print(json.dumps(result, ensure_ascii=False))
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-audit-scheduler.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Run the per-path audit schedules that are due.
+
+Invoked by one cron entry every five minutes. For each configured path whose time has
+come, run the isolated check; in ``check-and-apply`` mode also apply the resulting pool
+through the same preview/apply path the panel uses, so both entry points share one
+implementation and one transaction owner.
+
+Nothing here widens a filter: ``apply_preview`` refuses an empty pool and refuses a
+report whose subscription no longer matches the live config.
+"""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+HERE = Path(__file__).resolve().parent
+
+def _load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, HERE / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+audit = _load('node_audit', 'geomask-node-audit.py')
+apply = _load('node_apply', 'geomask-apply.py')
+
+# A path is run at most once per local day, and only after its configured minute.
+STATE = Path(os.environ.get('GM_AUDIT_STATE', '/etc/geomask/node-audit/state'))
+RUNS = STATE / 'schedule-runs.json'
+TOLERANCE_MINUTES = 360
+
+def _now():
+    return time.localtime()
+
+def _minutes(hhmm):
+    try:
+        hh, mm = hhmm.split(':')
+        return int(hh) * 60 + int(mm)
+    except Exception:
+        return None
+
+def _load_runs():
+    try:
+        return json.loads(RUNS.read_bytes())
+    except Exception:
+        return {}
+
+def _save_runs(data):
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = RUNS.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    os.replace(tmp, RUNS)
+
+def due(entry, now):
+    """True when this path's schedule should fire now."""
+    schedule = entry.get('schedule') or {}
+    if not schedule.get('enabled'):
+        return False
+    target = _minutes(schedule.get('time') or '')
+    if target is None:
+        return False
+    current = now.tm_hour * 60 + now.tm_min
+    delta = current - target
+    if delta < 0 or delta > TOLERANCE_MINUTES:
+        return False
+    today = '%04d-%02d-%02d' % (now.tm_year, now.tm_mon, now.tm_mday)
+    return entry.get('_last_run') != today
+
+def _source_revision():
+    """Digest of the live mihomo config; matches what a check records."""
+    return audit.digest(audit.CONFIG.read_bytes())
+
+def run_one(entry):
+    ident = entry['id']
+    mode = (entry.get('schedule') or {}).get('mode', 'check-only')
+    result = {'path': ident, 'mode': mode}
+
+    started = audit.start(ident, actor='cron')
+    if not started.get('ok'):
+        return dict(result, ok=False, stage='start', error=started.get('error'))
+
+    job_id = started.get('job_id')
+    deadline = time.monotonic() + 900
+    report = None
+    while time.monotonic() < deadline:
+        report = audit.audit_job_get(job_id).get('job')
+        if report and report.get('status') in ('complete', 'error', 'stale', 'cancelled'):
+            break
+        time.sleep(3)
+    if not report:
+        return dict(result, ok=False, stage='check', error='no job state')
+    if report.get('status') != 'complete':
+        return dict(result, ok=False, stage='check', status=report.get('status'),
+                    error=report.get('error'))
+    result['check'] = report.get('counts')
+
+    if mode != 'check-and-apply':
+        return dict(result, ok=True, applied=False)
+
+    try:
+        source_revision = _source_revision()
+        preview = apply.preview_apply(ident, report.get('job_id'),
+                                      report.get('settings_revision'), source_revision)
+        applied = apply.apply_preview(ident, preview['preview_id'],
+                                      report.get('settings_revision'))
+        return dict(result, ok=True, applied=True,
+                    node_count=applied.get('node_count'), tx_id=applied.get('tx_id'))
+    except Exception as exc:
+        return dict(result, ok=False, stage='apply', applied=False,
+                    error=str(exc) if isinstance(exc, (apply.ApplyError, audit.AuditError))
+                    else type(exc).__name__)
+
+def main():
+    now = _now()
+    runs = _load_runs()
+    try:
+        settings = audit.get()
+    except Exception as exc:
+        print(json.dumps({'ok': False, 'error': type(exc).__name__}))
+        return 1
+
+    today = '%04d-%02d-%02d' % (now.tm_year, now.tm_mon, now.tm_mday)
+    results = []
+    for entry in settings.get('paths', []):
+        entry['_last_run'] = (runs.get(entry['id']) or {}).get('date')
+        if not due(entry, now):
+            continue
+        outcome = run_one(entry)
+        results.append(outcome)
+        runs[entry['id']] = {'date': today, 'at': time.strftime('%F %T'),
+                             'result': outcome}
+        _save_runs(runs)
+
+    # Expired applied pools are dropped on the same tick.
+    try:
+        expired = apply.handle_expired_pools()
+    except Exception as exc:
+        expired = {'ok': False, 'error': type(exc).__name__}
+
+    print(json.dumps({'ok': True, 'ran': results, 'expired': expired}, ensure_ascii=False))
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
+
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-subscription-status.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Read-only: which subscription backs each path's group.
+
+The panel used to derive this from the mihomo config text with a regex that expected
+`  - name: ...` and a double-quoted provider URL. Applying a verified pool re-serialises
+the config with PyYAML, which writes `- name: ...` and bare scalars, so every path lost
+its assignment at once. A managed pool provider has no URL either, so even a tolerant
+parser cannot tell which subscription feeds it: that link is recorded in the node-audit
+state at apply time.
+
+This module reads the three existing sources structurally and never writes anything:
+no seed, no migration, no directories. Unknown is reported as unknown, never guessed.
+"""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+MANAGED_PREFIX = 'audit-'
+APPLIED_STATES = ('applied', 'expired', 'applying')
+PATH_IDS = ('vpn', 'vpn_nop2p', 'ai')
+
+DEFAULT_CONFIG = Path(os.environ.get('GM_SUBSTATUS_CONFIG', '/etc/mihomo/config.yaml'))
+DEFAULT_STORE = Path(os.environ.get('GM_SUBSTATUS_STORE', '/etc/geomask/node-audit.json'))
+DEFAULT_REGISTRY = Path(os.environ.get('GM_SUBSTATUS_REGISTRY', '/etc/geomask-subs.list'))
+
+
+def _load_state_module():
+    candidates = [Path(__file__).with_name('geomask-audit-state.py'),
+                  Path('/usr/lib/geomask/geomask-audit-state.py')]
+    for candidate in candidates:
+        if candidate.exists():
+            spec = importlib.util.spec_from_file_location('substatus_state', candidate)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    raise RuntimeError('audit state module not found')
+
+
+_state = _load_state_module()
+PATHS = _state.PATHS
+
+
+def parse_registry(raw):
+    """Registry rows are `id|name|url`, one per line, `#` comments allowed."""
+    rows = []
+    for line in raw.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        fields = line.split('|', 2)
+        if len(fields) != 3 or not fields[0]:
+            continue
+        rows.append({'id': fields[0], 'name': fields[1], 'url': fields[2]})
+    return rows
+
+
+def _url_index(rows):
+    index = {}
+    for row in rows:
+        if row['url']:
+            index.setdefault(row['url'], []).append(row['id'])
+    return index
+
+
+def _group_providers(config, group_name):
+    groups = [g for g in (config.get('proxy-groups') or [])
+              if isinstance(g, dict) and g.get('name') == group_name]
+    if not groups:
+        return None, 'group_missing'
+    if len(groups) > 1:
+        return None, 'group_duplicate'
+    use = groups[0].get('use')
+    if not isinstance(use, list) or not use:
+        return [], 'group_has_no_providers'
+    if any(not isinstance(p, str) or not p for p in use):
+        return None, 'group_bad_use'
+    return use, None
+
+
+def _managed_source(config, store, ident, group_name, provider_id, providers, index):
+    """Link a managed file provider back to the subscription recorded at apply time.
+
+    Only a record that provably describes this very provider and group is used. A stale
+    or partial record must not light up somebody else's row.
+    """
+    applied = ((store.get('paths') or {}).get(ident) or {}).get('applied') or {}
+    spec = providers.get(provider_id) or {}
+    if applied.get('status') not in APPLIED_STATES:
+        return None, 'managed_source_unrecorded'
+    if applied.get('provider_id') != provider_id:
+        return None, 'managed_source_unrecorded'
+    if applied.get('group') and applied.get('group') != group_name:
+        return None, 'managed_source_unrecorded'
+    if spec.get('type') != 'file':
+        return None, 'managed_source_unverified'
+    previous = applied.get('previous_use')
+    if not isinstance(previous, list) or not previous:
+        return None, 'managed_source_unrecorded'
+    ids, sources = [], []
+    for pid in previous:
+        if not isinstance(pid, str) or pid not in providers:
+            return None, 'managed_source_missing'
+        url = (providers.get(pid) or {}).get('url')
+        if not isinstance(url, str) or not url:
+            return None, 'managed_source_missing'
+        sources.append(pid)
+        ids.extend(index.get(url, []))
+    return {'ids': list(dict.fromkeys(ids)), 'sources': sources}, None
+
+
+def _resolve_one(config, store, index, ident):
+    group_name = PATHS[ident][0]
+    providers = config.get('proxy-providers') or {}
+    use, problem = _group_providers(config, group_name)
+    record = {
+        'status': 'unknown',
+        'subscription_ids': [],
+        'actual_provider_ids': list(use or []),
+        'source_provider_ids': [],
+        'via': None,
+        'reason_code': problem,
+    }
+    if use is None:
+        record['status'] = 'not-configured' if problem == 'group_missing' else 'unknown'
+        return record
+    if not use:
+        record['status'] = 'not-configured'
+        return record
+
+    ids, sources = [], []
+    vias = set()
+    reasons = []
+    for provider_id in use:
+        if provider_id.startswith(MANAGED_PREFIX):
+            resolved, problem = _managed_source(config, store, ident, group_name,
+                                                provider_id, providers, index)
+            vias.add('managed')
+        else:
+            spec = providers.get(provider_id) or {}
+            url = spec.get('url')
+            if not isinstance(url, str) or not url:
+                resolved, problem = None, 'provider_without_url'
+            else:
+                resolved, problem = {'ids': index.get(url, []), 'sources': [provider_id]}, None
+            vias.add('direct')
+        if resolved is None:
+            reasons.append(problem)
+            continue
+        ids.extend(resolved['ids'])
+        sources.extend(resolved['sources'])
+
+    record['subscription_ids'] = list(dict.fromkeys(ids))
+    record['source_provider_ids'] = list(dict.fromkeys(sources))
+    record['via'] = None
+    if reasons and record['subscription_ids']:
+        record['status'] = 'partial'
+        record['reason_code'] = reasons[0]
+    elif reasons:
+        record['status'] = 'unknown'
+        record['reason_code'] = reasons[0]
+    elif record['subscription_ids']:
+        record['status'] = 'resolved'
+        record['reason_code'] = None
+        record['via'] = vias.pop() if len(vias) == 1 else None
+    else:
+        record['status'] = 'unregistered'
+        record['reason_code'] = 'registry_has_no_match'
+    return record
+
+
+def resolve_subscription_bindings(config, store, registry_rows):
+    """Pure resolver: config/state/registry in, per-path binding out."""
+    index = _url_index(registry_rows)
+    return {ident: _resolve_one(config, store or {}, index, ident) for ident in PATH_IDS}
+
+
+def _read_snapshot(config_path, store_path, registry_path):
+    def read(path):
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RuntimeError('unreadable_input') from exc
+    return read(config_path), read(store_path), read(registry_path)
+
+
+def _parse_snapshot(config_bytes, store_bytes, registry_bytes):
+    if config_bytes is None:
+        raise RuntimeError('config_unreadable')
+    config = _state.yaml12_load(config_bytes)
+    if not isinstance(config, dict):
+        raise RuntimeError('config_unreadable')
+    if store_bytes is None:
+        store = {}
+    else:
+        store = _state.strict_json(store_bytes)
+        if not isinstance(store, dict):
+            raise RuntimeError('state_unreadable')
+    registry_raw = '' if registry_bytes is None else registry_bytes.decode('utf-8', 'replace')
+    bindings = resolve_subscription_bindings(config, store, parse_registry(registry_raw))
+    return bindings, config, store
+
+
+def _read_and_resolve(config_path=None, store_path=None, registry_path=None):
+    """Read the snapshot twice when it changes underneath us; repeat instability is unknown."""
+    config_path = Path(config_path or DEFAULT_CONFIG)
+    store_path = Path(store_path or DEFAULT_STORE)
+    registry_path = Path(registry_path or DEFAULT_REGISTRY)
+    first = _read_snapshot(config_path, store_path, registry_path)
+    result = _parse_snapshot(*first)
+    if _read_snapshot(config_path, store_path, registry_path) != first:
+        second = _read_snapshot(config_path, store_path, registry_path)
+        result = _parse_snapshot(*second)
+        if _read_snapshot(config_path, store_path, registry_path) != second:
+            raise RuntimeError('snapshot_changed')
+    return result
+
+
+def read_subscription_bindings(config_path=None, store_path=None, registry_path=None):
+    try:
+        bindings, _, _ = _read_and_resolve(config_path, store_path, registry_path)
+        return bindings
+    except Exception as exc:
+        reason = str(exc) if isinstance(exc, RuntimeError) and str(exc) else 'unreadable_input'
+        if reason not in ('config_unreadable', 'state_unreadable', 'snapshot_changed',
+                          'unreadable_input'):
+            reason = 'unreadable_input'
+        return {ident: {'status': 'unknown', 'subscription_ids': [],
+                        'actual_provider_ids': [], 'source_provider_ids': [],
+                        'via': None, 'reason_code': reason} for ident in PATH_IDS}
+
+
+def _legacy_fields(bindings):
+    """Old scalar fields stay single-valued; a shared source is genuinely ambiguous there."""
+    out = {}
+    for ident in PATH_IDS:
+        ids = bindings[ident]['subscription_ids']
+        out[ident] = ids[0] if bindings[ident]['status'] == 'resolved' and len(ids) == 1 else ''
+    return out
+
+
+def _source_urls(bindings, config):
+    urls = {}
+    for ident in PATH_IDS:
+        record = bindings[ident]
+        url = ''
+        if record['status'] == 'resolved' and len(record['source_provider_ids']) == 1:
+            candidate = ((config.get('proxy-providers') or {})
+                         .get(record['source_provider_ids'][0]) or {}).get('url')
+            if isinstance(candidate, str):
+                url = candidate
+        urls[ident] = url
+    return urls
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ('status', 'ai-sub'):
+        print('usage: geomask-subscription-status.py status|ai-sub', file=sys.stderr)
+        return 2
+    mode = argv[1]
+    raw = sys.stdin.read() if mode == 'status' else ''
+    if mode == 'status' and raw.strip():
+        # A malformed base must not be replaced by a bindings-only payload: the panel would
+        # lose every other field. Say nothing and let the caller keep its own response.
+        try:
+            json.loads(raw)
+        except ValueError:
+            print('base status is not valid JSON', file=sys.stderr)
+            return 3
+    try:
+        bindings, config, _ = _read_and_resolve()
+        failure = None
+    except Exception as exc:
+        bindings = read_subscription_bindings()
+        config = {}
+        failure = str(exc) if isinstance(exc, RuntimeError) and str(exc) else 'unreadable_input'
+
+    if mode == 'ai-sub':
+        record = bindings['ai']
+        provider = (record['actual_provider_ids'] or [''])[0]
+        url = ''
+        if failure is None and provider:
+            candidate = ((config.get('proxy-providers') or {}).get(provider) or {}).get('url')
+            if isinstance(candidate, str):
+                url = candidate
+        print(json.dumps({'provider': provider, 'url': url,
+                          'source_provider_ids': record['source_provider_ids'],
+                          'source_subscription_ids': record['subscription_ids']},
+                         ensure_ascii=False))
+        return 0
+
+    try:
+        base = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        base = {}
+    if not isinstance(base, dict):
+        base = {}
+    legacy = _legacy_fields(bindings)
+    base['subscription_bindings'] = bindings
+    base['vpn_sub'] = legacy['vpn']
+    base['vpn_nop2p_sub'] = legacy['vpn_nop2p']
+    base['ai_sub'] = legacy['ai']
+    if failure is None:
+        urls = _source_urls(bindings, config)
+        base['vpn_url'] = urls['vpn']
+        base['vpn_nop2p_url'] = urls['vpn_nop2p']
+        base['ai_url'] = urls['ai']
+    print(json.dumps(base, ensure_ascii=False))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
+
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-slot-patch.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Structural slot patcher: point a mihomo group at a subscription URL.
+
+Historically this was a text rewriter that expected `  - name: GROUP` and a double-quoted
+provider URL. Applying a verified pool re-serialises the whole config via PyYAML, which
+writes `- name:` at column 0 and bare scalars, so every rewrite failed - switching the AI
+slot answered "no AI group anchor" although the group was right there.
+
+Read and write the YAML structure instead, with YAML 1.2 boolean semantics so a round trip
+cannot turn `off` into `false`. Prints one machine-readable line: updated:<provider> or
+created:<provider>.
+"""
+import copy
+import re
+import sys
+
+import yaml
+
+GROUPS = ('VPN', 'VPN-noP2P', 'AI')
+GROUP_TEMPLATE = {
+    'type': 'url-test',
+    'url': 'https://www.gstatic.com/generate_204',
+    'interval': 180,
+    'tolerance': 99999,
+    'lazy': False,
+}
+
+
+def loader():
+    """PyYAML follows YAML 1.1, where off/on/yes/no are booleans; mihomo uses 1.2."""
+    class Loader(yaml.SafeLoader):
+        pass
+
+    resolutions = {}
+    for first, rules in yaml.SafeLoader.yaml_implicit_resolvers.items():
+        kept = [(tag, regexp) for tag, regexp in rules
+                if tag not in ('tag:yaml.org,2002:bool', 'tag:yaml.org,2002:timestamp')]
+        if kept:
+            resolutions[first] = kept
+    Loader.yaml_implicit_resolvers = resolutions
+    bool_re = re.compile(r'^(?:true|True|TRUE|false|False|FALSE)$')
+    for first in 'tTfF':
+        Loader.add_implicit_resolver('tag:yaml.org,2002:bool', bool_re, [first])
+    return Loader
+
+
+def find_group(doc, name):
+    for entry in doc.get('proxy-groups') or []:
+        if isinstance(entry, dict) and entry.get('name') == name:
+            return entry
+    return None
+
+
+def uses_provider(doc, name, provider):
+    group = find_group(doc, name)
+    if not group:
+        return False
+    return provider in (group.get('use') or [])
+
+
+def free_provider_name(providers):
+    name = 'slot'
+    index = 2
+    while name in providers:
+        name = 'slot%d' % index
+        index += 1
+    return name
+
+
+def new_provider(doc, url):
+    """A fresh http provider; copy the header block (e.g. x-hwid) from an existing one.
+
+    No health-check options on purpose: mihomo drops nodes that fail one from the group,
+    which silently empties a lane and turns every rule using it into 502s.
+    """
+    spec = {'type': 'http', 'url': url, 'interval': 3600}
+    for existing in (doc.get('proxy-providers') or {}).values():
+        if isinstance(existing, dict) and isinstance(existing.get('header'), dict) \
+                and existing['header']:
+            # Deep-copy: a shared dict would be dumped as a YAML anchor/alias, coupling
+            # the new provider to the one it was copied from.
+            spec['header'] = copy.deepcopy(existing['header'])
+            break
+    return spec
+
+
+def rewrite_vpn_rules(doc):
+    """A VPN lane needs the IP half of the ruleset and must not end in a RESERVE anchor."""
+    rules = doc.get('rules')
+    if not isinstance(rules, list):
+        return
+    has_bulk = any(isinstance(rule, str) and rule.startswith('RULE-SET,mtrickle_bulk')
+                   for rule in rules)
+    if not has_bulk:
+        for index, rule in enumerate(rules):
+            if isinstance(rule, str) and rule.startswith('RULE-SET,mtrickle,VPN-noP2P'):
+                rules.insert(index, 'RULE-SET,mtrickle_bulk,VPN')
+                break
+    doc['rules'] = [rule.replace(',RESERVE', ',VPN')
+                    if isinstance(rule, str) and rule.endswith(',RESERVE') else rule
+                    for rule in rules]
+
+
+def main(argv):
+    if len(argv) != 4:
+        sys.stderr.write('usage: slot patcher <config> <group> <url>\n')
+        return 2
+    config_path, group, url = argv[1], argv[2], argv[3]
+    with open(config_path, encoding='utf-8') as handle:
+        doc = yaml.load(handle, Loader=loader())
+    if not isinstance(doc, dict):
+        sys.stderr.write('mihomo config is not a mapping\n')
+        return 2
+    providers = doc.get('proxy-providers')
+    if not isinstance(providers, dict):
+        sys.stderr.write('no proxy-providers section\n')
+        return 2
+
+    target = find_group(doc, group)
+    if target is not None:
+        use = target.get('use')
+        if not isinstance(use, list) or not use:
+            sys.stderr.write('group %s is fed by inline proxies, not a provider\n' % group)
+            return 2
+        current = use[0]
+        spec = providers.get(current)
+        # A managed pool (audit-*) is a file provider built from verified nodes: never
+        # rewrite it into an http subscription, and never leave the group half-switched.
+        managed = str(current).startswith('audit-') or \
+            (isinstance(spec, dict) and spec.get('type') == 'file')
+        shared = any(other != group and uses_provider(doc, other, current) for other in GROUPS)
+        if not shared and not managed:
+            if not isinstance(spec, dict):
+                sys.stderr.write('provider %s is missing from the config\n' % current)
+                return 2
+            spec['url'] = url
+            spec.setdefault('type', 'http')
+            action = 'updated:' + current
+        else:
+            created = free_provider_name(providers)
+            providers[created] = new_provider(doc, url)
+            target['use'] = [created if item == current else item for item in use]
+            action = 'created:' + created
+    else:
+        created = free_provider_name(providers)
+        providers[created] = new_provider(doc, url)
+        entry = {'name': group}
+        entry.update(GROUP_TEMPLATE)
+        entry['use'] = [created]
+        groups = doc.get('proxy-groups')
+        if not isinstance(groups, list):
+            groups = []
+            doc['proxy-groups'] = groups
+        anchor = next((index for index, item in enumerate(groups)
+                       if isinstance(item, dict) and item.get('name') == 'AI'), None)
+        if anchor is None:
+            groups.append(entry)
+        else:
+            groups.insert(anchor + 1, entry)
+        if group == 'VPN':
+            rewrite_vpn_rules(doc)
+        action = 'created:' + created
+
+    body = yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+    with open(config_path, 'w', encoding='utf-8', newline='') as handle:
+        handle.write(body)
+    print(action)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
+
+ASSET_EOF
   save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
 #!/bin/sh
 # geo-backend.sh - backend for LuCI "Гео-маскировка и AI" panel (geo-sync ubus object).
@@ -214,13 +4821,38 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.25.3"
+BACKEND_VERSION="1.27.10"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
+# safe_write resources
+SAFE_WRITE_PY=/usr/bin/safe_write.py
+# read-only subscription-assignment resolver (config + audit state + registry, never writes)
+SUB_STATUS_PY=/usr/lib/geomask/geomask-subscription-status.py
+# Interpreter for the python helpers; GM_PYTHON only lets tests point at their own python.
+PYTHON_BIN=${GM_PYTHON:-python3}
+SUB_STATUS_PYTHON=$PYTHON_BIN
 UPD_CHECK=$UPD_DIR/check.json
 UPD_STATUS=$UPD_DIR/status.json
 UPD_PIDF=$UPD_DIR/pid
 UPD_TTL=3600
+
+# safe_write shell wrapper
+# usage: _safe_write <resource> <live_content> <editable_json> [backup_age_seconds]
+# returns: 0=ok, 1=validation fail, 2=backup gate fail, 3=trial fail, 4=install/reload fail, 5=rollback fail
+# stdout: new live content on success
+_safe_write() {
+    _resource="$1"
+    _live_content="$2"
+    _editable_json="$3"
+    _max_age="${4:-300}"
+
+    if [ ! -f "$SAFE_WRITE_PY" ]; then
+        printf '{"ok":false,"error":"safe_write.py not installed"}\n' >&2
+        return 1
+    fi
+
+    python3 "$SAFE_WRITE_PY" "$_resource" "$_live_content" "$_editable_json" "$_max_age"
+}
 UPD_REPO=kabzon93region/geomask
 DEPLOY_JS=/www/luci-static/resources/view/geo-sync/main.js
 DEPLOY_GUARD=/usr/bin/geomask-guard.sh
@@ -353,7 +4985,10 @@ cmd_status() {
   BYPASS=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"bypass"' | wc -l | tr -d ' ')
   REALTZ=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"realtz"' | wc -l | tr -d ' ')
   N_AI=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"ai"' | wc -l | tr -d ' ')
-  RULES=$(ip rule show | grep -c 'lookup main' || echo 0)
+  # grep -c always prints its count; appending '|| echo 0' used to yield "0\n0" and
+  # produced invalid JSON whenever no rule matched.
+  RULES=$(ip rule show 2>/dev/null | grep -c 'lookup main')
+  RULES=${RULES:-0}
   _sub2u=$(_url_of_provider "$(_prov_of_group VPN)")
   _subu=$(_url_of_provider "$(_prov_of_group VPN-noP2P)")
   _aiu=$(_url_of_provider "$(_prov_of_group AI)")
@@ -368,7 +5003,11 @@ cmd_status() {
   elif ip route get 1.1.1.1 mark 0x64 2>/dev/null | grep -q 'dev AI' \
        && netstat -ltnpu 2>/dev/null | grep -q '192.168.0.53:5353 '; then AIDNS=1
   else AIDNS=2; fi
-  printf '{"vpn_node":"%s","vpn_cc":"%s","vpn_nop2p_node":"%s","vpn_nop2p_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"vpn_sub":"%s","ai_sub":"%s","vpn_nop2p_sub":"%s","vpn_url":"%s","ai_url":"%s","vpn_nop2p_url":"%s","aidns":%s}' \
+  # The assignment badges used to be derived here from config text with a regex that
+  # expected `  - name:` and a quoted URL. Applying a pool re-serialises the config with
+  # PyYAML, so every path lost its badge at once. The resolver reads the same three files
+  # structurally and also links a managed pool back to its recorded subscription.
+  _STATUS_JSON=$(printf '{"vpn_node":"%s","vpn_cc":"%s","vpn_nop2p_node":"%s","vpn_nop2p_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"vpn_sub":"%s","ai_sub":"%s","vpn_nop2p_sub":"%s","vpn_url":"%s","ai_url":"%s","vpn_nop2p_url":"%s","aidns":%s}' \
     "$(json_esc "$VPN_NODE")" "$(_node_cc "$VPN_NODE")" \
     "$(json_esc "$VPNNP_NODE")" "$(_node_cc "$VPNNP_NODE")" \
     "$(json_esc "$AI_NODE")" "$(_node_cc "$AI_NODE")" \
@@ -376,7 +5015,14 @@ cmd_status() {
     "$AI_RC" "$MT_RC" "$(json_esc "$GOOGLE_CC")" "$(json_esc "$SYNC_AT")" \
     "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES" \
     "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$VPN_SUB_ID")" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPNNP_SUB_ID")" \
-    "$(json_esc "$_sub2u")" "$(json_esc "$_aiu")" "$(json_esc "$_subu")" "$AIDNS"
+    "$(json_esc "$_sub2u")" "$(json_esc "$_aiu")" "$(json_esc "$_subu")" "$AIDNS")
+  if [ -f "$SUB_STATUS_PY" ]; then
+    _MERGED=$(printf '%s' "$_STATUS_JSON" | "$SUB_STATUS_PYTHON" -B "$SUB_STATUS_PY" status 2>/dev/null)
+    case "$_MERGED" in
+      '{'*'}') _STATUS_JSON=$_MERGED ;;
+    esac
+  fi
+  printf '%s\n' "$_STATUS_JSON"
 }
 
 # country fragment from a node name (flag emoji or RU word) - coarse, for display
@@ -705,6 +5351,24 @@ EOF
       /etc/init.d/firewall reload >/dev/null 2>&1
     fi
   fi
+  # v1.27.10: the accept drop-in above was written only when the AI zone was first
+  # created. On a box where the zone already existed (ours), a WireGuard peer routed
+  # by MagiTrickle into the AI tunnel hit forward_wg with no matching accept, so fw4
+  # answered the phone with a TCP reset and YouTube stalled after the first second.
+  # Ensure the WG rule on every run, not just at creation time.
+  _ai_drop=/usr/share/nftables.d/ruleset-post/99-ai-accept.nft
+  if [ ! -s "$_ai_drop" ] || ! grep -q 'iifname "Wireguard" oifname "AI"' "$_ai_drop" 2>/dev/null; then
+    mkdir -p /usr/share/nftables.d/ruleset-post
+    cat > "$_ai_drop" <<'EOF'
+table inet fw4 {
+    chain accept_to_AI {
+        iifname "br-lan" oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
+        iifname "Wireguard" oifname "AI" counter accept comment "custom: WG peers to AI tunnel"
+    }
+}
+EOF
+    /etc/init.d/firewall reload >/dev/null 2>&1
+  fi
   # table 101: LAN/host routes must stay local, only internet goes to AI tunnel
   ip route show table main | grep -v '^default' | while IFS= read -r _r; do
     ip route replace table 101 $_r 2>/dev/null
@@ -781,8 +5445,14 @@ EOF
 
 # ---- AI path (no own subscription since v1.23.0; rides the provider its group uses) ----
 cmd_ai_sub_get() {
-  # the old code read a hardcoded "de5" provider that is retired - the honest answer is
-  # whatever provider the AI group is currently fed by (or empty if none).
+  # `provider` stays the provider the AI group actually rides (for a managed pool that is
+  # the audit-* file provider). The resolved source subscription is an added field.
+  if [ -f "$SUB_STATUS_PY" ]; then
+    _AIJSON=$("$SUB_STATUS_PYTHON" -B "$SUB_STATUS_PY" ai-sub 2>/dev/null)
+    case "$_AIJSON" in
+      '{"provider"'*) printf '%s\n' "$_AIJSON"; return 0 ;;
+    esac
+  fi
   p=$(_prov_of_group AI)
   u=''
   [ -n "$p" ] && u=$(_url_of_provider "$p")
@@ -790,13 +5460,15 @@ cmd_ai_sub_get() {
 }
 
 # ---- slot patcher: point a group (VPN / VPN-noP2P / AI) at a subscription URL ----
-# v1.25.2: the patcher used to live in the _SLOT_PY shell variable with doubled backslashes;
-# python received "\\n" and "\\"" literally, died with a SyntaxError, and every slot switch
-# failed with "provider de5 not found in config". A quoted heredoc is verbatim AND pycheck.py
-# syntax-validates it on every test run.
-# Isolation: if the target provider is shared with another group (e.g. AI rides the same
-# provider as VPN), this group gets its own "slot" provider instead of silently re-pointing
-# the shared one - switching AI must never move VPN/VPN-noP2P nodes.
+# The patcher used to rewrite the config as TEXT and required `  - name: GROUP` with a
+# double-quoted provider URL. Applying a verified pool re-serialises the config with PyYAML
+# (`- name:` at column 0, bare scalars), so every switch failed: the AI slot claimed its
+# anchor was missing while the group was present. assets/geomask-slot-patch.py parses and
+# writes YAML structurally (YAML 1.2 booleans) and is syntax-checked by the test suite.
+# Isolation: a provider shared with another group, or a managed audit-* file pool, is never
+# re-pointed in place - the group gets its own "slot" provider, so switching AI cannot move
+# VPN/VPN-noP2P or rewrite a verified pool.
+SLOT_PATCH_PY=/usr/lib/geomask/geomask-slot-patch.py
 _slot_apply() { # _slot_apply <group> <url> -> patch config so <group> is fed by <url>
   _g="$1"; URL="$2"
   case "$URL" in
@@ -807,115 +5479,12 @@ _slot_apply() { # _slot_apply <group> <url> -> patch config so <group> is fed by
     printf '{"error":"url contains forbidden characters"}'; return 1
   fi
   [ -f "$MIHOMO_CONF" ] || { printf '{"error":"mihomo config missing"}'; return 1; }
+  if [ ! -f "$SLOT_PATCH_PY" ]; then
+    printf '{"error":"slot patcher not installed"}'; return 1
+  fi
   cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_slot" 2>/dev/null
-  PYF=/tmp/geo-slot-py.$$
-  cat > "$PYF" <<'PYEOF'
-import re, sys
-cfg, group, url = sys.argv[1], sys.argv[2], sys.argv[3]
-t = open(cfg, encoding="utf-8").read()
-
-def group_block(grp):
-    return re.search(r"(?m)^  - name: %s\s*\n(?:^(?:    .*|\s*)\n)*" % re.escape(grp), t)
-
-def provider_of(grp):
-    m = group_block(grp)
-    if not m:
-        return None, None
-    u = re.search(r"use:\n((?:\s+-\s+\S+\n?)+)", m.group(0))
-    if u:
-        return re.findall(r"-\s+(\S+)", u.group(1))[0], m
-    return None, m
-
-def first_provider_headers():
-    """Copy the header block from the first provider - new providers need it (e.g. x-hwid)."""
-    pm = re.search(r"(?m)^proxy-providers:\n  (\S+):\n((?:    .*\n?)*)", t)
-    if not pm:
-        return ""
-    hm = re.search(r"    header:\n((?:      .*\n?)*)", pm.group(2))
-    return hm.group(0) if hm else ""
-
-prov, gm = provider_of(group)
-
-if prov:
-    shared = []
-    for other in ("VPN", "VPN-noP2P", "AI"):
-        if other == group:
-            continue
-        op, _ = provider_of(other)
-        if op == prov:
-            shared.append(other)
-    if not shared:
-        n = re.subn(r'(?m)^(  %s:\n(?:.*\n)*?    url: )"[^"]*"' % re.escape(prov),
-                    lambda mm: mm.group(1) + '"' + url + '"', t, count=1)
-        if n[1] == 0:
-            sys.stderr.write("provider %s has no url line\n" % prov)
-            sys.exit(2)
-        print("updated:%s" % prov)
-        sys.exit(0)
-    # shared provider (e.g. AI rides the same sub as VPN): isolate this group on its own provider
-    newp = "slot"
-    while re.search(r"(?m)^  %s:\n" % newp, t):
-        newp = "slot%d" % (int(newp[4:]) + 1 if newp != "slot" else 2)
-    tpl = "  %s:\n    type: http\n    url: \"%s\"\n    interval: 3600\n%s" % (newp, url, first_provider_headers())
-    ppm = re.search(r"(?m)^proxy-providers:\n", t)
-    if not ppm:
-        sys.stderr.write("no proxy-providers section\n")
-        sys.exit(2)
-    t = t[:ppm.end()] + tpl + t[ppm.end():]
-    # v1.25.3: re-match the group block AFTER the insert. The old code reused byte offsets
-    # from the pre-insert text, so the repoint landed len(tpl) bytes early, slicing mid-line
-    # into another group's exclude-filter (unclosed quote) - mihomo -t failed with
-    # "yaml: did not find expected key" and the switch reported "config test failed".
-    gm = group_block(group)
-    if gm is None:
-        sys.stderr.write("group %s block not found after provider insert\n" % group)
-        sys.exit(2)
-    blk = gm.group(0)
-    newblk = re.sub(r"(?m)^(\s+- )%s(\s*)$" % re.escape(prov), r"\g<1>" + newp + r"\g<2>", blk, count=1)
-    if newblk == blk:
-        sys.stderr.write("failed to repoint group %s use list\n" % group)
-        sys.exit(2)
-    t = t[:gm.start()] + newblk + t[gm.end():]
-    open(cfg, "w", encoding="utf-8", newline="").write(t)
-    print("created:%s" % newp)
-    sys.exit(0)
-
-if gm is not None:
-    sys.stderr.write("group %s exists but is fed by inline proxies, not a provider\n" % group)
-    sys.exit(2)
-
-# group absent (e.g. VPN-noP2P on a fresh install) - create provider + group
-newp = "slot"
-while re.search(r"(?m)^  %s:\n" % newp, t):
-    newp = "slot%d" % (int(newp[4:]) + 1 if newp != "slot" else 2)
-prov = newp
-# v1.21.3: no provider health-check here on purpose - mihomo drops nodes that fail it from the
-# group, which silently empties a lane and turns every rule using it into 502s.
-tpl = "  %s:\n    type: http\n    url: \"%s\"\n    interval: 3600\n%s" % (prov, url, first_provider_headers())
-ppm = re.search(r"(?m)^proxy-providers:\n", t)
-if not ppm:
-    sys.stderr.write("no proxy-providers section\n")
-    sys.exit(2)
-t = t[:ppm.end()] + tpl + t[ppm.end():]
-grp = ("\n  - name: %s\n    type: url-test\n    use:\n      - %s\n"
-       "    url: \"https://www.gstatic.com/generate_204\"\n    interval: 180\n"
-       "    tolerance: 99999\n    lazy: false\n" % (group, prov))
-gm2 = group_block("AI")
-if not gm2:
-    sys.stderr.write("no AI group anchor\n")
-    sys.exit(2)
-t = t[:gm2.end()] + grp + t[gm2.end():]
-if group == "VPN":
-    if "RULE-SET,mtrickle_bulk" not in t:
-        t = t.replace("  - RULE-SET,mtrickle,VPN-noP2P\n",
-                      "  - RULE-SET,mtrickle_bulk,VPN\n  - RULE-SET,mtrickle,VPN-noP2P\n", 1)
-    t = t.replace(",RESERVE\n", ",VPN\n")
-open(cfg, "w", encoding="utf-8", newline="").write(t)
-print("created:%s" % prov)
-PYEOF
-  _res=$(python3 "$PYF" "$MIHOMO_CONF" "$_g" "$URL" 2>&1)
+  _res=$("$PYTHON_BIN" -B "$SLOT_PATCH_PY" "$MIHOMO_CONF" "$_g" "$URL" 2>&1)
   _rc=$?
-  rm -f "$PYF"
   if [ "$_rc" -ne 0 ]; then
     mv -f "$MIHOMO_CONF.bak_slot" "$MIHOMO_CONF" 2>/dev/null
     printf '{"ok":false,"error":"%s"}' "$(json_esc "$_res")"; return 1
@@ -1009,6 +5578,18 @@ cmd_sub_del() {
   ID="$1"
   case "$ID" in ''|*[!0-9]*) printf '{"error":"bad id"}'; return 1 ;; esac
   [ -f "$SUBS_FILE" ] || { printf '{"error":"registry empty"}'; return 1; }
+  # A path may still be backed by this subscription. Deleting the registry entry would
+  # leave its group pointing at a provider whose source no longer exists, so refuse until
+  # the path is switched to another subscription.
+  URL=$(awk -F'|' -v id="$ID" '$1==id {print $3; exit}' "$SUBS_FILE")
+  if [ -n "$URL" ] && [ -f "$NODE_AUDIT" ]; then
+    USED=$(python3 "$NODE_AUDIT" source-in-use "$URL" 2>/dev/null)
+    case "$USED" in
+      *'"in_use": true'*|*'"in_use":true'*)
+        printf '{"error":"subscription is used by a path; switch the path to another subscription before deleting it"}'
+        return 1 ;;
+    esac
+  fi
   grep -v "^$ID|" "$SUBS_FILE" > "$SUBS_FILE.tmp" || true
   mv -f "$SUBS_FILE.tmp" "$SUBS_FILE"
   echo "$(date +%FT%T) SUB del $ID" >> "$LOG"
@@ -1333,9 +5914,13 @@ cmd_nodes_get() {
   case "$_st" in '{'*'}'*) : ;; *) _st=null ;; esac
   _blk=$(while IFS= read -r _l; do [ -n "$_l" ] && printf '"%s",' "$(json_esc "$_l")"; done < "$NODESBLOCK" 2>/dev/null | sed 's/,$//')
   _lastlog=$(grep NODESCAN "$LOG" 2>/dev/null | tail -3 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
-  printf '{"ok":true,"enabled":%s,"schedule":"%s","state":%s,"conf":{"bad_countries":"%s","bad_asns":"%s","base_filter":"%s","sub_provider":"%s"},"blocked":[%s],"log":[%s]}\n' \
+  # conf fields with node-scan defaults (must mirror geomask-node-scan.sh)
+  printf '{"ok":true,"enabled":%s,"schedule":"%s","state":%s,"conf":{"bad_countries":"%s","bad_asns":"%s","base_filter":"%s","sub_provider":"%s","name_filter_groups":"%s","sub_user_agent":"%s","ai_guard":"%s","ai_group":"%s","ai_egress_url":"%s","ai_expect":"%s","ai_listener":"%s","ai_exclude_base":"%s"},"blocked":[%s],"log":[%s]}\n' \
     "$_en" "$_sched" "$_st" \
     "$(_nconf bad_countries)" "$(_nconf bad_asns)" "$(_nconf base_filter)" "$(_nconf sub_provider)" \
+    "$(_nconf name_filter_groups)" "$(_nconf sub_user_agent)" "$(_nconf ai_guard)" \
+    "$(_nconf ai_group)" "$(_nconf ai_egress_url)" "$(_nconf ai_expect)" \
+    "$(_nconf ai_listener)" "$(_nconf ai_exclude_base)" \
     "$_blk" "$_lastlog"
 }
 
@@ -1495,47 +6080,156 @@ cmd_torrent_extra() {
   sh "$TORRENT_SH" --extra "$1" 2>/dev/null | tail -1
 }
 
+# Independent, report-only service-egress audit. Never calls the legacy mutating scan.
+NODE_AUDIT=${GM_NODE_AUDIT:-/usr/lib/geomask/geomask-node-audit.py}
+NODE_APPLY=${GM_NODE_APPLY:-/usr/lib/geomask/geomask-apply.py}
+cmd_nodes_paths_get() {
+  python3 "$NODE_AUDIT" get
+}
+cmd_nodes_path_save() {
+  python3 "$NODE_AUDIT" save "$1" "$2" "$3"
+}
+cmd_nodes_path_check() {
+  case "$1" in vpn|vpn_nop2p|ai) : ;; *) printf '{"ok":false,"error":"invalid path"}\n'; return 1 ;; esac
+  [ -f "$NODE_AUDIT" ] || { printf '{"ok":false,"error":"audit module not installed"}\n'; return 1; }
+  # Module validates and reserves synchronously, then forks with the job lock.
+  python3 "$NODE_AUDIT" start "$1"
+}
+cmd_nodes_audit_events_get() {
+  python3 "$NODE_AUDIT" audit-events "$1" "$2" "$3"
+}
+cmd_nodes_audit_job_get() {
+  python3 "$NODE_AUDIT" audit-job "$1"
+}
+cmd_nodes_audit_cancel() {
+  python3 "$NODE_AUDIT" audit-cancel "$1"
+}
+cmd_nodes_path_preview() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" preview "$1" "$2" "$3" "$4"
+}
+cmd_nodes_path_apply() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" apply "$1" "$2" "$3"
+}
+cmd_nodes_path_apply_status() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" status "$1"
+}
+cmd_nodes_path_revoke() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" revoke "$1"
+}
+cmd_mtrickle_sync() {
+  python3 /usr/lib/geomask/geomask-sync-youtube.py mtrickle-sync
+}
+cmd_nodes_audit_schedule_get() {
+  python3 "$NODE_AUDIT" schedule-get "$1"
+}
+cmd_nodes_audit_schedule_set() {
+  python3 "$NODE_AUDIT" schedule-set "$1" "$2" "$3" "$4"
+}
+
+# v1.16.0: Policy management (paths, filters, subscriptions, preview)
+cmd_policy_get() {
+  _pol=/etc/geomask/policies.yaml
+  [ -f "$_pol" ] || { printf '{"ok":false,"error":"policy file not found"}\n'; return 1; }
+  cat "$_pol"
+}
+
+cmd_policy_preview() {
+  _py=/usr/lib/geomask/policy_preview.py
+  [ -f "$_py" ] || { printf '{"ok":false,"error":"preview engine not installed"}\n'; return 1; }
+  _path_id="$2"
+  _nodes_json="$3"
+  if [ -z "$_path_id" ]; then
+    printf '{"ok":false,"error":"path_id required"}\n'; return 1
+  fi
+  if [ -z "$_nodes_json" ]; then
+    _nodes_json='[]'
+  fi
+  python3 "$_py" "$_path_id" --nodes-json "$_nodes_json"
+}
+
+cmd_policy_apply() {
+  _pol=/etc/geomask/policies.yaml
+  [ -f "$_pol" ] || { printf '{"ok":false,"error":"policy file not found"}\n'; return 1; }
+  _new_policy="$2"
+  if [ -z "$_new_policy" ]; then
+    printf '{"ok":false,"error":"policy_json required"}\n'; return 1
+  fi
+  # Validate JSON structure
+  echo "$_new_policy" | python3 -m json.tool >/dev/null 2>&1 || { printf '{"ok":false,"error":"invalid JSON"}\n'; return 1; }
+  # Backup current policy
+  _bak="/etc/geomask/policies.yaml.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$_pol" "$_bak"
+  # Write new policy
+  printf '%s' "$_new_policy" > "$_pol"
+  # Verify the new policy is valid
+  python3 -c "import yaml, sys; yaml.safe_load(open('/etc/geomask/policies.yaml'))" 2>/dev/null || {
+    mv "$_bak" "$_pol"
+    printf '{"ok":false,"error":"invalid policy structure"}\n'; return 1
+  }
+  printf '{"ok":true,"backup":"%s"}\n' "$(basename "$_bak")"
+}
+
 case "$1" in
-  status)     cmd_status ;;
-  leases)     cmd_leases ;;
-  log)        cmd_log ;;
-  backups)    cmd_backups ;;
-  stack)      cmd_stack ;;
+  # >>> geo-rpc generated:dispatch (tools/geo-rpc.json) >>>
+  status)                   cmd_status ;;
+  leases)                   cmd_leases ;;
+  log)                      cmd_log ;;
+  backups)                  cmd_backups ;;
+  stack)                    cmd_stack ;;
   nodescan)   # kick the node audit in background (returns immediately; panel re-reads stack)
     ( /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 & )
     printf '{"ok":true,"started":true}\n' ;;
-  nodes_get)  cmd_nodes_get ;;
-  nodes_set)  cmd_nodes_set "$2" "$3" "$4" "$5" "$6" "$7" ;;
-  sync_set)   cmd_sync_set "$2" ;;
-  syncd_set)  cmd_syncd_set "$2" ;;
-  pin_set)    cmd_pin_set "$2" ;;
-  lists_get)  cmd_lists_get ;;
-  lists_seed) cmd_lists_seed ;;
-  yt_get)     cmd_yt_get ;;
-  yt_mode)    cmd_yt_mode "$2" ;;
-  yt_reset)   cmd_yt_reset ;;
-  torrent_get)      cmd_torrent_get ;;
-  torrent_refresh)  cmd_torrent_refresh ;;
-  torrent_listener) cmd_torrent_listener "$2" ;;
-  torrent_extra)    cmd_torrent_extra "$2" ;;
-  sync_lists) cmd_sync_lists ;;
-  aidns)      cmd_aidns_apply ;;
-  google)     cmd_google ;;
-  global)     cmd_global "$2" ;;
-  ipv6)       cmd_ipv6 "$2" ;;
-  dev_add)    cmd_dev_add "$2" "$3" "$4" "$5" ;;
-  dev_del)    cmd_dev_del "$2" ;;
-  ai_sub_get) cmd_ai_sub_get ;;
-  ai_sub_set) cmd_ai_sub_set "$2" ;;
-  subs_list)  cmd_subs_list ;;
-  sub_add)    cmd_sub_add "$2" "$3" ;;
-  sub_del)    cmd_sub_del "$2" ;;
-  ai_sub_use)   cmd_ai_sub_use "$2" ;;
-  vpn_sub_use)  cmd_vpn_sub_use "$2" ;;
-  vpnnp_sub_use) cmd_vpnnp_sub_use "$2" ;;
-  upd_check)    cmd_upd_check "$2" ;;
-  upd_status)   cmd_upd_status ;;
-  upd_apply)    cmd_upd_apply ;;
+  nodes_get)                cmd_nodes_get ;;
+  nodes_paths_get)          cmd_nodes_paths_get ;;
+  nodes_path_save)          cmd_nodes_path_save "$2" "$3" "$4" ;;
+  nodes_path_check)         cmd_nodes_path_check "$2" ;;
+  nodes_audit_events_get)   cmd_nodes_audit_events_get "$2" "$3" "$4" ;;
+  nodes_audit_job_get)      cmd_nodes_audit_job_get "$2" ;;
+  nodes_audit_cancel)       cmd_nodes_audit_cancel "$2" ;;
+  nodes_set)                cmd_nodes_set "$2" "$3" "$4" "$5" "$6" "$7" ;;
+  sync_set)                 cmd_sync_set "$2" ;;
+  syncd_set)                cmd_syncd_set "$2" ;;
+  pin_set)                  cmd_pin_set "$2" ;;
+  lists_get)                cmd_lists_get ;;
+  lists_seed)               cmd_lists_seed ;;
+  yt_get)                   cmd_yt_get ;;
+  yt_mode)                  cmd_yt_mode "$2" ;;
+  yt_reset)                 cmd_yt_reset ;;
+  torrent_get)              cmd_torrent_get ;;
+  torrent_refresh)          cmd_torrent_refresh ;;
+  torrent_listener)         cmd_torrent_listener "$2" ;;
+  torrent_extra)            cmd_torrent_extra "$2" ;;
+  sync_lists)               cmd_sync_lists ;;
+  aidns)                    cmd_aidns_apply ;;
+  google)                   cmd_google ;;
+  global)                   cmd_global "$2" ;;
+  ipv6)                     cmd_ipv6 "$2" ;;
+  dev_add)                  cmd_dev_add "$2" "$3" "$4" "$5" ;;
+  dev_del)                  cmd_dev_del "$2" ;;
+  ai_sub_get)               cmd_ai_sub_get ;;
+  ai_sub_set)               cmd_ai_sub_set "$2" ;;
+  subs_list)                cmd_subs_list ;;
+  subs_seed)                cmd_subs_seed ;;
+  sub_add)                  cmd_sub_add "$2" "$3" ;;
+  sub_del)                  cmd_sub_del "$2" ;;
+  ai_sub_use)               cmd_ai_sub_use "$2" ;;
+  vpn_sub_use)              cmd_vpn_sub_use "$2" ;;
+  vpnnp_sub_use)            cmd_vpnnp_sub_use "$2" ;;
+  upd_check)                cmd_upd_check "$2" ;;
+  upd_status)               cmd_upd_status ;;
+  upd_apply)                cmd_upd_apply ;;
+  nodes_path_preview)       cmd_nodes_path_preview "$2" "$3" "$4" "$5" ;;
+  nodes_path_apply)         cmd_nodes_path_apply "$2" "$3" "$4" ;;
+  nodes_path_revoke)        cmd_nodes_path_revoke "$2" ;;
+  nodes_path_apply_status)  cmd_nodes_path_apply_status "$2" ;;
+  mtrickle_sync)            cmd_mtrickle_sync ;;
+  nodes_audit_schedule_get) cmd_nodes_audit_schedule_get "$2" ;;
+  nodes_audit_schedule_set) cmd_nodes_audit_schedule_set "$2" "$3" "$4" "$5" ;;
+  # <<< geo-rpc generated:dispatch <<<
   *) printf '{"error":"usage"}'; exit 1 ;;
 esac
 
@@ -1551,45 +6245,60 @@ BACKEND="/usr/bin/geo-backend.sh"
 
 list_methods() {
 	json_init
-	json_add_object "status";     json_close_object
-	json_add_object "leases";     json_close_object
-	json_add_object "log";        json_close_object
-	json_add_object "backups";    json_close_object
-	json_add_object "stack";      json_close_object
-	json_add_object "nodescan";   json_close_object
-	json_add_object "nodes_get";  json_close_object
-	json_add_object "nodes_set";  json_add_string "enabled" "string"; json_add_string "schedule" "string"; json_add_string "countries" "string"; json_add_string "asns" "string"; json_add_string "base" "string"; json_add_string "provider" "string"; json_close_object
-	json_add_object "sync_set";   json_add_string "interval" "string"; json_close_object
-	json_add_object "syncd_set";  json_add_string "state" "string"; json_close_object
-	json_add_object "pin_set";    json_add_string "state" "string"; json_close_object
-	json_add_object "lists_get";  json_close_object
-	json_add_object "lists_seed"; json_close_object
-	json_add_object "yt_get";     json_close_object
-	json_add_object "yt_mode";    json_add_string "mode" "string"; json_close_object
-	json_add_object "yt_reset";   json_close_object
-	json_add_object "torrent_get"; json_close_object
-	json_add_object "torrent_refresh"; json_close_object
-	json_add_object "torrent_listener"; json_add_string "state" "string"; json_close_object
-	json_add_object "torrent_extra"; json_add_string "hosts" "string"; json_close_object
-	json_add_object "sync_lists"; json_close_object
-	json_add_object "aidns";      json_close_object
-	json_add_object "google";     json_close_object
-	json_add_object "global";     json_add_string "mode" "string"; json_close_object
-	json_add_object "ipv6";       json_add_string "state" "string"; json_close_object
-	json_add_object "dev_add";    json_add_string "ip" "string"; json_add_string "mode" "string"; json_add_string "mac" "string"; json_add_string "name" "string"; json_close_object
-	json_add_object "dev_del";    json_add_string "ip" "string"; json_close_object
-	json_add_object "ai_sub_get"; json_close_object
-	json_add_object "ai_sub_set"; json_add_string "url" "string"; json_close_object
-	json_add_object "subs_list";  json_close_object
-	json_add_object "subs_seed"; json_close_object
-	json_add_object "sub_add";    json_add_string "name" "string"; json_add_string "url" "string"; json_close_object
-	json_add_object "sub_del";    json_add_string "id" "string"; json_close_object
-	json_add_object "ai_sub_use";   json_add_string "id" "string"; json_close_object
-	json_add_object "vpn_sub_use";  json_add_string "id" "string"; json_close_object
-	json_add_object "vpnnp_sub_use"; json_add_string "id" "string"; json_close_object
-	json_add_object "upd_check";    json_add_string "force" "string"; json_close_object
-	json_add_object "upd_status";   json_close_object
-	json_add_object "upd_apply";    json_close_object
+	# >>> geo-rpc generated:list (tools/geo-rpc.json) >>>
+	json_add_object "status";                   json_close_object
+	json_add_object "leases";                   json_close_object
+	json_add_object "log";                      json_close_object
+	json_add_object "backups";                  json_close_object
+	json_add_object "stack";                    json_close_object
+	json_add_object "nodescan";                 json_close_object
+	json_add_object "nodes_get";                json_close_object
+	json_add_object "nodes_paths_get";          json_close_object
+	json_add_object "nodes_path_save";          json_add_string "path_id" "string"; json_add_string "countries" "string"; json_add_string "expected_revision" "string"; json_close_object
+	json_add_object "nodes_path_check";         json_add_string "path_id" "string"; json_close_object
+	json_add_object "nodes_audit_events_get";   json_add_string "path_id" "string"; json_add_string "before" "string"; json_add_string "limit" "string"; json_close_object
+	json_add_object "nodes_audit_job_get";      json_add_string "job_id" "string"; json_close_object
+	json_add_object "nodes_audit_cancel";       json_add_string "job_id" "string"; json_close_object
+	json_add_object "nodes_set";                json_add_string "enabled" "string"; json_add_string "schedule" "string"; json_add_string "countries" "string"; json_add_string "asns" "string"; json_add_string "base" "string"; json_add_string "provider" "string"; json_close_object
+	json_add_object "sync_set";                 json_add_string "interval" "string"; json_close_object
+	json_add_object "syncd_set";                json_add_string "state" "string"; json_close_object
+	json_add_object "pin_set";                  json_add_string "state" "string"; json_close_object
+	json_add_object "lists_get";                json_close_object
+	json_add_object "lists_seed";               json_close_object
+	json_add_object "yt_get";                   json_close_object
+	json_add_object "yt_mode";                  json_add_string "mode" "string"; json_close_object
+	json_add_object "yt_reset";                 json_close_object
+	json_add_object "torrent_get";              json_close_object
+	json_add_object "torrent_refresh";          json_close_object
+	json_add_object "torrent_listener";         json_add_string "state" "string"; json_close_object
+	json_add_object "torrent_extra";            json_add_string "hosts" "string"; json_close_object
+	json_add_object "sync_lists";               json_close_object
+	json_add_object "aidns";                    json_close_object
+	json_add_object "google";                   json_close_object
+	json_add_object "global";                   json_add_string "mode" "string"; json_close_object
+	json_add_object "ipv6";                     json_add_string "state" "string"; json_close_object
+	json_add_object "dev_add";                  json_add_string "ip" "string"; json_add_string "mode" "string"; json_add_string "mac" "string"; json_add_string "name" "string"; json_close_object
+	json_add_object "dev_del";                  json_add_string "ip" "string"; json_close_object
+	json_add_object "ai_sub_get";               json_close_object
+	json_add_object "ai_sub_set";               json_add_string "url" "string"; json_close_object
+	json_add_object "subs_list";                json_close_object
+	json_add_object "subs_seed";                json_close_object
+	json_add_object "sub_add";                  json_add_string "name" "string"; json_add_string "url" "string"; json_close_object
+	json_add_object "sub_del";                  json_add_string "id" "string"; json_close_object
+	json_add_object "ai_sub_use";               json_add_string "id" "string"; json_close_object
+	json_add_object "vpn_sub_use";              json_add_string "id" "string"; json_close_object
+	json_add_object "vpnnp_sub_use";            json_add_string "id" "string"; json_close_object
+	json_add_object "upd_check";                json_add_string "force" "string"; json_close_object
+	json_add_object "upd_status";               json_close_object
+	json_add_object "upd_apply";                json_close_object
+	json_add_object "nodes_path_preview";       json_add_string "path_id" "string"; json_add_string "report_id" "string"; json_add_string "expected_path_revision" "string"; json_add_string "expected_source_revision" "string"; json_close_object
+	json_add_object "nodes_path_apply";         json_add_string "path_id" "string"; json_add_string "preview_id" "string"; json_add_string "expected_path_revision" "string"; json_close_object
+	json_add_object "nodes_path_revoke";        json_add_string "path_id" "string"; json_close_object
+	json_add_object "nodes_path_apply_status";  json_add_string "path_id" "string"; json_close_object
+	json_add_object "mtrickle_sync";            json_close_object
+	json_add_object "nodes_audit_schedule_get"; json_add_string "path_id" "string"; json_close_object
+	json_add_object "nodes_audit_schedule_set"; json_add_string "path_id" "string"; json_add_string "enabled" "string"; json_add_string "time" "string"; json_add_string "mode" "string"; json_close_object
+	# <<< geo-rpc generated:list <<<
 	json_dump
 }
 
@@ -1597,47 +6306,69 @@ call_method() {
 	local input method
 	method="$1"
 	input="$(cat)"
+	case "$method" in
+		nodes_paths_get|nodes_path_save|nodes_path_check)
+			# Validate raw types/control characters before jshn can coerce/drop them.
+			_guard=$(printf '%s' "$input" | python3 "${GM_NODE_AUDIT:-/usr/lib/geomask/geomask-node-audit.py}" validate-rpc "$method")
+			[ "$?" = 0 ] || { printf '%s\n' "$_guard"; return 1; }
+			;;
+	esac
 	json_load "$input" 2>/dev/null
 	case "$method" in
-		status)     "$BACKEND" status ;;
-		leases)     "$BACKEND" leases ;;
-		log)        "$BACKEND" log ;;
-		backups)    "$BACKEND" backups ;;
-		stack)      "$BACKEND" stack ;;
-		nodescan)   "$BACKEND" nodescan ;;
-		nodes_get)  "$BACKEND" nodes_get ;;
-		nodes_set)  json_get_var enabled enabled; json_get_var schedule schedule; json_get_var countries countries; json_get_var asns asns; json_get_var base base; json_get_var provider provider; "$BACKEND" nodes_set "$enabled" "$schedule" "$countries" "$asns" "$base" "$provider" ;;
-		sync_set)   json_get_var interval interval; "$BACKEND" sync_set "$interval" ;;
-		syncd_set)  json_get_var state state; "$BACKEND" syncd_set "$state" ;;
-		pin_set)    json_get_var state state; "$BACKEND" pin_set "$state" ;;
-		lists_get)  "$BACKEND" lists_get ;;
-		lists_seed) "$BACKEND" lists_seed ;;
-		yt_get)     "$BACKEND" yt_get ;;
-		yt_mode)    json_get_var mode mode; "$BACKEND" yt_mode "$mode" ;;
-		yt_reset)   "$BACKEND" yt_reset ;;
-		torrent_get)      "$BACKEND" torrent_get ;;
-		torrent_refresh)  "$BACKEND" torrent_refresh ;;
-		torrent_listener) json_get_var state state; "$BACKEND" torrent_listener "$state" ;;
-		torrent_extra)    json_get_var hosts hosts; "$BACKEND" torrent_extra "$hosts" ;;
-		sync_lists) "$BACKEND" sync_lists ;;
-		aidns)      "$BACKEND" aidns ;;
-		google)     "$BACKEND" google ;;
-		global)     json_get_var mode mode;   "$BACKEND" global "$mode" ;;
-		ipv6)       json_get_var state state; "$BACKEND" ipv6 "$state" ;;
-		dev_add)    json_get_var ip ip; json_get_var mode mode; json_get_var mac mac; json_get_var name name; "$BACKEND" dev_add "$ip" "$mode" "$mac" "$name" ;;
-		dev_del)    json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;
-		ai_sub_get) "$BACKEND" ai_sub_get ;;
-		ai_sub_set) json_get_var url url; "$BACKEND" ai_sub_set "$url" ;;
-		subs_list)  "$BACKEND" subs_list ;;
-		subs_seed)  "$BACKEND" subs_seed ;;
-		sub_add)    json_get_var name name; json_get_var url url; "$BACKEND" sub_add "$name" "$url" ;;
-		sub_del)    json_get_var id id; "$BACKEND" sub_del "$id" ;;
-		ai_sub_use)   json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;
-		vpn_sub_use)  json_get_var id id; "$BACKEND" vpn_sub_use "$id" ;;
-		vpnnp_sub_use) json_get_var id id; "$BACKEND" vpnnp_sub_use "$id" ;;
-		upd_check)    json_get_var force force; "$BACKEND" upd_check "$force" ;;
-		upd_status)   "$BACKEND" upd_status ;;
-		upd_apply)    "$BACKEND" upd_apply ;;
+		# >>> geo-rpc generated:call (tools/geo-rpc.json) >>>
+		status)                   "$BACKEND" status ;;
+		leases)                   "$BACKEND" leases ;;
+		log)                      "$BACKEND" log ;;
+		backups)                  "$BACKEND" backups ;;
+		stack)                    "$BACKEND" stack ;;
+		nodescan)                 "$BACKEND" nodescan ;;
+		nodes_get)                "$BACKEND" nodes_get ;;
+		nodes_paths_get)          "$BACKEND" nodes_paths_get ;;
+		nodes_path_save)          json_get_var path_id path_id; json_get_var countries countries; json_get_var expected_revision expected_revision; "$BACKEND" nodes_path_save "$path_id" "$countries" "$expected_revision" ;;
+		nodes_path_check)         json_get_var path_id path_id; "$BACKEND" nodes_path_check "$path_id" ;;
+		nodes_audit_events_get)   json_get_var path_id path_id; json_get_var before before; json_get_var limit limit; "$BACKEND" nodes_audit_events_get "$path_id" "$before" "$limit" ;;
+		nodes_audit_job_get)      json_get_var job_id job_id; "$BACKEND" nodes_audit_job_get "$job_id" ;;
+		nodes_audit_cancel)       json_get_var job_id job_id; "$BACKEND" nodes_audit_cancel "$job_id" ;;
+		nodes_set)                json_get_var enabled enabled; json_get_var schedule schedule; json_get_var countries countries; json_get_var asns asns; json_get_var base base; json_get_var provider provider; "$BACKEND" nodes_set "$enabled" "$schedule" "$countries" "$asns" "$base" "$provider" ;;
+		sync_set)                 json_get_var interval interval; "$BACKEND" sync_set "$interval" ;;
+		syncd_set)                json_get_var state state; "$BACKEND" syncd_set "$state" ;;
+		pin_set)                  json_get_var state state; "$BACKEND" pin_set "$state" ;;
+		lists_get)                "$BACKEND" lists_get ;;
+		lists_seed)               "$BACKEND" lists_seed ;;
+		yt_get)                   "$BACKEND" yt_get ;;
+		yt_mode)                  json_get_var mode mode; "$BACKEND" yt_mode "$mode" ;;
+		yt_reset)                 "$BACKEND" yt_reset ;;
+		torrent_get)              "$BACKEND" torrent_get ;;
+		torrent_refresh)          "$BACKEND" torrent_refresh ;;
+		torrent_listener)         json_get_var state state; "$BACKEND" torrent_listener "$state" ;;
+		torrent_extra)            json_get_var hosts hosts; "$BACKEND" torrent_extra "$hosts" ;;
+		sync_lists)               "$BACKEND" sync_lists ;;
+		aidns)                    "$BACKEND" aidns ;;
+		google)                   "$BACKEND" google ;;
+		global)                   json_get_var mode mode; "$BACKEND" global "$mode" ;;
+		ipv6)                     json_get_var state state; "$BACKEND" ipv6 "$state" ;;
+		dev_add)                  json_get_var ip ip; json_get_var mode mode; json_get_var mac mac; json_get_var name name; "$BACKEND" dev_add "$ip" "$mode" "$mac" "$name" ;;
+		dev_del)                  json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;
+		ai_sub_get)               "$BACKEND" ai_sub_get ;;
+		ai_sub_set)               json_get_var url url; "$BACKEND" ai_sub_set "$url" ;;
+		subs_list)                "$BACKEND" subs_list ;;
+		subs_seed)                "$BACKEND" subs_seed ;;
+		sub_add)                  json_get_var name name; json_get_var url url; "$BACKEND" sub_add "$name" "$url" ;;
+		sub_del)                  json_get_var id id; "$BACKEND" sub_del "$id" ;;
+		ai_sub_use)               json_get_var id id; "$BACKEND" ai_sub_use "$id" ;;
+		vpn_sub_use)              json_get_var id id; "$BACKEND" vpn_sub_use "$id" ;;
+		vpnnp_sub_use)            json_get_var id id; "$BACKEND" vpnnp_sub_use "$id" ;;
+		upd_check)                json_get_var force force; "$BACKEND" upd_check "$force" ;;
+		upd_status)               "$BACKEND" upd_status ;;
+		upd_apply)                "$BACKEND" upd_apply ;;
+		nodes_path_preview)       json_get_var path_id path_id; json_get_var report_id report_id; json_get_var expected_path_revision expected_path_revision; json_get_var expected_source_revision expected_source_revision; "$BACKEND" nodes_path_preview "$path_id" "$report_id" "$expected_path_revision" "$expected_source_revision" ;;
+		nodes_path_apply)         json_get_var path_id path_id; json_get_var preview_id preview_id; json_get_var expected_path_revision expected_path_revision; "$BACKEND" nodes_path_apply "$path_id" "$preview_id" "$expected_path_revision" ;;
+		nodes_path_revoke)        json_get_var path_id path_id; "$BACKEND" nodes_path_revoke "$path_id" ;;
+		nodes_path_apply_status)  json_get_var path_id path_id; "$BACKEND" nodes_path_apply_status "$path_id" ;;
+		mtrickle_sync)            "$BACKEND" mtrickle_sync ;;
+		nodes_audit_schedule_get) json_get_var path_id path_id; "$BACKEND" nodes_audit_schedule_get "$path_id" ;;
+		nodes_audit_schedule_set) json_get_var path_id path_id; json_get_var enabled enabled; json_get_var time time; json_get_var mode mode; "$BACKEND" nodes_audit_schedule_set "$path_id" "$enabled" "$time" "$mode" ;;
+		# <<< geo-rpc generated:call <<<
 		*) echo '{"error":"unknown method"}'; return 1 ;;
 	esac
 }
@@ -1665,13 +6396,13 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "ai_sub_get", "subs_list", "upd_check", "upd_status", "lists_get", "yt_get", "torrent_get" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "ai_sub_get", "subs_list", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
 				"system": [ "info" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "subs_seed", "upd_apply", "nodescan", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra" ]
+				"geo-sync": [ "nodescan", "nodes_path_save", "nodes_path_check", "nodes_audit_cancel", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra", "sync_lists", "aidns", "google", "global", "ipv6", "dev_add", "dev_del", "ai_sub_set", "subs_seed", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "upd_apply", "nodes_path_preview", "nodes_path_apply", "nodes_path_revoke", "mtrickle_sync", "nodes_audit_schedule_set" ]
 			}
 		}
 	}
@@ -1700,48 +6431,66 @@ ASSET_EOF
 'require rpc';
 'require ui';
 
-var callStatus = rpc.declare({ object: 'geo-sync', method: 'status', expect: {} });
-var callLeases = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} });
-var callLog    = rpc.declare({ object: 'geo-sync', method: 'log',    expect: {} });
-var callBackups = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
-var callStack  = rpc.declare({ object: 'geo-sync', method: 'stack', expect: {} });
-var callNodescan = rpc.declare({ object: 'geo-sync', method: 'nodescan', expect: {} });
-var callLists  = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
-var callGoogle = rpc.declare({ object: 'geo-sync', method: 'google',  expect: {} });
+// >>> geo-rpc generated:decl (tools/geo-rpc.json) >>>
+var callStatus                = rpc.declare({ object: 'geo-sync', method: 'status', expect: {} });
+var callLeases                = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} });
+var callLog                   = rpc.declare({ object: 'geo-sync', method: 'log', expect: {} });
+var callBackups               = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
+var callStack                 = rpc.declare({ object: 'geo-sync', method: 'stack', expect: {} });
+var callNodescan              = rpc.declare({ object: 'geo-sync', method: 'nodescan', expect: {} });
+var callNodesGet              = rpc.declare({ object: 'geo-sync', method: 'nodes_get', expect: {} });
+var callNodesPathsGet         = rpc.declare({ object: 'geo-sync', method: 'nodes_paths_get', expect: {} });
 /* params as OBJECT (not array): array form expects positional args and would
    wrap {mode:...} into {"mode":{...}} breaking rpcd json_get_var */
-var callGlobal = rpc.declare({ object: 'geo-sync', method: 'global',  params: { mode: null }, expect: {} });
-var callIpv6   = rpc.declare({ object: 'geo-sync', method: 'ipv6',    params: { state: null }, expect: {} });
-var callDevAdd = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
-var callDevDel = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
-var callAiSubGet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
-var callAiSubSet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
-var callSubsList = rpc.declare({ object: 'geo-sync', method: 'subs_list', expect: {} });
-var callSubsSeed = rpc.declare({ object: 'geo-sync', method: 'subs_seed', expect: {} });
-var callSubAdd   = rpc.declare({ object: 'geo-sync', method: 'sub_add',   params: { name: null, url: null }, expect: {} });
-var callSubDel   = rpc.declare({ object: 'geo-sync', method: 'sub_del',   params: { id: null }, expect: {} });
-var callAiSubUse   = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use',   params: { id: null }, expect: {} });
-var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  params: { id: null }, expect: {} });
-var callVpnnpSubUse = rpc.declare({ object: 'geo-sync', method: 'vpnnp_sub_use', params: { id: null }, expect: {} });
-var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
-var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
-var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var callNodesGet   = rpc.declare({ object: 'geo-sync', method: 'nodes_get',   expect: {} });
-var callNodesSet   = rpc.declare({ object: 'geo-sync', method: 'nodes_set',   params: { enabled: null, schedule: null, countries: null, asns: null, base: null, provider: null }, expect: {} });
-var callSyncSet    = rpc.declare({ object: 'geo-sync', method: 'sync_set',    params: { interval: null }, expect: {} });
-var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   params: { state: null }, expect: {} });
-var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
-var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
-var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
-var callYtGet      = rpc.declare({ object: 'geo-sync', method: 'yt_get',      expect: {} });
-var callYtMode     = rpc.declare({ object: 'geo-sync', method: 'yt_mode',     params: { mode: null }, expect: {} });
-var callYtReset    = rpc.declare({ object: 'geo-sync', method: 'yt_reset',    expect: {} });
-var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', expect: {} });
-var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
-var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
-var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
-var PANEL_VERSION = '1.25.3';
+var callNodesPathSave         = rpc.declare({ object: 'geo-sync', method: 'nodes_path_save', params: [ 'path_id', 'countries', 'expected_revision' ], expect: {} });
+var callNodesPathCheck        = rpc.declare({ object: 'geo-sync', method: 'nodes_path_check', params: [ 'path_id' ], expect: {} });
+var callNodesAuditEventsGet   = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_events_get', params: [ 'path_id', 'before', 'limit' ], expect: {} });
+var callNodesAuditJobGet      = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_job_get', params: [ 'job_id' ], expect: {} });
+var callNodesAuditCancel      = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_cancel', params: [ 'job_id' ], expect: {} });
+var callNodesSet              = rpc.declare({ object: 'geo-sync', method: 'nodes_set', params: { enabled: null, schedule: null, countries: null, asns: null, base: null, provider: null }, expect: {} });
+var callSyncSet               = rpc.declare({ object: 'geo-sync', method: 'sync_set', params: { interval: null }, expect: {} });
+var callSyncdSet              = rpc.declare({ object: 'geo-sync', method: 'syncd_set', params: { state: null }, expect: {} });
+var callPinSet                = rpc.declare({ object: 'geo-sync', method: 'pin_set', params: { state: null }, expect: {} });
+var callListsGet              = rpc.declare({ object: 'geo-sync', method: 'lists_get', expect: {} });
+var callListsSeed             = rpc.declare({ object: 'geo-sync', method: 'lists_seed', expect: {} });
+var callYtGet                 = rpc.declare({ object: 'geo-sync', method: 'yt_get', expect: {} });
+var callYtMode                = rpc.declare({ object: 'geo-sync', method: 'yt_mode', params: { mode: null }, expect: {} });
+var callYtReset               = rpc.declare({ object: 'geo-sync', method: 'yt_reset', expect: {} });
+var callTorGet                = rpc.declare({ object: 'geo-sync', method: 'torrent_get', expect: {} });
+var callTorRefresh            = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
+var callTorListener           = rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
+var callTorExtra              = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
+var callLists                 = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
+var callGoogle                = rpc.declare({ object: 'geo-sync', method: 'google', expect: {} });
+var callGlobal                = rpc.declare({ object: 'geo-sync', method: 'global', params: { mode: null }, expect: {} });
+var callIpv6                  = rpc.declare({ object: 'geo-sync', method: 'ipv6', params: { state: null }, expect: {} });
+var callDevAdd                = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
+var callDevDel                = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
+var callAiSubGet              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
+var callAiSubSet              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
+var callSubsList              = rpc.declare({ object: 'geo-sync', method: 'subs_list', expect: {} });
+var callSubsSeed              = rpc.declare({ object: 'geo-sync', method: 'subs_seed', expect: {} });
+var callSubAdd                = rpc.declare({ object: 'geo-sync', method: 'sub_add', params: { name: null, url: null }, expect: {} });
+var callSubDel                = rpc.declare({ object: 'geo-sync', method: 'sub_del', params: { id: null }, expect: {} });
+var callAiSubUse              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use', params: { id: null }, expect: {} });
+var callVpnSubUse             = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use', params: { id: null }, expect: {} });
+var callVpnnpSubUse           = rpc.declare({ object: 'geo-sync', method: 'vpnnp_sub_use', params: { id: null }, expect: {} });
+var callUpdCheck              = rpc.declare({ object: 'geo-sync', method: 'upd_check', params: { force: null }, expect: {} });
+var callUpdStatus             = rpc.declare({ object: 'geo-sync', method: 'upd_status', expect: {} });
+var callUpdApply              = rpc.declare({ object: 'geo-sync', method: 'upd_apply', expect: {} });
+var callNodesPathPreview      = rpc.declare({ object: 'geo-sync', method: 'nodes_path_preview', params: [ 'path_id', 'report_id', 'expected_path_revision', 'expected_source_revision' ], expect: {} });
+var callNodesPathApply        = rpc.declare({ object: 'geo-sync', method: 'nodes_path_apply', params: [ 'path_id', 'preview_id', 'expected_path_revision' ], expect: {} });
+var callNodesPathRevoke       = rpc.declare({ object: 'geo-sync', method: 'nodes_path_revoke', params: [ 'path_id' ], expect: {} });
+var callNodesPathApplyStatus  = rpc.declare({ object: 'geo-sync', method: 'nodes_path_apply_status', params: [ 'path_id' ], expect: {} });
+var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtrickle_sync', expect: {} });
+var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
+var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
+// <<< geo-rpc generated:decl <<<
+var PANEL_VERSION = '1.27.10';
 
+/* Job observers, keyed by path id. They live outside the view because reload() builds a
+   new instance while the old timer would otherwise keep polling. */
+var POLL_TIMERS = {};
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
 	function flash(ok) {
@@ -1919,7 +6668,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet() ]);
 	},
 
 	render: function(all) {
@@ -1934,6 +6683,7 @@ return view.extend({
 		var lt = all[10] || {};
 		var yt = all[11] || {};
 		var tor = all[12] || {};
+		var pathAudit = all[13] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -2014,10 +6764,77 @@ return view.extend({
 			if (!u) return '—';
 			return String(u).replace(/\/[^/]*$/, '/...');
 		}
+		/* Assignment badges. The scalar *_sub fields are single-valued and were derived from
+		   the config text; after an apply re-serialises the config they were all empty at once.
+		   subscription_bindings is computed structurally and knows a managed pool's original
+		   subscription, so it wins whenever it is present - even when its list is empty. */
+		var bindings = st.subscription_bindings || null;
+		function bindingIds(pathId) {
+			if (!bindings) return null;
+			var record = bindings[pathId] || {};
+			return Array.isArray(record.subscription_ids) ? record.subscription_ids : [];
+		}
+		function hasBinding(pathId, id) {
+			var ids = bindingIds(pathId);
+			if (ids === null) return false;
+			return ids.indexOf(id) >= 0;
+		}
+		var REASON_TEXT = {
+			group_missing: 'группа пути не найдена в конфиге',
+			group_duplicate: 'в конфиге несколько групп с таким именем',
+			group_has_no_providers: 'группа не подключена к провайдеру',
+			group_bad_use: 'список провайдеров группы некорректен',
+			provider_without_url: 'у провайдера нет ссылки на подписку',
+			managed_source_unrecorded: 'не записано, из какой подписки собран проверенный пул',
+			managed_source_unverified: 'проверенный пул не подтверждён записью применения',
+			managed_source_missing: 'исходная подписка проверенного пула отсутствует в конфиге',
+			registry_has_no_match: 'ни одна запись реестра не совпала с источником',
+			config_unreadable: 'конфиг mihomo не читается',
+			state_unreadable: 'состояние проверок не читается',
+			snapshot_changed: 'конфиг менялся во время чтения',
+			unreadable_input: 'не удалось прочитать данные назначения'
+		};
+		function assignmentNotice() {
+			if (!bindings) return null;
+			var lines = [];
+			[['vpn', 'VPN'], ['vpn_nop2p', 'VPN-noP2P'], ['ai', 'AI']].forEach(function(pair) {
+				var record = bindings[pair[0]] || {};
+				if (record.status === 'partial' || record.status === 'unknown' ||
+					record.status === 'unregistered') {
+					var why = REASON_TEXT[record.reason_code] || record.reason_code || 'причина неизвестна';
+					lines.push(pair[1] + ': назначение не подтверждено (' + why + ')');
+				}
+			});
+			var known = {};
+			subs.forEach(function(s) { known[s.id] = true; });
+			var dangling = false;
+			Object.keys(bindings).forEach(function(key) {
+				((bindings[key] || {}).subscription_ids || []).forEach(function(id) {
+					if (!known[id]) dangling = true;
+				});
+			});
+			if (dangling) {
+				lines.push('данные назначений изменились — обновите страницу');
+			}
+			if (!lines.length) return null;
+			return E('div', { 'class': 'gs-hint gs-warn', style: 'margin:0 0 8px' }, lines.join(' · '));
+		}
+		function managedNote() {
+			if (!bindings) return E('span', {});
+			var notes = [];
+			[['vpn', 'VPN'], ['vpn_nop2p', 'VPN-noP2P'], ['ai', 'AI']].forEach(function(pair) {
+				var record = bindings[pair[0]] || {};
+				if (record.via === 'managed' && (record.subscription_ids || []).length) {
+					notes.push(pair[1] + ' работает на проверенном пуле — ниже его исходная подписка');
+				}
+			});
+			if (!notes.length) return E('span', {});
+			return E('div', { 'class': 'gs-hint', style: 'margin:0 0 8px' }, notes.join(' · '));
+		}
 		function subRow(s) {
-			var isVpn = !!(st.vpn_sub && st.vpn_sub === s.id);
-			var isVpnNP = !!(st.vpn_nop2p_sub && st.vpn_nop2p_sub === s.id);
-			var isAi = !!(st.ai_sub && st.ai_sub === s.id);
+			var isVpn = bindings ? hasBinding('vpn', s.id) : !!(st.vpn_sub && st.vpn_sub === s.id);
+			var isVpnNP = bindings ? hasBinding('vpn_nop2p', s.id) : !!(st.vpn_nop2p_sub && st.vpn_nop2p_sub === s.id);
+			var isAi = bindings ? hasBinding('ai', s.id) : !!(st.ai_sub && st.ai_sub === s.id);
 			var dest = [];
 			if (isVpn)   dest.push(E('span', { 'class': 'gs-badge gs-on' }, 'VPN'));
 			if (isAi)    dest.push(E('span', { 'class': 'gs-badge gs-ok' }, 'AI'));
@@ -2097,6 +6914,8 @@ return view.extend({
 				'«VPN» — полоса для всего, что выглядит как P2P (правила по IP, пины зависших YouTube-рёбер, ' +
 				'ответы входящим пирам), «AI» — Google и AI-сервисы. Кнопка активного слота подсвечена. ' +
 				'Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
+			assignmentNotice() || E('span', {}),
+			managedNote(),
 			E('table', { 'class': 'gs-table gs-subs' },
 				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
 					.concat(subs.map(subRow))),
@@ -2726,7 +7545,255 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [ btnTorExtra ])
 		]));
 
-		/* ===================== Node audit (nodes tab, v1.12.0) ===================== */
+		/* Isolated per-path service-egress observations; no production apply. */
+		panels.nodes.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Раздельные фильтры выхода: VPN / VPN-noP2P / AI'),
+			E('p', { 'class': 'gs-hint' }, 'Проверка не переключает рабочие узлы. Страна определяется по ответу сайта, не по адресу входного сервера. Сохранение — желаемая настройка, не применение фильтра. Старый ночной сканер ниже работает отдельно.'),
+			pathAudit.error ? E('p', {}, 'Ошибка: ' + pathAudit.error) : E('span', {}, '')
+		]));
+		(pathAudit.paths || []).forEach(function(path) {
+			// Keep an unsaved edit per path. Reloading the page (or the automatic reload after
+			// a check) used to wipe whatever was typed in the other cards.
+			var draftKey = 'gs-draft-' + path.id;
+			var draft = '';
+			try { draft = localStorage.getItem(draftKey) || ''; } catch (e) { draft = ''; }
+			var savedValue = (path.countries_allow || []).join(',');
+			var input = E('input', { 'class': 'gs-text', type: 'text', size: 22,
+				value: draft || savedValue,
+				'input': function() {
+					try { localStorage.setItem(draftKey, this.value); } catch (e) { /* ignore */ }
+				} });
+			var draftHint = draft && draft !== savedValue
+				? E('span', { 'class': 'gs-warn' }, 'есть несохранённый ввод')
+				: E('span', {});
+			var report = path.report || {};
+			var status = E('div', { 'class': 'gs-hint' }, report.status ? ('Проверка: ' + report.status + (report.stale ? ' · УСТАРЕЛА' : '')) : 'Ещё не проверялся');
+			var save = E('button', { 'class': 'gs-btn', 'click': function() {
+				save.disabled = true;
+				callNodesPathSave(path.id, input.value.trim().toUpperCase(), pathAudit.revision).then(function(res) {
+					if (!res || !res.ok) throw new Error((res || {}).error || 'Сохранение не подтверждено');
+					try { localStorage.removeItem(draftKey); } catch (e) { /* ignore */ }
+					ui.addNotification(null, E('p', {}, res.changed ? 'Желаемый фильтр сохранён. В mihomo не применён.' : 'Настройки не изменились.'), 'info');
+					view.reload();
+				}).catch(function(err) { ui.addNotification(null, E('p', {}, String(err)), 'error'); }).finally(function() { save.disabled = false; });
+			} }, 'Сохранить настройки');
+			var run = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+				run.disabled = true;
+				callNodesPathCheck(path.id).then(function(res) {
+					if (!res || !res.ok) throw new Error((res || {}).error || 'Запуск не подтверждён');
+					var jobId = res.job_id;
+					// Store jobId for polling and cancel
+					run._jobId = jobId;
+					status.textContent = 'Проверка запущена (job ' + jobId + '). Ожидание результатов...';
+					run.style.display = 'none';
+					cancel.style.display = 'inline-block';
+					view.pollJob(jobId, path.id);
+				}).catch(function(err) { ui.addNotification(null, E('p', {}, String(err)), 'error'); }).finally(function() { run.disabled = false; });
+			} }, 'Проверить ' + path.label);
+			var cancel = E('button', { 'class': 'gs-btn gs-btn-warn', style: 'display:none', 'click': function() {
+				var jobId = run._jobId;
+				if (jobId) {
+					cancel.disabled = true;
+					callNodesAuditCancel(jobId).then(function(res) {
+						if (res && res.ok) {
+							status.textContent = 'Отмена запрошена, ожидание завершения...';
+							cancel.style.display = 'none';
+							// polling will detect cancelled status and reload
+						} else {
+							ui.addNotification(null, E('p', {}, 'Отмена не удалась: ' + ((res || {}).error || 'unknown')), 'error');
+						}
+					}).catch(function(err) { ui.addNotification(null, E('p', {}, String(err)), 'error'); }).finally(function() { cancel.disabled = false; });
+				}
+			} }, 'Отменить');
+			var rows = (report.nodes || []).map(function(node) {
+				var facts = Object.keys(node.probes || {}).map(function(service) {
+					var proof = node.probes[service];
+					return service + ': ' + (proof.country || 'UNKNOWN') + (proof.ip ? ' / ' + proof.ip : '') + (proof.reason ? ' (' + proof.reason + ')' : '');
+				}).join(' · ');
+				return E('div', { 'class': 'gs-upd-meta' }, node.name + ' — ' + node.status + '\n' + facts);
+			});
+			panels.nodes.appendChild(E('div', { 'class': 'gs-card' }, [
+				E('h3', {}, path.label),
+				E('p', { 'class': 'gs-hint' }, 'Источник: ' + ((path.providers || []).join(', ') || 'не определён') + (path.configured ? ' · сохранено' : ' · предлагаемые страны, ещё не сохранены')),
+				E('div', { 'class': 'gs-row' }, [E('span', {}, 'Разрешённые страны выхода (ISO-2)'), input, save, run,
+					E('button', { 'class': 'gs-btn', 'click': function() { view.reload(); } }, 'Обновить результаты'), draftHint]),
+				status,
+				E('p', { 'class': 'gs-hint' }, report.error || report.limit || 'HTTP 200/204 Google не означает US. Проверки SOCKS5h не подтверждают путь клиента с локальным hosts.'),
+				// What admission actually means for this path, in plain words.
+				path.id === 'ai' ? E('p', { 'class': 'gs-hint' },
+					'Допуск AI: ChatGPT и Cloudflare. Google не отдаёт страну в машинно-читаемом виде — '
+					+ 'его страна показывается как «неизмерима» и в допуске не участвует.') : E('span', {}),
+				// Positive state of the filter. Without this the card only ever showed a
+				// warning when something was wrong, so "nothing applied" and "applied and
+				// healthy" looked identical to the owner.
+				(function() {
+					var d = path.applied_detail || {};
+					var state = d.status || 'never';
+					var text, cls = 'gs-hint';
+					if (state === 'applied') {
+						text = 'Фильтр действует: ' + (d.node_count || 0) + ' проверенных узлов'
+							+ (d.applied_at ? ', применён ' + new Date(d.applied_at).toLocaleString() : '')
+							+ (d.provider_id ? ' · ' + d.provider_id : '');
+					} else if (state === 'applying') {
+						// An apply in flight, or one that died between commit and bookkeeping.
+						// The group may already be pinned, so this must never read as "not applied".
+						text = 'Применение не завершено: пул может быть уже подключён. Проверьте состав '
+							+ 'и при необходимости отзовите фильтр.';
+						cls = 'gs-warn';
+					} else if (state === 'expired') {
+						text = 'Фильтр действует, но доказательства просрочены: нужен новый Check и повторное применение';
+						cls = 'gs-warn';
+					} else if (state === 'revoked') {
+						text = 'Фильтр отозван: путь снова использует исходный источник';
+					} else {
+						text = 'Фильтр не применялся: путь использует исходный источник без сужения';
+					}
+					// Desired and acting are different questions: say so when they diverge.
+					var acting = (d.acting_countries || []).join(',');
+					var desired = (path.countries_allow || []).join(',');
+					var nodes = [E('p', { 'class': cls }, text)];
+					if ((state === 'applied' || state === 'expired') && acting && acting !== desired) {						nodes.push(E('p', { 'class': 'gs-hint' },
+							'Желаемые страны: ' + (desired || '—') + ' · действующие: ' + acting));
+					}
+					return E('div', {}, nodes);
+				})(),
+				E('div', {}, rows),
+				// Revoke is always available while a filter is in force: an owner must be able
+				// to undo an apply even when the report has gone stale, which is exactly the
+				// state an apply itself creates.
+				path.applied && (path.applied_detail || {}).status !== 'revoked' ? E('div', { 'class': 'gs-row', style: 'margin-top: 8px' }, [
+					E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesPathRevoke(path.id).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Отзыв не подтверждён');
+							ui.addNotification(null, E('p', {}, res.revoked ? 'Фильтр отозван, исходный источник и фильтр группы восстановлены' : 'Активного фильтра нет'), 'info');
+							view.reload();
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'Отозвать фильтр')
+				]) : E('span', {}),
+				// Preview and Apply section
+				report.status === 'complete' && !report.stale && report.counts && report.counts.eligible > 0 ? E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color,#30363d)' }, [
+					E('button', { 'class': 'gs-btn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesPathPreview(path.id, report.job_id, report.settings_revision, report.source_revision).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Предпросмотр не подтверждён');
+							// Show preview in notification
+							var msg = 'Предпросмотр: ' + res.eligible_count + ' подходят, ' + res.excluded_count + ' исключены, ' + res.unknown_count + ' неизвестно.';
+							if (res.to_add && res.to_add.length) msg += ' Добавится: ' + res.to_add.join(', ');
+							if (res.to_remove && res.to_remove.length) msg += ' Удалится: ' + res.to_remove.join(', ');
+							if (res.warnings && res.warnings.length) msg += ' ⚠ ' + res.warnings.join('; ');
+							ui.addNotification(null, E('p', {}, msg), 'info');
+							// Store preview_id for apply
+							path._preview_id = res.preview_id;
+						}).catch(function(err) {
+							btn.disabled = false;
+							// A check that finished after this page was drawn replaces the
+							// report, so the card holds a dead job id. Refresh instead of
+							// leaving the owner with an unexplained refusal.
+							if (/Report ID mismatch|Report not found|Report not complete/i.test(String(err))) {
+								ui.addNotification(null, E('p', {},
+									'Отчёт обновился после загрузки страницы. Данные перечитаны — '
+									+ 'нажмите «Предпросмотр» ещё раз.'), 'warning');
+								view.reload();
+								return;
+							}
+							ui.addNotification(null, E('p', {}, String(err)), 'error');
+						});
+					} }, 'Предпросмотр'),
+					E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+						var btn = this; 
+						var previewId = path._preview_id;
+						if (!previewId) { ui.addNotification(null, E('p', {}, 'Сначала сделайте предпросмотр'), 'error'); return; }
+						btn.disabled = true;
+						callNodesPathApply(path.id, previewId, report.settings_revision).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Применение не подтверждено');
+							ui.addNotification(null, E('p', {}, 'Фильтр применён к трафику (' + (res.tx_id || '') + ')'), 'info');
+							view.reload();
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'Применить фильтр'),
+				]) : E('span', {}),
+				// History section
+				E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color,#30363d)' }, [
+					E('button', { 'class': 'gs-btn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesAuditEventsGet(path.id, null, 10).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'История не загружена');
+							var msg = 'История (' + res.events.length + '):\n' + res.events.map(function(e) {
+								var ts = e.timestamp;
+								var t;
+								if (ts) {
+									t = new Date(ts).toLocaleString();
+								} else if (e.event_id) {
+									// Fallback: extract ISO timestamp from event_id prefix (format: 2026-11-09T14:16:28.149342+03:00-xxx)
+									var m = e.event_id.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/);
+									if (m) t = new Date(m[1]).toLocaleString();
+								}
+								t = t || 'Время неизвестно';
+								return t + ' [' + e.action + '] ' + (e.result || '') + (e.revoked_nodes ? ' · отозвано: ' + e.revoked_nodes.join(', ') : '');
+							}).join('\n');
+							ui.addNotification(null, E('p', { 'style': 'white-space: pre-wrap; max-height: 300px; overflow: auto' }, msg), 'info');
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'История')
+				]),
+				// Drift detection
+				report.status === 'complete' && !report.stale && path.applied && path.applied_detail && path.applied_detail.runtime_verified === false ? E('div', { 'class': 'gs-row gs-warn', style: 'margin-top: 8px; padding: 8px; background: #d2992222; border: 1px solid #d29922; border-radius: 6px' }, [
+					E('span', { 'class': 'gs-warn' }, '⚠ Применённый фильтр не подтверждён на работающем mihomo.'),
+					E('button', { 'class': 'gs-btn', 'click': function() { view.reload(); } }, 'Перезагрузить')
+				]) : E('span', {}),
+				// Expired evidence: the filter is still narrowing the pool, it was not widened.
+				path.applied_detail && path.applied_detail.status === 'expired' ? E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding: 8px; background: #d2992222; border: 1px solid #d29922; border-radius: 6px' }, [
+					E('span', { 'class': 'gs-warn' }, '⏳ Срок давности проверки истёк. Фильтр продолжает действовать и путь не расширен: нужен новый Check и повторное применение.'),
+					E('button', { 'class': 'gs-btn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesPathCheck(path.id).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Проверка не запущена');
+							view.reload();
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'Проверить сейчас')
+				]) : E('span', {}),
+				// Schedule section
+				(function() {
+					var sched = path.schedule || {};
+					var inTime = E('input', { 'class': 'gs-text', type: 'text', value: sched.time || '03:30', size: 6 });
+					var inMode = E('select', { 'class': 'gs-text' }, [
+						E('option', { value: 'check-only' }, 'Только проверка'),
+						E('option', { value: 'check-and-apply' }, 'Проверка и применение')
+					]);
+					inMode.value = sched.mode || 'check-only';
+					var chkEn = E('input', { 'class': 'gs-check', type: 'checkbox' });
+					chkEn.checked = sched.enabled === true;
+
+					function persist() {
+						callNodesAuditScheduleSet(path.id, chkEn.checked ? 'true' : 'false',
+							inTime.value.trim(), inMode.value).then(function(res) {
+							if (!res || !res.ok) {
+								ui.addNotification(null, E('p', {}, 'Ошибка: ' + ((res || {}).error || 'unknown')), 'error');
+								return;
+							}
+							ui.addNotification(null, E('p', {}, 'Расписание сохранено'), 'info');
+							view.reload();
+						}).catch(function(err) {
+							ui.addNotification(null, E('p', {}, String(err)), 'error');
+						});
+					}
+
+					return E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color,#30363d)' }, [
+						E('span', { 'class': 'gs-label' }, 'Расписание проверки'),
+						E('label', { 'class': 'gs-check' }, [chkEn, E('span', {}, 'включено')]),
+						E('span', { 'class': 'gs-label' }, 'Время (ЧЧ:ММ)'), inTime,
+						E('span', { 'class': 'gs-label' }, 'Режим'), inMode,
+						E('button', { 'class': 'gs-btn', 'click': persist }, 'Сохранить расписание')
+					]);
+				})()
+			]));
+		});
+
+		/* ===================== Legacy node audit (separate server-country policy) ===================== */
 		var conf = nd.conf || {};
 		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
 		var inSched = E('input', { 'class': 'gs-text', type: 'text', value: nd.schedule || '03:30', size: 6 });
@@ -2837,12 +7904,88 @@ return view.extend({
 
 	reload: function() {
 		var view = this;
-		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet() ]).then(function(all) {
+		var calls = [
+			callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(),
+			callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet()
+		];
+		return Promise.all(calls).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);
 		});
+	},
+
+	// Poll job status until complete.
+	//
+	// One timer per path, kept outside the view instance: reload() builds a new view, so a
+	// timer owned by the old one survived and kept polling -- several clicks, or a couple of
+	// reloads, produced a swarm of overlapping requests and one "interrupted" notice each.
+	// A transient timeout is retried a few times before it is reported at all.
+	pollJob: function(jobId, pathId) {
+		var view = this;
+		if (POLL_TIMERS[pathId]) {
+			clearInterval(POLL_TIMERS[pathId].timer);
+			delete POLL_TIMERS[pathId];
+		}
+		var state = { jobId: jobId, failures: 0, timer: null };
+
+		function stop() {
+			if (state.timer !== null) {
+				clearInterval(state.timer);
+				state.timer = null;
+			}
+			if (POLL_TIMERS[pathId] === state) delete POLL_TIMERS[pathId];
+		}
+
+		state.timer = setInterval(function() {
+			callNodesAuditJobGet(jobId).then(function(res) {
+				if (!res || !res.ok) {
+					var error = (res || {}).error || 'ошибка RPC';
+					stop();
+					// A newer check replaced this job file; the card already shows it.
+					if (error !== 'job not found') {
+						ui.addNotification(null, E('p', {}, 'Наблюдение прервано: ' + error), 'warning');
+					}
+					return;
+				}
+				state.failures = 0;
+				var job = res.job || {};
+				var st = job.status;
+				if (st === 'complete' || st === 'error' || st === 'stale' || st === 'cancelled') {
+					stop();
+					var msg, kind = 'info';
+					if (st === 'complete') {
+						var counts = job.counts || {};
+						msg = 'Проверка завершена: ' + (counts.eligible || 0) + ' допущено, '
+							+ (counts.excluded || 0) + ' исключено, '
+							+ (counts.unknown || 0) + ' неизвестно.';
+					} else if (st === 'stale') {
+						var staleCounts = job.counts || {};
+						msg = 'Проверка завершена, но результат уже устарел (конфиг изменился): '
+							+ (staleCounts.eligible || 0) + ' допущено, '
+							+ (staleCounts.excluded || 0) + ' исключено, '
+							+ (staleCounts.unknown || 0) + ' неизвестно. Нужна повторная проверка.';
+						kind = 'warning';
+					} else if (st === 'cancelled') {
+						msg = 'Проверка отменена.';
+						kind = 'warning';
+					} else {
+						msg = 'Проверка завершилась ошибкой: ' + (job.error || 'причина не указана');
+						kind = 'error';
+					}
+					ui.addNotification(null, E('p', {}, msg), kind);
+					view.reload();
+				}
+			}).catch(function(err) {
+				state.failures += 1;
+				if (state.failures < 3) return;
+				stop();
+				ui.addNotification(null, E('p', {}, 'Наблюдение прервано: ' + String(err)
+					+ '. Нажмите «Обновить результаты».'), 'warning');
+			});
+		}, 2000);
+		POLL_TIMERS[pathId] = state;
 	}
 });
 
@@ -3176,7 +8319,7 @@ write_mihomo_config() {
     printf '%s\n' '  # yandexcom.net which are NOT covered by the yandex.ru/.net namespace. These'
     printf '%s\n' '  # are also listed in /etc/geomask/zapret-always-exclude.txt so nfqws never'
     printf '%s\n' '  # DPI-mangles them (owner: Yandex must bypass zapret too).'
-    for _yd in yandex.ru yandex.net yandex.com yandexcloud.net yandex-net.ru yandexcom.net yandex-team.ru yastatic.net yasandbox.net ya.ru yandex.kz yandex.by yandex.az yandex.am yandex.ge yandex.tj yandex.tm yandex.uz yandex.md yandex.aero yandex.co.il; do
+    for _yd in yandex.ru yandex.net yandex.com yandex.com.tr yandexcloud.net yandex-net.ru yandexcom.net yandex-team.ru yastatic.net yasandbox.net ya.ru yandex.kz yandex.by yandex.az yandex.am yandex.ge yandex.tj yandex.tm yandex.uz yandex.md yandex.aero yandex.co.il yandex.eu yandex.lt yandex.lv yandex.ee; do
       printf '  - DOMAIN-SUFFIX,%s,DIRECT\n' "$_yd"
     done
     printf '%s\n' '  - RULE-SET,ytvpn,VPN-noP2P'
@@ -3195,6 +8338,7 @@ write_mihomo_config() {
     printf '%s\n' '  # STUN: stop WebRTC leaking the real (RU) IP, keep calls working'
     printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN-noP2P'
     printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,19302)),VPN-noP2P'
+
     printf '%s\n' '  - MATCH,GLOBAL'
     printf '\n'
     printf '%s\n' 'sniffer:'
@@ -3557,12 +8701,12 @@ ASSET_EOF
   # 3) AI DoH worker (second https-dns-proxy instance, runs as dnsai)
   save_stream /etc/init.d/ai-doh 755 <<'ASSET_EOF'
 #!/bin/sh /etc/rc.common
-# geomask: DNS-over-HTTPS worker for AI-mode devices (marked -> AI tunnel)
+# geomask: DNS-over-HTTPS worker for AI-mode devices (DoH via AI listener)
 START=21
 USE_PROCD=1
 start_service() {
   procd_open_instance
-  procd_set_param command /usr/sbin/https-dns-proxy -a 127.0.0.1 -p 5055 -r https://cloudflare-dns.com/dns-query -u dnsai -g dnsai
+  procd_set_param command /usr/sbin/https-dns-proxy -a 127.0.0.1 -p 5055 -r https://cloudflare-dns.com/dns-query -t socks5h://127.0.0.1:7891 -b 8.8.8.8,1.1.1.1 -u dnsai -g dnsai
   procd_set_param respawn
   procd_close_instance
 }
@@ -21234,6 +26378,11 @@ yandex.uz
 yandex.md
 yandex.aero
 yandex.co.il
+yandex.com.tr
+yandex.eu
+yandex.lt
+yandex.lv
+yandex.ee
 
 ASSET_EOF
   fi
@@ -21784,11 +26933,14 @@ _provision_netfw() {
   fi
   # A /32 tun subnet means the lan->lane forwarding alone does NOT emit an accept rule
   # (fw4 leaves accept_to_<zone> empty). Add the explicit accept, same as the AI lane does.
+  # WireGuard peers need the same line: MagiTrickle can route a phone into this lane too,
+  # and without it fw4 answers the peer with a TCP reset (found on the AI lane, 10.11).
   mkdir -p /usr/share/nftables.d/ruleset-post
   cat > "$NFT" <<EOF
 table inet fw4 {
     chain accept_to_$LANE_NAME {
         iifname "br-lan" oifname "$LANE_NAME" counter accept comment "geomask-lane: LAN clients to $LANE_NAME tunnel"
+        iifname "Wireguard" oifname "$LANE_NAME" counter accept comment "geomask-lane: WG peers to $LANE_NAME tunnel"
     }
 }
 EOF
@@ -22314,6 +27466,14 @@ apply_routes() {
     ip route replace table 100 default dev Mihomo 2>/dev/null
   fi
   ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
+  # --- WireGuard peers are remote LAN clients (10.10.0.0/24). Without this rule their
+  #     traffic falls through to main (real WAN IP), so anything blocked for the ISP -
+  #     YouTube first of all - fails on the phone while local network still works.
+  #     Same table as br-lan, so LAN access and the tunnel policy both keep working.
+  #     The rule needs the device to exist: add it only once the link is up. ---
+  if ip link show Wireguard >/dev/null 2>&1; then
+    ip rule show | grep -q 'iif Wireguard lookup 100' || ip rule add priority 32759 iif Wireguard lookup 100
+  fi
   # --- ICMP bypass: must stay ABOVE the magitrickle fwmark rule base. That base
   #     is dynamic (drifts down as groups grow): observed 32558..32609 over time.
   #     A low pref (19901) is always above it, so ping to a marked IP never dies
@@ -22387,7 +27547,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.25.3"
+GUARD_VERSION="1.27.10"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -22596,6 +27756,10 @@ ASSET_EOF
 if python3 -c 'pass' >/dev/null 2>&1; then _py=python3; else _py=python; fi
 exec "$_py" - "$@" <<'PYEOF'
 import re, sys, json, time, urllib.request, urllib.parse, subprocess, os
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 # every path is env-overridable so the script can be exercised by the sandbox tests
 _E=os.environ
@@ -22605,11 +27769,67 @@ BLOCKF=_E.get('GM_NODES_BLOCK','/etc/geomask-node-block.txt')
 STATE=_E.get('GM_NODES_STATE','/tmp/geomask-nodescan.state')
 LOG=_E.get('GM_NODES_LOG','/root/geo-sync.log')
 
-def log(msg):
-    line='%s NODESCAN %s\n' % (time.strftime('%F %T'), msg)
+def log(msg, lv='INFO'):
+    line='%s NODESCAN [%s] %s\n' % (time.strftime('%F %T'), lv, msg)
     try:
         with open(LOG,'a') as f: f.write(line)
     except Exception: pass
+
+# The managed transaction (geomask-config-tx.py) owns the same config file. This scan
+# reads the file, spends minutes probing, then writes: without a check it would install
+# a candidate built on a file that no longer exists and silently undo a committed apply.
+TX_LOCK=_E.get('GM_CONFIG_TX_LOCK','/etc/geomask/.config-tx.lock')
+# Provider ids created by the node-audit coordinator. Its groups are not ours to edit.
+MANAGED_PREFIX='audit-'
+
+class ConfigWriteRefused(Exception):
+    pass
+
+def _sha(b):
+    import hashlib
+    return hashlib.sha256(b).hexdigest()
+
+def install_config_candidate(candidate_path, expected_live):
+    """Replace the live config with candidate_path only if it still equals expected_live.
+
+    Runs under the transaction lock so a commit cannot interleave between the digest
+    check and the rename.
+    """
+    import contextlib
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+
+    @contextlib.contextmanager
+    def held():
+        if fcntl is None:
+            yield
+            return
+        try:
+            os.makedirs(os.path.dirname(TX_LOCK), exist_ok=True)
+            fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            yield
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try: fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError: pass
+            os.close(fd)
+
+    expected = _sha(expected_live.encode('utf-8') if isinstance(expected_live, str) else expected_live)
+    with held():
+        try:
+            with open(CFG, 'rb') as f:
+                live = f.read()
+        except OSError as e:
+            raise ConfigWriteRefused('cannot read the live config: %s' % e)
+        if _sha(live) != expected:
+            raise ConfigWriteRefused('config changed during the scan (a managed apply or a manual edit); the scan result is stale')
+        os.replace(candidate_path, CFG)
 
 cfgd={}
 try:
@@ -22618,7 +27838,7 @@ try:
         if ln and not ln.startswith('#') and '=' in ln:
             k,_,v=ln.partition('='); cfgd[k.strip()]=v.strip()
 except Exception as e:
-    log('conf read failed: %s' % e); sys.exit(1)
+    log('conf read failed: %s' % e, 'ERR'); sys.exit(1)
 
 bad_countries={c.strip().upper() for c in cfgd.get('bad_countries','RU,BY').split(',') if c.strip()}
 bad_asns={('AS'+a.replace('AS','').strip().upper()) for a in cfgd.get('bad_asns','').split(',') if a.strip()}
@@ -22639,8 +27859,31 @@ if '--list-providers' in _argv:
     _n=re.search(r'\n(?=[a-z])', _h[1:])
     if _n: _h=_h[:_n.start()+1]
     print(','.join(p for p in re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', _h, re.M)
-                   if re.search(r'^  %s:\n(?:.*\n)*?\s+url:' % re.escape(p), _h, re.M)))
+                   if re.search(r'^  %s:\n(?:.*\n)*?\s+url:' % re.escape(p), _h, re.M)
+                   and not p.startswith(MANAGED_PREFIX)))
     sys.exit(0)
+# v1.22.9: active OpenAI-egress guard for the AI group. A node labelled "USA" can still reach
+# OpenAI from elsewhere - un1.pro's servers resolved to US IPs but routed OpenAI traffic through
+# a Helsinki/Russia relay, so a name filter and even a server-country check both passed it. Only
+# an actual OpenAI request reveals the truth. Test every node the AI group would use through the
+# AI listener and exclude the liars by exact name. Never empties the group (if all fail, that is
+# a provider outage to investigate, not something to hide by deleting the last node).
+if '--admission-check' in _argv:
+    _adm_py='/usr/lib/geomask/admission_service.py'
+    if not os.path.isfile(_adm_py):
+        log('admission-check: admission_service.py not found', 'ERR'); sys.exit(1)
+    _path_id=cfgd.get('ai_group','AI')
+    _nodes_json='[]'
+    if '--nodes-json' in _argv:
+        _idx=_argv.index('--nodes-json')
+        if _idx+1 < len(_argv):
+            _nodes_json=_argv[_idx+1]
+    r=subprocess.run(['python3',_adm_py,_path_id,'--nodes-json',_nodes_json],capture_output=True,text=True,timeout=120)
+    sys.stdout.write(r.stdout)
+    if r.returncode!=0:
+        sys.stderr.write(r.stderr)
+    sys.exit(r.returncode)
+
 # v1.22.9: active OpenAI-egress guard for the AI group. A node labelled "USA" can still reach
 # OpenAI from elsewhere - un1.pro's servers resolved to US IPs but routed OpenAI traffic through
 # a Helsinki/Russia relay, so a name filter and even a server-country check both passed it. Only
@@ -22656,6 +27899,19 @@ if '--ai-guard' in _argv:
     expect=cfgd.get('ai_expect','US').strip().upper()
     listener=cfgd.get('ai_listener','http://127.0.0.1:7891')
     static_ex=cfgd.get('ai_exclude_base','HY2')
+    
+    # Check admission cache first
+    _adm_cache='/tmp/geomask-admission-cache.json'
+    _adm_ok=set()
+    if os.path.isfile(_adm_cache):
+        try:
+            _adm_data=json.load(open(_adm_cache,encoding='utf-8'))
+            for _nid,_nadm in _adm_data.items():
+                if _nadm.get('admitted'):
+                    _adm_ok.add(_nadm.get('node_id',''))
+        except Exception:
+            pass
+    
     def _api(path,data=None):
         r=urllib.request.Request('http://127.0.0.1:9090'+path,method='PUT' if data else 'GET')
         if sec: r.add_header('Authorization','Bearer '+sec)
@@ -22666,21 +27922,25 @@ if '--ai-guard' in _argv:
         try:
             op=urllib.request.build_opener(urllib.request.ProxyHandler({'http':listener,'https':listener}),
                 urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
-            return op.open(urllib.request.Request(egress_url,headers={'User-Agent':'curl/8'}),timeout=18).read(4000).decode('utf-8','replace')
+            return op.open(urllib.request.Request(egress_url + ('&' if '?' in egress_url else '?') + '_=%d'%int(_t.time()),headers={'User-Agent':'curl/8'}),timeout=18).read(4000).decode('utf-8','replace')
         except Exception: return ''
     g=_api('/proxies/'+ai_group); members=list(g.get('all') or [])
     if not members:
-        log('ai-guard: AI group empty or unreachable - skip'); sys.exit(0)
+        log('ai-guard: AI group empty or unreachable - skip', 'WARN'); sys.exit(0)
     liars=[]
     for m in members:
-        _api('/proxies/'+ai_group,{'name':m}); _t.sleep(1.2)
+        # Check admission cache first
+        if m in _adm_ok:
+            log('ai-guard: %s admitted via cache' % m, 'OK')
+            continue
+        _api('/proxies/'+ai_group,{'name':m}); _t.sleep(3.0)
         b=_egress(); mm=re.search(r'(?m)^loc=(\w+)',b); loc=(mm.group(1).upper() if mm else '')
         if loc!=expect:
-            liars.append(m); log('ai-guard: %s egress loc=%r != %s -> exclude' % (m,loc,expect))
+            liars.append(m); log('ai-guard: %s egress loc=%r != %s -> exclude' % (m,loc,expect), 'WARN')
         else:
-            log('ai-guard: %s ok (loc=%s)' % (m,expect))
+            log('ai-guard: %s ok (loc=%s)' % (m,expect), 'OK')
     if len(liars)>=len(members):
-        log('ai-guard: ALL %d AI nodes fail the egress test - NOT excluding (would empty the group); provider issue to investigate' % len(members))
+        log('ai-guard: ALL %d AI nodes fail the egress test - NOT excluding (would empty the group); provider issue to investigate' % len(members), 'WARN')
         sys.exit(0)
     seen=set(); parts=[]
     for p in ([x for x in static_ex.split('|') if x.strip()] if static_ex.strip() else [])+[re.escape(n) for n in sorted(liars)]:
@@ -22688,14 +27948,14 @@ if '--ai-guard' in _argv:
         if p and p not in seen: seen.add(p); parts.append(p)
     new_ex='|'.join(parts)
     mb=re.search(r'(?m)^  - name: '+re.escape(ai_group)+r'\n(?:    .*\n|\n)*?(?=^  - name:|^[a-z]|\Z)', text)
-    if not mb: log('ai-guard: AI group block not found'); sys.exit(1)
+    if not mb: log('ai-guard: AI group block not found', 'ERR'); sys.exit(1)
     blk=mb.group(0); esc=new_ex.replace("'","''"); line="    exclude-filter: '%s'"%esc
     if re.search(r'(?m)^\s*exclude-filter:',blk):
         nb=re.sub(r'(?m)^\s*exclude-filter:.*$', line, blk, count=1)
     else:
         nb=re.sub(r"(?m)^(\s*filter:.*\n)", r"\g<0>"+line+"\n", blk, count=1)
     if nb==blk:
-        log('ai-guard: AI exclude-filter already up to date'); sys.exit(0)
+        log('ai-guard: AI exclude-filter already up to date', 'OK'); sys.exit(0)
     out=text[:mb.start()]+nb+text[mb.end():]
     open(CFG+'.bak_aiguard','w',encoding='utf-8').write(text)
     open(CFG+'.tmp','w',encoding='utf-8').write(out)
@@ -22704,14 +27964,20 @@ if '--ai-guard' in _argv:
     if rc!=0:
         try: os.remove(CFG+'.tmp')
         except Exception: pass
-        log('ai-guard: VALIDATION FAILED, config untouched (rc=%d)'%rc); sys.exit(1)
-    os.replace(CFG+'.tmp',CFG)
+        log('ai-guard: VALIDATION FAILED, config untouched (rc=%d)'%rc, 'ERR'); sys.exit(1)
+    try:
+        install_config_candidate(CFG+'.tmp', text)
+    except ConfigWriteRefused as e:
+        try: os.remove(CFG+'.tmp')
+        except Exception: pass
+        log('ai-guard: not applying - %s' % e, 'WARN')
+        sys.exit(4)
     try:
         r=urllib.request.Request('http://127.0.0.1:9090/configs?force=true',data=json.dumps({'path':CFG}).encode(),method='PUT',headers={'Content-Type':'application/json'})
         if sec: r.add_header('Authorization','Bearer '+sec)
         urllib.request.urlopen(r,timeout=8).read()
-    except Exception as e: log('ai-guard: reload failed %s'%e)
-    log('ai-guard: applied, excluded %d liar(s): %s' % (len(liars), ','.join(liars)))
+    except Exception as e: log('ai-guard: reload failed %s'%e, 'ERR')
+    log('ai-guard: applied, excluded %d liar(s): %s' % (len(liars), ','.join(liars)), 'OK')
     sys.exit(0)
 if '--provider' in _argv:
     provider=_argv[_argv.index('--provider')+1]
@@ -22720,7 +27986,7 @@ elif provider.strip()=='all':
     try:
         _i=_t.index('\nproxy-providers:\n')
     except ValueError:
-        log('sub_provider=all but no proxy-providers section'); sys.exit(1)
+        log('sub_provider=all but no proxy-providers section', 'ERR'); sys.exit(1)
     _head=_t[_i:]
     # stop at the next top-level key so rule-providers entries cannot be mistaken for proxies
     _nxt=re.search(r'\n(?=[a-z])', _head[1:])
@@ -22730,7 +27996,7 @@ elif provider.strip()=='all':
     _provs=[p for p in re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', _head, re.M)
             if re.search(r'^  %s:\n(?:.*\n)*?\s+url:' % re.escape(p), _head, re.M)]
     if not _provs:
-        log('sub_provider=all but no proxy-provider with a url was found - refusing to no-op')
+        log('sub_provider=all but no proxy-provider with a url was found - refusing to no-op', 'ERR')
         sys.exit(1)
     log('scanning all %d providers: %s' % (len(_provs), ','.join(_provs)))
     # One provider failing must not erase the others: a blocked subscription legitimately
@@ -22738,14 +28004,21 @@ elif provider.strip()=='all':
     # every single pass failed - otherwise the nightly job would glow red forever.
     _ok=[]; _bad=[]; _skip=[]
     for _p in _provs:
-        r=subprocess.run(['/bin/sh', '/usr/bin/geomask-node-scan.sh', '--provider', _p])
-        if r.returncode==0: _ok.append(_p)
-        elif r.returncode==3: _skip.append(_p)
-        else: _bad.append(_p)
+        # capture child stdout so per-provider progress reaches the NODESCAN log
+        # (the bare line is "nodes=N blocked=N errors=N applied=..." from the child)
+        r=subprocess.run(['/bin/sh', '/usr/bin/geomask-node-scan.sh', '--provider', _p],
+                         capture_output=True, text=True)
+        _o=((r.stdout or '') + ' ' + (r.stderr or '')).strip()
+        if r.returncode==0:
+            _ok.append(_p); log('provider %s: %s' % (_p, _o or 'ok'), 'OK')
+        elif r.returncode==3:
+            _skip.append(_p); log('provider %s: skipped by design%s' % (_p, ': %s' % _o if _o else ''), 'INFO')
+        else:
+            _bad.append(_p); log('provider %s failed (rc=%d): %s' % (_p, r.returncode, _o or 'no output'), 'ERR')
     log('all-provider pass done: ok=[%s] skipped-by-design=[%s] failed=[%s]'
         % (','.join(_ok), ','.join(_skip), ','.join(_bad)))
     if not _ok and not _skip:
-        log('every provider failed - nothing was updated'); sys.exit(1)
+        log('every provider failed - nothing was updated', 'ERR'); sys.exit(1)
     # run the AI OpenAI-egress guard once per scan (not per provider)
     if cfgd.get('ai_guard','1').strip().lower() in ('1','true','yes','on'):
         subprocess.run(['/bin/sh', '/usr/bin/geomask-node-scan.sh', '--ai-guard'])
@@ -22797,12 +28070,12 @@ for _try in range(3):
         # not recognise the client or is rate-limiting; the real payload is 12-15 KB.
         if len(raw) > 2000:
             break
-        log('subscription looks like a stub (%d bytes), retrying' % len(raw))
+        log('subscription looks like a stub (%d bytes), retrying' % len(raw), 'WARN')
     except Exception as e:
-        log('subscription download failed (try %d/3): %s' % (_try+1, e))
+        log('subscription download failed (try %d/3): %s' % (_try+1, e), 'WARN')
     time.sleep(5*(_try+1))
 if not raw.strip():
-    log('subscription download failed: empty response'); sys.exit(1)
+    log('subscription download failed: empty response', 'ERR'); sys.exit(1)
 sub_text=raw
 # v1.13.8: only base64-decode when the body really is base64. b64decode(validate=False)
 # silently discards ':' and spaces, so feeding it a YAML config produced mojibake and the
@@ -22867,11 +28140,11 @@ if not nodes:
 MIN_NODES=3
 if len(nodes) < MIN_NODES:
     log('suspiciously few nodes parsed (%d < %d) - subscription format changed? refusing to rewrite filter'
-        % (len(nodes), MIN_NODES))
+        % (len(nodes), MIN_NODES), 'ERR')
     sys.exit(1)
 
 if not nodes:
-    log('no nodes parsed from subscription'); sys.exit(1)
+    log('no nodes parsed from subscription', 'ERR'); sys.exit(1)
 
 # geodb per unique server (cached)
 cache={}
@@ -22938,7 +28211,14 @@ def provider_of_block(blk):
 
 def apply_filter_all(cfgtext, filt, prov, name_filter_groups):
     """write the filter into every GROUP that uses this provider. Never listeners, never a
-    group that is not listed in name_filter_groups for the base part."""
+    group that is not listed in name_filter_groups for the base part.
+
+    A group pinned to a managed provider belongs to the node-audit coordinator. Writing an
+    exclude-filter into it would silently narrow the pool that was just applied and verified,
+    so those groups are refused rather than merged -- the unified owner has to mean something.
+    """
+    if str(prov).startswith(MANAGED_PREFIX):
+        return cfgtext, False, 0, 0
     esc=filt.replace("'", "''")
     line="    exclude-filter: '%s'" % esc
     out=[]; cursor=0; touched=0; matched=0
@@ -22973,7 +28253,7 @@ if matched == 0:
     print('nodes=%d blocked=%d errors=%d applied=False (no name-filtered group)'
           % (total, len(blocked), errs)); sys.exit(3)
 if not changed:
-    log('filter for provider %s already up to date across %d group(s)' % (provider, matched))
+    log('filter for provider %s already up to date across %d group(s)' % (provider, matched), 'OK')
     print('nodes=%d blocked=%d errors=%d applied=False (already up to date)'
           % (total, len(blocked), errs)); sys.exit(0)
 applied=False
@@ -22985,7 +28265,14 @@ if changed:
     except Exception:
         rc=1
     if rc==0:
-        os.replace(CFG+'.tmp', CFG)
+        try:
+            install_config_candidate(CFG+'.tmp', text)
+        except ConfigWriteRefused as e:
+            try: os.remove(CFG+'.tmp')
+            except Exception: pass
+            log('not applying - %s' % e, 'WARN')
+            print('nodes=%d blocked=%d errors=%d applied=False (config changed during the scan)'
+                  % (total, len(blocked), errs)); sys.exit(4)
         try:
             # v1.13.7: controller is protected by a secret; without Bearer the reload 401s
             sm=re.search(r'^secret:\s*(\S+)', text, re.M)
@@ -22996,15 +28283,15 @@ if changed:
             if sec: r.add_header('Authorization', 'Bearer '+sec)
             urllib.request.urlopen(r, timeout=8).read()
         except Exception as e:
-            log('reload failed: %s' % e)
-        log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs))
+            log('reload failed: %s' % e, 'WARN')
+        log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs), 'OK')
         applied=True
     else:
         try: os.remove(CFG+'.tmp')
         except Exception: pass
-        log('VALIDATION FAILED - config untouched (test rc=%d)' % rc)
+        log('VALIDATION FAILED - config untouched (test rc=%d)' % rc, 'ERR')
 else:
-    log('no change (blocked=%d of %d, errors=%d)' % (len(blocked), total, errs))
+    log('no change (blocked=%d of %d, errors=%d)' % (len(blocked), total, errs), 'OK')
 
 # remember list + state for the panel
 try:
@@ -23070,8 +28357,63 @@ ASSET_EOF
   else
     info "nodes conf: keeping existing /etc/geomask-nodes.conf"
   fi
+  # v1.28.0: the night audit is now owned by the per-path scheduler.
+  # The legacy 03:30 nodescan cron keeps running for paths that were never configured,
+  # so a reinstall cannot silently stop auditing a router the owner never migrated.
+  # Migration only seeds check-only schedules; it never enables auto-apply.
+  _migrate_nodescan_cron() {
+    if crontab -l 2>/dev/null | grep -q 'geomask-node-scan.*geomask-nodescan'; then
+      _old_time=$(crontab -l 2>/dev/null | grep 'geomask-node-scan.*geomask-nodescan' \
+                  | awk '{printf "%02d:%02d", $2, $1}' | head -1)
+      [ -n "$_old_time" ] || _old_time="03:30"
+      if [ -f "$(P /usr/lib/geomask/geomask-node-audit.py)" ]; then
+        _seeded=$(python3 - "$_old_time" <<'PYEOF' 2>/dev/null || echo 0
+import sys
+sys.path.insert(0, '/usr/lib/geomask')
+import importlib.util
+spec = importlib.util.spec_from_file_location(
+    'node_audit', '/usr/lib/geomask/geomask-node-audit.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+when = sys.argv[1]
+seeded = 0
+for ident in ('vpn', 'vpn_nop2p', 'ai'):
+    current = mod.schedule_get(ident).get('schedule') or {}
+    if current.get('enabled'):
+        continue          # the owner already chose a schedule: never overwrite it
+    mod.schedule_set(ident, 'true', when, 'check-only')
+    seeded += 1
+print(seeded)
+PYEOF
+)
+        info "legacy nodescan cron found (${_old_time}); seeded check-only schedules for ${_seeded:-0} unconfigured path(s)"
+      else
+        warn "node-audit module missing: leaving the legacy nodescan cron untouched"
+      fi
+    else
+      info "legacy nodescan cron: none"
+    fi
+  }
+  _migrate_nodescan_cron
+  # Install the legacy cron only if it is absent AND no path has a schedule, so a router
+  # that the owner migrated is not audited twice every night.
   if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
     info "nodescan cron already present"
+  elif _sched_active=$(python3 - <<'PYEOF' 2>/dev/null
+import sys, importlib.util, json
+try:
+    spec = importlib.util.spec_from_file_location(
+        'node_audit', '/usr/lib/geomask/geomask-node-audit.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    data, _ = mod.load_store()
+    print(1 if any((p.get('schedule') or {}).get('enabled')
+                   for p in data.get('paths', {}).values()) else 0)
+except Exception:
+    print(0)
+PYEOF
+) && [ "${_sched_active:-0}" = "1" ]; then
+    info "per-path scheduler is active: not adding the legacy nodescan cron"
   else
     ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
   fi
@@ -24034,6 +29376,19 @@ geomask_uninstall() {
   rm -f "$(P /usr/bin/geomask-lane.sh)"
   rm -f "$(P /usr/bin/geomask-dnscheck.sh)"
   info "removed: vpnwatch (conf /etc/geomask/vpnwatch.conf and the audit log kept)"
+  # v1.28.0: node-audit subsystem modules. The settings store (/etc/geomask/node-audit.json),
+  # its event log and the immutable report/pool directories are deliberately KEPT - they are
+  # the operator's desired policies and the evidence behind them.
+  for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
+            geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
+            geomask-sync-youtube.py geomask-audit-scheduler.py geomask-subscription-status.py \
+            geomask-slot-patch.py; do
+    rm -f "$(P /usr/lib/geomask/$_m)"
+  done
+  if crontab -l 2>/dev/null | grep -q 'geomask-audit-schedule'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-audit-schedule' | crontab - 2>/dev/null || true
+  fi
+  info "removed: node-audit modules (settings, events and reports kept under /etc/geomask)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

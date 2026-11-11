@@ -13,6 +13,14 @@ apply_routes() {
     ip route replace table 100 default dev Mihomo 2>/dev/null
   fi
   ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
+  # --- WireGuard peers are remote LAN clients (10.10.0.0/24). Without this rule their
+  #     traffic falls through to main (real WAN IP), so anything blocked for the ISP -
+  #     YouTube first of all - fails on the phone while local network still works.
+  #     Same table as br-lan, so LAN access and the tunnel policy both keep working.
+  #     The rule needs the device to exist: add it only once the link is up. ---
+  if ip link show Wireguard >/dev/null 2>&1; then
+    ip rule show | grep -q 'iif Wireguard lookup 100' || ip rule add priority 32759 iif Wireguard lookup 100
+  fi
   # --- ICMP bypass: must stay ABOVE the magitrickle fwmark rule base. That base
   #     is dynamic (drifts down as groups grow): observed 32558..32609 over time.
   #     A low pref (19901) is always above it, so ping to a marked IP never dies

@@ -35,10 +35,35 @@ MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
 BACKEND_VERSION="@@BACKEND_VERSION@@"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
+# safe_write resources
+SAFE_WRITE_PY=/usr/bin/safe_write.py
+# read-only subscription-assignment resolver (config + audit state + registry, never writes)
+SUB_STATUS_PY=/usr/lib/geomask/geomask-subscription-status.py
+# Interpreter for the python helpers; GM_PYTHON only lets tests point at their own python.
+PYTHON_BIN=${GM_PYTHON:-python3}
+SUB_STATUS_PYTHON=$PYTHON_BIN
 UPD_CHECK=$UPD_DIR/check.json
 UPD_STATUS=$UPD_DIR/status.json
 UPD_PIDF=$UPD_DIR/pid
 UPD_TTL=3600
+
+# safe_write shell wrapper
+# usage: _safe_write <resource> <live_content> <editable_json> [backup_age_seconds]
+# returns: 0=ok, 1=validation fail, 2=backup gate fail, 3=trial fail, 4=install/reload fail, 5=rollback fail
+# stdout: new live content on success
+_safe_write() {
+    _resource="$1"
+    _live_content="$2"
+    _editable_json="$3"
+    _max_age="${4:-300}"
+
+    if [ ! -f "$SAFE_WRITE_PY" ]; then
+        printf '{"ok":false,"error":"safe_write.py not installed"}\n' >&2
+        return 1
+    fi
+
+    python3 "$SAFE_WRITE_PY" "$_resource" "$_live_content" "$_editable_json" "$_max_age"
+}
 UPD_REPO=kabzon93region/geomask
 DEPLOY_JS=/www/luci-static/resources/view/geo-sync/main.js
 DEPLOY_GUARD=/usr/bin/geomask-guard.sh
@@ -171,7 +196,10 @@ cmd_status() {
   BYPASS=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"bypass"' | wc -l | tr -d ' ')
   REALTZ=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"realtz"' | wc -l | tr -d ' ')
   N_AI=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"ai"' | wc -l | tr -d ' ')
-  RULES=$(ip rule show | grep -c 'lookup main' || echo 0)
+  # grep -c always prints its count; appending '|| echo 0' used to yield "0\n0" and
+  # produced invalid JSON whenever no rule matched.
+  RULES=$(ip rule show 2>/dev/null | grep -c 'lookup main')
+  RULES=${RULES:-0}
   _sub2u=$(_url_of_provider "$(_prov_of_group VPN)")
   _subu=$(_url_of_provider "$(_prov_of_group VPN-noP2P)")
   _aiu=$(_url_of_provider "$(_prov_of_group AI)")
@@ -186,7 +214,11 @@ cmd_status() {
   elif ip route get 1.1.1.1 mark 0x64 2>/dev/null | grep -q 'dev AI' \
        && netstat -ltnpu 2>/dev/null | grep -q '192.168.0.53:5353 '; then AIDNS=1
   else AIDNS=2; fi
-  printf '{"vpn_node":"%s","vpn_cc":"%s","vpn_nop2p_node":"%s","vpn_nop2p_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"vpn_sub":"%s","ai_sub":"%s","vpn_nop2p_sub":"%s","vpn_url":"%s","ai_url":"%s","vpn_nop2p_url":"%s","aidns":%s}' \
+  # The assignment badges used to be derived here from config text with a regex that
+  # expected `  - name:` and a quoted URL. Applying a pool re-serialises the config with
+  # PyYAML, so every path lost its badge at once. The resolver reads the same three files
+  # structurally and also links a managed pool back to its recorded subscription.
+  _STATUS_JSON=$(printf '{"vpn_node":"%s","vpn_cc":"%s","vpn_nop2p_node":"%s","vpn_nop2p_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"vpn_sub":"%s","ai_sub":"%s","vpn_nop2p_sub":"%s","vpn_url":"%s","ai_url":"%s","vpn_nop2p_url":"%s","aidns":%s}' \
     "$(json_esc "$VPN_NODE")" "$(_node_cc "$VPN_NODE")" \
     "$(json_esc "$VPNNP_NODE")" "$(_node_cc "$VPNNP_NODE")" \
     "$(json_esc "$AI_NODE")" "$(_node_cc "$AI_NODE")" \
@@ -194,7 +226,14 @@ cmd_status() {
     "$AI_RC" "$MT_RC" "$(json_esc "$GOOGLE_CC")" "$(json_esc "$SYNC_AT")" \
     "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES" \
     "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$VPN_SUB_ID")" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPNNP_SUB_ID")" \
-    "$(json_esc "$_sub2u")" "$(json_esc "$_aiu")" "$(json_esc "$_subu")" "$AIDNS"
+    "$(json_esc "$_sub2u")" "$(json_esc "$_aiu")" "$(json_esc "$_subu")" "$AIDNS")
+  if [ -f "$SUB_STATUS_PY" ]; then
+    _MERGED=$(printf '%s' "$_STATUS_JSON" | "$SUB_STATUS_PYTHON" -B "$SUB_STATUS_PY" status 2>/dev/null)
+    case "$_MERGED" in
+      '{'*'}') _STATUS_JSON=$_MERGED ;;
+    esac
+  fi
+  printf '%s\n' "$_STATUS_JSON"
 }
 
 # country fragment from a node name (flag emoji or RU word) - coarse, for display
@@ -523,6 +562,24 @@ EOF
       /etc/init.d/firewall reload >/dev/null 2>&1
     fi
   fi
+  # v1.27.10: the accept drop-in above was written only when the AI zone was first
+  # created. On a box where the zone already existed (ours), a WireGuard peer routed
+  # by MagiTrickle into the AI tunnel hit forward_wg with no matching accept, so fw4
+  # answered the phone with a TCP reset and YouTube stalled after the first second.
+  # Ensure the WG rule on every run, not just at creation time.
+  _ai_drop=/usr/share/nftables.d/ruleset-post/99-ai-accept.nft
+  if [ ! -s "$_ai_drop" ] || ! grep -q 'iifname "Wireguard" oifname "AI"' "$_ai_drop" 2>/dev/null; then
+    mkdir -p /usr/share/nftables.d/ruleset-post
+    cat > "$_ai_drop" <<'EOF'
+table inet fw4 {
+    chain accept_to_AI {
+        iifname "br-lan" oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
+        iifname "Wireguard" oifname "AI" counter accept comment "custom: WG peers to AI tunnel"
+    }
+}
+EOF
+    /etc/init.d/firewall reload >/dev/null 2>&1
+  fi
   # table 101: LAN/host routes must stay local, only internet goes to AI tunnel
   ip route show table main | grep -v '^default' | while IFS= read -r _r; do
     ip route replace table 101 $_r 2>/dev/null
@@ -599,8 +656,14 @@ EOF
 
 # ---- AI path (no own subscription since v1.23.0; rides the provider its group uses) ----
 cmd_ai_sub_get() {
-  # the old code read a hardcoded "de5" provider that is retired - the honest answer is
-  # whatever provider the AI group is currently fed by (or empty if none).
+  # `provider` stays the provider the AI group actually rides (for a managed pool that is
+  # the audit-* file provider). The resolved source subscription is an added field.
+  if [ -f "$SUB_STATUS_PY" ]; then
+    _AIJSON=$("$SUB_STATUS_PYTHON" -B "$SUB_STATUS_PY" ai-sub 2>/dev/null)
+    case "$_AIJSON" in
+      '{"provider"'*) printf '%s\n' "$_AIJSON"; return 0 ;;
+    esac
+  fi
   p=$(_prov_of_group AI)
   u=''
   [ -n "$p" ] && u=$(_url_of_provider "$p")
@@ -608,13 +671,15 @@ cmd_ai_sub_get() {
 }
 
 # ---- slot patcher: point a group (VPN / VPN-noP2P / AI) at a subscription URL ----
-# v1.25.2: the patcher used to live in the _SLOT_PY shell variable with doubled backslashes;
-# python received "\\n" and "\\"" literally, died with a SyntaxError, and every slot switch
-# failed with "provider de5 not found in config". A quoted heredoc is verbatim AND pycheck.py
-# syntax-validates it on every test run.
-# Isolation: if the target provider is shared with another group (e.g. AI rides the same
-# provider as VPN), this group gets its own "slot" provider instead of silently re-pointing
-# the shared one - switching AI must never move VPN/VPN-noP2P nodes.
+# The patcher used to rewrite the config as TEXT and required `  - name: GROUP` with a
+# double-quoted provider URL. Applying a verified pool re-serialises the config with PyYAML
+# (`- name:` at column 0, bare scalars), so every switch failed: the AI slot claimed its
+# anchor was missing while the group was present. assets/geomask-slot-patch.py parses and
+# writes YAML structurally (YAML 1.2 booleans) and is syntax-checked by the test suite.
+# Isolation: a provider shared with another group, or a managed audit-* file pool, is never
+# re-pointed in place - the group gets its own "slot" provider, so switching AI cannot move
+# VPN/VPN-noP2P or rewrite a verified pool.
+SLOT_PATCH_PY=/usr/lib/geomask/geomask-slot-patch.py
 _slot_apply() { # _slot_apply <group> <url> -> patch config so <group> is fed by <url>
   _g="$1"; URL="$2"
   case "$URL" in
@@ -625,115 +690,12 @@ _slot_apply() { # _slot_apply <group> <url> -> patch config so <group> is fed by
     printf '{"error":"url contains forbidden characters"}'; return 1
   fi
   [ -f "$MIHOMO_CONF" ] || { printf '{"error":"mihomo config missing"}'; return 1; }
+  if [ ! -f "$SLOT_PATCH_PY" ]; then
+    printf '{"error":"slot patcher not installed"}'; return 1
+  fi
   cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_slot" 2>/dev/null
-  PYF=/tmp/geo-slot-py.$$
-  cat > "$PYF" <<'PYEOF'
-import re, sys
-cfg, group, url = sys.argv[1], sys.argv[2], sys.argv[3]
-t = open(cfg, encoding="utf-8").read()
-
-def group_block(grp):
-    return re.search(r"(?m)^  - name: %s\s*\n(?:^(?:    .*|\s*)\n)*" % re.escape(grp), t)
-
-def provider_of(grp):
-    m = group_block(grp)
-    if not m:
-        return None, None
-    u = re.search(r"use:\n((?:\s+-\s+\S+\n?)+)", m.group(0))
-    if u:
-        return re.findall(r"-\s+(\S+)", u.group(1))[0], m
-    return None, m
-
-def first_provider_headers():
-    """Copy the header block from the first provider - new providers need it (e.g. x-hwid)."""
-    pm = re.search(r"(?m)^proxy-providers:\n  (\S+):\n((?:    .*\n?)*)", t)
-    if not pm:
-        return ""
-    hm = re.search(r"    header:\n((?:      .*\n?)*)", pm.group(2))
-    return hm.group(0) if hm else ""
-
-prov, gm = provider_of(group)
-
-if prov:
-    shared = []
-    for other in ("VPN", "VPN-noP2P", "AI"):
-        if other == group:
-            continue
-        op, _ = provider_of(other)
-        if op == prov:
-            shared.append(other)
-    if not shared:
-        n = re.subn(r'(?m)^(  %s:\n(?:.*\n)*?    url: )"[^"]*"' % re.escape(prov),
-                    lambda mm: mm.group(1) + '"' + url + '"', t, count=1)
-        if n[1] == 0:
-            sys.stderr.write("provider %s has no url line\n" % prov)
-            sys.exit(2)
-        print("updated:%s" % prov)
-        sys.exit(0)
-    # shared provider (e.g. AI rides the same sub as VPN): isolate this group on its own provider
-    newp = "slot"
-    while re.search(r"(?m)^  %s:\n" % newp, t):
-        newp = "slot%d" % (int(newp[4:]) + 1 if newp != "slot" else 2)
-    tpl = "  %s:\n    type: http\n    url: \"%s\"\n    interval: 3600\n%s" % (newp, url, first_provider_headers())
-    ppm = re.search(r"(?m)^proxy-providers:\n", t)
-    if not ppm:
-        sys.stderr.write("no proxy-providers section\n")
-        sys.exit(2)
-    t = t[:ppm.end()] + tpl + t[ppm.end():]
-    # v1.25.3: re-match the group block AFTER the insert. The old code reused byte offsets
-    # from the pre-insert text, so the repoint landed len(tpl) bytes early, slicing mid-line
-    # into another group's exclude-filter (unclosed quote) - mihomo -t failed with
-    # "yaml: did not find expected key" and the switch reported "config test failed".
-    gm = group_block(group)
-    if gm is None:
-        sys.stderr.write("group %s block not found after provider insert\n" % group)
-        sys.exit(2)
-    blk = gm.group(0)
-    newblk = re.sub(r"(?m)^(\s+- )%s(\s*)$" % re.escape(prov), r"\g<1>" + newp + r"\g<2>", blk, count=1)
-    if newblk == blk:
-        sys.stderr.write("failed to repoint group %s use list\n" % group)
-        sys.exit(2)
-    t = t[:gm.start()] + newblk + t[gm.end():]
-    open(cfg, "w", encoding="utf-8", newline="").write(t)
-    print("created:%s" % newp)
-    sys.exit(0)
-
-if gm is not None:
-    sys.stderr.write("group %s exists but is fed by inline proxies, not a provider\n" % group)
-    sys.exit(2)
-
-# group absent (e.g. VPN-noP2P on a fresh install) - create provider + group
-newp = "slot"
-while re.search(r"(?m)^  %s:\n" % newp, t):
-    newp = "slot%d" % (int(newp[4:]) + 1 if newp != "slot" else 2)
-prov = newp
-# v1.21.3: no provider health-check here on purpose - mihomo drops nodes that fail it from the
-# group, which silently empties a lane and turns every rule using it into 502s.
-tpl = "  %s:\n    type: http\n    url: \"%s\"\n    interval: 3600\n%s" % (prov, url, first_provider_headers())
-ppm = re.search(r"(?m)^proxy-providers:\n", t)
-if not ppm:
-    sys.stderr.write("no proxy-providers section\n")
-    sys.exit(2)
-t = t[:ppm.end()] + tpl + t[ppm.end():]
-grp = ("\n  - name: %s\n    type: url-test\n    use:\n      - %s\n"
-       "    url: \"https://www.gstatic.com/generate_204\"\n    interval: 180\n"
-       "    tolerance: 99999\n    lazy: false\n" % (group, prov))
-gm2 = group_block("AI")
-if not gm2:
-    sys.stderr.write("no AI group anchor\n")
-    sys.exit(2)
-t = t[:gm2.end()] + grp + t[gm2.end():]
-if group == "VPN":
-    if "RULE-SET,mtrickle_bulk" not in t:
-        t = t.replace("  - RULE-SET,mtrickle,VPN-noP2P\n",
-                      "  - RULE-SET,mtrickle_bulk,VPN\n  - RULE-SET,mtrickle,VPN-noP2P\n", 1)
-    t = t.replace(",RESERVE\n", ",VPN\n")
-open(cfg, "w", encoding="utf-8", newline="").write(t)
-print("created:%s" % prov)
-PYEOF
-  _res=$(python3 "$PYF" "$MIHOMO_CONF" "$_g" "$URL" 2>&1)
+  _res=$("$PYTHON_BIN" -B "$SLOT_PATCH_PY" "$MIHOMO_CONF" "$_g" "$URL" 2>&1)
   _rc=$?
-  rm -f "$PYF"
   if [ "$_rc" -ne 0 ]; then
     mv -f "$MIHOMO_CONF.bak_slot" "$MIHOMO_CONF" 2>/dev/null
     printf '{"ok":false,"error":"%s"}' "$(json_esc "$_res")"; return 1
@@ -827,6 +789,18 @@ cmd_sub_del() {
   ID="$1"
   case "$ID" in ''|*[!0-9]*) printf '{"error":"bad id"}'; return 1 ;; esac
   [ -f "$SUBS_FILE" ] || { printf '{"error":"registry empty"}'; return 1; }
+  # A path may still be backed by this subscription. Deleting the registry entry would
+  # leave its group pointing at a provider whose source no longer exists, so refuse until
+  # the path is switched to another subscription.
+  URL=$(awk -F'|' -v id="$ID" '$1==id {print $3; exit}' "$SUBS_FILE")
+  if [ -n "$URL" ] && [ -f "$NODE_AUDIT" ]; then
+    USED=$(python3 "$NODE_AUDIT" source-in-use "$URL" 2>/dev/null)
+    case "$USED" in
+      *'"in_use": true'*|*'"in_use":true'*)
+        printf '{"error":"subscription is used by a path; switch the path to another subscription before deleting it"}'
+        return 1 ;;
+    esac
+  fi
   grep -v "^$ID|" "$SUBS_FILE" > "$SUBS_FILE.tmp" || true
   mv -f "$SUBS_FILE.tmp" "$SUBS_FILE"
   echo "$(date +%FT%T) SUB del $ID" >> "$LOG"
@@ -1151,9 +1125,13 @@ cmd_nodes_get() {
   case "$_st" in '{'*'}'*) : ;; *) _st=null ;; esac
   _blk=$(while IFS= read -r _l; do [ -n "$_l" ] && printf '"%s",' "$(json_esc "$_l")"; done < "$NODESBLOCK" 2>/dev/null | sed 's/,$//')
   _lastlog=$(grep NODESCAN "$LOG" 2>/dev/null | tail -3 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
-  printf '{"ok":true,"enabled":%s,"schedule":"%s","state":%s,"conf":{"bad_countries":"%s","bad_asns":"%s","base_filter":"%s","sub_provider":"%s"},"blocked":[%s],"log":[%s]}\n' \
+  # conf fields with node-scan defaults (must mirror geomask-node-scan.sh)
+  printf '{"ok":true,"enabled":%s,"schedule":"%s","state":%s,"conf":{"bad_countries":"%s","bad_asns":"%s","base_filter":"%s","sub_provider":"%s","name_filter_groups":"%s","sub_user_agent":"%s","ai_guard":"%s","ai_group":"%s","ai_egress_url":"%s","ai_expect":"%s","ai_listener":"%s","ai_exclude_base":"%s"},"blocked":[%s],"log":[%s]}\n' \
     "$_en" "$_sched" "$_st" \
     "$(_nconf bad_countries)" "$(_nconf bad_asns)" "$(_nconf base_filter)" "$(_nconf sub_provider)" \
+    "$(_nconf name_filter_groups)" "$(_nconf sub_user_agent)" "$(_nconf ai_guard)" \
+    "$(_nconf ai_group)" "$(_nconf ai_egress_url)" "$(_nconf ai_expect)" \
+    "$(_nconf ai_listener)" "$(_nconf ai_exclude_base)" \
     "$_blk" "$_lastlog"
 }
 
@@ -1313,46 +1291,155 @@ cmd_torrent_extra() {
   sh "$TORRENT_SH" --extra "$1" 2>/dev/null | tail -1
 }
 
+# Independent, report-only service-egress audit. Never calls the legacy mutating scan.
+NODE_AUDIT=${GM_NODE_AUDIT:-/usr/lib/geomask/geomask-node-audit.py}
+NODE_APPLY=${GM_NODE_APPLY:-/usr/lib/geomask/geomask-apply.py}
+cmd_nodes_paths_get() {
+  python3 "$NODE_AUDIT" get
+}
+cmd_nodes_path_save() {
+  python3 "$NODE_AUDIT" save "$1" "$2" "$3"
+}
+cmd_nodes_path_check() {
+  case "$1" in vpn|vpn_nop2p|ai) : ;; *) printf '{"ok":false,"error":"invalid path"}\n'; return 1 ;; esac
+  [ -f "$NODE_AUDIT" ] || { printf '{"ok":false,"error":"audit module not installed"}\n'; return 1; }
+  # Module validates and reserves synchronously, then forks with the job lock.
+  python3 "$NODE_AUDIT" start "$1"
+}
+cmd_nodes_audit_events_get() {
+  python3 "$NODE_AUDIT" audit-events "$1" "$2" "$3"
+}
+cmd_nodes_audit_job_get() {
+  python3 "$NODE_AUDIT" audit-job "$1"
+}
+cmd_nodes_audit_cancel() {
+  python3 "$NODE_AUDIT" audit-cancel "$1"
+}
+cmd_nodes_path_preview() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" preview "$1" "$2" "$3" "$4"
+}
+cmd_nodes_path_apply() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" apply "$1" "$2" "$3"
+}
+cmd_nodes_path_apply_status() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" status "$1"
+}
+cmd_nodes_path_revoke() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" revoke "$1"
+}
+cmd_mtrickle_sync() {
+  python3 /usr/lib/geomask/geomask-sync-youtube.py mtrickle-sync
+}
+cmd_nodes_audit_schedule_get() {
+  python3 "$NODE_AUDIT" schedule-get "$1"
+}
+cmd_nodes_audit_schedule_set() {
+  python3 "$NODE_AUDIT" schedule-set "$1" "$2" "$3" "$4"
+}
+
+# v1.16.0: Policy management (paths, filters, subscriptions, preview)
+cmd_policy_get() {
+  _pol=/etc/geomask/policies.yaml
+  [ -f "$_pol" ] || { printf '{"ok":false,"error":"policy file not found"}\n'; return 1; }
+  cat "$_pol"
+}
+
+cmd_policy_preview() {
+  _py=/usr/lib/geomask/policy_preview.py
+  [ -f "$_py" ] || { printf '{"ok":false,"error":"preview engine not installed"}\n'; return 1; }
+  _path_id="$2"
+  _nodes_json="$3"
+  if [ -z "$_path_id" ]; then
+    printf '{"ok":false,"error":"path_id required"}\n'; return 1
+  fi
+  if [ -z "$_nodes_json" ]; then
+    _nodes_json='[]'
+  fi
+  python3 "$_py" "$_path_id" --nodes-json "$_nodes_json"
+}
+
+cmd_policy_apply() {
+  _pol=/etc/geomask/policies.yaml
+  [ -f "$_pol" ] || { printf '{"ok":false,"error":"policy file not found"}\n'; return 1; }
+  _new_policy="$2"
+  if [ -z "$_new_policy" ]; then
+    printf '{"ok":false,"error":"policy_json required"}\n'; return 1
+  fi
+  # Validate JSON structure
+  echo "$_new_policy" | python3 -m json.tool >/dev/null 2>&1 || { printf '{"ok":false,"error":"invalid JSON"}\n'; return 1; }
+  # Backup current policy
+  _bak="/etc/geomask/policies.yaml.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$_pol" "$_bak"
+  # Write new policy
+  printf '%s' "$_new_policy" > "$_pol"
+  # Verify the new policy is valid
+  python3 -c "import yaml, sys; yaml.safe_load(open('/etc/geomask/policies.yaml'))" 2>/dev/null || {
+    mv "$_bak" "$_pol"
+    printf '{"ok":false,"error":"invalid policy structure"}\n'; return 1
+  }
+  printf '{"ok":true,"backup":"%s"}\n' "$(basename "$_bak")"
+}
+
 case "$1" in
-  status)     cmd_status ;;
-  leases)     cmd_leases ;;
-  log)        cmd_log ;;
-  backups)    cmd_backups ;;
-  stack)      cmd_stack ;;
+  # >>> geo-rpc generated:dispatch (tools/geo-rpc.json) >>>
+  status)                   cmd_status ;;
+  leases)                   cmd_leases ;;
+  log)                      cmd_log ;;
+  backups)                  cmd_backups ;;
+  stack)                    cmd_stack ;;
   nodescan)   # kick the node audit in background (returns immediately; panel re-reads stack)
     ( /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 & )
     printf '{"ok":true,"started":true}\n' ;;
-  nodes_get)  cmd_nodes_get ;;
-  nodes_set)  cmd_nodes_set "$2" "$3" "$4" "$5" "$6" "$7" ;;
-  sync_set)   cmd_sync_set "$2" ;;
-  syncd_set)  cmd_syncd_set "$2" ;;
-  pin_set)    cmd_pin_set "$2" ;;
-  lists_get)  cmd_lists_get ;;
-  lists_seed) cmd_lists_seed ;;
-  yt_get)     cmd_yt_get ;;
-  yt_mode)    cmd_yt_mode "$2" ;;
-  yt_reset)   cmd_yt_reset ;;
-  torrent_get)      cmd_torrent_get ;;
-  torrent_refresh)  cmd_torrent_refresh ;;
-  torrent_listener) cmd_torrent_listener "$2" ;;
-  torrent_extra)    cmd_torrent_extra "$2" ;;
-  sync_lists) cmd_sync_lists ;;
-  aidns)      cmd_aidns_apply ;;
-  google)     cmd_google ;;
-  global)     cmd_global "$2" ;;
-  ipv6)       cmd_ipv6 "$2" ;;
-  dev_add)    cmd_dev_add "$2" "$3" "$4" "$5" ;;
-  dev_del)    cmd_dev_del "$2" ;;
-  ai_sub_get) cmd_ai_sub_get ;;
-  ai_sub_set) cmd_ai_sub_set "$2" ;;
-  subs_list)  cmd_subs_list ;;
-  sub_add)    cmd_sub_add "$2" "$3" ;;
-  sub_del)    cmd_sub_del "$2" ;;
-  ai_sub_use)   cmd_ai_sub_use "$2" ;;
-  vpn_sub_use)  cmd_vpn_sub_use "$2" ;;
-  vpnnp_sub_use) cmd_vpnnp_sub_use "$2" ;;
-  upd_check)    cmd_upd_check "$2" ;;
-  upd_status)   cmd_upd_status ;;
-  upd_apply)    cmd_upd_apply ;;
+  nodes_get)                cmd_nodes_get ;;
+  nodes_paths_get)          cmd_nodes_paths_get ;;
+  nodes_path_save)          cmd_nodes_path_save "$2" "$3" "$4" ;;
+  nodes_path_check)         cmd_nodes_path_check "$2" ;;
+  nodes_audit_events_get)   cmd_nodes_audit_events_get "$2" "$3" "$4" ;;
+  nodes_audit_job_get)      cmd_nodes_audit_job_get "$2" ;;
+  nodes_audit_cancel)       cmd_nodes_audit_cancel "$2" ;;
+  nodes_set)                cmd_nodes_set "$2" "$3" "$4" "$5" "$6" "$7" ;;
+  sync_set)                 cmd_sync_set "$2" ;;
+  syncd_set)                cmd_syncd_set "$2" ;;
+  pin_set)                  cmd_pin_set "$2" ;;
+  lists_get)                cmd_lists_get ;;
+  lists_seed)               cmd_lists_seed ;;
+  yt_get)                   cmd_yt_get ;;
+  yt_mode)                  cmd_yt_mode "$2" ;;
+  yt_reset)                 cmd_yt_reset ;;
+  torrent_get)              cmd_torrent_get ;;
+  torrent_refresh)          cmd_torrent_refresh ;;
+  torrent_listener)         cmd_torrent_listener "$2" ;;
+  torrent_extra)            cmd_torrent_extra "$2" ;;
+  sync_lists)               cmd_sync_lists ;;
+  aidns)                    cmd_aidns_apply ;;
+  google)                   cmd_google ;;
+  global)                   cmd_global "$2" ;;
+  ipv6)                     cmd_ipv6 "$2" ;;
+  dev_add)                  cmd_dev_add "$2" "$3" "$4" "$5" ;;
+  dev_del)                  cmd_dev_del "$2" ;;
+  ai_sub_get)               cmd_ai_sub_get ;;
+  ai_sub_set)               cmd_ai_sub_set "$2" ;;
+  subs_list)                cmd_subs_list ;;
+  subs_seed)                cmd_subs_seed ;;
+  sub_add)                  cmd_sub_add "$2" "$3" ;;
+  sub_del)                  cmd_sub_del "$2" ;;
+  ai_sub_use)               cmd_ai_sub_use "$2" ;;
+  vpn_sub_use)              cmd_vpn_sub_use "$2" ;;
+  vpnnp_sub_use)            cmd_vpnnp_sub_use "$2" ;;
+  upd_check)                cmd_upd_check "$2" ;;
+  upd_status)               cmd_upd_status ;;
+  upd_apply)                cmd_upd_apply ;;
+  nodes_path_preview)       cmd_nodes_path_preview "$2" "$3" "$4" "$5" ;;
+  nodes_path_apply)         cmd_nodes_path_apply "$2" "$3" "$4" ;;
+  nodes_path_revoke)        cmd_nodes_path_revoke "$2" ;;
+  nodes_path_apply_status)  cmd_nodes_path_apply_status "$2" ;;
+  mtrickle_sync)            cmd_mtrickle_sync ;;
+  nodes_audit_schedule_get) cmd_nodes_audit_schedule_get "$2" ;;
+  nodes_audit_schedule_set) cmd_nodes_audit_schedule_set "$2" "$3" "$4" "$5" ;;
+  # <<< geo-rpc generated:dispatch <<<
   *) printf '{"error":"usage"}'; exit 1 ;;
 esac

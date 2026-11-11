@@ -10,6 +10,10 @@
 if python3 -c 'pass' >/dev/null 2>&1; then _py=python3; else _py=python; fi
 exec "$_py" - "$@" <<'PYEOF'
 import re, sys, json, time, urllib.request, urllib.parse, subprocess, os
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 # every path is env-overridable so the script can be exercised by the sandbox tests
 _E=os.environ
@@ -19,11 +23,67 @@ BLOCKF=_E.get('GM_NODES_BLOCK','/etc/geomask-node-block.txt')
 STATE=_E.get('GM_NODES_STATE','/tmp/geomask-nodescan.state')
 LOG=_E.get('GM_NODES_LOG','/root/geo-sync.log')
 
-def log(msg):
-    line='%s NODESCAN %s\n' % (time.strftime('%F %T'), msg)
+def log(msg, lv='INFO'):
+    line='%s NODESCAN [%s] %s\n' % (time.strftime('%F %T'), lv, msg)
     try:
         with open(LOG,'a') as f: f.write(line)
     except Exception: pass
+
+# The managed transaction (geomask-config-tx.py) owns the same config file. This scan
+# reads the file, spends minutes probing, then writes: without a check it would install
+# a candidate built on a file that no longer exists and silently undo a committed apply.
+TX_LOCK=_E.get('GM_CONFIG_TX_LOCK','/etc/geomask/.config-tx.lock')
+# Provider ids created by the node-audit coordinator. Its groups are not ours to edit.
+MANAGED_PREFIX='audit-'
+
+class ConfigWriteRefused(Exception):
+    pass
+
+def _sha(b):
+    import hashlib
+    return hashlib.sha256(b).hexdigest()
+
+def install_config_candidate(candidate_path, expected_live):
+    """Replace the live config with candidate_path only if it still equals expected_live.
+
+    Runs under the transaction lock so a commit cannot interleave between the digest
+    check and the rename.
+    """
+    import contextlib
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+
+    @contextlib.contextmanager
+    def held():
+        if fcntl is None:
+            yield
+            return
+        try:
+            os.makedirs(os.path.dirname(TX_LOCK), exist_ok=True)
+            fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            yield
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try: fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError: pass
+            os.close(fd)
+
+    expected = _sha(expected_live.encode('utf-8') if isinstance(expected_live, str) else expected_live)
+    with held():
+        try:
+            with open(CFG, 'rb') as f:
+                live = f.read()
+        except OSError as e:
+            raise ConfigWriteRefused('cannot read the live config: %s' % e)
+        if _sha(live) != expected:
+            raise ConfigWriteRefused('config changed during the scan (a managed apply or a manual edit); the scan result is stale')
+        os.replace(candidate_path, CFG)
 
 cfgd={}
 try:
@@ -32,7 +92,7 @@ try:
         if ln and not ln.startswith('#') and '=' in ln:
             k,_,v=ln.partition('='); cfgd[k.strip()]=v.strip()
 except Exception as e:
-    log('conf read failed: %s' % e); sys.exit(1)
+    log('conf read failed: %s' % e, 'ERR'); sys.exit(1)
 
 bad_countries={c.strip().upper() for c in cfgd.get('bad_countries','RU,BY').split(',') if c.strip()}
 bad_asns={('AS'+a.replace('AS','').strip().upper()) for a in cfgd.get('bad_asns','').split(',') if a.strip()}
@@ -53,8 +113,31 @@ if '--list-providers' in _argv:
     _n=re.search(r'\n(?=[a-z])', _h[1:])
     if _n: _h=_h[:_n.start()+1]
     print(','.join(p for p in re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', _h, re.M)
-                   if re.search(r'^  %s:\n(?:.*\n)*?\s+url:' % re.escape(p), _h, re.M)))
+                   if re.search(r'^  %s:\n(?:.*\n)*?\s+url:' % re.escape(p), _h, re.M)
+                   and not p.startswith(MANAGED_PREFIX)))
     sys.exit(0)
+# v1.22.9: active OpenAI-egress guard for the AI group. A node labelled "USA" can still reach
+# OpenAI from elsewhere - un1.pro's servers resolved to US IPs but routed OpenAI traffic through
+# a Helsinki/Russia relay, so a name filter and even a server-country check both passed it. Only
+# an actual OpenAI request reveals the truth. Test every node the AI group would use through the
+# AI listener and exclude the liars by exact name. Never empties the group (if all fail, that is
+# a provider outage to investigate, not something to hide by deleting the last node).
+if '--admission-check' in _argv:
+    _adm_py='/usr/lib/geomask/admission_service.py'
+    if not os.path.isfile(_adm_py):
+        log('admission-check: admission_service.py not found', 'ERR'); sys.exit(1)
+    _path_id=cfgd.get('ai_group','AI')
+    _nodes_json='[]'
+    if '--nodes-json' in _argv:
+        _idx=_argv.index('--nodes-json')
+        if _idx+1 < len(_argv):
+            _nodes_json=_argv[_idx+1]
+    r=subprocess.run(['python3',_adm_py,_path_id,'--nodes-json',_nodes_json],capture_output=True,text=True,timeout=120)
+    sys.stdout.write(r.stdout)
+    if r.returncode!=0:
+        sys.stderr.write(r.stderr)
+    sys.exit(r.returncode)
+
 # v1.22.9: active OpenAI-egress guard for the AI group. A node labelled "USA" can still reach
 # OpenAI from elsewhere - un1.pro's servers resolved to US IPs but routed OpenAI traffic through
 # a Helsinki/Russia relay, so a name filter and even a server-country check both passed it. Only
@@ -70,6 +153,19 @@ if '--ai-guard' in _argv:
     expect=cfgd.get('ai_expect','US').strip().upper()
     listener=cfgd.get('ai_listener','http://127.0.0.1:7891')
     static_ex=cfgd.get('ai_exclude_base','HY2')
+    
+    # Check admission cache first
+    _adm_cache='/tmp/geomask-admission-cache.json'
+    _adm_ok=set()
+    if os.path.isfile(_adm_cache):
+        try:
+            _adm_data=json.load(open(_adm_cache,encoding='utf-8'))
+            for _nid,_nadm in _adm_data.items():
+                if _nadm.get('admitted'):
+                    _adm_ok.add(_nadm.get('node_id',''))
+        except Exception:
+            pass
+    
     def _api(path,data=None):
         r=urllib.request.Request('http://127.0.0.1:9090'+path,method='PUT' if data else 'GET')
         if sec: r.add_header('Authorization','Bearer '+sec)
@@ -80,21 +176,25 @@ if '--ai-guard' in _argv:
         try:
             op=urllib.request.build_opener(urllib.request.ProxyHandler({'http':listener,'https':listener}),
                 urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
-            return op.open(urllib.request.Request(egress_url,headers={'User-Agent':'curl/8'}),timeout=18).read(4000).decode('utf-8','replace')
+            return op.open(urllib.request.Request(egress_url + ('&' if '?' in egress_url else '?') + '_=%d'%int(_t.time()),headers={'User-Agent':'curl/8'}),timeout=18).read(4000).decode('utf-8','replace')
         except Exception: return ''
     g=_api('/proxies/'+ai_group); members=list(g.get('all') or [])
     if not members:
-        log('ai-guard: AI group empty or unreachable - skip'); sys.exit(0)
+        log('ai-guard: AI group empty or unreachable - skip', 'WARN'); sys.exit(0)
     liars=[]
     for m in members:
-        _api('/proxies/'+ai_group,{'name':m}); _t.sleep(1.2)
+        # Check admission cache first
+        if m in _adm_ok:
+            log('ai-guard: %s admitted via cache' % m, 'OK')
+            continue
+        _api('/proxies/'+ai_group,{'name':m}); _t.sleep(3.0)
         b=_egress(); mm=re.search(r'(?m)^loc=(\w+)',b); loc=(mm.group(1).upper() if mm else '')
         if loc!=expect:
-            liars.append(m); log('ai-guard: %s egress loc=%r != %s -> exclude' % (m,loc,expect))
+            liars.append(m); log('ai-guard: %s egress loc=%r != %s -> exclude' % (m,loc,expect), 'WARN')
         else:
-            log('ai-guard: %s ok (loc=%s)' % (m,expect))
+            log('ai-guard: %s ok (loc=%s)' % (m,expect), 'OK')
     if len(liars)>=len(members):
-        log('ai-guard: ALL %d AI nodes fail the egress test - NOT excluding (would empty the group); provider issue to investigate' % len(members))
+        log('ai-guard: ALL %d AI nodes fail the egress test - NOT excluding (would empty the group); provider issue to investigate' % len(members), 'WARN')
         sys.exit(0)
     seen=set(); parts=[]
     for p in ([x for x in static_ex.split('|') if x.strip()] if static_ex.strip() else [])+[re.escape(n) for n in sorted(liars)]:
@@ -102,14 +202,14 @@ if '--ai-guard' in _argv:
         if p and p not in seen: seen.add(p); parts.append(p)
     new_ex='|'.join(parts)
     mb=re.search(r'(?m)^  - name: '+re.escape(ai_group)+r'\n(?:    .*\n|\n)*?(?=^  - name:|^[a-z]|\Z)', text)
-    if not mb: log('ai-guard: AI group block not found'); sys.exit(1)
+    if not mb: log('ai-guard: AI group block not found', 'ERR'); sys.exit(1)
     blk=mb.group(0); esc=new_ex.replace("'","''"); line="    exclude-filter: '%s'"%esc
     if re.search(r'(?m)^\s*exclude-filter:',blk):
         nb=re.sub(r'(?m)^\s*exclude-filter:.*$', line, blk, count=1)
     else:
         nb=re.sub(r"(?m)^(\s*filter:.*\n)", r"\g<0>"+line+"\n", blk, count=1)
     if nb==blk:
-        log('ai-guard: AI exclude-filter already up to date'); sys.exit(0)
+        log('ai-guard: AI exclude-filter already up to date', 'OK'); sys.exit(0)
     out=text[:mb.start()]+nb+text[mb.end():]
     open(CFG+'.bak_aiguard','w',encoding='utf-8').write(text)
     open(CFG+'.tmp','w',encoding='utf-8').write(out)
@@ -118,14 +218,20 @@ if '--ai-guard' in _argv:
     if rc!=0:
         try: os.remove(CFG+'.tmp')
         except Exception: pass
-        log('ai-guard: VALIDATION FAILED, config untouched (rc=%d)'%rc); sys.exit(1)
-    os.replace(CFG+'.tmp',CFG)
+        log('ai-guard: VALIDATION FAILED, config untouched (rc=%d)'%rc, 'ERR'); sys.exit(1)
+    try:
+        install_config_candidate(CFG+'.tmp', text)
+    except ConfigWriteRefused as e:
+        try: os.remove(CFG+'.tmp')
+        except Exception: pass
+        log('ai-guard: not applying - %s' % e, 'WARN')
+        sys.exit(4)
     try:
         r=urllib.request.Request('http://127.0.0.1:9090/configs?force=true',data=json.dumps({'path':CFG}).encode(),method='PUT',headers={'Content-Type':'application/json'})
         if sec: r.add_header('Authorization','Bearer '+sec)
         urllib.request.urlopen(r,timeout=8).read()
-    except Exception as e: log('ai-guard: reload failed %s'%e)
-    log('ai-guard: applied, excluded %d liar(s): %s' % (len(liars), ','.join(liars)))
+    except Exception as e: log('ai-guard: reload failed %s'%e, 'ERR')
+    log('ai-guard: applied, excluded %d liar(s): %s' % (len(liars), ','.join(liars)), 'OK')
     sys.exit(0)
 if '--provider' in _argv:
     provider=_argv[_argv.index('--provider')+1]
@@ -134,7 +240,7 @@ elif provider.strip()=='all':
     try:
         _i=_t.index('\nproxy-providers:\n')
     except ValueError:
-        log('sub_provider=all but no proxy-providers section'); sys.exit(1)
+        log('sub_provider=all but no proxy-providers section', 'ERR'); sys.exit(1)
     _head=_t[_i:]
     # stop at the next top-level key so rule-providers entries cannot be mistaken for proxies
     _nxt=re.search(r'\n(?=[a-z])', _head[1:])
@@ -144,7 +250,7 @@ elif provider.strip()=='all':
     _provs=[p for p in re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', _head, re.M)
             if re.search(r'^  %s:\n(?:.*\n)*?\s+url:' % re.escape(p), _head, re.M)]
     if not _provs:
-        log('sub_provider=all but no proxy-provider with a url was found - refusing to no-op')
+        log('sub_provider=all but no proxy-provider with a url was found - refusing to no-op', 'ERR')
         sys.exit(1)
     log('scanning all %d providers: %s' % (len(_provs), ','.join(_provs)))
     # One provider failing must not erase the others: a blocked subscription legitimately
@@ -152,14 +258,21 @@ elif provider.strip()=='all':
     # every single pass failed - otherwise the nightly job would glow red forever.
     _ok=[]; _bad=[]; _skip=[]
     for _p in _provs:
-        r=subprocess.run(['/bin/sh', '/usr/bin/geomask-node-scan.sh', '--provider', _p])
-        if r.returncode==0: _ok.append(_p)
-        elif r.returncode==3: _skip.append(_p)
-        else: _bad.append(_p)
+        # capture child stdout so per-provider progress reaches the NODESCAN log
+        # (the bare line is "nodes=N blocked=N errors=N applied=..." from the child)
+        r=subprocess.run(['/bin/sh', '/usr/bin/geomask-node-scan.sh', '--provider', _p],
+                         capture_output=True, text=True)
+        _o=((r.stdout or '') + ' ' + (r.stderr or '')).strip()
+        if r.returncode==0:
+            _ok.append(_p); log('provider %s: %s' % (_p, _o or 'ok'), 'OK')
+        elif r.returncode==3:
+            _skip.append(_p); log('provider %s: skipped by design%s' % (_p, ': %s' % _o if _o else ''), 'INFO')
+        else:
+            _bad.append(_p); log('provider %s failed (rc=%d): %s' % (_p, r.returncode, _o or 'no output'), 'ERR')
     log('all-provider pass done: ok=[%s] skipped-by-design=[%s] failed=[%s]'
         % (','.join(_ok), ','.join(_skip), ','.join(_bad)))
     if not _ok and not _skip:
-        log('every provider failed - nothing was updated'); sys.exit(1)
+        log('every provider failed - nothing was updated', 'ERR'); sys.exit(1)
     # run the AI OpenAI-egress guard once per scan (not per provider)
     if cfgd.get('ai_guard','1').strip().lower() in ('1','true','yes','on'):
         subprocess.run(['/bin/sh', '/usr/bin/geomask-node-scan.sh', '--ai-guard'])
@@ -211,12 +324,12 @@ for _try in range(3):
         # not recognise the client or is rate-limiting; the real payload is 12-15 KB.
         if len(raw) > 2000:
             break
-        log('subscription looks like a stub (%d bytes), retrying' % len(raw))
+        log('subscription looks like a stub (%d bytes), retrying' % len(raw), 'WARN')
     except Exception as e:
-        log('subscription download failed (try %d/3): %s' % (_try+1, e))
+        log('subscription download failed (try %d/3): %s' % (_try+1, e), 'WARN')
     time.sleep(5*(_try+1))
 if not raw.strip():
-    log('subscription download failed: empty response'); sys.exit(1)
+    log('subscription download failed: empty response', 'ERR'); sys.exit(1)
 sub_text=raw
 # v1.13.8: only base64-decode when the body really is base64. b64decode(validate=False)
 # silently discards ':' and spaces, so feeding it a YAML config produced mojibake and the
@@ -281,11 +394,11 @@ if not nodes:
 MIN_NODES=3
 if len(nodes) < MIN_NODES:
     log('suspiciously few nodes parsed (%d < %d) - subscription format changed? refusing to rewrite filter'
-        % (len(nodes), MIN_NODES))
+        % (len(nodes), MIN_NODES), 'ERR')
     sys.exit(1)
 
 if not nodes:
-    log('no nodes parsed from subscription'); sys.exit(1)
+    log('no nodes parsed from subscription', 'ERR'); sys.exit(1)
 
 # geodb per unique server (cached)
 cache={}
@@ -352,7 +465,14 @@ def provider_of_block(blk):
 
 def apply_filter_all(cfgtext, filt, prov, name_filter_groups):
     """write the filter into every GROUP that uses this provider. Never listeners, never a
-    group that is not listed in name_filter_groups for the base part."""
+    group that is not listed in name_filter_groups for the base part.
+
+    A group pinned to a managed provider belongs to the node-audit coordinator. Writing an
+    exclude-filter into it would silently narrow the pool that was just applied and verified,
+    so those groups are refused rather than merged -- the unified owner has to mean something.
+    """
+    if str(prov).startswith(MANAGED_PREFIX):
+        return cfgtext, False, 0, 0
     esc=filt.replace("'", "''")
     line="    exclude-filter: '%s'" % esc
     out=[]; cursor=0; touched=0; matched=0
@@ -387,7 +507,7 @@ if matched == 0:
     print('nodes=%d blocked=%d errors=%d applied=False (no name-filtered group)'
           % (total, len(blocked), errs)); sys.exit(3)
 if not changed:
-    log('filter for provider %s already up to date across %d group(s)' % (provider, matched))
+    log('filter for provider %s already up to date across %d group(s)' % (provider, matched), 'OK')
     print('nodes=%d blocked=%d errors=%d applied=False (already up to date)'
           % (total, len(blocked), errs)); sys.exit(0)
 applied=False
@@ -399,7 +519,14 @@ if changed:
     except Exception:
         rc=1
     if rc==0:
-        os.replace(CFG+'.tmp', CFG)
+        try:
+            install_config_candidate(CFG+'.tmp', text)
+        except ConfigWriteRefused as e:
+            try: os.remove(CFG+'.tmp')
+            except Exception: pass
+            log('not applying - %s' % e, 'WARN')
+            print('nodes=%d blocked=%d errors=%d applied=False (config changed during the scan)'
+                  % (total, len(blocked), errs)); sys.exit(4)
         try:
             # v1.13.7: controller is protected by a secret; without Bearer the reload 401s
             sm=re.search(r'^secret:\s*(\S+)', text, re.M)
@@ -410,15 +537,15 @@ if changed:
             if sec: r.add_header('Authorization', 'Bearer '+sec)
             urllib.request.urlopen(r, timeout=8).read()
         except Exception as e:
-            log('reload failed: %s' % e)
-        log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs))
+            log('reload failed: %s' % e, 'WARN')
+        log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs), 'OK')
         applied=True
     else:
         try: os.remove(CFG+'.tmp')
         except Exception: pass
-        log('VALIDATION FAILED - config untouched (test rc=%d)' % rc)
+        log('VALIDATION FAILED - config untouched (test rc=%d)' % rc, 'ERR')
 else:
-    log('no change (blocked=%d of %d, errors=%d)' % (len(blocked), total, errs))
+    log('no change (blocked=%d of %d, errors=%d)' % (len(blocked), total, errs), 'OK')
 
 # remember list + state for the panel
 try:

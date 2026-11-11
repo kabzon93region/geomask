@@ -33,7 +33,7 @@
 
 set -u
 
-GM_VERSION="1.25.3"
+GM_VERSION="1.27.10"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -166,6 +166,16 @@ step1_verify() { step1_check; }
 step2_check() {
   _need=0
   for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
+           /usr/lib/geomask/geomask-node-audit.py \
+           /usr/lib/geomask/geomask-audit-state.py \
+           /usr/lib/geomask/geomask-config-tx.py \
+           /usr/lib/geomask/geomask-config-owner.py \
+           /usr/lib/geomask/geomask-apply.py \
+           /usr/lib/geomask/geomask-lane-torrent.py \
+           /usr/lib/geomask/geomask-sync-youtube.py \
+           /usr/lib/geomask/geomask-audit-scheduler.py \
+           /usr/lib/geomask/geomask-subscription-status.py \
+           /usr/lib/geomask/geomask-slot-patch.py \
            /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
            /usr/share/luci/menu.d/luci-app-geo-sync.json \
            /www/luci-static/resources/view/geo-sync/main.js; do
@@ -179,6 +189,36 @@ step2_check() {
   return $_need
 }
 step2_apply() {
+  save_stream /usr/lib/geomask/geomask-node-audit.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-node-audit.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-audit-state.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-audit-state.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-config-tx.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-config-tx.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-config-owner.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-config-owner.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-apply.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-apply.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-lane-torrent.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-lane-torrent.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-sync-youtube.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-sync-youtube.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-audit-scheduler.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-audit-scheduler.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-subscription-status.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-subscription-status.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-slot-patch.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-slot-patch.py@@
+ASSET_EOF
   save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
 @@ASSET:geo-backend.sh@@
 ASSET_EOF
@@ -523,7 +563,7 @@ write_mihomo_config() {
     printf '%s\n' '  # yandexcom.net which are NOT covered by the yandex.ru/.net namespace. These'
     printf '%s\n' '  # are also listed in /etc/geomask/zapret-always-exclude.txt so nfqws never'
     printf '%s\n' '  # DPI-mangles them (owner: Yandex must bypass zapret too).'
-    for _yd in yandex.ru yandex.net yandex.com yandexcloud.net yandex-net.ru yandexcom.net yandex-team.ru yastatic.net yasandbox.net ya.ru yandex.kz yandex.by yandex.az yandex.am yandex.ge yandex.tj yandex.tm yandex.uz yandex.md yandex.aero yandex.co.il; do
+    for _yd in yandex.ru yandex.net yandex.com yandex.com.tr yandexcloud.net yandex-net.ru yandexcom.net yandex-team.ru yastatic.net yasandbox.net ya.ru yandex.kz yandex.by yandex.az yandex.am yandex.ge yandex.tj yandex.tm yandex.uz yandex.md yandex.aero yandex.co.il yandex.eu yandex.lt yandex.lv yandex.ee; do
       printf '  - DOMAIN-SUFFIX,%s,DIRECT\n' "$_yd"
     done
     printf '%s\n' '  - RULE-SET,ytvpn,VPN-noP2P'
@@ -542,6 +582,7 @@ write_mihomo_config() {
     printf '%s\n' '  # STUN: stop WebRTC leaking the real (RU) IP, keep calls working'
     printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN-noP2P'
     printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,19302)),VPN-noP2P'
+
     printf '%s\n' '  - MATCH,GLOBAL'
     printf '\n'
     printf '%s\n' 'sniffer:'
@@ -904,12 +945,12 @@ ASSET_EOF
   # 3) AI DoH worker (second https-dns-proxy instance, runs as dnsai)
   save_stream /etc/init.d/ai-doh 755 <<'ASSET_EOF'
 #!/bin/sh /etc/rc.common
-# geomask: DNS-over-HTTPS worker for AI-mode devices (marked -> AI tunnel)
+# geomask: DNS-over-HTTPS worker for AI-mode devices (DoH via AI listener)
 START=21
 USE_PROCD=1
 start_service() {
   procd_open_instance
-  procd_set_param command /usr/sbin/https-dns-proxy -a 127.0.0.1 -p 5055 -r https://cloudflare-dns.com/dns-query -u dnsai -g dnsai
+  procd_set_param command /usr/sbin/https-dns-proxy -a 127.0.0.1 -p 5055 -r https://cloudflare-dns.com/dns-query -t socks5h://127.0.0.1:7891 -b 8.8.8.8,1.1.1.1 -u dnsai -g dnsai
   procd_set_param respawn
   procd_close_instance
 }
@@ -1190,8 +1231,63 @@ ASSET_EOF
   else
     info "nodes conf: keeping existing /etc/geomask-nodes.conf"
   fi
+  # v1.28.0: the night audit is now owned by the per-path scheduler.
+  # The legacy 03:30 nodescan cron keeps running for paths that were never configured,
+  # so a reinstall cannot silently stop auditing a router the owner never migrated.
+  # Migration only seeds check-only schedules; it never enables auto-apply.
+  _migrate_nodescan_cron() {
+    if crontab -l 2>/dev/null | grep -q 'geomask-node-scan.*geomask-nodescan'; then
+      _old_time=$(crontab -l 2>/dev/null | grep 'geomask-node-scan.*geomask-nodescan' \
+                  | awk '{printf "%02d:%02d", $2, $1}' | head -1)
+      [ -n "$_old_time" ] || _old_time="03:30"
+      if [ -f "$(P /usr/lib/geomask/geomask-node-audit.py)" ]; then
+        _seeded=$(python3 - "$_old_time" <<'PYEOF' 2>/dev/null || echo 0
+import sys
+sys.path.insert(0, '/usr/lib/geomask')
+import importlib.util
+spec = importlib.util.spec_from_file_location(
+    'node_audit', '/usr/lib/geomask/geomask-node-audit.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+when = sys.argv[1]
+seeded = 0
+for ident in ('vpn', 'vpn_nop2p', 'ai'):
+    current = mod.schedule_get(ident).get('schedule') or {}
+    if current.get('enabled'):
+        continue          # the owner already chose a schedule: never overwrite it
+    mod.schedule_set(ident, 'true', when, 'check-only')
+    seeded += 1
+print(seeded)
+PYEOF
+)
+        info "legacy nodescan cron found (${_old_time}); seeded check-only schedules for ${_seeded:-0} unconfigured path(s)"
+      else
+        warn "node-audit module missing: leaving the legacy nodescan cron untouched"
+      fi
+    else
+      info "legacy nodescan cron: none"
+    fi
+  }
+  _migrate_nodescan_cron
+  # Install the legacy cron only if it is absent AND no path has a schedule, so a router
+  # that the owner migrated is not audited twice every night.
   if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
     info "nodescan cron already present"
+  elif _sched_active=$(python3 - <<'PYEOF' 2>/dev/null
+import sys, importlib.util, json
+try:
+    spec = importlib.util.spec_from_file_location(
+        'node_audit', '/usr/lib/geomask/geomask-node-audit.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    data, _ = mod.load_store()
+    print(1 if any((p.get('schedule') or {}).get('enabled')
+                   for p in data.get('paths', {}).values()) else 0)
+except Exception:
+    print(0)
+PYEOF
+) && [ "${_sched_active:-0}" = "1" ]; then
+    info "per-path scheduler is active: not adding the legacy nodescan cron"
   else
     ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
   fi
@@ -1633,6 +1729,19 @@ geomask_uninstall() {
   rm -f "$(P /usr/bin/geomask-lane.sh)"
   rm -f "$(P /usr/bin/geomask-dnscheck.sh)"
   info "removed: vpnwatch (conf /etc/geomask/vpnwatch.conf and the audit log kept)"
+  # v1.28.0: node-audit subsystem modules. The settings store (/etc/geomask/node-audit.json),
+  # its event log and the immutable report/pool directories are deliberately KEPT - they are
+  # the operator's desired policies and the evidence behind them.
+  for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
+            geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
+            geomask-sync-youtube.py geomask-audit-scheduler.py geomask-subscription-status.py \
+            geomask-slot-patch.py; do
+    rm -f "$(P /usr/lib/geomask/$_m)"
+  done
+  if crontab -l 2>/dev/null | grep -q 'geomask-audit-schedule'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-audit-schedule' | crontab - 2>/dev/null || true
+  fi
+  info "removed: node-audit modules (settings, events and reports kept under /etc/geomask)"
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi

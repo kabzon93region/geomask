@@ -3,48 +3,66 @@
 'require rpc';
 'require ui';
 
-var callStatus = rpc.declare({ object: 'geo-sync', method: 'status', expect: {} });
-var callLeases = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} });
-var callLog    = rpc.declare({ object: 'geo-sync', method: 'log',    expect: {} });
-var callBackups = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
-var callStack  = rpc.declare({ object: 'geo-sync', method: 'stack', expect: {} });
-var callNodescan = rpc.declare({ object: 'geo-sync', method: 'nodescan', expect: {} });
-var callLists  = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
-var callGoogle = rpc.declare({ object: 'geo-sync', method: 'google',  expect: {} });
+// >>> geo-rpc generated:decl (tools/geo-rpc.json) >>>
+var callStatus                = rpc.declare({ object: 'geo-sync', method: 'status', expect: {} });
+var callLeases                = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} });
+var callLog                   = rpc.declare({ object: 'geo-sync', method: 'log', expect: {} });
+var callBackups               = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
+var callStack                 = rpc.declare({ object: 'geo-sync', method: 'stack', expect: {} });
+var callNodescan              = rpc.declare({ object: 'geo-sync', method: 'nodescan', expect: {} });
+var callNodesGet              = rpc.declare({ object: 'geo-sync', method: 'nodes_get', expect: {} });
+var callNodesPathsGet         = rpc.declare({ object: 'geo-sync', method: 'nodes_paths_get', expect: {} });
 /* params as OBJECT (not array): array form expects positional args and would
    wrap {mode:...} into {"mode":{...}} breaking rpcd json_get_var */
-var callGlobal = rpc.declare({ object: 'geo-sync', method: 'global',  params: { mode: null }, expect: {} });
-var callIpv6   = rpc.declare({ object: 'geo-sync', method: 'ipv6',    params: { state: null }, expect: {} });
-var callDevAdd = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
-var callDevDel = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
-var callAiSubGet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
-var callAiSubSet = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
-var callSubsList = rpc.declare({ object: 'geo-sync', method: 'subs_list', expect: {} });
-var callSubsSeed = rpc.declare({ object: 'geo-sync', method: 'subs_seed', expect: {} });
-var callSubAdd   = rpc.declare({ object: 'geo-sync', method: 'sub_add',   params: { name: null, url: null }, expect: {} });
-var callSubDel   = rpc.declare({ object: 'geo-sync', method: 'sub_del',   params: { id: null }, expect: {} });
-var callAiSubUse   = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use',   params: { id: null }, expect: {} });
-var callVpnSubUse  = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use',  params: { id: null }, expect: {} });
-var callVpnnpSubUse = rpc.declare({ object: 'geo-sync', method: 'vpnnp_sub_use', params: { id: null }, expect: {} });
-var callUpdCheck   = rpc.declare({ object: 'geo-sync', method: 'upd_check',    params: { force: null }, expect: {} });
-var callUpdStatus  = rpc.declare({ object: 'geo-sync', method: 'upd_status',   expect: {} });
-var callUpdApply   = rpc.declare({ object: 'geo-sync', method: 'upd_apply',    expect: {} });
-var callNodesGet   = rpc.declare({ object: 'geo-sync', method: 'nodes_get',   expect: {} });
-var callNodesSet   = rpc.declare({ object: 'geo-sync', method: 'nodes_set',   params: { enabled: null, schedule: null, countries: null, asns: null, base: null, provider: null }, expect: {} });
-var callSyncSet    = rpc.declare({ object: 'geo-sync', method: 'sync_set',    params: { interval: null }, expect: {} });
-var callSyncdSet   = rpc.declare({ object: 'geo-sync', method: 'syncd_set',   params: { state: null }, expect: {} });
-var callPinSet     = rpc.declare({ object: 'geo-sync', method: 'pin_set',     params: { state: null }, expect: {} });
-var callListsGet   = rpc.declare({ object: 'geo-sync', method: 'lists_get',   expect: {} });
-var callListsSeed  = rpc.declare({ object: 'geo-sync', method: 'lists_seed',  expect: {} });
-var callYtGet      = rpc.declare({ object: 'geo-sync', method: 'yt_get',      expect: {} });
-var callYtMode     = rpc.declare({ object: 'geo-sync', method: 'yt_mode',     params: { mode: null }, expect: {} });
-var callYtReset    = rpc.declare({ object: 'geo-sync', method: 'yt_reset',    expect: {} });
-var callTorGet     = rpc.declare({ object: 'geo-sync', method: 'torrent_get', expect: {} });
-var callTorRefresh = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
-var callTorListener= rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
-var callTorExtra   = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
+var callNodesPathSave         = rpc.declare({ object: 'geo-sync', method: 'nodes_path_save', params: [ 'path_id', 'countries', 'expected_revision' ], expect: {} });
+var callNodesPathCheck        = rpc.declare({ object: 'geo-sync', method: 'nodes_path_check', params: [ 'path_id' ], expect: {} });
+var callNodesAuditEventsGet   = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_events_get', params: [ 'path_id', 'before', 'limit' ], expect: {} });
+var callNodesAuditJobGet      = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_job_get', params: [ 'job_id' ], expect: {} });
+var callNodesAuditCancel      = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_cancel', params: [ 'job_id' ], expect: {} });
+var callNodesSet              = rpc.declare({ object: 'geo-sync', method: 'nodes_set', params: { enabled: null, schedule: null, countries: null, asns: null, base: null, provider: null }, expect: {} });
+var callSyncSet               = rpc.declare({ object: 'geo-sync', method: 'sync_set', params: { interval: null }, expect: {} });
+var callSyncdSet              = rpc.declare({ object: 'geo-sync', method: 'syncd_set', params: { state: null }, expect: {} });
+var callPinSet                = rpc.declare({ object: 'geo-sync', method: 'pin_set', params: { state: null }, expect: {} });
+var callListsGet              = rpc.declare({ object: 'geo-sync', method: 'lists_get', expect: {} });
+var callListsSeed             = rpc.declare({ object: 'geo-sync', method: 'lists_seed', expect: {} });
+var callYtGet                 = rpc.declare({ object: 'geo-sync', method: 'yt_get', expect: {} });
+var callYtMode                = rpc.declare({ object: 'geo-sync', method: 'yt_mode', params: { mode: null }, expect: {} });
+var callYtReset               = rpc.declare({ object: 'geo-sync', method: 'yt_reset', expect: {} });
+var callTorGet                = rpc.declare({ object: 'geo-sync', method: 'torrent_get', expect: {} });
+var callTorRefresh            = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
+var callTorListener           = rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
+var callTorExtra              = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
+var callLists                 = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
+var callGoogle                = rpc.declare({ object: 'geo-sync', method: 'google', expect: {} });
+var callGlobal                = rpc.declare({ object: 'geo-sync', method: 'global', params: { mode: null }, expect: {} });
+var callIpv6                  = rpc.declare({ object: 'geo-sync', method: 'ipv6', params: { state: null }, expect: {} });
+var callDevAdd                = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
+var callDevDel                = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
+var callAiSubGet              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
+var callAiSubSet              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
+var callSubsList              = rpc.declare({ object: 'geo-sync', method: 'subs_list', expect: {} });
+var callSubsSeed              = rpc.declare({ object: 'geo-sync', method: 'subs_seed', expect: {} });
+var callSubAdd                = rpc.declare({ object: 'geo-sync', method: 'sub_add', params: { name: null, url: null }, expect: {} });
+var callSubDel                = rpc.declare({ object: 'geo-sync', method: 'sub_del', params: { id: null }, expect: {} });
+var callAiSubUse              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use', params: { id: null }, expect: {} });
+var callVpnSubUse             = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use', params: { id: null }, expect: {} });
+var callVpnnpSubUse           = rpc.declare({ object: 'geo-sync', method: 'vpnnp_sub_use', params: { id: null }, expect: {} });
+var callUpdCheck              = rpc.declare({ object: 'geo-sync', method: 'upd_check', params: { force: null }, expect: {} });
+var callUpdStatus             = rpc.declare({ object: 'geo-sync', method: 'upd_status', expect: {} });
+var callUpdApply              = rpc.declare({ object: 'geo-sync', method: 'upd_apply', expect: {} });
+var callNodesPathPreview      = rpc.declare({ object: 'geo-sync', method: 'nodes_path_preview', params: [ 'path_id', 'report_id', 'expected_path_revision', 'expected_source_revision' ], expect: {} });
+var callNodesPathApply        = rpc.declare({ object: 'geo-sync', method: 'nodes_path_apply', params: [ 'path_id', 'preview_id', 'expected_path_revision' ], expect: {} });
+var callNodesPathRevoke       = rpc.declare({ object: 'geo-sync', method: 'nodes_path_revoke', params: [ 'path_id' ], expect: {} });
+var callNodesPathApplyStatus  = rpc.declare({ object: 'geo-sync', method: 'nodes_path_apply_status', params: [ 'path_id' ], expect: {} });
+var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtrickle_sync', expect: {} });
+var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
+var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
+// <<< geo-rpc generated:decl <<<
 var PANEL_VERSION = '@@PANEL_VERSION@@';
 
+/* Job observers, keyed by path id. They live outside the view because reload() builds a
+   new instance while the old timer would otherwise keep polling. */
+var POLL_TIMERS = {};
 /* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
 function copyToClipboard(txt, btn) {
 	function flash(ok) {
@@ -222,7 +240,7 @@ return view.extend({
 	load: function() {
 		injectStyle();
 		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet() ]);
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet() ]);
 	},
 
 	render: function(all) {
@@ -237,6 +255,7 @@ return view.extend({
 		var lt = all[10] || {};
 		var yt = all[11] || {};
 		var tor = all[12] || {};
+		var pathAudit = all[13] || {};
 		var view = this;
 		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
 		var wrap = E('div', { 'class': 'gs-wrap' });
@@ -317,10 +336,77 @@ return view.extend({
 			if (!u) return '—';
 			return String(u).replace(/\/[^/]*$/, '/...');
 		}
+		/* Assignment badges. The scalar *_sub fields are single-valued and were derived from
+		   the config text; after an apply re-serialises the config they were all empty at once.
+		   subscription_bindings is computed structurally and knows a managed pool's original
+		   subscription, so it wins whenever it is present - even when its list is empty. */
+		var bindings = st.subscription_bindings || null;
+		function bindingIds(pathId) {
+			if (!bindings) return null;
+			var record = bindings[pathId] || {};
+			return Array.isArray(record.subscription_ids) ? record.subscription_ids : [];
+		}
+		function hasBinding(pathId, id) {
+			var ids = bindingIds(pathId);
+			if (ids === null) return false;
+			return ids.indexOf(id) >= 0;
+		}
+		var REASON_TEXT = {
+			group_missing: 'группа пути не найдена в конфиге',
+			group_duplicate: 'в конфиге несколько групп с таким именем',
+			group_has_no_providers: 'группа не подключена к провайдеру',
+			group_bad_use: 'список провайдеров группы некорректен',
+			provider_without_url: 'у провайдера нет ссылки на подписку',
+			managed_source_unrecorded: 'не записано, из какой подписки собран проверенный пул',
+			managed_source_unverified: 'проверенный пул не подтверждён записью применения',
+			managed_source_missing: 'исходная подписка проверенного пула отсутствует в конфиге',
+			registry_has_no_match: 'ни одна запись реестра не совпала с источником',
+			config_unreadable: 'конфиг mihomo не читается',
+			state_unreadable: 'состояние проверок не читается',
+			snapshot_changed: 'конфиг менялся во время чтения',
+			unreadable_input: 'не удалось прочитать данные назначения'
+		};
+		function assignmentNotice() {
+			if (!bindings) return null;
+			var lines = [];
+			[['vpn', 'VPN'], ['vpn_nop2p', 'VPN-noP2P'], ['ai', 'AI']].forEach(function(pair) {
+				var record = bindings[pair[0]] || {};
+				if (record.status === 'partial' || record.status === 'unknown' ||
+					record.status === 'unregistered') {
+					var why = REASON_TEXT[record.reason_code] || record.reason_code || 'причина неизвестна';
+					lines.push(pair[1] + ': назначение не подтверждено (' + why + ')');
+				}
+			});
+			var known = {};
+			subs.forEach(function(s) { known[s.id] = true; });
+			var dangling = false;
+			Object.keys(bindings).forEach(function(key) {
+				((bindings[key] || {}).subscription_ids || []).forEach(function(id) {
+					if (!known[id]) dangling = true;
+				});
+			});
+			if (dangling) {
+				lines.push('данные назначений изменились — обновите страницу');
+			}
+			if (!lines.length) return null;
+			return E('div', { 'class': 'gs-hint gs-warn', style: 'margin:0 0 8px' }, lines.join(' · '));
+		}
+		function managedNote() {
+			if (!bindings) return E('span', {});
+			var notes = [];
+			[['vpn', 'VPN'], ['vpn_nop2p', 'VPN-noP2P'], ['ai', 'AI']].forEach(function(pair) {
+				var record = bindings[pair[0]] || {};
+				if (record.via === 'managed' && (record.subscription_ids || []).length) {
+					notes.push(pair[1] + ' работает на проверенном пуле — ниже его исходная подписка');
+				}
+			});
+			if (!notes.length) return E('span', {});
+			return E('div', { 'class': 'gs-hint', style: 'margin:0 0 8px' }, notes.join(' · '));
+		}
 		function subRow(s) {
-			var isVpn = !!(st.vpn_sub && st.vpn_sub === s.id);
-			var isVpnNP = !!(st.vpn_nop2p_sub && st.vpn_nop2p_sub === s.id);
-			var isAi = !!(st.ai_sub && st.ai_sub === s.id);
+			var isVpn = bindings ? hasBinding('vpn', s.id) : !!(st.vpn_sub && st.vpn_sub === s.id);
+			var isVpnNP = bindings ? hasBinding('vpn_nop2p', s.id) : !!(st.vpn_nop2p_sub && st.vpn_nop2p_sub === s.id);
+			var isAi = bindings ? hasBinding('ai', s.id) : !!(st.ai_sub && st.ai_sub === s.id);
 			var dest = [];
 			if (isVpn)   dest.push(E('span', { 'class': 'gs-badge gs-on' }, 'VPN'));
 			if (isAi)    dest.push(E('span', { 'class': 'gs-badge gs-ok' }, 'AI'));
@@ -400,6 +486,8 @@ return view.extend({
 				'«VPN» — полоса для всего, что выглядит как P2P (правила по IP, пины зависших YouTube-рёбер, ' +
 				'ответы входящим пирам), «AI» — Google и AI-сервисы. Кнопка активного слота подсвечена. ' +
 				'Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
+			assignmentNotice() || E('span', {}),
+			managedNote(),
 			E('table', { 'class': 'gs-table gs-subs' },
 				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
 					.concat(subs.map(subRow))),
@@ -1029,7 +1117,255 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [ btnTorExtra ])
 		]));
 
-		/* ===================== Node audit (nodes tab, v1.12.0) ===================== */
+		/* Isolated per-path service-egress observations; no production apply. */
+		panels.nodes.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Раздельные фильтры выхода: VPN / VPN-noP2P / AI'),
+			E('p', { 'class': 'gs-hint' }, 'Проверка не переключает рабочие узлы. Страна определяется по ответу сайта, не по адресу входного сервера. Сохранение — желаемая настройка, не применение фильтра. Старый ночной сканер ниже работает отдельно.'),
+			pathAudit.error ? E('p', {}, 'Ошибка: ' + pathAudit.error) : E('span', {}, '')
+		]));
+		(pathAudit.paths || []).forEach(function(path) {
+			// Keep an unsaved edit per path. Reloading the page (or the automatic reload after
+			// a check) used to wipe whatever was typed in the other cards.
+			var draftKey = 'gs-draft-' + path.id;
+			var draft = '';
+			try { draft = localStorage.getItem(draftKey) || ''; } catch (e) { draft = ''; }
+			var savedValue = (path.countries_allow || []).join(',');
+			var input = E('input', { 'class': 'gs-text', type: 'text', size: 22,
+				value: draft || savedValue,
+				'input': function() {
+					try { localStorage.setItem(draftKey, this.value); } catch (e) { /* ignore */ }
+				} });
+			var draftHint = draft && draft !== savedValue
+				? E('span', { 'class': 'gs-warn' }, 'есть несохранённый ввод')
+				: E('span', {});
+			var report = path.report || {};
+			var status = E('div', { 'class': 'gs-hint' }, report.status ? ('Проверка: ' + report.status + (report.stale ? ' · УСТАРЕЛА' : '')) : 'Ещё не проверялся');
+			var save = E('button', { 'class': 'gs-btn', 'click': function() {
+				save.disabled = true;
+				callNodesPathSave(path.id, input.value.trim().toUpperCase(), pathAudit.revision).then(function(res) {
+					if (!res || !res.ok) throw new Error((res || {}).error || 'Сохранение не подтверждено');
+					try { localStorage.removeItem(draftKey); } catch (e) { /* ignore */ }
+					ui.addNotification(null, E('p', {}, res.changed ? 'Желаемый фильтр сохранён. В mihomo не применён.' : 'Настройки не изменились.'), 'info');
+					view.reload();
+				}).catch(function(err) { ui.addNotification(null, E('p', {}, String(err)), 'error'); }).finally(function() { save.disabled = false; });
+			} }, 'Сохранить настройки');
+			var run = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+				run.disabled = true;
+				callNodesPathCheck(path.id).then(function(res) {
+					if (!res || !res.ok) throw new Error((res || {}).error || 'Запуск не подтверждён');
+					var jobId = res.job_id;
+					// Store jobId for polling and cancel
+					run._jobId = jobId;
+					status.textContent = 'Проверка запущена (job ' + jobId + '). Ожидание результатов...';
+					run.style.display = 'none';
+					cancel.style.display = 'inline-block';
+					view.pollJob(jobId, path.id);
+				}).catch(function(err) { ui.addNotification(null, E('p', {}, String(err)), 'error'); }).finally(function() { run.disabled = false; });
+			} }, 'Проверить ' + path.label);
+			var cancel = E('button', { 'class': 'gs-btn gs-btn-warn', style: 'display:none', 'click': function() {
+				var jobId = run._jobId;
+				if (jobId) {
+					cancel.disabled = true;
+					callNodesAuditCancel(jobId).then(function(res) {
+						if (res && res.ok) {
+							status.textContent = 'Отмена запрошена, ожидание завершения...';
+							cancel.style.display = 'none';
+							// polling will detect cancelled status and reload
+						} else {
+							ui.addNotification(null, E('p', {}, 'Отмена не удалась: ' + ((res || {}).error || 'unknown')), 'error');
+						}
+					}).catch(function(err) { ui.addNotification(null, E('p', {}, String(err)), 'error'); }).finally(function() { cancel.disabled = false; });
+				}
+			} }, 'Отменить');
+			var rows = (report.nodes || []).map(function(node) {
+				var facts = Object.keys(node.probes || {}).map(function(service) {
+					var proof = node.probes[service];
+					return service + ': ' + (proof.country || 'UNKNOWN') + (proof.ip ? ' / ' + proof.ip : '') + (proof.reason ? ' (' + proof.reason + ')' : '');
+				}).join(' · ');
+				return E('div', { 'class': 'gs-upd-meta' }, node.name + ' — ' + node.status + '\n' + facts);
+			});
+			panels.nodes.appendChild(E('div', { 'class': 'gs-card' }, [
+				E('h3', {}, path.label),
+				E('p', { 'class': 'gs-hint' }, 'Источник: ' + ((path.providers || []).join(', ') || 'не определён') + (path.configured ? ' · сохранено' : ' · предлагаемые страны, ещё не сохранены')),
+				E('div', { 'class': 'gs-row' }, [E('span', {}, 'Разрешённые страны выхода (ISO-2)'), input, save, run,
+					E('button', { 'class': 'gs-btn', 'click': function() { view.reload(); } }, 'Обновить результаты'), draftHint]),
+				status,
+				E('p', { 'class': 'gs-hint' }, report.error || report.limit || 'HTTP 200/204 Google не означает US. Проверки SOCKS5h не подтверждают путь клиента с локальным hosts.'),
+				// What admission actually means for this path, in plain words.
+				path.id === 'ai' ? E('p', { 'class': 'gs-hint' },
+					'Допуск AI: ChatGPT и Cloudflare. Google не отдаёт страну в машинно-читаемом виде — '
+					+ 'его страна показывается как «неизмерима» и в допуске не участвует.') : E('span', {}),
+				// Positive state of the filter. Without this the card only ever showed a
+				// warning when something was wrong, so "nothing applied" and "applied and
+				// healthy" looked identical to the owner.
+				(function() {
+					var d = path.applied_detail || {};
+					var state = d.status || 'never';
+					var text, cls = 'gs-hint';
+					if (state === 'applied') {
+						text = 'Фильтр действует: ' + (d.node_count || 0) + ' проверенных узлов'
+							+ (d.applied_at ? ', применён ' + new Date(d.applied_at).toLocaleString() : '')
+							+ (d.provider_id ? ' · ' + d.provider_id : '');
+					} else if (state === 'applying') {
+						// An apply in flight, or one that died between commit and bookkeeping.
+						// The group may already be pinned, so this must never read as "not applied".
+						text = 'Применение не завершено: пул может быть уже подключён. Проверьте состав '
+							+ 'и при необходимости отзовите фильтр.';
+						cls = 'gs-warn';
+					} else if (state === 'expired') {
+						text = 'Фильтр действует, но доказательства просрочены: нужен новый Check и повторное применение';
+						cls = 'gs-warn';
+					} else if (state === 'revoked') {
+						text = 'Фильтр отозван: путь снова использует исходный источник';
+					} else {
+						text = 'Фильтр не применялся: путь использует исходный источник без сужения';
+					}
+					// Desired and acting are different questions: say so when they diverge.
+					var acting = (d.acting_countries || []).join(',');
+					var desired = (path.countries_allow || []).join(',');
+					var nodes = [E('p', { 'class': cls }, text)];
+					if ((state === 'applied' || state === 'expired') && acting && acting !== desired) {						nodes.push(E('p', { 'class': 'gs-hint' },
+							'Желаемые страны: ' + (desired || '—') + ' · действующие: ' + acting));
+					}
+					return E('div', {}, nodes);
+				})(),
+				E('div', {}, rows),
+				// Revoke is always available while a filter is in force: an owner must be able
+				// to undo an apply even when the report has gone stale, which is exactly the
+				// state an apply itself creates.
+				path.applied && (path.applied_detail || {}).status !== 'revoked' ? E('div', { 'class': 'gs-row', style: 'margin-top: 8px' }, [
+					E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesPathRevoke(path.id).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Отзыв не подтверждён');
+							ui.addNotification(null, E('p', {}, res.revoked ? 'Фильтр отозван, исходный источник и фильтр группы восстановлены' : 'Активного фильтра нет'), 'info');
+							view.reload();
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'Отозвать фильтр')
+				]) : E('span', {}),
+				// Preview and Apply section
+				report.status === 'complete' && !report.stale && report.counts && report.counts.eligible > 0 ? E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color,#30363d)' }, [
+					E('button', { 'class': 'gs-btn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesPathPreview(path.id, report.job_id, report.settings_revision, report.source_revision).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Предпросмотр не подтверждён');
+							// Show preview in notification
+							var msg = 'Предпросмотр: ' + res.eligible_count + ' подходят, ' + res.excluded_count + ' исключены, ' + res.unknown_count + ' неизвестно.';
+							if (res.to_add && res.to_add.length) msg += ' Добавится: ' + res.to_add.join(', ');
+							if (res.to_remove && res.to_remove.length) msg += ' Удалится: ' + res.to_remove.join(', ');
+							if (res.warnings && res.warnings.length) msg += ' ⚠ ' + res.warnings.join('; ');
+							ui.addNotification(null, E('p', {}, msg), 'info');
+							// Store preview_id for apply
+							path._preview_id = res.preview_id;
+						}).catch(function(err) {
+							btn.disabled = false;
+							// A check that finished after this page was drawn replaces the
+							// report, so the card holds a dead job id. Refresh instead of
+							// leaving the owner with an unexplained refusal.
+							if (/Report ID mismatch|Report not found|Report not complete/i.test(String(err))) {
+								ui.addNotification(null, E('p', {},
+									'Отчёт обновился после загрузки страницы. Данные перечитаны — '
+									+ 'нажмите «Предпросмотр» ещё раз.'), 'warning');
+								view.reload();
+								return;
+							}
+							ui.addNotification(null, E('p', {}, String(err)), 'error');
+						});
+					} }, 'Предпросмотр'),
+					E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+						var btn = this; 
+						var previewId = path._preview_id;
+						if (!previewId) { ui.addNotification(null, E('p', {}, 'Сначала сделайте предпросмотр'), 'error'); return; }
+						btn.disabled = true;
+						callNodesPathApply(path.id, previewId, report.settings_revision).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Применение не подтверждено');
+							ui.addNotification(null, E('p', {}, 'Фильтр применён к трафику (' + (res.tx_id || '') + ')'), 'info');
+							view.reload();
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'Применить фильтр'),
+				]) : E('span', {}),
+				// History section
+				E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color,#30363d)' }, [
+					E('button', { 'class': 'gs-btn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesAuditEventsGet(path.id, null, 10).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'История не загружена');
+							var msg = 'История (' + res.events.length + '):\n' + res.events.map(function(e) {
+								var ts = e.timestamp;
+								var t;
+								if (ts) {
+									t = new Date(ts).toLocaleString();
+								} else if (e.event_id) {
+									// Fallback: extract ISO timestamp from event_id prefix (format: 2026-11-09T14:16:28.149342+03:00-xxx)
+									var m = e.event_id.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/);
+									if (m) t = new Date(m[1]).toLocaleString();
+								}
+								t = t || 'Время неизвестно';
+								return t + ' [' + e.action + '] ' + (e.result || '') + (e.revoked_nodes ? ' · отозвано: ' + e.revoked_nodes.join(', ') : '');
+							}).join('\n');
+							ui.addNotification(null, E('p', { 'style': 'white-space: pre-wrap; max-height: 300px; overflow: auto' }, msg), 'info');
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'История')
+				]),
+				// Drift detection
+				report.status === 'complete' && !report.stale && path.applied && path.applied_detail && path.applied_detail.runtime_verified === false ? E('div', { 'class': 'gs-row gs-warn', style: 'margin-top: 8px; padding: 8px; background: #d2992222; border: 1px solid #d29922; border-radius: 6px' }, [
+					E('span', { 'class': 'gs-warn' }, '⚠ Применённый фильтр не подтверждён на работающем mihomo.'),
+					E('button', { 'class': 'gs-btn', 'click': function() { view.reload(); } }, 'Перезагрузить')
+				]) : E('span', {}),
+				// Expired evidence: the filter is still narrowing the pool, it was not widened.
+				path.applied_detail && path.applied_detail.status === 'expired' ? E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding: 8px; background: #d2992222; border: 1px solid #d29922; border-radius: 6px' }, [
+					E('span', { 'class': 'gs-warn' }, '⏳ Срок давности проверки истёк. Фильтр продолжает действовать и путь не расширен: нужен новый Check и повторное применение.'),
+					E('button', { 'class': 'gs-btn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesPathCheck(path.id).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Проверка не запущена');
+							view.reload();
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'Проверить сейчас')
+				]) : E('span', {}),
+				// Schedule section
+				(function() {
+					var sched = path.schedule || {};
+					var inTime = E('input', { 'class': 'gs-text', type: 'text', value: sched.time || '03:30', size: 6 });
+					var inMode = E('select', { 'class': 'gs-text' }, [
+						E('option', { value: 'check-only' }, 'Только проверка'),
+						E('option', { value: 'check-and-apply' }, 'Проверка и применение')
+					]);
+					inMode.value = sched.mode || 'check-only';
+					var chkEn = E('input', { 'class': 'gs-check', type: 'checkbox' });
+					chkEn.checked = sched.enabled === true;
+
+					function persist() {
+						callNodesAuditScheduleSet(path.id, chkEn.checked ? 'true' : 'false',
+							inTime.value.trim(), inMode.value).then(function(res) {
+							if (!res || !res.ok) {
+								ui.addNotification(null, E('p', {}, 'Ошибка: ' + ((res || {}).error || 'unknown')), 'error');
+								return;
+							}
+							ui.addNotification(null, E('p', {}, 'Расписание сохранено'), 'info');
+							view.reload();
+						}).catch(function(err) {
+							ui.addNotification(null, E('p', {}, String(err)), 'error');
+						});
+					}
+
+					return E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color,#30363d)' }, [
+						E('span', { 'class': 'gs-label' }, 'Расписание проверки'),
+						E('label', { 'class': 'gs-check' }, [chkEn, E('span', {}, 'включено')]),
+						E('span', { 'class': 'gs-label' }, 'Время (ЧЧ:ММ)'), inTime,
+						E('span', { 'class': 'gs-label' }, 'Режим'), inMode,
+						E('button', { 'class': 'gs-btn', 'click': persist }, 'Сохранить расписание')
+					]);
+				})()
+			]));
+		});
+
+		/* ===================== Legacy node audit (separate server-country policy) ===================== */
 		var conf = nd.conf || {};
 		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
 		var inSched = E('input', { 'class': 'gs-text', type: 'text', value: nd.schedule || '03:30', size: 6 });
@@ -1140,11 +1476,87 @@ return view.extend({
 
 	reload: function() {
 		var view = this;
-		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
-			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet() ]).then(function(all) {
+		var calls = [
+			callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(),
+			callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet()
+		];
+		return Promise.all(calls).then(function(all) {
 			var newView = view.render(all);
 			var old = document.querySelector('.gs-wrap');
 			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);
 		});
+	},
+
+	// Poll job status until complete.
+	//
+	// One timer per path, kept outside the view instance: reload() builds a new view, so a
+	// timer owned by the old one survived and kept polling -- several clicks, or a couple of
+	// reloads, produced a swarm of overlapping requests and one "interrupted" notice each.
+	// A transient timeout is retried a few times before it is reported at all.
+	pollJob: function(jobId, pathId) {
+		var view = this;
+		if (POLL_TIMERS[pathId]) {
+			clearInterval(POLL_TIMERS[pathId].timer);
+			delete POLL_TIMERS[pathId];
+		}
+		var state = { jobId: jobId, failures: 0, timer: null };
+
+		function stop() {
+			if (state.timer !== null) {
+				clearInterval(state.timer);
+				state.timer = null;
+			}
+			if (POLL_TIMERS[pathId] === state) delete POLL_TIMERS[pathId];
+		}
+
+		state.timer = setInterval(function() {
+			callNodesAuditJobGet(jobId).then(function(res) {
+				if (!res || !res.ok) {
+					var error = (res || {}).error || 'ошибка RPC';
+					stop();
+					// A newer check replaced this job file; the card already shows it.
+					if (error !== 'job not found') {
+						ui.addNotification(null, E('p', {}, 'Наблюдение прервано: ' + error), 'warning');
+					}
+					return;
+				}
+				state.failures = 0;
+				var job = res.job || {};
+				var st = job.status;
+				if (st === 'complete' || st === 'error' || st === 'stale' || st === 'cancelled') {
+					stop();
+					var msg, kind = 'info';
+					if (st === 'complete') {
+						var counts = job.counts || {};
+						msg = 'Проверка завершена: ' + (counts.eligible || 0) + ' допущено, '
+							+ (counts.excluded || 0) + ' исключено, '
+							+ (counts.unknown || 0) + ' неизвестно.';
+					} else if (st === 'stale') {
+						var staleCounts = job.counts || {};
+						msg = 'Проверка завершена, но результат уже устарел (конфиг изменился): '
+							+ (staleCounts.eligible || 0) + ' допущено, '
+							+ (staleCounts.excluded || 0) + ' исключено, '
+							+ (staleCounts.unknown || 0) + ' неизвестно. Нужна повторная проверка.';
+						kind = 'warning';
+					} else if (st === 'cancelled') {
+						msg = 'Проверка отменена.';
+						kind = 'warning';
+					} else {
+						msg = 'Проверка завершилась ошибкой: ' + (job.error || 'причина не указана');
+						kind = 'error';
+					}
+					ui.addNotification(null, E('p', {}, msg), kind);
+					view.reload();
+				}
+			}).catch(function(err) {
+				state.failures += 1;
+				if (state.failures < 3) return;
+				stop();
+				ui.addNotification(null, E('p', {}, 'Наблюдение прервано: ' + String(err)
+					+ '. Нажмите «Обновить результаты».'), 'warning');
+			});
+		}, 2000);
+		POLL_TIMERS[pathId] = state;
 	}
 });

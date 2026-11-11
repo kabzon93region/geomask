@@ -26,3 +26,8 @@ yandex.uz
 yandex.md
 yandex.aero
 yandex.co.il
+yandex.com.tr
+yandex.eu
+yandex.lt
+yandex.lv
+yandex.ee

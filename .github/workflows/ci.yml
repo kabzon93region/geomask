@@ -16,11 +16,26 @@ jobs:
         with:
           python-version: '3.x'
 
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pyyaml
+
       - name: Build consistency (geomask.sh == build of geomask.sh.in + assets)
         run: python tools/check_build.py
 
-      - name: Syntax check
+      - name: RPC manifest parity (four generated integration points)
+        run: python tools/gen-geo-rpc.py --check
+
+      - name: Syntax check (installer shell)
         run: sh -n geomask.sh
+
+      - name: Syntax check (panel JavaScript)
+        run: node --check assets/geo-sync-page.js
+
+      - name: Compile every shipped python module
+        run: python -m py_compile assets/geomask-node-audit.py assets/geomask-audit-state.py assets/geomask-config-tx.py assets/geomask-config-owner.py assets/geomask-apply.py assets/geomask-lane-torrent.py assets/geomask-sync-youtube.py tools/gen-geo-rpc.py tools/node-audit-save.py
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Sandbox tests
         run: bash tests/run_tests.sh

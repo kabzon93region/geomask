@@ -1,0 +1,59 @@
+{
+  "id": "path_ai",
+  "name": "AI Path",
+  "version": "1.0.0",
+  "schema_version": 1,
+  "type": "path",
+  "description": "AI path with US-only admission control",
+  "author": "geomask",
+  "license": "MIT",
+  "dependencies": [
+    {
+      "module_id": "core",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": ""
+    },
+    {
+      "module_id": "subscription:sub",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": "AI borrows main subscription"
+    },
+    {
+      "module_id": "admission_service",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": "Admission proof required"
+    }
+  ],
+  "provides": [
+    "path:ai",
+    "filter:ai_filter"
+  ],
+  "owned_resources": [
+    {
+      "type": "config",
+      "path": "/etc/geomask/policies.yaml#path:ai",
+      "description": ""
+    },
+    {
+      "type": "filter",
+      "path": "/etc/mihomo/ruleset/ai.yaml",
+      "description": ""
+    }
+  ],
+  "config_files": [
+    "/etc/geomask/policies.yaml"
+  ],
+  "config_schema": {},
+  "services": [
+    "mihomo"
+  ],
+  "cron_jobs": [],
+  "rpc_methods": [],
+  "state": "enabled",
+  "enabled": true,
+  "created_at": "2026-11-07T19:08:47.715949Z",
+  "updated_at": "2026-11-07T19:08:47.715949Z"
+}

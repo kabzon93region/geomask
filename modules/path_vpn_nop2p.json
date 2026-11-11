@@ -1,0 +1,53 @@
+{
+  "id": "path_vpn_nop2p",
+  "name": "VPN-noP2P Path",
+  "version": "1.0.0",
+  "schema_version": 1,
+  "type": "path",
+  "description": "Restricted VPN path (DE, PL) without P2P",
+  "author": "geomask",
+  "license": "MIT",
+  "dependencies": [
+    {
+      "module_id": "core",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": ""
+    },
+    {
+      "module_id": "subscription:de5",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": "Restricted subscription"
+    }
+  ],
+  "provides": [
+    "path:vpn_nop2p",
+    "filter:base_filter"
+  ],
+  "owned_resources": [
+    {
+      "type": "config",
+      "path": "/etc/geomask/policies.yaml#path:vpn_nop2p",
+      "description": ""
+    },
+    {
+      "type": "filter",
+      "path": "/etc/mihomo/ruleset/vpn_nop2p.yaml",
+      "description": ""
+    }
+  ],
+  "config_files": [
+    "/etc/geomask/policies.yaml"
+  ],
+  "config_schema": {},
+  "services": [
+    "mihomo"
+  ],
+  "cron_jobs": [],
+  "rpc_methods": [],
+  "state": "enabled",
+  "enabled": true,
+  "created_at": "2026-11-07T19:08:47.715944Z",
+  "updated_at": "2026-11-07T19:08:47.715944Z"
+}

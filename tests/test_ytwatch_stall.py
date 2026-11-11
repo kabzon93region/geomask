@@ -9,6 +9,7 @@ import re
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = (ROOT / 'assets' / 'geomask-ytwatch.sh').read_text(encoding='utf-8')
@@ -92,10 +93,27 @@ class WiringTests(unittest.TestCase):
         self.assertRegex(BODY, r"st\['stall_seen'\]=\{\}")
 
     def test_pinned_edges_are_not_reported_as_stalled(self):
-        # connections opened before a pin stay "stalled" until they time out; counting them
-        # makes the panel claim an already-fixed edge is still broken (seen live on 31.10)
-        self.assertRegex(BODY, r"stalled=\{h:n for h,n in stalled_all\.items\(\) if h not in edges\}")
-        self.assertRegex(BODY, r"st\.get\('stall_seen'\) or \{\}\)\.items\(\) if h not in edges")
+        # Run the actual scan with isolated state/API dependencies: formatting is irrelevant,
+        # but pins, low-count noise and sample counters must retain their real behavior.
+        state = {'stall_seen': {'pinned': 20, 'qualifying': 1, 'quiet': 5},
+                 'pins': ['pinned']}
+        saved, api, sync = Mock(), Mock(), Mock()
+        ns = load_funcs(
+            ['do_scan'], group_name='fixture', group_id=lambda _: 'group-id',
+            mode='auto', load_state=lambda: state,
+            rule_state=lambda _: ([], {'pinned': True}), recent_failures=lambda: {},
+            stalled_edges=lambda: {'pinned': 9, 'qualifying': 3, 'quiet': 2},
+            stall_min_conns=3, blanket_when=999, blanket_permanent=False,
+            threshold=2, stall_threshold=100, cap=40, save_state=saved,
+            api=api, sync_now=sync, log=Mock())
+        ns['do_scan']()
+        saved.assert_called_once()
+        result = saved.call_args.args[0]
+        self.assertEqual(result['stalled'], {'qualifying': 3})
+        self.assertEqual(result['stall_seen'], {'qualifying': 2})
+        self.assertEqual(result['pins'], ['pinned'])
+        api.assert_not_called()
+        sync.assert_not_called()
 
 
 if __name__ == '__main__':

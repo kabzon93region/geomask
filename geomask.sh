@@ -6375,7 +6375,10 @@ def fetch(url, timeout=20, max_bytes=4_000_000):
 
 
 def index_url(config):
-    return RAW.format(repo=config['repo'], ref=config['ref'], path=INDEX_PATH)
+    # raw.githubusercontent.com sits behind caches that can serve a stale catalogue for
+    # minutes after a push; a changing query string keeps the fetch honest.
+    base = RAW.format(repo=config['repo'], ref=config['ref'], path=INDEX_PATH)
+    return '%s?t=%d' % (base, int(time.time()))
 
 
 def load_index(config, force=False, fetcher=None):

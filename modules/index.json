@@ -196,7 +196,7 @@
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "f64400abe6d04ae02abbae19c59f620a3157e4fc74c226f084b5369ef87dfd50"
+          "sha256": "96086129c97d878a29d9217f4df43003f27d9c633d5901dd77db4771857e3495"
         }
       ]
     },
@@ -255,7 +255,7 @@
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "53a9c2b8fac871b228c3df78224522ad169b1868ea91e391b9ab8a33ba7d9696"
+          "sha256": "183e8bb474c552be75534538c5924af7f64c12cac44edfce879dc6033f0e9a45"
         }
       ]
     },

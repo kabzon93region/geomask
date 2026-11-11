@@ -7510,7 +7510,14 @@ def check_module(module_id):
                  'not-selected': 'не выбран на этом роутере'}
         states = {'current': 'ok', 'update-available': 'warn', 'modified': 'warn',
                   'incomplete': 'fail', 'not-selected': 'ok'}
-        return states.get(item['state'], 'warn'), names.get(item['state'], item['state']), details
+        fixes = {
+            'update-available': 'Обновите модуль: панель → Модули → «Обновить».',
+            'modified': 'Вернуть каталожную версию: панель → Модули → «Перезаписать».',
+            'incomplete': 'Файлов не хватает: панель → Модули → «Обновить»; если не помогло — переустановка.',
+            'not-selected': 'Модуль не выбран при установке. Включить: sh geomask.sh --modules=core,path_vpn,%s.' % module_id,
+        }
+        return (states.get(item['state'], 'warn'), names.get(item['state'], item['state']),
+                details, fixes.get(item['state'], ''))
     return probe
 
 
@@ -7944,9 +7951,11 @@ def check_update_state():
 CHECKS = []
 
 
-def register(area, check_id, title, factory, hint='', live=False):
+def register(area, check_id, title, factory, hint='', live=False, fix=''):
+    """fix: what the owner should do when the check is not ok. Static text is enough for
+    most checks; the ones whose remedy depends on the state return it themselves."""
     CHECKS.append({'id': check_id, 'area': area, 'title': title, 'fn': factory,
-                   'hint': hint, 'live': live})
+                   'hint': hint, 'live': live, 'fix': fix})
 
 
 def build_registry():
@@ -7963,20 +7972,36 @@ def build_registry():
         register('modules', 'mod_' + module_id, 'Модуль %s' % names.get(module_id, module_id),
                  check_module(module_id))
     register('router', 'router_system', 'Система и аптайм', check_router_system)
-    register('router', 'router_resources', 'Ресурсы: память, диск, загрузка', check_router_resources)
-    register('router', 'router_services', 'Службы роутера', check_router_services)
-    register('router', 'router_netfilter', 'Firewall и маршрутизация', check_router_netfilter)
-    register('router', 'router_backup', 'Свежесть бэкапа', check_router_backup)
-    register('network', 'net_wan', 'WAN и маршрут по умолчанию', check_net_wan)
-    register('network', 'net_dns', 'DNS и блокировка рекламы', check_net_dns)
-    register('network', 'net_internet', 'Доступ в интернет', check_net_internet)
-    register('network', 'net_tunnels', 'Туннели и MTU', check_net_tunnels)
+    register('router', 'router_resources', 'Ресурсы: память, диск, загрузка', check_router_resources,
+             fix='Освободите место: старые бэкапы в /root/geomask-backups, логи в /root/geomask-logs. '
+                 'При высокой загрузке посмотрите, кто её даёт: top -n1')
+    register('router', 'router_services', 'Службы роутера', check_router_services,
+             fix='Поднимите службу: /etc/init.d/<служба> restart. Если не поднимается — logread | tail -40')
+    register('router', 'router_netfilter', 'Firewall и маршрутизация', check_router_netfilter,
+             fix='Перезапустите: /etc/init.d/firewall restart, затем /etc/init.d/magitrickle restart; '
+                 'после этого sh geomask.sh --step 5')
+    register('router', 'router_backup', 'Свежесть бэкапа', check_router_backup,
+             fix='Создайте бэкап: sh geomask.sh --backup — копия ляжет в /root/geomask-backups и на ПК')
+    register('network', 'net_wan', 'WAN и маршрут по умолчанию', check_net_wan,
+             fix='Проверьте кабель и PPPoE: logread | grep -i wan, ip -4 addr show; '
+                 'перезапуск: /etc/init.d/network restart')
+    register('network', 'net_dns', 'DNS и блокировка рекламы', check_net_dns,
+             fix='Перезапустите dnsmasq: /etc/init.d/dnsmasq restart; upstream — LuCI → Сеть → DHCP/DNS')
+    register('network', 'net_internet', 'Доступ в интернет', check_net_internet,
+             fix='Проверьте WAN и текущий узел: панель → Обзор. Пустой узел — панель → Подписки → «Обновить»')
+    register('network', 'net_tunnels', 'Туннели и MTU', check_net_tunnels,
+             fix='Поднимите туннель: /etc/init.d/hev-socks5-tunnel restart; конфиги в /etc/mihomo/*.yml')
     for check_id, group, title in PATH_GROUPS:
-        register('paths', check_id, 'Путь %s' % title, check_path(group))
+        register('paths', check_id, 'Путь %s' % title, check_path(group),
+                 fix='Обновите подписку: панель → Подписки → «Обновить». Если узлов нет — проблема на стороне провайдера')
     register('paths', 'path_egress', 'Страна выхода каждого пути', check_path_egress,
-             'делает запрос наружу, занимает несколько секунд', live=True)
-    register('paths', 'path_rules', 'Правила и валидность конфига', check_geo_invariants)
-    register('router', 'update_state', 'Обновления модулей', check_update_state)
+             'делает запрос наружу, занимает несколько секунд', live=True,
+             fix='Слушатель не отвечает: проверьте узел группы в панели → Обзор; '
+                 'для VPN — слушатель torrent-direct на 192.168.0.1:7894')
+    register('paths', 'path_rules', 'Правила и валидность конфига', check_geo_invariants,
+             fix='Верните правила: sh geomask.sh --step 5 (синк) или --reinstall; проверка: mihomo -d /etc/mihomo -t')
+    register('router', 'update_state', 'Обновления модулей', check_update_state,
+             fix='Панель → Модули → «Проверить обновления», затем обновите нужные модули')
     return CHECKS
 
 
@@ -7991,22 +8016,45 @@ def run_check(check_id):
     check = find_check(check_id)
     if check is None:
         return {'id': check_id, 'state': 'fail', 'title': check_id,
-                'summary': 'нет такой проверки', 'details': []}
+                'summary': 'нет такой проверки', 'details': [], 'fix': ''}
     started = time.time()
+    fix = check.get('fix') or ''
     try:
-        state, summary, details = check['fn']()
+        outcome = check['fn']()
+        if isinstance(outcome, tuple) and len(outcome) == 4:
+            state, summary, details, fix = outcome
+        else:
+            state, summary, details = outcome
     except Exception as exc:  # a broken check must not break the tab
         state, summary, details = 'fail', 'проверка упала: %s' % exc, []
     result = {
         'id': check['id'], 'area': check['area'], 'title': check['title'],
         'state': state, 'summary': summary, 'details': details,
         'hint': check.get('hint') or '',
+        'fix': fix if state != 'ok' else '',
         'took_ms': int((time.time() - started) * 1000),
         'log': log_path(check['id']),
     }
     lines = ['%s' % summary] + ['  ' + item for item in details]
+    if result['fix']:
+        lines.append('  → ' + result['fix'])
     write_log(check['id'], state, lines)
     return result
+
+
+def verdict(checks):
+    """One line the owner can read without opening anything."""
+    counts = {'ok': 0, 'warn': 0, 'fail': 0}
+    for item in checks:
+        counts[item['state']] = counts.get(item['state'], 0) + 1
+    if counts['fail']:
+        text = 'есть проблемы: %d — откройте их, в каждой написано, что делать' % counts['fail']
+    elif counts['warn']:
+        text = 'всё работает, но %d проверок просят внимания' % counts['warn']
+    else:
+        text = 'всё в порядке'
+    return {'counts': counts, 'text': text, 'state': 'fail' if counts['fail'] else
+            ('warn' if counts['warn'] else 'ok')}
 
 
 def run_all(include_live=False):
@@ -8017,7 +8065,10 @@ def run_all(include_live=False):
         if check.get('live') and not include_live:
             continue
         results.append(run_check(check['id']))
-    payload = {'ok': True, 'generated': now_iso(), 'version': VERSION, 'checks': results}
+    summary = verdict(results)
+    payload = {'ok': True, 'generated': now_iso(), 'version': VERSION,
+               'verdict': summary['text'], 'verdict_state': summary['state'],
+               'counts': summary['counts'], 'checks': results}
     try:
         with open(CACHE + '.tmp', 'w', encoding='utf-8', newline='\n') as handle:
             json.dump(payload, handle, ensure_ascii=False)
@@ -8037,10 +8088,14 @@ def list_checks():
         previous = last.get(check['id']) or {}
         item['last_state'] = previous.get('state', '')
         item['last_summary'] = previous.get('summary', '')
+        item['last_fix'] = previous.get('fix', '')
         item['last_at'] = cached.get('generated', '') if previous else ''
         item['log'] = log_path(check['id'])
         checks.append(item)
     return {'ok': True, 'version': VERSION, 'generated': cached.get('generated', ''),
+            'verdict': cached.get('verdict', ''),
+            'verdict_state': cached.get('verdict_state', ''),
+            'counts': cached.get('counts') or {},
             'checks': checks}
 
 
@@ -8053,34 +8108,39 @@ def trace_domain(domain, live=False):
     steps = []
     lines = ['Домен: %s' % domain, '']
 
-    def step(stage, verdict, detail):
-        steps.append({'stage': stage, 'verdict': verdict, 'detail': detail})
+    def step(stage, verdict, detail, fix=''):
+        steps.append({'stage': stage, 'verdict': verdict, 'detail': detail, 'fix': fix})
         lines.append('%-22s %s' % (stage + ':', detail))
 
     # 1. DNS
     probe = resolve(domain)
     if probe['blocked']:
-        step('DNS', 'fail', 'домен заблокирован (0.0.0.0) — adblock или hosts')
+        step('DNS', 'fail', 'домен заблокирован (0.0.0.0) — adblock или hosts',
+             'Разрешите домен в LuCI → adblock-fast (список разрешённых) или уберите его из hosts.')
     elif probe['ips']:
         step('DNS', 'ok', '→ %s' % ', '.join(probe['ips'][:4]))
     else:
-        step('DNS', 'fail', 'не разрешается через 127.0.0.1')
+        step('DNS', 'fail', 'не разрешается через 127.0.0.1',
+             'DNS не отвечает: /etc/init.d/dnsmasq restart; upstream — LuCI → Сеть → DHCP/DNS.')
     ips = probe['ips']
 
     # 2. MagiTrickle
     route = magitrickle_route(domain)
     if route is None:
-        step('MagiTrickle', 'warn', 'домена нет ни в одной группе — пойдёт по общим правилам')
+        step('MagiTrickle', 'warn', 'домена нет ни в одной группе — пойдёт по общим правилам',
+             'Чтобы задать направление, добавьте домен в группу MagiTrickle (вкладка «Списки и синк»).')
     else:
         group, rule, _ = route
         step('MagiTrickle', 'ok', 'группа «%s» (интерфейс %s), правило %s:%s'
              % (group['name'], group['interface'] or '?', rule.get('type') or 'namespace',
-                rule.get('rule')))
+                rule.get('rule')),
+             'Поменять направление: MagiTrickle → группа «%s» (вкладка «Списки и синк»).' % group['name'])
 
     # 3. mihomo rule
     hit = mihomo_route(domain, ips)
     if hit is None:
-        step('Правило mihomo', 'warn', 'ни одно правило не совпало — сработает MATCH')
+        step('Правило mihomo', 'warn', 'ни одно правило не совпало — сработает MATCH',
+             'Домен не покрыт ни одним списком mihomo: добавьте его в список нужной группы.')
     else:
         step('Правило mihomo', 'ok', '#%d %s → %s%s'
              % (hit['index'], hit['rule'], hit['policy'],
@@ -8095,7 +8155,8 @@ def trace_domain(domain, live=False):
             if 'UDP' in ((hit or {}).get('rule') or '').upper():
                 step('Выход', 'ok', 'QUIC (UDP/443) отбрасывается — видео идёт по TCP, это штатно')
             else:
-                step('Выход', 'fail', 'REJECT — трафик отбрасывается')
+                step('Выход', 'fail', 'REJECT — трафик отбрасывается',
+                     'Правило REJECT блокирует домен: найдите его в правилах mihomo и уберите или смените политику.')
         else:
             step('Выход', 'ok', 'напрямую через провайдера — страна Россия (RU)')
     elif policy in ('VPN', 'VPN-noP2P', 'AI'):
@@ -8105,11 +8166,14 @@ def trace_domain(domain, live=False):
                 policy, info['now'],
                 (', страна ' + info['country'] + ' (' + info['cc'] + ')') if info['country'] else ''))
         elif info:
-            step('Выход', 'warn', '%s не выбрал узел (узлов: %d)' % (policy, info['nodes']))
+            step('Выход', 'warn', '%s не выбрал узел (узлов: %d)' % (policy, info['nodes']),
+                 'Группа %s пуста: панель → Подписки → «Обновить»; если узлов нет — проверьте провайдера.' % policy)
         else:
-            step('Выход', 'warn', 'группа %s не отвечает через API' % policy)
+            step('Выход', 'warn', 'группа %s не отвечает через API' % policy,
+                 'Mihomo не отвечает на 127.0.0.1:9090: /etc/init.d/mihomo restart.')
     else:
-        step('Выход', 'warn', 'политика %s — уточните вручную' % policy)
+        step('Выход', 'warn', 'политика %s — уточните вручную' % policy,
+             'Проверьте правило в /etc/mihomo/config.yaml.')
 
     # 5. live probe
     if live:
@@ -8119,18 +8183,25 @@ def trace_domain(domain, live=False):
             code = out.split()[0]
             took = out.split()[1] if len(out.split()) > 1 else '?'
             step('Проверка HTTP', 'ok' if code.startswith(('2', '3')) else 'warn',
-                 'HTTP %s за %s с (с роутера)' % (code, took))
+                 'HTTP %s за %s с (с роутера)' % (code, took),
+                 '' if code.startswith(('2', '3')) else
+                 'Сайт ответил HTTP %s: это ответ самого сайта, а не блокировка роутера.' % code)
         else:
-            step('Проверка HTTP', 'warn', 'нет ответа (rc=%s)' % rc)
+            step('Проверка HTTP', 'warn', 'нет ответа (rc=%s)' % rc,
+                 'Проверьте путь: панель → Обзор (узел группы) и Диагностика → «Сеть».')
 
     lines.append('')
     lines.append('Итог: %s' % (steps[2]['detail'] if len(steps) > 2 else ''))
-    if route is not None:
-        lines.append('Изменить направление: MagiTrickle → группа «%s» (вкладка «Списки и синк»).'
-                     % route[0]['name'])
-    else:
-        lines.append('Домена нет в списках MagiTrickle: чтобы задать направление, добавьте его '
-                     'в нужную группу (вкладка «Списки и синк»).')
+    fix = ''
+    for wanted in ('fail', 'warn'):
+        for item in steps:
+            if item['verdict'] == wanted and item.get('fix'):
+                fix = item['fix']
+                break
+        if fix:
+            break
+    if fix:
+        lines.append('Что делать: ' + fix)
     state = 'ok'
     for item in steps:
         if item['verdict'] == 'fail':
@@ -8140,7 +8211,7 @@ def trace_domain(domain, live=False):
             state = 'warn'
     write_log('domain_trace', state, lines)
     return {'ok': True, 'domain': domain, 'state': state, 'steps': steps,
-            'lines': lines, 'log': log_path('domain_trace')}
+            'lines': lines, 'fix': fix, 'log': log_path('domain_trace')}
 
 
 # --------------------------------------------------------------------------- cli
@@ -8393,7 +8464,7 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "f64400abe6d04ae02abbae19c59f620a3157e4fc74c226f084b5369ef87dfd50"
+          "sha256": "96086129c97d878a29d9217f4df43003f27d9c633d5901dd77db4771857e3495"
         }
       ]
     },
@@ -8452,7 +8523,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "53a9c2b8fac871b228c3df78224522ad169b1868ea91e391b9ab8a33ba7d9696"
+          "sha256": "183e8bb474c552be75534538c5924af7f64c12cac44edfce879dc6033f0e9a45"
         }
       ]
     },
@@ -9757,6 +9828,12 @@ return view.extend({
 		/* ===================== ДИАГНОСТИКА (v1.29.1) ===================== */
 		var diagData = (diag.checks || []).slice();
 		var diagSummary = E('span', { 'class': 'gs-meta' }, '');
+		var diagVerdict = E('div', { 'class': 'gs-hint', style: 'margin:6px 0' },
+			diag.verdict || 'Проверок ещё не было — нажмите «Проверить всё».');
+		if (diag.verdict_state) {
+			diagVerdict.style.color = diag.verdict_state === 'fail' ? '#f85149'
+				: (diag.verdict_state === 'warn' ? '#d29922' : '#3fb950');
+		}
 		var diagRowsBox = E('div', {});
 		var diagLogBox = E('pre', { 'class': 'gs-log', style: 'display:none' });
 		var domInput = E('input', { 'class': 'gs-input', 'placeholder': 'example.com', style: 'min-width:240px' });
@@ -9782,12 +9859,14 @@ return view.extend({
 						diagData[i].last_state = r.state;
 						diagData[i].last_summary = r.summary;
 						diagData[i]._details = r.details || [];
+						diagData[i]._fix = r.fix || '';
 						found = true;
 						break;
 					}
 				}
 				if (!found) diagData.push({ id: r.id, area: r.area, title: r.title, live: r.live,
-					last_state: r.state, last_summary: r.summary, _details: r.details || [] });
+					last_state: r.state, last_summary: r.summary, _details: r.details || [],
+					_fix: r.fix || '' });
 			});
 			diagRender();
 		}
@@ -9804,7 +9883,7 @@ return view.extend({
 				if (!items.length) return;
 				diagRowsBox.appendChild(E('div', { 'class': 'gs-hint', style: 'margin-top:12px' }, area[1]));
 				items.forEach(function(c) {
-					diagRowsBox.appendChild(E('div', { 'class': 'gs-row', style: 'flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border-color,#30363d)' }, [
+					var rows = [
 						E('span', { 'style': 'flex:1' }, c.title + (c.live ? ' · живая' : '')),
 						E('span', { 'class': 'gs-meta' }, c.last_summary || ''),
 						diagBadge(c.last_state),
@@ -9812,7 +9891,12 @@ return view.extend({
 						E('button', { 'class': 'gs-btn', 'click': function() { diagShowLog(c.id, c.title); } }, 'Лог'),
 						E('div', { 'class': 'gs-meta', style: 'flex-basis:100%;color:#8b949e' },
 							(c._details && c._details.length) ? c._details.join(' · ') : '')
-					]));
+					];
+					if (c._fix && c.last_state !== 'ok') {
+						rows.push(E('div', { 'class': 'gs-meta', style: 'flex-basis:100%;color:#d29922' },
+							'→ ' + c._fix));
+					}
+					diagRowsBox.appendChild(E('div', { 'class': 'gs-row', style: 'flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border-color,#30363d)' }, rows));
 				});
 			});
 		}
@@ -9826,6 +9910,11 @@ return view.extend({
 					return;
 				}
 				diagMerge(res && res.checks);
+				if (res && res.verdict) {
+					diagVerdict.textContent = res.verdict;
+					diagVerdict.style.color = res.verdict_state === 'fail' ? '#f85149'
+						: (res.verdict_state === 'warn' ? '#d29922' : '#3fb950');
+				}
 			}).catch(function(e) {
 				ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
 			}).then(function() {
@@ -9865,6 +9954,7 @@ return view.extend({
 		panels.diag.appendChild(E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Диагностика'),
 			E('div', { 'class': 'gs-hint' }, 'Проверки выполняются на роутере. У каждой свой лог, логи хранятся 7 дней.'),
+			diagVerdict,
 			E('div', { 'class': 'gs-row', style: 'margin:8px 0;gap:10px;align-items:center' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function(ev) { diagRun('all', ev.target); } }, 'Проверить всё'),
 				diagSummary

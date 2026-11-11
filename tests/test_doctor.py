@@ -264,7 +264,9 @@ class DoctorRegistryTests(unittest.TestCase):
         # the registry is built from the shipped catalogue, not from the router's copy
         self._index = doctor.MODULE_INDEX
         doctor.MODULE_INDEX = str(ROOT / 'modules' / 'index.json')
-        self.addCleanup(lambda: setattr(doctor, 'MODULE_INDEX', self._index))
+        doctor.CHECKS = []
+        self.addCleanup(lambda: (setattr(doctor, 'MODULE_INDEX', self._index),
+                                 setattr(doctor, 'CHECKS', [])))
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         doctor.LOG_DIR = self._tmp.name
@@ -321,7 +323,15 @@ class DoctorCheckTests(unittest.TestCase):
 
     def setUp(self):
         self._run = doctor.run
-        self.addCleanup(lambda: setattr(doctor, 'run', self._run))
+        self._index = doctor.MODULE_INDEX
+        self._updater = doctor.MODULE_UPDATER
+        doctor.MODULE_INDEX = str(ROOT / 'modules' / 'index.json')
+        doctor.MODULE_UPDATER = str(ROOT / 'assets' / 'geomask-module-update.py')
+        doctor.CHECKS = []
+        self.addCleanup(lambda: (setattr(doctor, 'run', self._run),
+                                 setattr(doctor, 'MODULE_INDEX', self._index),
+                                 setattr(doctor, 'MODULE_UPDATER', self._updater),
+                                 setattr(doctor, 'CHECKS', [])))
 
     def fake(self, answers):
         def call(cmd, timeout=8, stdin=None):
@@ -359,6 +369,42 @@ class DoctorCheckTests(unittest.TestCase):
         self.fake([(['nft', 'list', 'tables'], (0, 'table ip filter'))])
         state, _, _ = doctor.check_router_netfilter()
         self.assertEqual(state, 'fail')
+
+    def test_a_failing_check_carries_a_remedy(self):
+        doctor.LOG_DIR = tempfile.mkdtemp()
+        result = doctor.run_check('router_backup')
+        self.assertIn(result['state'], ('warn', 'fail'))
+        self.assertTrue(result['fix'], 'a non-ok check must say what to do')
+        self.assertIn('бэкап', result['fix'].lower())
+
+    def test_a_healthy_check_carries_no_remedy(self):
+        doctor.LOG_DIR = tempfile.mkdtemp()
+        self.fake([(['nft', 'list', 'tables'], (0, 'table inet fw4\ntable ip mangle')),
+                   (['nft', 'list', 'table'], (0, 'jump MT_abc')),
+                   (['ip', '-4'], (0, '17840: from all lookup 101'))])
+        result = doctor.run_check('router_netfilter')
+        self.assertEqual(result['state'], 'ok')
+        self.assertEqual(result['fix'], '')
+
+    def test_module_check_remedy_depends_on_the_state(self):
+        self._index = doctor.MODULE_INDEX
+        doctor.MODULE_INDEX = str(ROOT / 'modules' / 'index.json')
+        self.addCleanup(lambda: setattr(doctor, 'MODULE_INDEX', self._index))
+        state, summary, details, fix = doctor.check_module('youtube')()
+        self.assertIn(state, ('fail', 'warn', 'ok'))
+        if state != 'ok':
+            self.assertIn('Модули', fix)
+
+    def test_verdict_summarises_the_run(self):
+        healthy = doctor.verdict([{'state': 'ok'}, {'state': 'ok'}])
+        self.assertEqual(healthy['state'], 'ok')
+        self.assertIn('в порядке', healthy['text'])
+        warned = doctor.verdict([{'state': 'ok'}, {'state': 'warn'}])
+        self.assertEqual(warned['state'], 'warn')
+        broken = doctor.verdict([{'state': 'ok'}, {'state': 'fail'}, {'state': 'warn'}])
+        self.assertEqual(broken['state'], 'fail')
+        self.assertEqual(broken['counts'], {'ok': 1, 'warn': 1, 'fail': 1})
+        self.assertIn('что делать', broken['text'])
 
     def test_egress_country_survives_a_blocking_geo_service(self):
         # the AI lane's exit gets 403 from ipinfo.io; the next service must answer

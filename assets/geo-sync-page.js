@@ -986,6 +986,12 @@ return view.extend({
 		/* ===================== ДИАГНОСТИКА (v1.29.1) ===================== */
 		var diagData = (diag.checks || []).slice();
 		var diagSummary = E('span', { 'class': 'gs-meta' }, '');
+		var diagVerdict = E('div', { 'class': 'gs-hint', style: 'margin:6px 0' },
+			diag.verdict || 'Проверок ещё не было — нажмите «Проверить всё».');
+		if (diag.verdict_state) {
+			diagVerdict.style.color = diag.verdict_state === 'fail' ? '#f85149'
+				: (diag.verdict_state === 'warn' ? '#d29922' : '#3fb950');
+		}
 		var diagRowsBox = E('div', {});
 		var diagLogBox = E('pre', { 'class': 'gs-log', style: 'display:none' });
 		var domInput = E('input', { 'class': 'gs-input', 'placeholder': 'example.com', style: 'min-width:240px' });
@@ -1011,12 +1017,14 @@ return view.extend({
 						diagData[i].last_state = r.state;
 						diagData[i].last_summary = r.summary;
 						diagData[i]._details = r.details || [];
+						diagData[i]._fix = r.fix || '';
 						found = true;
 						break;
 					}
 				}
 				if (!found) diagData.push({ id: r.id, area: r.area, title: r.title, live: r.live,
-					last_state: r.state, last_summary: r.summary, _details: r.details || [] });
+					last_state: r.state, last_summary: r.summary, _details: r.details || [],
+					_fix: r.fix || '' });
 			});
 			diagRender();
 		}
@@ -1033,7 +1041,7 @@ return view.extend({
 				if (!items.length) return;
 				diagRowsBox.appendChild(E('div', { 'class': 'gs-hint', style: 'margin-top:12px' }, area[1]));
 				items.forEach(function(c) {
-					diagRowsBox.appendChild(E('div', { 'class': 'gs-row', style: 'flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border-color,#30363d)' }, [
+					var rows = [
 						E('span', { 'style': 'flex:1' }, c.title + (c.live ? ' · живая' : '')),
 						E('span', { 'class': 'gs-meta' }, c.last_summary || ''),
 						diagBadge(c.last_state),
@@ -1041,7 +1049,12 @@ return view.extend({
 						E('button', { 'class': 'gs-btn', 'click': function() { diagShowLog(c.id, c.title); } }, 'Лог'),
 						E('div', { 'class': 'gs-meta', style: 'flex-basis:100%;color:#8b949e' },
 							(c._details && c._details.length) ? c._details.join(' · ') : '')
-					]));
+					];
+					if (c._fix && c.last_state !== 'ok') {
+						rows.push(E('div', { 'class': 'gs-meta', style: 'flex-basis:100%;color:#d29922' },
+							'→ ' + c._fix));
+					}
+					diagRowsBox.appendChild(E('div', { 'class': 'gs-row', style: 'flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border-color,#30363d)' }, rows));
 				});
 			});
 		}
@@ -1055,6 +1068,11 @@ return view.extend({
 					return;
 				}
 				diagMerge(res && res.checks);
+				if (res && res.verdict) {
+					diagVerdict.textContent = res.verdict;
+					diagVerdict.style.color = res.verdict_state === 'fail' ? '#f85149'
+						: (res.verdict_state === 'warn' ? '#d29922' : '#3fb950');
+				}
 			}).catch(function(e) {
 				ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
 			}).then(function() {
@@ -1094,6 +1112,7 @@ return view.extend({
 		panels.diag.appendChild(E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Диагностика'),
 			E('div', { 'class': 'gs-hint' }, 'Проверки выполняются на роутере. У каждой свой лог, логи хранятся 7 дней.'),
+			diagVerdict,
 			E('div', { 'class': 'gs-row', style: 'margin:8px 0;gap:10px;align-items:center' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function(ev) { diagRun('all', ev.target); } }, 'Проверить всё'),
 				diagSummary

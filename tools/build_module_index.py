@@ -69,12 +69,20 @@ def source_path(repo_file):
     return None
 
 
-def sha256(path):
-    digest = hashlib.sha256()
+# build.py stamps these markers while assembling geomask.sh, and scripts/router/
+# deploy_luci_fix.py stamps them while deploying, so the bytes that land on the router
+# are NOT the bytes in the repository. The catalogue hashes what the router gets -
+# otherwise the panel and the backend would look locally modified after every install.
+VERSION_MARKERS = ('@@PANEL_VERSION@@', '@@BACKEND_VERSION@@', '@@GUARD_VERSION@@')
+
+
+def sha256_installed(path, version):
+    """SHA-256 of the file as the installer writes it (markers stamped)."""
     with open(path, 'rb') as handle:
-        for chunk in iter(lambda: handle.read(65536), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
+        data = handle.read()
+    for marker in VERSION_MARKERS:
+        data = data.replace(marker.encode(), version.encode())
+    return hashlib.sha256(data).hexdigest()
 
 
 def load_modules():
@@ -109,6 +117,7 @@ def main():
     assets = asset_map()
     modules = load_modules()
     owner = owners(modules)
+    version = core_version()
 
     catalogue = {}
     problems = []
@@ -139,7 +148,7 @@ def main():
             'path': path,
             'source': os.path.relpath(source, ROOT).replace(os.sep, '/'),
             'mode': mode,
-            'sha256': sha256(source),
+            'sha256': sha256_installed(source, version),
         })
 
     index = {

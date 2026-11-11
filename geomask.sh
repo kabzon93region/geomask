@@ -6562,6 +6562,20 @@ def digest_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
+# build.py stamps these markers while assembling geomask.sh, and the deploy tool stamps
+# them while deploying, so the repository keeps the placeholders while the router gets
+# the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
+# before it is verified - otherwise the panel and the backend would always fail the
+# checksum. tools/build_module_index.py applies the same rule on the other side.
+VERSION_MARKERS = ('1.29.0', '1.29.0', '1.29.0')
+
+
+def stamp_versions(data, version):
+    for marker in VERSION_MARKERS:
+        data = data.replace(marker.encode(), str(version).encode())
+    return data
+
+
 def digest_file(path):
     try:
         with open(path, 'rb') as handle:
@@ -6773,7 +6787,7 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
             if not force and current != known:
                 raise UpdateError('%s was modified locally; use --force to overwrite' % path)
         url = RAW.format(repo=config['repo'], ref=config['ref'], path=entry['source'])
-        data = fetcher(url)
+        data = stamp_versions(fetcher(url), index.get('core_version') or '0')
         actual = digest_bytes(data)
         if actual != entry['sha256']:
             raise UpdateError('%s: checksum mismatch (index %s, download %s)'
@@ -7016,13 +7030,13 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "5ea6910acdaa9cd19cada40f15db066a38beee79bccbe74cd37fca2b3f12f4b6"
+          "sha256": "56d65734e8e24382578610883e53916935b290a0f2872da19226883c694110c0"
         },
         {
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "c213974511e6c4dfe8cf9a76b71c785cddabd21804f9d71d6d0c5a1eca68dbff"
+          "sha256": "3489cbb4842454e11abddadedd0e24ec7f45a9197999a84b57ee5eab72fafc7f"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -7130,7 +7144,7 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "11ad407207de5e6327353d05aad455db9a19daa9179790b10c4cc93f861e1511"
+          "sha256": "deb8c8387e346d915f2099b71e496f47a15d60aba2772bb51eeec4249cdcef02"
         }
       ]
     },

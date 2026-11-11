@@ -52,6 +52,20 @@ def digest_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
 
+# build.py stamps these markers while assembling geomask.sh, and the deploy tool stamps
+# them while deploying, so the repository keeps the placeholders while the router gets
+# the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
+# before it is verified - otherwise the panel and the backend would always fail the
+# checksum. tools/build_module_index.py applies the same rule on the other side.
+VERSION_MARKERS = ('@@PANEL_VERSION@@', '@@BACKEND_VERSION@@', '@@GUARD_VERSION@@')
+
+
+def stamp_versions(data, version):
+    for marker in VERSION_MARKERS:
+        data = data.replace(marker.encode(), str(version).encode())
+    return data
+
+
 def digest_file(path):
     try:
         with open(path, 'rb') as handle:
@@ -263,7 +277,7 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
             if not force and current != known:
                 raise UpdateError('%s was modified locally; use --force to overwrite' % path)
         url = RAW.format(repo=config['repo'], ref=config['ref'], path=entry['source'])
-        data = fetcher(url)
+        data = stamp_versions(fetcher(url), index.get('core_version') or '0')
         actual = digest_bytes(data)
         if actual != entry['sha256']:
             raise UpdateError('%s: checksum mismatch (index %s, download %s)'

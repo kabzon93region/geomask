@@ -336,21 +336,34 @@ def seed_state(index, state, state_path=DEFAULT_STATE):
     """Record what is on disk right now, so later edits are detectable.
 
     The installer calls this once with the index it shipped: without a baseline every
-    untouched file would look locally modified on the first update.
+    untouched file would look locally modified on the first update. The version is taken
+    from the index only when every file of the module already matches it - seeding a
+    router that carries older bytes must not pretend it is current.
     """
     modules = state.setdefault('modules', {})
     seeded = 0
     for ident, module in (index.get('modules') or {}).items():
         hashes = {}
+        expected = 0
+        matched = True
         for entry in module.get('files') or []:
+            expected += 1
             actual = digest_file(entry['path'])
             if actual is not None:
                 hashes[entry['path']] = actual
+            if actual != entry['sha256']:
+                matched = False
         record = modules.setdefault(ident, {})
         if hashes:
             record['files'] = hashes
-            record.setdefault('version', module.get('version', '0.0.0'))
             seeded += 1
+        if not expected:
+            # a module without files (panel-only) ships with the release it names
+            record.setdefault('version', module.get('version', '0.0.0'))
+        elif matched and hashes:
+            record['version'] = module.get('version', '0.0.0')
+        else:
+            record.setdefault('version', module.get('version', '0.0.0'))
     write_json(state_path, state)
     return seeded
 

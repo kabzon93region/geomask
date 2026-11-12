@@ -232,6 +232,21 @@ class ModuleUpdateTests(unittest.TestCase):
         self.assertFalse(payload['ok'])
         self.assertIn('not part of this install', payload['error'])
 
+    def test_seed_records_the_version_when_the_files_match(self):
+        path = self.put(str(self.root / 'bin' / 'tool.sh'), b'body\n')
+        state = {'schema': 1, 'modules': {}}
+        updater.seed_state(self.index('1.1.0'), state, str(self.state_path))
+        saved = json.loads(self.state_path.read_text(encoding='utf-8'))
+        self.assertEqual(saved['modules']['core']['version'], '1.1.0')
+        self.assertEqual(saved['modules']['core']['files'][path], sha(b'body\n'))
+
+    def test_seed_keeps_an_old_version_when_the_bytes_differ(self):
+        self.put(str(self.root / 'bin' / 'tool.sh'), b'body\n', on_disk=b'older\n')
+        state = {'schema': 1, 'modules': {'core': {'version': '0.9.0', 'files': {}}}}
+        updater.seed_state(self.index('1.1.0'), state, str(self.state_path))
+        saved = json.loads(self.state_path.read_text(encoding='utf-8'))
+        self.assertEqual(saved['modules']['core']['version'], '0.9.0')
+
     # --- guards -----------------------------------------------------------
     def test_dependency_must_be_new_enough(self):
         index = {'schema': 1, 'modules': {

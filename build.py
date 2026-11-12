@@ -68,7 +68,13 @@ def load(name):
     p = os.path.join(ASSETS, name)
     if not os.path.exists(p):
         raise SystemExit("asset missing: " + p)
-    return open(p, encoding="utf-8").read()
+    data = open(p, encoding="utf-8").read()
+    # exactly one trailing newline: the heredoc in the template supplies the last one, and
+    # the catalogue hashes these very bytes - a second newline made every installed module
+    # differ from its hash by one byte.
+    if not data.endswith("\n") or data.endswith("\n\n"):
+        raise SystemExit("asset %s must end with exactly one newline" % name)
+    return data
 
 def main():
     tpl = open(TPL, encoding="utf-8").read()
@@ -83,7 +89,8 @@ def main():
             for line in data.splitlines():
                 if line.strip() == delim:
                     raise SystemExit("asset %s contains delimiter %s" % (key, delim))
-        return data
+        # the template line ends with a newline, so the asset must not carry its own
+        return data.rstrip("\n")
 
     out, n = re.subn(r"@@ASSET:([A-Za-z0-9._-]+)@@", repl, tpl)
     if n == 0:

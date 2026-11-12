@@ -77,9 +77,16 @@ VERSION_MARKERS = ('@@PANEL_VERSION@@', '@@BACKEND_VERSION@@', '@@GUARD_VERSION@
 
 
 def sha256_installed(path, version):
-    """SHA-256 of the file as the installer writes it (markers stamped)."""
-    with open(path, 'rb') as handle:
-        data = handle.read()
+    """SHA-256 of the file as the installer writes it (markers stamped, LF line endings).
+
+    build.py reads every asset as text (universal newlines) and the heredoc adds one final
+    newline, so a CRLF file in the working tree is installed with LF. Hashing the raw bytes
+    made such a file differ from its own catalogue entry by one byte per line, and every
+    module then looked "изменён локально" after an official update.
+    """
+    with open(path, encoding='utf-8') as handle:
+        text = handle.read()
+    data = (text.rstrip('\n') + '\n').encode('utf-8')
     for marker in VERSION_MARKERS:
         data = data.replace(marker.encode(), version.encode())
     return hashlib.sha256(data).hexdigest()

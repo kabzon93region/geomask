@@ -30,6 +30,32 @@ def installer_version():
     return re.search(r'(?m)^GM_VERSION="([^"]+)"', text).group(1)
 
 
+def installed_bytes(path):
+    """Exactly what build.py puts into the heredoc: text (LF), one final newline.
+
+    Reading bytes instead is how a CRLF asset in the working tree ended up hashed with
+    CRLF while the installer wrote LF - one byte per line apart, so every module looked
+    locally modified right after an official update.
+    """
+    text = path.read_text(encoding='utf-8')
+    return (text.rstrip('\n') + '\n').encode('utf-8')
+
+
+def heredoc_blocks(installer_text):
+    """{install path: body} for every save_stream block of the built installer."""
+    lines = installer_text.splitlines(True)
+    blocks = {}
+    for position, line in enumerate(lines):
+        match = re.match(r"\s*save_stream\s+(/\S+)\s+\d{3,4}\s+<<'?(\w+)'?\s*$", line)
+        if not match:
+            continue
+        terminator = match.group(2)
+        end = next(index for index in range(position + 1, len(lines))
+                   if lines[index].rstrip('\n') == terminator)
+        blocks[match.group(1)] = ''.join(lines[position + 1:end])
+    return blocks
+
+
 class ModuleIndexTests(unittest.TestCase):
     def setUp(self):
         self.index = json.loads(INDEX.read_text(encoding='utf-8'))
@@ -46,9 +72,25 @@ class ModuleIndexTests(unittest.TestCase):
 
     def test_hashes_match_the_stamped_assets(self):
         for entry in self.entries():
-            data = (ROOT / entry['source']).read_bytes()
-            actual = hashlib.sha256(stamped(data, self.version)).hexdigest()
+            data = stamped(installed_bytes(ROOT / entry['source']), self.version)
+            actual = hashlib.sha256(data).hexdigest()
             self.assertEqual(entry['sha256'], actual, entry['path'])
+
+    def test_the_installer_writes_exactly_the_catalogued_bytes(self):
+        # the built installer is the only writer on a fresh router and during an update
+        blocks = heredoc_blocks((ROOT / 'geomask.sh').read_text(encoding='utf-8'))
+        for entry in self.entries():
+            body = blocks.get(entry['path'])
+            self.assertIsNotNone(body, 'нет блока save_stream для ' + entry['path'])
+            actual = hashlib.sha256(stamped(body.encode('utf-8'), self.version)).hexdigest()
+            self.assertEqual(entry['sha256'], actual, entry['path'])
+
+    def test_every_asset_ends_with_exactly_one_newline(self):
+        # build.py strips trailing newlines and the heredoc adds one back
+        for entry in self.entries():
+            data = (ROOT / entry['source']).read_bytes()
+            self.assertTrue(data.endswith(b'\n'), entry['source'])
+            self.assertFalse(data.endswith(b'\n\n'), entry['source'])
 
     def test_core_version_matches_the_installer(self):
         self.assertEqual(self.index['core_version'], self.version)

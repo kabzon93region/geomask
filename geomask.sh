@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.3"
+GM_VERSION="1.30.4"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -3882,7 +3882,6 @@ if __name__ == '__main__':
                  'error': str(exc) if isinstance(exc, (ApplyError, AuditError)) else type(exc).__name__}
     print(json.dumps(value, ensure_ascii=False))
     raise SystemExit(0 if value.get('ok') else 1)
-
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-lane-torrent.py 755 <<'ASSET_EOF'
 #!/usr/bin/env python3
@@ -4542,7 +4541,6 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-subscription-status.py 755 <<'ASSET_EOF'
 #!/usr/bin/env python3
@@ -4860,7 +4858,6 @@ def main(argv):
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))
-
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-slot-patch.py 755 <<'ASSET_EOF'
 #!/usr/bin/env python3
@@ -5035,7 +5032,6 @@ def main(argv):
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))
-
 ASSET_EOF
   save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
 #!/bin/sh
@@ -5072,7 +5068,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.3"
+BACKEND_VERSION="1.30.4"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6579,7 +6575,6 @@ case "$1" in
   # <<< geo-rpc generated:dispatch <<<
   *) printf '{"error":"usage"}'; exit 1 ;;
 esac
-
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-module-update.py 755 <<'ASSET_EOF'
 #!/usr/bin/env python3
@@ -6641,7 +6636,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.3', '1.30.3', '1.30.3')
+VERSION_MARKERS = ('1.30.4', '1.30.4', '1.30.4')
 
 
 def stamp_versions(data, version):
@@ -7037,7 +7032,6 @@ def main(argv=None):
 
 if __name__ == '__main__':
     sys.exit(main())
-
 ASSET_EOF
   # v1.30.1: safe editor for the MagiTrickle lists (add/remove one domain at a time).
   save_stream /usr/lib/geomask/geomask-lists-edit.py 755 <<'ASSET_EOF'
@@ -7360,7 +7354,6 @@ def main(argv=None):
 
 if __name__ == '__main__':
     sys.exit(main())
-
 ASSET_EOF
   # v1.29.1: the diagnostics engine behind the "Диагностика" tab - checks, route trace, logs.
   save_stream /usr/lib/geomask/geomask-doctor.py 755 <<'ASSET_EOF'
@@ -8898,15 +8891,14 @@ def main(argv=None):
 
 if __name__ == '__main__':
     sys.exit(main())
-
 ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.3",
+  "core_version": "1.30.4",
   "modules": {
     "admission_service": {
-      "version": "1.30.0",
+      "version": "1.30.3",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -8938,7 +8930,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.0",
+      "version": "1.30.3",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9022,7 +9014,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-apply.py",
           "source": "assets/geomask-apply.py",
           "mode": 755,
-          "sha256": "81059ce99d7d8835d5c2f83efef4389073518608c10a08c69a857b41211c3f02"
+          "sha256": "532d02d66727b682ab35471e02bbbe56239f3e277c95da016a4cc2698a4bdec9"
         },
         {
           "path": "/usr/lib/geomask/geomask-audit-scheduler.py",
@@ -9034,25 +9026,25 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-audit-state.py",
           "source": "assets/geomask-audit-state.py",
           "mode": 755,
-          "sha256": "de34fadc2deebc3f2e66c956c9643bf0c193ee0f0adc94a678937d49ff418af5"
+          "sha256": "76a19490b446d24aac3c8e674c7033bec429c81689ea6d66489edae0c5409817"
         },
         {
           "path": "/usr/lib/geomask/geomask-config-owner.py",
           "source": "assets/geomask-config-owner.py",
           "mode": 755,
-          "sha256": "e71903c705829852b94e7dacc08db1891cd862bf8cc840d139384796378d06b3"
+          "sha256": "b7e10c607a4d03af4c5a80a377657325d7a15880af47ab82a5050390eae2335b"
         },
         {
           "path": "/usr/lib/geomask/geomask-config-tx.py",
           "source": "assets/geomask-config-tx.py",
           "mode": 755,
-          "sha256": "0306dcebc4c2ac5ee8bed09e6335c276160c6d69af88809a3c55bffd028c4bae"
+          "sha256": "268884f05788b6bd6bbb720ec32b5e1f99e0d5ead716cfacb29a28e42c4899e8"
         },
         {
           "path": "/usr/lib/geomask/geomask-lane-torrent.py",
           "source": "assets/geomask-lane-torrent.py",
           "mode": 755,
-          "sha256": "8fd6eb2acb24f960a02b6439b462f2e82f79577a5d3ffa5c491dd84a5e1bb284"
+          "sha256": "561779de905c37d46b9d76fa08eaf363c195c8dea10dbf126c4ec6908b9f6939"
         },
         {
           "path": "/usr/lib/geomask/geomask-lists-edit.py",
@@ -9064,7 +9056,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-node-audit.py",
           "source": "assets/geomask-node-audit.py",
           "mode": 755,
-          "sha256": "2bc9a49b34b3995b511b55f2985f900fc53ec7c947a3dbaf323ad1050e0f3e3e"
+          "sha256": "c650ba7ba920339833290619846a738148bc7bee31c4780dcf5a85acdc4b5acb"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
@@ -9082,12 +9074,12 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-sync-youtube.py",
           "source": "assets/geomask-sync-youtube.py",
           "mode": 755,
-          "sha256": "15d0cd4e7135d46cf2c465191d2708b01df790899306fe8a1e6eeb45b011307b"
+          "sha256": "22b4a2e34ed05045e5304c11fb0e1a98f2c5346cbd58122f5fea1e4c040db6b2"
         }
       ]
     },
     "device_modes": {
-      "version": "1.30.0",
+      "version": "1.30.3",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9163,7 +9155,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "f39c9e26ee6920c8999ba4781dbbf1080dd977133ad158dae51f6f8f035230cd"
+          "sha256": "bebc1ac8f640df9a520236b73967c708dfa95814b7ada2b2ee817e45bfa28d3e"
         }
       ]
     },
@@ -9179,7 +9171,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "935053650e2818191ab79be2e63d1f43ca76ca539159460bd0fe64e15ade4623"
+          "sha256": "56de68d97cef2aa18696e56ac23dca1db387c6839b8418ed25aa77c47012b22a"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9203,12 +9195,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "98e380c9e40ae39f59bed92065fc3970b20739fd1062740636a8585f6d4dc3c3"
+          "sha256": "176806de20fe2bc3f2ae34edc5741f24121114ac31785cba5f389f2636187feb"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.0",
+      "version": "1.30.3",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9219,7 +9211,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.0",
+      "version": "1.30.3",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9229,7 +9221,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.0",
+      "version": "1.30.3",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9239,7 +9231,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.0",
+      "version": "1.30.3",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9305,7 +9297,6 @@ ASSET_EOF
     }
   }
 }
-
 ASSET_EOF
   save_stream /usr/libexec/rpcd/geo-sync 755 <<'ASSET_EOF'
 #!/bin/sh
@@ -9475,7 +9466,6 @@ case "$1" in
 		;;
 	*) echo '{"error":"usage: geo-sync {list|call <method>}"}'; exit 1 ;;
 esac
-
 ASSET_EOF
   save_stream /usr/share/rpcd/acl.d/luci-app-geo-sync.json 644 <<'ASSET_EOF'
 {
@@ -9494,7 +9484,6 @@ ASSET_EOF
 		}
 	}
 }
-
 ASSET_EOF
 
   # v1.30.3: the release identity of THIS router. The panel compares the GitHub release
@@ -9522,7 +9511,6 @@ ASSET_EOF
 		}
 	}
 }
-
 ASSET_EOF
   save_stream /www/luci-static/resources/view/geo-sync/main.js 644 <<'ASSET_EOF'
 'use strict';
@@ -9592,7 +9580,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.3';
+var PANEL_VERSION = '1.30.4';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -11311,7 +11299,6 @@ return view.extend({
 		POLL_TIMERS[pathId] = state;
 	}
 });
-
 ASSET_EOF
   info "reloading rpcd + luci menu..."
   initd rpcd reload 2>/dev/null || true
@@ -12053,7 +12040,6 @@ start_service() {
   procd_set_param respawn
   procd_close_instance
 }
-
 ASSET_EOF
   # 4) AI dnsmasq (upstream = the AI DoH worker; RU-domain resolvers copied from main dnsmasq)
   {
@@ -12080,7 +12066,6 @@ start_service() {
   procd_set_param respawn
   procd_close_instance
 }
-
 ASSET_EOF
   # 5) nft rules (DNAT for ai devices + mark for dnsai sockets)
   aidns_generate_nft || return 1
@@ -28688,7 +28673,6 @@ groups:
     type: namespace
     rule: gtix.net
     enable: true
-
 ASSET_EOF
   save_stream /usr/bin/geomask-seed-lists.py 755 <<'ASSET_EOF'
 #!/usr/bin/env python3
@@ -28794,7 +28778,6 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-
 ASSET_EOF
 }
 
@@ -29361,7 +29344,6 @@ if c1 or c2:
     except Exception:
         pass
 PYEOF
-
 ASSET_EOF
   save_stream /etc/mihomo/ruleset/ytdirect.yaml 644 <<'ASSET_EOF'
 # YouTube DIRECT ruleset (non-video assets) - DO NOT EDIT manually.
@@ -29557,7 +29539,6 @@ payload:
   - DOMAIN-SUFFIX,yt4.ggpht.com
   - DOMAIN-SUFFIX,ytimg.com
   - DOMAIN-SUFFIX,ytimg.l.google.com
-
 ASSET_EOF
   # v1.29.0: the core mihomo config always references these rulesets, so a deselected
   # module must still leave a valid (empty) file behind - otherwise `mihomo -t` fails.
@@ -29572,7 +29553,6 @@ ASSET_EOF
 # This seed only matters before the first sync so mihomo -t has a valid ruleset. Edit in MagiTrickle.
 payload:
   - DOMAIN-SUFFIX,googlevideo.com
-
 ASSET_EOF
   else
     info "ytvpn list: keeping existing /etc/mihomo/ruleset/ytvpn.yaml (sync-managed)"
@@ -29700,7 +29680,6 @@ payload:
   - IP-CIDR,107.189.2.131/32,no-resolve
   - IP-CIDR,207.241.226.111/32,no-resolve
   - IP-CIDR,207.241.231.226/32,no-resolve
-
 ASSET_EOF
   else
     info "torrentdirect list: keeping existing /etc/mihomo/ruleset/torrentdirect.yaml"
@@ -29721,7 +29700,6 @@ ASSET_EOF
 api.epicgames.dev
 firstlook.gg
 live.wardogs.bulkhead.pragmaengine.com
-
 ASSET_EOF
   fi
   # v1.25.0: domains that must bypass zapret DPI even though they go DIRECT (Yandex).
@@ -29763,7 +29741,6 @@ yandex.eu
 yandex.lt
 yandex.lv
 yandex.ee
-
 ASSET_EOF
   fi
   # v1.17.0: torrent admin - rebuild the tracker ruleset / toggle the DIRECT listener from the panel
@@ -30055,7 +30032,6 @@ else:
     log('ruleset refresh: nothing changed (%d domains)' % d)
 print(json.dumps({'ok': True, 'domains': d, 'raw_ips': i2, 'changed': changed}))
 PYEOF
-
 ASSET_EOF
   # v1.21.4: keep an existing lane across reinstalls - it carries an interface the owner may have
   # assigned MagiTrickle lists to, and losing it silently reroutes those lists.
@@ -30245,7 +30221,6 @@ if [ $FAIL -eq 0 ] && [ $WARN -eq 0 ]; then echo "=== RESULT: DNS looks healthy 
 elif [ $FAIL -eq 0 ]; then echo "=== RESULT: working, but $WARN warning(s) above are worth a look ==="
 else echo "=== RESULT: $FAIL problem(s) - DNS is likely broken for clients ==="; fi
 exit $FAIL
-
 ASSET_EOF
   # v1.21.0: extra tunnel lane - gives MagiTrickle's interface dropdown a real netdev that
   # always exits through the restricted subscription, so a list can be pointed at it directly.
@@ -30470,7 +30445,6 @@ case "${1:-status}" in
   status)  status ;;
   *) die "usage: geomask-lane.sh {install|status|remove}" ;;
 esac
-
 ASSET_EOF
   # v1.20.6: morning check - read-only audit the owner runs after the restricted
   # subscription comes back, before enabling the torrent client again.
@@ -30583,7 +30557,6 @@ else
   echo "=== RESULT: $FAIL problem(s) - read the FAIL lines above before torrenting ==="
 fi
 exit $FAIL
-
 ASSET_EOF
   # v1.18.0: VPN lane audit - record what tries to use the P2P-restricted subscription while it
   # is offline, so the operator can see the future load before switching it back on.
@@ -30605,7 +30578,6 @@ logfile=/root/geomask-vpn-audit.log
 
 # Keep at most this many lines (oldest are dropped)
 max_lines=20000
-
 ASSET_EOF
   else
     info "vpnwatch conf: keeping existing /etc/geomask/vpnwatch.conf"
@@ -30823,7 +30795,6 @@ if '--clear' in args:
     print(json.dumps({'ok': True, 'cleared': LOGF})); sys.exit(0)
 do_tick()
 PYEOF
-
 ASSET_EOF
   cron_ensure diagnostic '# geomask-vpnwatch$' '* * * * * /usr/bin/geomask-vpnwatch.sh --tick >/dev/null 2>&1 # geomask-vpnwatch'
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
@@ -30905,7 +30876,6 @@ else
     done ) >/dev/null 2>&1 &
 fi
 exit 0
-
 ASSET_EOF
   save_stream /usr/bin/geomask-guard.sh 755 <<'ASSET_EOF'
 #!/bin/sh
@@ -30923,7 +30893,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.3"
+GUARD_VERSION="1.30.4"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -31101,13 +31071,11 @@ if [ -n "$NEED_FLUSH" ]; then
 fi
 
 exit 0
-
 ASSET_EOF
   save_stream /etc/hotplug.d/iface/99-geomask-guard 755 <<'ASSET_EOF'
 #!/bin/sh
 [ "$ACTION" = "ifup" ] || exit 0
 ( /usr/bin/geomask-guard.sh >/dev/null 2>&1 & )
-
 ASSET_EOF
   cron_ensure guard '# geomask-guard$' '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard'
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
@@ -31678,7 +31646,6 @@ try:
 except Exception: pass
 print('nodes=%d blocked=%d errors=%d applied=%s' % (total, len(blocked), errs, applied))
 PYEOF
-
 ASSET_EOF
   if [ ! -s "$(P /etc/geomask-nodes.conf)" ]; then
     save_stream /etc/geomask-nodes.conf 644 <<'ASSET_EOF'
@@ -31725,7 +31692,6 @@ ai_egress_url=https://chatgpt.com/cdn-cgi/trace
 ai_expect=US
 ai_listener=http://127.0.0.1:7891
 ai_exclude_base=HY2
-
 ASSET_EOF
   else
     info "nodes conf: keeping existing /etc/geomask-nodes.conf"
@@ -32161,7 +32127,6 @@ if '--mode' in args:
     print(json.dumps({'ok': ok, 'mode': mode})); sys.exit(0 if ok else 1)
 do_scan()
 PYEOF
-
 ASSET_EOF
   if [ ! -s "$(P /etc/geomask-ytwatch.conf)" ]; then
     save_stream /etc/geomask-ytwatch.conf 644 <<'ASSET_EOF'
@@ -32213,7 +32178,6 @@ max_pins=40
 
 # MagiTrickle group that feeds ytvpn.yaml (created by geomask, editable at :8080)
 group_name=GoogleVideo VPN
-
 ASSET_EOF
   else
     # Keeping the operator's file must not mean "never learn new options": every key that the
@@ -32268,7 +32232,6 @@ max_pins=40
 
 # MagiTrickle group that feeds ytvpn.yaml (created by geomask, editable at :8080)
 group_name=GoogleVideo VPN
-
 ASSET_EOF
     _added=$(python3 - "$(P /etc/geomask-ytwatch.conf)" /tmp/geomask-ytwatch.conf.new <<'PYEOF'
 import sys
@@ -32332,7 +32295,6 @@ while true; do
     _prev=$_c
   fi
 done
-
 ASSET_EOF
   save_stream /etc/init.d/geomask-syncd 755 <<'ASSET_EOF'
 #!/bin/sh /etc/rc.common
@@ -32350,7 +32312,6 @@ start_service() {
 	procd_set_param pidfile /var/run/geomask-syncd.pid
 	procd_close_instance
 }
-
 ASSET_EOF
   initd geomask-syncd enable >/dev/null 2>&1 || true
   if pgrep -f geomask-syncd.sh >/dev/null 2>&1; then

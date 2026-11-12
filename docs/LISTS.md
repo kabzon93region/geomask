@@ -47,6 +47,31 @@ MagiTrickle меняют (добавили AI-провайдер и т.п.) и �
 3. CI-тест S17 проверяет, что в шаблоне нет URL/HWID/32-hex секретов;
 4. коммит + релиз.
 
+## Правка одного домена (v1.30.1)
+
+Шаблон догоняет роутер только при явном сиде, поэтому добавленный в git домен на живом
+роутере сам не появится — и наоборот, домен может быть в группе, но с выключенным
+правилом (`enable: false`), и тогда MagiTrickle его не маршрутизирует.
+
+Для точечных правок есть `geomask-lists-edit.py` (на роутере
+`/usr/lib/geomask/geomask-lists-edit.py`):
+
+```sh
+python3 /usr/lib/geomask/geomask-lists-edit.py groups
+python3 /usr/lib/geomask/geomask-lists-edit.py add    --group "To VPN" --domain plati.market
+python3 /usr/lib/geomask/geomask-lists-edit.py move   --group "To VPN" --domain plati.market
+python3 /usr/lib/geomask/geomask-lists-edit.py remove --domain plati.market
+```
+
+`move` — это одна транзакция: домен вынимается из старой группы и кладётся в новую, чтобы
+он не оказался сразу в двух (тогда путь не определён). Перед записью инструмент считает
+группы и правила и отказывается от правки, которую не может разобрать обратно; держит
+pre-image в `/tmp`; останавливает magitrickled, пишет, поднимает и ждёт сервис; при
+неудаче возвращает файл; в конце запускает синк mihomo. `--dry-run` показывает план.
+
+Интерфейс группы задаёт путь: `Mihomo` → в туннель (дальше решают правила mihomo,
+`RULE-SET,mtrickle,VPN`), `VPN-noP2P`/`AI` → сразу в этот туннель, `pppoe-wan` → напрямую.
+
 ## Связанные проверки
 
 - Тесты: `tests/run_tests.sh` → сценарий **S17** (wiring + скан секретов + контракт ситейлера).

@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,20 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = 'kabzon93region/geomask'
 INSTALLER = os.path.join(ROOT, 'geomask.sh')
+
+
+def bash():
+    """Git Bash on Windows is not on PATH; the workspace keeps it in Program Files."""
+    candidates = [os.environ.get('GM_BASH'), r'C:\Program Files\Git\bin\bash.exe', 'bash']
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if os.path.isabs(candidate) and os.path.exists(candidate):
+            return candidate
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return 'bash'
 
 
 def run(cmd, cwd=ROOT, timeout=900, check=False):
@@ -134,7 +149,7 @@ def run_tests():
         ('RPC-манифест', [sys.executable, 'tools/gen-geo-rpc.py', '--check']),
         ('python-тесты', [sys.executable, '-B', '-m', 'unittest', 'discover',
                           '-s', 'tests', '-p', 'test_*.py']),
-        ('песочница', ['bash', 'tests/run_tests.sh']),
+        ('песочница', [bash(), 'tests/run_tests.sh']),
     ]
     failed = []
     for name, cmd in steps:
@@ -237,10 +252,10 @@ def verify(full=False):
         print('  ОШИБКА: GM_VERSION=%r, ожидался %r'
               % (found.group(1) if found else None, version))
         ok = False
-    syntax = run(['bash', '-n', target])
+    syntax = run([bash(), '-n', target])
     print('  sh -n                %s' % ('ok' if syntax.returncode == 0 else 'FAIL'))
     ok = ok and syntax.returncode == 0
-    listing = run(['bash', target, '--list-modules'], timeout=120)
+    listing = run([bash(), target, '--list-modules'], timeout=120)
     modules = len([line for line in (listing.stdout or '').splitlines() if line.strip()])
     print('  --list-modules       %s (%d строк)' % ('ok' if listing.returncode == 0 else 'FAIL',
                                                     modules))
@@ -248,7 +263,7 @@ def verify(full=False):
     if full:
         print('  полная песочница на скачанном файле (416 проверок)')
         env = dict(os.environ, GM_SCRIPT=target)
-        suite = subprocess.run(['bash', 'tests/run_tests.sh'], cwd=ROOT, env=env,
+        suite = subprocess.run([bash(), 'tests/run_tests.sh'], cwd=ROOT, env=env,
                                capture_output=True, text=True, encoding='utf-8',
                                errors='replace', timeout=1800)
         tail = [line for line in (suite.stdout or '').splitlines() if 'SANDBOX RESULT' in line]

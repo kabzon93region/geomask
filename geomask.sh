@@ -8587,6 +8587,8 @@ def host_route(host):
     if policy in ('VPN', 'VPN-noP2P', 'AI', 'GLOBAL'):
         info = group_state(policy) or {}
         cc, country = info.get('cc', ''), info.get('country', '')
+        if not cc and (info.get('now') or '').upper() == 'DIRECT':
+            cc, country = 'RU', 'Россия'     # GLOBAL defaults to DIRECT on this router
     elif policy == 'DIRECT':
         cc, country = 'RU', 'Россия'
     return {'host': host, 'group': (route[0]['name'] if route else ''),
@@ -8680,10 +8682,11 @@ def trace_domain(domain, live=False):
                  'Mihomo не отвечает на 127.0.0.1:9090: /etc/init.d/mihomo restart.')
     elif policy == 'GLOBAL':
         info = group_state('GLOBAL')
-        if info and info['now']:
-            step('Выход', 'warn', 'GLOBAL → узел «%s»%s (домен не покрыт правилами)'
-                 % (info['now'],
-                    (', страна ' + info['country'] + ' (' + info['cc'] + ')') if info['country'] else ''),
+        now = (info or {}).get('now') or ''
+        if now:
+            where = ('напрямую через провайдера, страна Россия (RU)' if now.upper() == 'DIRECT'
+                     else 'узел «%s»%s' % (now, (', страна ' + info['country']) if info.get('country') else ''))
+            step('Выход', 'warn', 'GLOBAL → %s (домен не покрыт правилами)' % where,
                  'Домен попадает в MATCH,GLOBAL: путь зависит от того, что выбрано в GLOBAL. '
                  'Чтобы он был предсказуем, добавьте домен в группу MagiTrickle: '
                  'geomask-lists-edit.py add --group "<группа>" --domain %s' % domain)
@@ -9084,7 +9087,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "35e8be4a1562acf4cf7ce30f8e6e03536d3fb79e4add0ef6a1c9bf987d49c0d6"
+          "sha256": "31689d5f314bbab10618b4dae6a1e31bfb11755d825436ed967ad6702c7966c4"
         }
       ]
     },

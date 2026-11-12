@@ -7683,6 +7683,25 @@ def magitrickle_route(domain):
     return best
 
 
+def magitrickle_disabled(domain):
+    """A group that lists the domain but with the rule switched off, if any.
+
+    This is the case the owner hit with plati.market: the domain was in a group all along,
+    the rule just had `enable: false`, so the trace said "not in any group" and sent them
+    looking for a missing list instead of a checkbox.
+    """
+    for group in parse_magitrickle(read_text(MT_CONF)):
+        for rule in group.get('rules') or []:
+            if rule.get('enable', True):
+                continue
+            kind = (rule.get('type') or 'namespace').lower()
+            if kind == 'subnet':
+                continue
+            if domain_matches(domain, rule.get('rule'), kind):
+                return group, rule
+    return None, None
+
+
 def parse_mihomo(text):
     """(rule_providers {name: path}, rules [text]) from the mihomo config.
 
@@ -8489,8 +8508,18 @@ def trace_domain(domain, live=False):
     # 2. MagiTrickle
     route = magitrickle_route(domain)
     if route is None:
-        step('MagiTrickle', 'warn', 'домена нет ни в одной группе — пойдёт по общим правилам',
-             'Чтобы задать направление, добавьте домен в группу MagiTrickle (вкладка «Списки и синк»).')
+        off_group, off_rule = magitrickle_disabled(domain)
+        if off_group is not None:
+            step('MagiTrickle', 'warn',
+                 'правило есть в группе «%s», но выключено (enable: false)'
+                 % (off_group['name'] or 'без имени'),
+                 'Включите правило в MagiTrickle (галочка у домена %s) или перенесите домен '
+                 'в нужную группу: geomask-lists-edit.py move --group "<группа>" --domain %s'
+                 % (off_rule.get('rule'), domain))
+        else:
+            step('MagiTrickle', 'warn', 'домена нет ни в одной группе — пойдёт по общим правилам',
+                 'Чтобы задать направление, добавьте домен в группу MagiTrickle: '
+                 'geomask-lists-edit.py add --group "<группа>" --domain %s' % domain)
     else:
         group, rule, _ = route
         step('MagiTrickle', 'ok', 'группа «%s» (интерфейс %s), правило %s:%s'
@@ -8868,7 +8897,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "0c7a3758f5024dc9e1e2319332b8d56d9bca14fd823efa4e94e5c7eb070013b3"
+          "sha256": "c359e2e949375cba76f3b6254e632fee3a639d90c36bf76f564bf83b56b2a884"
         }
       ]
     },

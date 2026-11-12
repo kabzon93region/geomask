@@ -117,6 +117,17 @@ class DoctorParserTests(unittest.TestCase):
         doctor.MT_CONF = self.write('mt.yaml', MT_CONFIG)
         self.assertIsNone(doctor.magitrickle_route('api.openai.com'))
 
+    def test_a_disabled_rule_is_named_not_called_missing(self):
+        # the live case: the domain was listed all along, the rule was switched off
+        text = ('groups:\n- id: a\n  name: Shops\n  interface: Mihomo\n  enable: true\n'
+                '  rules:\n  - id: r1\n    type: namespace\n    rule: plati.market\n'
+                '    enable: false\n')
+        doctor.MT_CONF = self.write('mt.yaml', text)
+        self.assertIsNone(doctor.magitrickle_route('plati.market'))
+        group, rule = doctor.magitrickle_disabled('plati.market')
+        self.assertEqual(group['name'], 'Shops')
+        self.assertEqual(rule['rule'], 'plati.market')
+
     def test_route_prefers_the_most_specific_rule(self):
         text = ('groups:\n- id: a\n  name: G\n  interface: Mihomo\n  enable: true\n'
                 '  rules:\n  - id: r1\n    type: namespace\n    rule: com\n    enable: true\n'

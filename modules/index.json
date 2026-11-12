@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "core_version": "1.30.6",
+  "core_version": "1.30.7",
   "modules": {
     "admission_service": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -35,7 +35,7 @@
       ]
     },
     "backup_share": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -184,7 +184,7 @@
       ]
     },
     "device_modes": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -260,7 +260,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "e0943255077f66425b2f1db8afe025865df31acb8783ac6c2bf5c79b10003252"
+          "sha256": "88b86fba23bc4bb32b0250a3c6763cece66ce8342ab5d231481d3bf84ecc0220"
         }
       ]
     },
@@ -276,7 +276,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "379e331f57b382f5ee2b0ba070f523f14319177a20120071f2aac64ef791f6b8"
+          "sha256": "96d27788ed7b95cf9051190b9bac4184054d0f0d3275f29e25e7163cd444a7e2"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -300,12 +300,12 @@
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "dc90385b9ea437633281ca95426409beb0dc91df87a308db027762d6076fe087"
+          "sha256": "0ea715261a6851196e46424c8c452a81574df749f2c4f4ab5abb5bc3ca5ca9ff"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -316,7 +316,7 @@
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -326,7 +326,7 @@
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -336,7 +336,7 @@
       "files": []
     },
     "self_update": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "service",
       "name": "Self Update",
       "dependencies": [

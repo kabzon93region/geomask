@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.6"
+GM_VERSION="1.30.7"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -5105,7 +5105,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.6"
+BACKEND_VERSION="1.30.7"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6673,7 +6673,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.6', '1.30.6', '1.30.6')
+VERSION_MARKERS = ('1.30.7', '1.30.7', '1.30.7')
 
 
 def stamp_versions(data, version):
@@ -8932,10 +8932,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.6",
+  "core_version": "1.30.7",
   "modules": {
     "admission_service": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -8967,7 +8967,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9116,7 +9116,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9192,7 +9192,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "e0943255077f66425b2f1db8afe025865df31acb8783ac6c2bf5c79b10003252"
+          "sha256": "88b86fba23bc4bb32b0250a3c6763cece66ce8342ab5d231481d3bf84ecc0220"
         }
       ]
     },
@@ -9208,7 +9208,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "379e331f57b382f5ee2b0ba070f523f14319177a20120071f2aac64ef791f6b8"
+          "sha256": "96d27788ed7b95cf9051190b9bac4184054d0f0d3275f29e25e7163cd444a7e2"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9232,12 +9232,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "dc90385b9ea437633281ca95426409beb0dc91df87a308db027762d6076fe087"
+          "sha256": "0ea715261a6851196e46424c8c452a81574df749f2c4f4ab5abb5bc3ca5ca9ff"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9248,7 +9248,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9258,7 +9258,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9268,7 +9268,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.5",
+      "version": "1.30.6",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9617,7 +9617,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.6';
+var PANEL_VERSION = '1.30.7';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -12040,6 +12040,19 @@ step4_check() {
 step4_apply() {
   mod_skipped ai_dns && return 0
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then info "AI-DNS disabled by flag - nothing to do"; return 0; fi
+  # v1.30.7: same rule as step 1 - what is installable from the feeds is installed here,
+  # not left to the owner. https-dns-proxy is the DoH worker this step configures.
+  if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
+    if have apk; then
+      info "installing: https-dns-proxy (apk)"
+      apk add https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
+        || warn "apk add https-dns-proxy failed - AI-DNS will not start until it is installed"
+    elif have opkg; then
+      info "installing: https-dns-proxy (opkg)"
+      opkg install https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
+        || warn "opkg install https-dns-proxy failed - AI-DNS will not start until it is installed"
+    fi
+  fi
   _bk=$(ensure_backup) || { bad "no backup - ABORTED"; return 1; }
   info "backup: $_bk"
   # 1) dedicated user for the AI DoH worker (sockets get marked by uid)
@@ -30930,7 +30943,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.6"
+GUARD_VERSION="1.30.7"
 
 log() { logger -t geomask-guard "$*"; }
 

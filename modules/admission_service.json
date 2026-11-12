@@ -1,7 +1,7 @@
 {
   "id": "admission_service",
   "name": "AI Admission Service",
-  "version": "1.30.5",
+  "version": "1.30.6",
   "schema_version": 1,
   "type": "service",
   "description": "AI node admission proof via multi-service verification",

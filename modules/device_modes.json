@@ -1,7 +1,7 @@
 {
   "id": "device_modes",
   "name": "Device Modes",
-  "version": "1.30.5",
+  "version": "1.30.6",
   "schema_version": 1,
   "type": "feature",
   "description": "Per-device routing modes (AI, VPN, VPN-noP2P, Bypass, Direct)",

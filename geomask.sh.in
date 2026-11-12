@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.6"
+GM_VERSION="1.30.7"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -1210,6 +1210,19 @@ step4_check() {
 step4_apply() {
   mod_skipped ai_dns && return 0
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then info "AI-DNS disabled by flag - nothing to do"; return 0; fi
+  # v1.30.7: same rule as step 1 - what is installable from the feeds is installed here,
+  # not left to the owner. https-dns-proxy is the DoH worker this step configures.
+  if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
+    if have apk; then
+      info "installing: https-dns-proxy (apk)"
+      apk add https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
+        || warn "apk add https-dns-proxy failed - AI-DNS will not start until it is installed"
+    elif have opkg; then
+      info "installing: https-dns-proxy (opkg)"
+      opkg install https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
+        || warn "opkg install https-dns-proxy failed - AI-DNS will not start until it is installed"
+    fi
+  fi
   _bk=$(ensure_backup) || { bad "no backup - ABORTED"; return 1; }
   info "backup: $_bk"
   # 1) dedicated user for the AI DoH worker (sockets get marked by uid)

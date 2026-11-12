@@ -247,6 +247,14 @@ class ModuleUpdateTests(unittest.TestCase):
         saved = json.loads(self.state_path.read_text(encoding='utf-8'))
         self.assertEqual(saved['modules']['core']['version'], '0.9.0')
 
+    def test_seed_versions_flag_trusts_the_installer(self):
+        # the installer wrote this release; a generated ruleset is not a local edit
+        self.put(str(self.root / 'bin' / 'tool.sh'), b'body\n', on_disk=b'generated\n')
+        state = {'schema': 1, 'modules': {'core': {'version': '0.9.0', 'files': {}}}}
+        updater.seed_state(self.index('1.1.0'), state, str(self.state_path), versions=True)
+        saved = json.loads(self.state_path.read_text(encoding='utf-8'))
+        self.assertEqual(saved['modules']['core']['version'], '1.1.0')
+
     # --- guards -----------------------------------------------------------
     def test_dependency_must_be_new_enough(self):
         index = {'schema': 1, 'modules': {

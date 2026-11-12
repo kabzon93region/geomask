@@ -332,13 +332,17 @@ def install_staged(module_id, staged, state, version, state_path=DEFAULT_STATE):
     return backup
 
 
-def seed_state(index, state, state_path=DEFAULT_STATE):
+def seed_state(index, state, state_path=DEFAULT_STATE, versions=False):
     """Record what is on disk right now, so later edits are detectable.
 
     The installer calls this once with the index it shipped: without a baseline every
-    untouched file would look locally modified on the first update. The version is taken
-    from the index only when every file of the module already matches it - seeding a
-    router that carries older bytes must not pretend it is current.
+    untouched file would look locally modified on the first update.
+
+    versions=False keeps the recorded version unless every file already matches the index.
+    versions=True stamps the index version on every module whose files exist - that is
+    what the installer and a deploy mean by "this release is what is on the router", and
+    it must not be confused by files the release itself generates (mihomo rulesets,
+    owner-edited configs) which legitimately differ from the shipped asset.
     """
     modules = state.setdefault('modules', {})
     seeded = 0
@@ -359,7 +363,9 @@ def seed_state(index, state, state_path=DEFAULT_STATE):
             seeded += 1
         if not expected:
             # a module without files (panel-only) ships with the release it names
-            record.setdefault('version', module.get('version', '0.0.0'))
+            record['version'] = module.get('version', '0.0.0')
+        elif versions and hashes:
+            record['version'] = module.get('version', '0.0.0')
         elif matched and hashes:
             record['version'] = module.get('version', '0.0.0')
         else:
@@ -376,6 +382,7 @@ def main(argv=None):
     parser.add_argument('--state', default=DEFAULT_STATE)
     parser.add_argument('--config', default=DEFAULT_CONFIG)
     parser.add_argument('--selection', default=DEFAULT_SELECTION)
+    parser.add_argument('--versions', action='store_true')
     parser.add_argument('--index-file', default='')
     args = parser.parse_args(argv)
 
@@ -390,7 +397,7 @@ def main(argv=None):
                 source = 'file'
             else:
                 index, source = load_index(config)
-            seeded = seed_state(index, state, args.state)
+            seeded = seed_state(index, state, args.state, versions=args.versions)
             print(json.dumps({'ok': True, 'seeded': seeded, 'source': source},
                              ensure_ascii=False))
             return 0

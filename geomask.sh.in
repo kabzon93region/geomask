@@ -449,9 +449,10 @@ ASSET_EOF
 @@ASSET:acl.json@@
 ASSET_EOF
 
-  # Baseline for per-module updates: record the hashes we just installed.
+  # Baseline for per-module updates: record the hashes and the versions we just installed
+  # (--versions: files this release generates, like mihomo rulesets, are not byte-equal).
   [ -f /etc/geomask/modules-index.json ] && \
-    python3 /usr/lib/geomask/geomask-module-update.py seed \
+    python3 /usr/lib/geomask/geomask-module-update.py seed --versions \
       --index-file /etc/geomask/modules-index.json >/dev/null 2>&1 || true
   # v1.29.0: remember which modules this router carries (panel + per-module updater read it).
   modules_state_sync

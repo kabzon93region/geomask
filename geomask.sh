@@ -7826,7 +7826,7 @@ def mihomo_route(domain, ips):
                 ok, note = match_condition(entry, domain, ips)
                 if ok:
                     return {'index': index, 'rule': rule, 'policy': policy,
-                            'note': 'RULE-SET %s → %s' % (name, note), 'ruleset': path}
+                            'note': 'в списке %s: %s' % (name, note), 'ruleset': path}
             continue
         ok, note = match_condition(rule, domain, ips)
         if ok:
@@ -8655,6 +8655,25 @@ def trace_domain(domain, live=False):
              % (hit['index'], hit['rule'], hit['policy'],
                 (' (' + hit['note'] + ')') if hit.get('note') else ''))
 
+    # 3b. where that rule set comes from - the owner asked whether it duplicates MagiTrickle
+    if hit and hit.get('ruleset'):
+        ruleset_path = hit['ruleset']
+        head = read_text(ruleset_path)[:200]
+        stamp = ''
+        try:
+            stamp = time.strftime('%d.%m %H:%M', time.localtime(os.path.getmtime(ruleset_path)))
+        except OSError:
+            pass
+        name = os.path.basename(ruleset_path)
+        if 'AUTO-GENERATED' in head:
+            step('Источник правила', 'ok',
+                 '%s (пересобран %s) — собран из групп MagiTrickle' % (name, stamp or '?'),
+                 'Домен вписан один раз, в MagiTrickle; файл для mihomo делает '
+                 'sync_mtrickle_mihomo.sh при каждом изменении групп.')
+        else:
+            step('Источник правила', 'ok', '%s — отдельный список, не из MagiTrickle' % name,
+                 'Этот файл ведётся отдельно от групп MagiTrickle: смотрите его историю в git.')
+
     # 4. exit
     policy = (hit or {}).get('policy', 'GLOBAL')
     if policy in ('DIRECT', 'REJECT'):
@@ -9087,7 +9106,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "31689d5f314bbab10618b4dae6a1e31bfb11755d825436ed967ad6702c7966c4"
+          "sha256": "08c30bbaca608c59126714dd2d2a310205571bedd1d0533daba070e5469ce679"
         }
       ]
     },

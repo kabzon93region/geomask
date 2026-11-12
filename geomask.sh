@@ -5888,7 +5888,14 @@ _upd_mark() { # $1=file, $2=marker name; supports NAME="v" and NAME = 'v'
   sed -n "s/.*$2[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" "$1" 2>/dev/null | head -1
 }
 
-_upd_core_ver() { # installed installer copy (may be absent)
+_upd_core_ver() { # release identity: the deployed marker first, then an installer copy
+  # v1.30.3: /etc/geomask/version is written by the installer and by a deploy, so it always
+  # describes THIS router. The /root and /tmp copies are leftovers from old runs: one of them
+  # (1.25.3) made the panel offer a "downgrade" to the release it already had.
+  if [ -s /etc/geomask/version ]; then
+    _v=$(sed -n 's/^[[:space:]]*\([0-9][0-9.]*\).*/\1/p' /etc/geomask/version 2>/dev/null | head -1)
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+  fi
   for f in /tmp/geomask.sh /root/geomask.sh; do
     [ -f "$f" ] || continue
     _v=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
@@ -5944,13 +5951,19 @@ _upd_local_block() { # $1 = latest version (no leading v)
   _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION); [ -n "$_guard" ] || _guard=none
   _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION); [ -n "$_backend" ] || _backend=none
   _LNEED=false
-  # The "core" marker is an installer copy under /tmp and dies on every reboot, so it must NOT
-  # decide whether an update is needed - otherwise a healthy router asks to reinstall after a
-  # restart. The release identity comes from the deployed (flash) components instead.
-  _cur=$_core
+  # The release identity comes from the deployed (flash) components - newest wins. The core
+  # marker is only a fallback: an installer copy under /tmp dies on every reboot, and a stale
+  # copy in /root once made a 1.30.0 router compare itself against 1.25.3 and offer a
+  # "downgrade" to the release it already had.
+  _cur=none
   for _cand in "$_backend" "$_panel" "$_guard"; do
-    [ "$_cur" = "none" ] && [ -n "$_cand" ] && [ "$_cand" != "none" ] && _cur=$_cand
+    [ "$_cand" = "none" ] && continue
+    [ -z "$_cand" ] && continue
+    if [ "$_cur" = "none" ]; then _cur=$_cand
+    elif _upd_newer "$_cand" "$_cur"; then _cur=$_cand
+    fi
   done
+  [ "$_cur" = "none" ] && _cur=$_core
   if [ "$_cur" = "none" ]; then _LNEED=true          # nothing deployed at all -> really needs install
   elif _upd_newer "$1" "$_cur"; then _LNEED=true
   elif [ "$_cur" = "$1" ] && { [ "$_panel" != "$1" ] || [ "$_guard" != "$1" ] || [ "$_backend" != "$1" ]; }; then
@@ -9166,7 +9179,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "c029eb4df0c9900c4afaa035e55db87b2fa2bb8d61865bc5c04cd14da3aa4d1a"
+          "sha256": "fd58f19bbe66893a230e3882826a00a6cc6df27c01a9a3350dabe31976690b72"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9190,7 +9203,7 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "876f41fb58a06a7ea7641a6a14ec07b274e7560d5879cfc30c925e834d08cf03"
+          "sha256": "60867eec902cfd3b94f3034463de4d30ba987e7c38083716817dea01075f2d75"
         }
       ]
     },
@@ -9483,6 +9496,10 @@ ASSET_EOF
 }
 
 ASSET_EOF
+
+  # v1.30.3: the release identity of THIS router. The panel compares the GitHub release
+  # against this file, so a leftover installer copy in /root cannot make it offer a downgrade.
+  printf '%s\n' "$GM_VERSION" > "$(P /etc/geomask/version)" 2>/dev/null || true
 
   # Baseline for per-module updates: record the hashes and the versions we just installed
   # (--versions: files this release generates, like mihomo rulesets, are not byte-equal).
@@ -10363,16 +10380,31 @@ return view.extend({
 				E('span', { 'class': 'gs-upd-meta' }, String(updErr))
 			]));
 		} else {
-			/* v1.30.0: the three component versions moved into the module list above - one
-			   place for every part of geomask. This card only answers "is there a release
-			   on GitHub, and do you want to install it". */
+			/* v1.30.3: show the installed release next to the GitHub one. Without it the card
+			   read as "1.25.3 - доступно обновление" on a router that already ran 1.30.0. */
+			var localRelease = loc.core || 'none';
+			var localNewer = false;
+			try {
+				var a = String(localRelease).split('.').map(Number),
+					b = String(latV).split('.').map(Number);
+				localNewer = localRelease !== 'none' && latV &&
+					(a[0] > b[0] || (a[0] === b[0] && (a[1] > b[1] ||
+					 (a[1] === b[1] && a[2] > b[2]))));
+			} catch (e) { localNewer = false; }
+			updChildren.push(verRow('Установлено', localRelease,
+				localNewer ? E('span', { 'class': 'gs-upd-meta' }, 'новее релиза на GitHub') : null));
 			updChildren.push(E('div', { 'class': 'gs-row' }, [
 				E('span', { 'class': 'gs-label' }, 'Доступно на GitHub'),
 				latV ? E('span', { 'class': 'gs-val gs-upd-latest' }, latTag) : E('span', {}, '—'),
 				upd.need === true
 					? E('span', { 'class': 'gs-badge gs-warn' }, 'доступно обновление')
-					: E('span', { 'class': 'gs-badge gs-ok' }, 'актуально')
+					: (localNewer
+						? E('span', { 'class': 'gs-badge gs-ok' }, 'локальная новее — обновлять не нужно')
+						: E('span', { 'class': 'gs-badge gs-ok' }, 'актуально'))
 			]));
+			updChildren.push(E('div', { 'class': 'gs-hint', 'style': 'margin:2px 0 8px' },
+				'Части: панель ' + (loc.panel || '—') + ' · бэкенд ' + (loc.backend || '—') +
+				' · guard ' + (loc.guard || '—') + '. Версии модулей — в списке выше.'));
 			/* The GitHub answer is cached for an hour on purpose (unauthenticated API allows
 			   ~60 requests/hour), so a release published minutes ago stays invisible. This
 			   button forces one live poll. */

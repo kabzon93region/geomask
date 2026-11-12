@@ -453,6 +453,10 @@ ASSET_EOF
 @@ASSET:acl.json@@
 ASSET_EOF
 
+  # v1.30.3: the release identity of THIS router. The panel compares the GitHub release
+  # against this file, so a leftover installer copy in /root cannot make it offer a downgrade.
+  printf '%s\n' "$GM_VERSION" > "$(P /etc/geomask/version)" 2>/dev/null || true
+
   # Baseline for per-module updates: record the hashes and the versions we just installed
   # (--versions: files this release generates, like mihomo rulesets, are not byte-equal).
   [ -f /etc/geomask/modules-index.json ] && \

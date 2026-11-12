@@ -276,7 +276,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "c029eb4df0c9900c4afaa035e55db87b2fa2bb8d61865bc5c04cd14da3aa4d1a"
+          "sha256": "fd58f19bbe66893a230e3882826a00a6cc6df27c01a9a3350dabe31976690b72"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -300,7 +300,7 @@
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "876f41fb58a06a7ea7641a6a14ec07b274e7560d5879cfc30c925e834d08cf03"
+          "sha256": "60867eec902cfd3b94f3034463de4d30ba987e7c38083716817dea01075f2d75"
         }
       ]
     },

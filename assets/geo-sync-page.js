@@ -853,16 +853,31 @@ return view.extend({
 				E('span', { 'class': 'gs-upd-meta' }, String(updErr))
 			]));
 		} else {
-			/* v1.30.0: the three component versions moved into the module list above - one
-			   place for every part of geomask. This card only answers "is there a release
-			   on GitHub, and do you want to install it". */
+			/* v1.30.3: show the installed release next to the GitHub one. Without it the card
+			   read as "1.25.3 - доступно обновление" on a router that already ran 1.30.0. */
+			var localRelease = loc.core || 'none';
+			var localNewer = false;
+			try {
+				var a = String(localRelease).split('.').map(Number),
+					b = String(latV).split('.').map(Number);
+				localNewer = localRelease !== 'none' && latV &&
+					(a[0] > b[0] || (a[0] === b[0] && (a[1] > b[1] ||
+					 (a[1] === b[1] && a[2] > b[2]))));
+			} catch (e) { localNewer = false; }
+			updChildren.push(verRow('Установлено', localRelease,
+				localNewer ? E('span', { 'class': 'gs-upd-meta' }, 'новее релиза на GitHub') : null));
 			updChildren.push(E('div', { 'class': 'gs-row' }, [
 				E('span', { 'class': 'gs-label' }, 'Доступно на GitHub'),
 				latV ? E('span', { 'class': 'gs-val gs-upd-latest' }, latTag) : E('span', {}, '—'),
 				upd.need === true
 					? E('span', { 'class': 'gs-badge gs-warn' }, 'доступно обновление')
-					: E('span', { 'class': 'gs-badge gs-ok' }, 'актуально')
+					: (localNewer
+						? E('span', { 'class': 'gs-badge gs-ok' }, 'локальная новее — обновлять не нужно')
+						: E('span', { 'class': 'gs-badge gs-ok' }, 'актуально'))
 			]));
+			updChildren.push(E('div', { 'class': 'gs-hint', 'style': 'margin:2px 0 8px' },
+				'Части: панель ' + (loc.panel || '—') + ' · бэкенд ' + (loc.backend || '—') +
+				' · guard ' + (loc.guard || '—') + '. Версии модулей — в списке выше.'));
 			/* The GitHub answer is cached for an hour on purpose (unauthenticated API allows
 			   ~60 requests/hour), so a release published minutes ago stays invisible. This
 			   button forces one live poll. */

@@ -848,7 +848,14 @@ _upd_mark() { # $1=file, $2=marker name; supports NAME="v" and NAME = 'v'
   sed -n "s/.*$2[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" "$1" 2>/dev/null | head -1
 }
 
-_upd_core_ver() { # installed installer copy (may be absent)
+_upd_core_ver() { # release identity: the deployed marker first, then an installer copy
+  # v1.30.3: /etc/geomask/version is written by the installer and by a deploy, so it always
+  # describes THIS router. The /root and /tmp copies are leftovers from old runs: one of them
+  # (1.25.3) made the panel offer a "downgrade" to the release it already had.
+  if [ -s /etc/geomask/version ]; then
+    _v=$(sed -n 's/^[[:space:]]*\([0-9][0-9.]*\).*/\1/p' /etc/geomask/version 2>/dev/null | head -1)
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+  fi
   for f in /tmp/geomask.sh /root/geomask.sh; do
     [ -f "$f" ] || continue
     _v=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
@@ -904,13 +911,19 @@ _upd_local_block() { # $1 = latest version (no leading v)
   _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION); [ -n "$_guard" ] || _guard=none
   _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION); [ -n "$_backend" ] || _backend=none
   _LNEED=false
-  # The "core" marker is an installer copy under /tmp and dies on every reboot, so it must NOT
-  # decide whether an update is needed - otherwise a healthy router asks to reinstall after a
-  # restart. The release identity comes from the deployed (flash) components instead.
-  _cur=$_core
+  # The release identity comes from the deployed (flash) components - newest wins. The core
+  # marker is only a fallback: an installer copy under /tmp dies on every reboot, and a stale
+  # copy in /root once made a 1.30.0 router compare itself against 1.25.3 and offer a
+  # "downgrade" to the release it already had.
+  _cur=none
   for _cand in "$_backend" "$_panel" "$_guard"; do
-    [ "$_cur" = "none" ] && [ -n "$_cand" ] && [ "$_cand" != "none" ] && _cur=$_cand
+    [ "$_cand" = "none" ] && continue
+    [ -z "$_cand" ] && continue
+    if [ "$_cur" = "none" ]; then _cur=$_cand
+    elif _upd_newer "$_cand" "$_cur"; then _cur=$_cand
+    fi
   done
+  [ "$_cur" = "none" ] && _cur=$_core
   if [ "$_cur" = "none" ]; then _LNEED=true          # nothing deployed at all -> really needs install
   elif _upd_newer "$1" "$_cur"; then _LNEED=true
   elif [ "$_cur" = "$1" ] && { [ "$_panel" != "$1" ] || [ "$_guard" != "$1" ] || [ "$_backend" != "$1" ]; }; then

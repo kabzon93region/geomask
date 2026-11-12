@@ -592,9 +592,14 @@ if [ "$(grep -c '_upd_local_block' "$HERE/../assets/geo-backend.sh")" -ge 3 ]; t
   echo "PASS: S21 helper defined and used in both paths"; pass=$((pass+1))
 else echo "FAIL: S21 helper not used in both paths"; failn=$((failn+1)); fi
 
-# ---------- scenario 22: reboot must not make the update card lie (v1.14.3) ----------
+# ---------- scenario 22: reboot must not make the update card lie (v1.14.3, v1.30.3) ----------
 echo "=== S22: release identity from flash components, not /tmp ==="
-if grep -qF 'The "core" marker is an installer copy under /tmp' "$HERE/../assets/geo-backend.sh" \
+# v1.30.3: the newest deployed component decides, and /etc/geomask/version is the release
+# identity. A stale installer copy in /root once made a 1.30.0 router offer a downgrade to
+# 1.25.3, so the core marker must never win over the deployed files.
+if grep -qF '_cur=none' "$HERE/../assets/geo-backend.sh" \
+   && grep -qF '[ "$_cur" = "none" ] && _cur=$_core' "$HERE/../assets/geo-backend.sh" \
+   && grep -qF '/etc/geomask/version' "$HERE/../assets/geo-backend.sh" \
    && grep -qF 'nothing deployed at all' "$HERE/../assets/geo-backend.sh"; then
   echo "PASS: S22 need-flag falls back to deployed components"; pass=$((pass+1))
 else echo "FAIL: S22 need-flag still driven by the volatile /tmp core marker"; failn=$((failn+1)); fi
@@ -602,6 +607,10 @@ else echo "FAIL: S22 need-flag still driven by the volatile /tmp core marker"; f
 if grep -qE 'if \[ "\$_core" = "none" \]; then _LNEED=true$' "$HERE/../assets/geo-backend.sh"; then
   echo "FAIL: S22 bare core=none -> need=true rule still present"; failn=$((failn+1))
 else echo "PASS: S22 no bare core=none -> need=true rule"; pass=$((pass+1)); fi
+# and the installer must record the release identity for the panel to compare against
+if grep -qF '/etc/geomask/version' "$HERE/../geomask.sh.in"; then
+  echo "PASS: S22 installer records /etc/geomask/version"; pass=$((pass+1))
+else echo "FAIL: S22 installer does not record the release identity"; failn=$((failn+1)); fi
 
 # ---------- scenario 23: torrent trackers must never reach the VPN lists (v1.14.4) ----------
 echo "=== S23: torrentdirect (trackers -> DIRECT) ==="

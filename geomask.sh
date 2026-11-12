@@ -8330,7 +8330,7 @@ ASSET_EOF
       "files": []
     },
     "core": {
-      "version": "1.30.0",
+      "version": "1.27.10",
       "type": "core",
       "name": "geomask (ядро)",
       "dependencies": [],
@@ -8507,7 +8507,7 @@ ASSET_EOF
       ]
     },
     "doctor": {
-      "version": "1.29.0",
+      "version": "1.30.0",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [

@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.4"
+GM_VERSION="1.30.5"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -334,6 +334,13 @@ step1_check() {
   _need=0
   [ -f "$(P /etc/openwrt_release)" ] && info "OpenWrt: $(grep '^DISTRIB_RELEASE=' "$(P /etc/openwrt_release)" 2>/dev/null | cut -d"'" -f2)" || { bad "not OpenWrt (/etc/openwrt_release missing)"; _need=1; }
   if have apk; then info "pkg manager: apk"; elif have opkg; then info "pkg manager: opkg"; else bad "no apk/opkg"; _need=1; fi
+  # v1.30.5: geomask is an overlay over mihomo, not a standalone product. Saying so here
+  # means a bare/reset router stops at step 1, before a single file is written, instead of
+  # installing the panel and only then reporting "mihomo binary missing" at step 3.
+  if have mihomo; then info "mihomo: present"
+  else bad "mihomo: MISSING - geomask is an overlay over mihomo; install mihomo first (its config, subscriptions and TUN come from it)"; _need=1; fi
+  if have magitrickled || [ -x "$(P /etc/init.d/magitrickle)" ]; then info "magitrickle: present"
+  else bad "magitrickle: MISSING - domain lists and per-domain routing live there; install magitrickle first"; _need=1; fi
   for c in python3 curl; do
     if have "$c"; then info "$c: present"; else warn "$c: MISSING (needed for magitrickle->mihomo sync)"; _need=1; fi
   done

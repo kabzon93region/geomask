@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.4"
+GM_VERSION="1.30.5"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -375,6 +375,13 @@ step1_check() {
   _need=0
   [ -f "$(P /etc/openwrt_release)" ] && info "OpenWrt: $(grep '^DISTRIB_RELEASE=' "$(P /etc/openwrt_release)" 2>/dev/null | cut -d"'" -f2)" || { bad "not OpenWrt (/etc/openwrt_release missing)"; _need=1; }
   if have apk; then info "pkg manager: apk"; elif have opkg; then info "pkg manager: opkg"; else bad "no apk/opkg"; _need=1; fi
+  # v1.30.5: geomask is an overlay over mihomo, not a standalone product. Saying so here
+  # means a bare/reset router stops at step 1, before a single file is written, instead of
+  # installing the panel and only then reporting "mihomo binary missing" at step 3.
+  if have mihomo; then info "mihomo: present"
+  else bad "mihomo: MISSING - geomask is an overlay over mihomo; install mihomo first (its config, subscriptions and TUN come from it)"; _need=1; fi
+  if have magitrickled || [ -x "$(P /etc/init.d/magitrickle)" ]; then info "magitrickle: present"
+  else bad "magitrickle: MISSING - domain lists and per-domain routing live there; install magitrickle first"; _need=1; fi
   for c in python3 curl; do
     if have "$c"; then info "$c: present"; else warn "$c: MISSING (needed for magitrickle->mihomo sync)"; _need=1; fi
   done
@@ -5068,7 +5075,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.4"
+BACKEND_VERSION="1.30.5"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6636,7 +6643,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.4', '1.30.4', '1.30.4')
+VERSION_MARKERS = ('1.30.5', '1.30.5', '1.30.5')
 
 
 def stamp_versions(data, version):
@@ -8895,10 +8902,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.4",
+  "core_version": "1.30.5",
   "modules": {
     "admission_service": {
-      "version": "1.30.3",
+      "version": "1.30.4",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -8930,7 +8937,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.3",
+      "version": "1.30.4",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -8939,7 +8946,7 @@ ASSET_EOF
       "files": []
     },
     "core": {
-      "version": "1.30.0",
+      "version": "1.30.4",
       "type": "core",
       "name": "geomask (ядро)",
       "dependencies": [],
@@ -9079,7 +9086,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.3",
+      "version": "1.30.4",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9155,7 +9162,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "bebc1ac8f640df9a520236b73967c708dfa95814b7ada2b2ee817e45bfa28d3e"
+          "sha256": "3bc4647fcaeab0868377cd8765edb3ae3e7337bf684906dee03a1e50148117f9"
         }
       ]
     },
@@ -9171,7 +9178,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "56de68d97cef2aa18696e56ac23dca1db387c6839b8418ed25aa77c47012b22a"
+          "sha256": "413681e44975229ee545330c4bb7e6cc439d2f370ae62aa7e1a1171554870529"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9195,12 +9202,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "176806de20fe2bc3f2ae34edc5741f24121114ac31785cba5f389f2636187feb"
+          "sha256": "d67f99f46e2d3886bf2615877f55716ca7003d5df311a1f3a446a75177c1699a"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.3",
+      "version": "1.30.4",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9211,7 +9218,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.3",
+      "version": "1.30.4",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9221,7 +9228,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.3",
+      "version": "1.30.4",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9231,7 +9238,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.3",
+      "version": "1.30.4",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9580,7 +9587,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.4';
+var PANEL_VERSION = '1.30.5';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -30893,7 +30900,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.4"
+GUARD_VERSION="1.30.5"
 
 log() { logger -t geomask-guard "$*"; }
 

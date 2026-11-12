@@ -22,10 +22,16 @@ def compile_nodes(nodes, namespace):
 
 
 def init_command(source):
+    """The AI-DoH init script: an asset since v1.30.0, an inline heredoc before that."""
     match = re.search(r"save_stream /etc/init.d/ai-doh 755 <<'ASSET_EOF'\n(.*?)\nASSET_EOF", source, re.S)
-    if not match:
+    if match and '@@ASSET:' in match.group(1):
+        asset = re.search(r'@@ASSET:([^@]+)@@', match.group(1)).group(1)
+        text = (ROOT / 'assets' / asset).read_text(encoding='utf-8')
+    elif match:
+        text = match.group(1)
+    else:
         raise AssertionError('AI-DoH service heredoc not found')
-    line = next(line for line in match.group(1).splitlines()
+    line = next(line for line in text.splitlines()
                 if 'procd_set_param command ' in line)
     return shlex.split(line)[2:]
 

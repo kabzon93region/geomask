@@ -274,7 +274,7 @@ return view.extend({
 			['obzor', 'Обзор'], ['dev', 'Устройства'], ['subs', 'Подписки'],
 			['lists', 'Списки и синк'], ['nodes', 'Узлы подписки'],
 			['diag', 'Диагностика'],
-			['bk', 'Бэкапы'], ['upd', 'Обновление'], ['mods', 'Модули'], ['set', 'Настройки']
+			['bk', 'Бэкапы'], ['mods', 'Модули'], ['set', 'Настройки']
 		];
 		var curTab = 'obzor';
 		try { curTab = localStorage.getItem('gs-tab') || 'obzor'; } catch (e) {}
@@ -836,7 +836,7 @@ return view.extend({
 		}
 
 		var updChildren = [
-			E('h3', {}, 'Обновления'),
+			E('h3', {}, 'Релиз geomask: обновление целиком'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
 				'Проверка версий — при открытии страницы (кэш 1 ч) и по кнопке. ' +
 				'Обновление geomask: полный бэкап роутера → скачивание релиза с GitHub (sha256) → ' +
@@ -853,11 +853,9 @@ return view.extend({
 				E('span', { 'class': 'gs-upd-meta' }, String(updErr))
 			]));
 		} else {
-			updChildren.push(verRow('geomask (ядро)', coreV,
-				(latV && coreV !== 'none' && coreV !== latV && !upd.need) ? E('span', { 'class': 'gs-upd-meta' }, 'локальная новее релиза') : null));
-			updChildren.push(verRow('Админка LuCI', loc.panel,
-				(loc.panel && loc.backend && loc.panel !== loc.backend) ? E('span', { 'class': 'gs-badge gs-warn' }, 'панель≠бэкенд') : null));
-			updChildren.push(verRow('geomask-guard', loc.guard));
+			/* v1.30.0: the three component versions moved into the module list above - one
+			   place for every part of geomask. This card only answers "is there a release
+			   on GitHub, and do you want to install it". */
 			updChildren.push(E('div', { 'class': 'gs-row' }, [
 				E('span', { 'class': 'gs-label' }, 'Доступно на GitHub'),
 				latV ? E('span', { 'class': 'gs-val gs-upd-latest' }, latTag) : E('span', {}, '—'),
@@ -926,7 +924,7 @@ return view.extend({
 		updChildren.push(updStatus);
 		updChildren.push(updLog);
 		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
-		panels.upd.appendChild(updCard);
+		/* v1.30.0: the release card lives in the module tab (appended after the list) */
 		updRenderLines((upds || {}).lines);
 		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) {
 			updStatus.style.color = '#d29922';
@@ -982,6 +980,9 @@ return view.extend({
 			]),
 			E('div', {}, modRows)
 		]));
+		/* v1.30.0: the release card (former «Обновление» tab) sits right here: one place
+		   to watch and update every part of geomask - modules first, the release below. */
+		panels.mods.appendChild(updCard);
 
 		/* ===================== ДИАГНОСТИКА (v1.29.1) ===================== */
 		var diagData = (diag.checks || []).slice();

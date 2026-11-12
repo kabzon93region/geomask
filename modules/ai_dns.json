@@ -1,7 +1,7 @@
 {
   "id": "ai_dns",
   "name": "AI DNS-over-HTTPS",
-  "version": "1.0.0",
+  "version": "1.30.0",
   "schema_version": 1,
   "type": "feature",
   "description": "AI-mode DNS via DoH through AI tunnel",

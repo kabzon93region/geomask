@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.29.0"
+GM_VERSION="1.30.0"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -125,7 +125,7 @@ _prov_url() {
 # lane the product has no purpose. Everything else is optional and can be left out
 # with --modules=... so a router only carries the features its owner wants.
 GM_REQUIRED_MODULES="core path_vpn"
-GM_ALL_MODULES="core path_vpn path_vpn_nop2p path_ai ai_dns youtube torrent diagnostic doctor device_modes backup_share self_update admission_service"
+GM_ALL_MODULES="core luci guard path_vpn path_vpn_nop2p path_ai ai_dns youtube torrent diagnostic doctor device_modes backup_share self_update admission_service"
 GM_MODULES=""
 
 module_required() { case " $GM_REQUIRED_MODULES " in *" $1 "*) return 0 ;; esac; return 1; }
@@ -136,7 +136,9 @@ module_selected() {
 }
 module_label() {
   case "$1" in
-    core) echo "ядро, панель, бэкенд, обновления" ;;
+    core) echo "geomask (ядро): синк, node-audit, лейн, списки" ;;
+    luci) echo "Админка LuCI: панель, бэкенд, RPC" ;;
+    guard) echo "geomask-guard: сторож маршрута после ifup" ;;
     path_vpn) echo "VPN-лейн (основной туннель)" ;;
     path_vpn_nop2p) echo "VPN-noP2P (без торрентов)" ;;
     path_ai) echo "AI-лейн (Google/OpenAI/Claude)" ;;
@@ -155,6 +157,8 @@ module_label() {
 module_owns_path() { # echoes the module id that owns an install path, if any
   GM_PATH_MODULE=""
   case "$1" in
+    "/etc/init.d/ai-doh") GM_PATH_MODULE="ai_dns" ;;
+    "/etc/init.d/dnsmasq-ai") GM_PATH_MODULE="ai_dns" ;;
     "/etc/geomask-nodes.conf") GM_PATH_MODULE="core" ;;
     "/etc/geomask/lists/magitrickle-groups.yaml") GM_PATH_MODULE="core" ;;
     "/etc/geomask/zapret-always-exclude.txt") GM_PATH_MODULE="core" ;;
@@ -162,8 +166,6 @@ module_owns_path() { # echoes the module id that owns an install path, if any
     "/etc/hotplug.d/iface/99-default-vpn-route") GM_PATH_MODULE="core" ;;
     "/etc/init.d/geomask-syncd") GM_PATH_MODULE="core" ;;
     "/root/sync_mtrickle_mihomo.sh") GM_PATH_MODULE="core" ;;
-    "/usr/bin/geo-backend.sh") GM_PATH_MODULE="core" ;;
-    "/usr/bin/geomask-guard.sh") GM_PATH_MODULE="core" ;;
     "/usr/bin/geomask-lane.sh") GM_PATH_MODULE="core" ;;
     "/usr/bin/geomask-node-scan.sh") GM_PATH_MODULE="core" ;;
     "/usr/bin/geomask-seed-lists.py") GM_PATH_MODULE="core" ;;
@@ -178,15 +180,18 @@ module_owns_path() { # echoes the module id that owns an install path, if any
     "/usr/lib/geomask/geomask-slot-patch.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-subscription-status.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-sync-youtube.py") GM_PATH_MODULE="core" ;;
-    "/usr/libexec/rpcd/geo-sync") GM_PATH_MODULE="core" ;;
-    "/usr/share/luci/menu.d/luci-app-geo-sync.json") GM_PATH_MODULE="core" ;;
-    "/usr/share/rpcd/acl.d/luci-app-geo-sync.json") GM_PATH_MODULE="core" ;;
-    "/www/luci-static/resources/view/geo-sync/main.js") GM_PATH_MODULE="core" ;;
     "/etc/geomask/vpnwatch.conf") GM_PATH_MODULE="diagnostic" ;;
     "/usr/bin/geomask-dnscheck.sh") GM_PATH_MODULE="diagnostic" ;;
     "/usr/bin/geomask-morning-check.sh") GM_PATH_MODULE="diagnostic" ;;
     "/usr/bin/geomask-vpnwatch.sh") GM_PATH_MODULE="diagnostic" ;;
     "/usr/lib/geomask/geomask-doctor.py") GM_PATH_MODULE="doctor" ;;
+    "/etc/hotplug.d/iface/99-geomask-guard") GM_PATH_MODULE="guard" ;;
+    "/usr/bin/geomask-guard.sh") GM_PATH_MODULE="guard" ;;
+    "/usr/bin/geo-backend.sh") GM_PATH_MODULE="luci" ;;
+    "/usr/libexec/rpcd/geo-sync") GM_PATH_MODULE="luci" ;;
+    "/usr/share/luci/menu.d/luci-app-geo-sync.json") GM_PATH_MODULE="luci" ;;
+    "/usr/share/rpcd/acl.d/luci-app-geo-sync.json") GM_PATH_MODULE="luci" ;;
+    "/www/luci-static/resources/view/geo-sync/main.js") GM_PATH_MODULE="luci" ;;
     "/etc/mihomo/ruleset/torrentdirect.yaml") GM_PATH_MODULE="torrent" ;;
     "/usr/bin/geomask-torrent.sh") GM_PATH_MODULE="torrent" ;;
     "/etc/geomask-ytwatch.conf") GM_PATH_MODULE="youtube" ;;
@@ -388,8 +393,7 @@ step1_verify() { step1_check; }
 # ============================================================ STEP 2: geo overlay (ours)
 step2_check() {
   _need=0
-  for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
-           /usr/lib/geomask/geomask-node-audit.py \
+  for f in /usr/lib/geomask/geomask-node-audit.py \
            /usr/lib/geomask/geomask-audit-state.py \
            /usr/lib/geomask/geomask-config-tx.py \
            /usr/lib/geomask/geomask-config-owner.py \
@@ -398,13 +402,21 @@ step2_check() {
            /usr/lib/geomask/geomask-sync-youtube.py \
            /usr/lib/geomask/geomask-audit-scheduler.py \
            /usr/lib/geomask/geomask-subscription-status.py \
-           /usr/lib/geomask/geomask-slot-patch.py \
-           /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
-           /usr/share/luci/menu.d/luci-app-geo-sync.json \
-           /www/luci-static/resources/view/geo-sync/main.js; do
+           /usr/lib/geomask/geomask-slot-patch.py; do
     if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
   done
-  if have ubus && ubus list 2>/dev/null | grep -qx 'geo-sync'; then info "ubus geo-sync: registered"; else bad "ubus geo-sync not registered"; _need=1; fi
+  # v1.30.0: the panel is its own module; without it there is nothing to register in ubus
+  if module_selected luci; then
+    for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
+             /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
+             /usr/share/luci/menu.d/luci-app-geo-sync.json \
+             /www/luci-static/resources/view/geo-sync/main.js; do
+      if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
+    done
+    if have ubus && ubus list 2>/dev/null | grep -qx 'geo-sync'; then info "ubus geo-sync: registered"; else bad "ubus geo-sync not registered"; _need=1; fi
+  else
+    mod_skipped luci
+  fi
   # v1.29.0: what this router is supposed to carry, and what the owner left out
   _sel=$(modules_state_read 2>/dev/null || true)
   if [ -n "$_sel" ]; then
@@ -5059,7 +5071,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.29.0"
+BACKEND_VERSION="1.30.0"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6615,7 +6627,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.29.0', '1.29.0', '1.29.0')
+VERSION_MARKERS = ('1.30.0', '1.30.0', '1.30.0')
 
 
 def stamp_versions(data, version):
@@ -7964,7 +7976,8 @@ def build_registry():
     if CHECKS:
         return CHECKS
     index = module_index()
-    names = {'core': 'ядро и панель', 'path_vpn': 'VPN-лейн', 'path_vpn_nop2p': 'VPN-noP2P',
+    names = {'core': 'ядро', 'luci': 'Админка LuCI', 'guard': 'geomask-guard',
+             'path_vpn': 'VPN-лейн', 'path_vpn_nop2p': 'VPN-noP2P',
              'path_ai': 'AI-лейн', 'ai_dns': 'AI-DNS', 'youtube': 'YouTube',
              'torrent': 'торренты', 'diagnostic': 'старые проверки',
              'device_modes': 'режимы устройств', 'backup_share': 'SMB-бэкапы',
@@ -8273,10 +8286,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.29.0",
+  "core_version": "1.30.0",
   "modules": {
     "admission_service": {
-      "version": "1.0.0",
+      "version": "1.30.0",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -8285,17 +8298,30 @@ ASSET_EOF
       "files": []
     },
     "ai_dns": {
-      "version": "1.0.0",
+      "version": "1.30.0",
       "type": "feature",
       "name": "AI DNS-over-HTTPS",
       "dependencies": [
         "core",
         "path_ai"
       ],
-      "files": []
+      "files": [
+        {
+          "path": "/etc/init.d/ai-doh",
+          "source": "assets/ai-doh.init",
+          "mode": 755,
+          "sha256": "33ec8738fb82b8a0f5c78caed8ff3c32b79eb298e2680b1817967d865422a02a"
+        },
+        {
+          "path": "/etc/init.d/dnsmasq-ai",
+          "source": "assets/dnsmasq-ai.init",
+          "mode": 755,
+          "sha256": "7ffa1f7edd43f69509a26c3c0c8f8bf984f49ce3b623fbc14622f7fedd93cccc"
+        }
+      ]
     },
     "backup_share": {
-      "version": "1.0.0",
+      "version": "1.30.0",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -8304,9 +8330,9 @@ ASSET_EOF
       "files": []
     },
     "core": {
-      "version": "1.0.0",
+      "version": "1.30.0",
       "type": "core",
-      "name": "Geomask Core",
+      "name": "geomask (ядро)",
       "dependencies": [],
       "files": [
         {
@@ -8350,18 +8376,6 @@ ASSET_EOF
           "source": "assets/sync_mtrickle_mihomo.sh",
           "mode": 755,
           "sha256": "5ac6ec58fd32ed3b24b8949e16b577eedb2e48ab2cc54ea0d5f34695f356cb0b"
-        },
-        {
-          "path": "/usr/bin/geo-backend.sh",
-          "source": "assets/geo-backend.sh",
-          "mode": 755,
-          "sha256": "3939e35e5a53721f338f98b85e4203bda137ca32b207a5d80ba7a3c8ba7c1832"
-        },
-        {
-          "path": "/usr/bin/geomask-guard.sh",
-          "source": "assets/geomask-guard.sh",
-          "mode": 755,
-          "sha256": "3489cbb4842454e11abddadedd0e24ec7f45a9197999a84b57ee5eab72fafc7f"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -8446,35 +8460,11 @@ ASSET_EOF
           "source": "assets/geomask-sync-youtube.py",
           "mode": 755,
           "sha256": "15d0cd4e7135d46cf2c465191d2708b01df790899306fe8a1e6eeb45b011307b"
-        },
-        {
-          "path": "/usr/libexec/rpcd/geo-sync",
-          "source": "assets/geo-sync",
-          "mode": 755,
-          "sha256": "4ae46bc291b39815ccd5054a6dc65e3d9a379debec9e363d232b3d691353f395"
-        },
-        {
-          "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
-          "source": "assets/menu-geo-sync.json",
-          "mode": 644,
-          "sha256": "6cc1c916cfd9e03403ece2d7c98924836404c24631e8d553b77466fd6f4aa8dd"
-        },
-        {
-          "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
-          "source": "assets/acl-geo-sync.json",
-          "mode": 644,
-          "sha256": "091ca0d7251664ae2a972aa86ecd2608b4efb85e27f17f7deebd6a70381020b3"
-        },
-        {
-          "path": "/www/luci-static/resources/view/geo-sync/main.js",
-          "source": "assets/geo-sync-page.js",
-          "mode": 644,
-          "sha256": "96086129c97d878a29d9217f4df43003f27d9c633d5901dd77db4771857e3495"
         }
       ]
     },
     "device_modes": {
-      "version": "1.0.0",
+      "version": "1.30.0",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -8483,7 +8473,7 @@ ASSET_EOF
       "files": []
     },
     "diagnostic": {
-      "version": "1.0.0",
+      "version": "1.23.1",
       "type": "diagnostic",
       "name": "Diagnostic Services",
       "dependencies": [
@@ -8517,7 +8507,7 @@ ASSET_EOF
       ]
     },
     "doctor": {
-      "version": "1.0.0",
+      "version": "1.29.0",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -8528,12 +8518,74 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "f0771a1246c58b9873b867514859c5b1ac0c3ff46a97c052301a89f957e43903"
+          "sha256": "0c7a3758f5024dc9e1e2319332b8d56d9bca14fd823efa4e94e5c7eb070013b3"
+        }
+      ]
+    },
+    "guard": {
+      "version": "1.30.0",
+      "type": "core",
+      "name": "geomask-guard",
+      "dependencies": [
+        "core"
+      ],
+      "files": [
+        {
+          "path": "/etc/hotplug.d/iface/99-geomask-guard",
+          "source": "assets/99-geomask-guard",
+          "mode": 755,
+          "sha256": "ba8d2a40c4aec007314a8c78fbc80da712afcc773fd7961b17dff575dbd22b64"
+        },
+        {
+          "path": "/usr/bin/geomask-guard.sh",
+          "source": "assets/geomask-guard.sh",
+          "mode": 755,
+          "sha256": "48e19078981899ba1f6237f5fea519d1461b9290bce2e48c1f879897e396db06"
+        }
+      ]
+    },
+    "luci": {
+      "version": "1.30.0",
+      "type": "core",
+      "name": "Админка LuCI",
+      "dependencies": [
+        "core"
+      ],
+      "files": [
+        {
+          "path": "/usr/bin/geo-backend.sh",
+          "source": "assets/geo-backend.sh",
+          "mode": 755,
+          "sha256": "c029eb4df0c9900c4afaa035e55db87b2fa2bb8d61865bc5c04cd14da3aa4d1a"
+        },
+        {
+          "path": "/usr/libexec/rpcd/geo-sync",
+          "source": "assets/geo-sync",
+          "mode": 755,
+          "sha256": "4ae46bc291b39815ccd5054a6dc65e3d9a379debec9e363d232b3d691353f395"
+        },
+        {
+          "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
+          "source": "assets/menu-geo-sync.json",
+          "mode": 644,
+          "sha256": "6cc1c916cfd9e03403ece2d7c98924836404c24631e8d553b77466fd6f4aa8dd"
+        },
+        {
+          "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
+          "source": "assets/acl-geo-sync.json",
+          "mode": 644,
+          "sha256": "091ca0d7251664ae2a972aa86ecd2608b4efb85e27f17f7deebd6a70381020b3"
+        },
+        {
+          "path": "/www/luci-static/resources/view/geo-sync/main.js",
+          "source": "assets/geo-sync-page.js",
+          "mode": 644,
+          "sha256": "876f41fb58a06a7ea7641a6a14ec07b274e7560d5879cfc30c925e834d08cf03"
         }
       ]
     },
     "path_ai": {
-      "version": "1.0.0",
+      "version": "1.30.0",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -8544,7 +8596,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.0.0",
+      "version": "1.30.0",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -8554,7 +8606,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.0.0",
+      "version": "1.30.0",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -8564,7 +8616,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.0.0",
+      "version": "1.30.0",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -8573,7 +8625,7 @@ ASSET_EOF
       "files": []
     },
     "torrent": {
-      "version": "1.0.0",
+      "version": "1.23.1",
       "type": "feature",
       "name": "Torrent Admin",
       "dependencies": [
@@ -8595,7 +8647,7 @@ ASSET_EOF
       ]
     },
     "youtube": {
-      "version": "1.0.0",
+      "version": "1.22.5",
       "type": "feature",
       "name": "YouTube Edge Watchdog",
       "dependencies": [
@@ -8912,7 +8964,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.29.0';
+var PANEL_VERSION = '1.30.0';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -9121,7 +9173,7 @@ return view.extend({
 			['obzor', 'Обзор'], ['dev', 'Устройства'], ['subs', 'Подписки'],
 			['lists', 'Списки и синк'], ['nodes', 'Узлы подписки'],
 			['diag', 'Диагностика'],
-			['bk', 'Бэкапы'], ['upd', 'Обновление'], ['mods', 'Модули'], ['set', 'Настройки']
+			['bk', 'Бэкапы'], ['mods', 'Модули'], ['set', 'Настройки']
 		];
 		var curTab = 'obzor';
 		try { curTab = localStorage.getItem('gs-tab') || 'obzor'; } catch (e) {}
@@ -9683,7 +9735,7 @@ return view.extend({
 		}
 
 		var updChildren = [
-			E('h3', {}, 'Обновления'),
+			E('h3', {}, 'Релиз geomask: обновление целиком'),
 			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
 				'Проверка версий — при открытии страницы (кэш 1 ч) и по кнопке. ' +
 				'Обновление geomask: полный бэкап роутера → скачивание релиза с GitHub (sha256) → ' +
@@ -9700,11 +9752,9 @@ return view.extend({
 				E('span', { 'class': 'gs-upd-meta' }, String(updErr))
 			]));
 		} else {
-			updChildren.push(verRow('geomask (ядро)', coreV,
-				(latV && coreV !== 'none' && coreV !== latV && !upd.need) ? E('span', { 'class': 'gs-upd-meta' }, 'локальная новее релиза') : null));
-			updChildren.push(verRow('Админка LuCI', loc.panel,
-				(loc.panel && loc.backend && loc.panel !== loc.backend) ? E('span', { 'class': 'gs-badge gs-warn' }, 'панель≠бэкенд') : null));
-			updChildren.push(verRow('geomask-guard', loc.guard));
+			/* v1.30.0: the three component versions moved into the module list above - one
+			   place for every part of geomask. This card only answers "is there a release
+			   on GitHub, and do you want to install it". */
 			updChildren.push(E('div', { 'class': 'gs-row' }, [
 				E('span', { 'class': 'gs-label' }, 'Доступно на GitHub'),
 				latV ? E('span', { 'class': 'gs-val gs-upd-latest' }, latTag) : E('span', {}, '—'),
@@ -9773,7 +9823,7 @@ return view.extend({
 		updChildren.push(updStatus);
 		updChildren.push(updLog);
 		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
-		panels.upd.appendChild(updCard);
+		/* v1.30.0: the release card lives in the module tab (appended after the list) */
 		updRenderLines((upds || {}).lines);
 		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) {
 			updStatus.style.color = '#d29922';
@@ -9829,6 +9879,9 @@ return view.extend({
 			]),
 			E('div', {}, modRows)
 		]));
+		/* v1.30.0: the release card (former «Обновление» tab) sits right here: one place
+		   to watch and update every part of geomask - modules first, the release below. */
+		panels.mods.appendChild(updCard);
 
 		/* ===================== ДИАГНОСТИКА (v1.29.1) ===================== */
 		var diagData = (diag.checks || []).slice();
@@ -11357,6 +11410,7 @@ start_service() {
   procd_set_param respawn
   procd_close_instance
 }
+
 ASSET_EOF
   # 4) AI dnsmasq (upstream = the AI DoH worker; RU-domain resolvers copied from main dnsmasq)
   {
@@ -11383,6 +11437,7 @@ start_service() {
   procd_set_param respawn
   procd_close_instance
 }
+
 ASSET_EOF
   # 5) nft rules (DNAT for ai devices + mark for dnsai sockets)
   aidns_generate_nft || return 1
@@ -28171,9 +28226,11 @@ step5_check() {
   else
     bad "syncd: /etc/init.d/geomask-syncd missing"; _need=1
   fi
-  if [ -x "$(P /usr/bin/geomask-guard.sh)" ]; then info "guard: present"; else bad "guard missing: /usr/bin/geomask-guard.sh"; _need=1; fi
-  if [ -x "$(P /etc/hotplug.d/iface/99-geomask-guard)" ]; then info "guard hotplug: present"; else bad "guard hotplug missing"; _need=1; fi
-  if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then info "guard cron */5: present"; else bad "guard cron missing"; _need=1; fi
+  if ! mod_skipped guard; then
+    if [ -x "$(P /usr/bin/geomask-guard.sh)" ]; then info "guard: present"; else bad "guard missing: /usr/bin/geomask-guard.sh"; _need=1; fi
+    if [ -x "$(P /etc/hotplug.d/iface/99-geomask-guard)" ]; then info "guard hotplug: present"; else bad "guard hotplug missing"; _need=1; fi
+  fi
+  cron_verify guard '# geomask-guard$' 'guard cron */5'
   # v1.11.0: node audit plumbing
   if [ -x "$(P /usr/bin/geomask-node-scan.sh)" ] && [ -s "$(P /etc/geomask-nodes.conf)" ]; then info "node-scan: installed"
   else bad "node-scan missing (script/conf)"; _need=1; fi
@@ -30223,7 +30280,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.29.0"
+GUARD_VERSION="1.30.0"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -30407,12 +30464,9 @@ ASSET_EOF
 #!/bin/sh
 [ "$ACTION" = "ifup" ] || exit 0
 ( /usr/bin/geomask-guard.sh >/dev/null 2>&1 & )
+
 ASSET_EOF
-  if crontab -l 2>/dev/null | grep -q 'geomask-guard'; then
-    info "guard cron already present"
-  else
-    ( crontab -l 2>/dev/null; echo '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard' ) | crontab - 2>/dev/null && info "cron added: */5 guard" || warn "cannot set crontab"
-  fi
+  cron_ensure guard '# geomask-guard$' '*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard'
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     info "cron already present"
   else

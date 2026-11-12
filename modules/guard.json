@@ -1,0 +1,49 @@
+{
+  "id": "guard",
+  "name": "geomask-guard",
+  "version": "1.30.0",
+  "schema_version": 1,
+  "type": "core",
+  "description": "Сторож маршрутизации: возвращает правила и маршрут по умолчанию после ifup",
+  "author": "geomask",
+  "license": "MIT",
+  "dependencies": [
+    {
+      "module_id": "core",
+      "required": true,
+      "min_version": "1.0.0",
+      "reason": ""
+    }
+  ],
+  "provides": [
+    "guard:route"
+  ],
+  "owned_resources": [
+    {
+      "type": "file",
+      "path": "/usr/bin/geomask-guard.sh",
+      "description": "восстановление правил и маршрута"
+    },
+    {
+      "type": "file",
+      "path": "/etc/hotplug.d/iface/99-geomask-guard",
+      "description": "запуск сторожа при подъёме интерфейса"
+    },
+    {
+      "type": "cron",
+      "path": "geomask-guard",
+      "description": "страховка каждые 5 минут"
+    }
+  ],
+  "config_files": [],
+  "config_schema": {},
+  "services": [],
+  "cron_jobs": [
+    "geomask-guard"
+  ],
+  "rpc_methods": [],
+  "state": "enabled",
+  "enabled": true,
+  "created_at": "2026-11-12T13:00:00.000000Z",
+  "updated_at": "2026-11-12T13:00:00.000000Z"
+}

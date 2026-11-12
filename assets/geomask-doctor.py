@@ -967,7 +967,8 @@ def build_registry():
     if CHECKS:
         return CHECKS
     index = module_index()
-    names = {'core': 'ядро и панель', 'path_vpn': 'VPN-лейн', 'path_vpn_nop2p': 'VPN-noP2P',
+    names = {'core': 'ядро', 'luci': 'Админка LuCI', 'guard': 'geomask-guard',
+             'path_vpn': 'VPN-лейн', 'path_vpn_nop2p': 'VPN-noP2P',
              'path_ai': 'AI-лейн', 'ai_dns': 'AI-DNS', 'youtube': 'YouTube',
              'torrent': 'торренты', 'diagnostic': 'старые проверки',
              'device_modes': 'режимы устройств', 'backup_share': 'SMB-бэкапы',

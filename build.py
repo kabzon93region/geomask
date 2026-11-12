@@ -52,6 +52,9 @@ MAP = {
     "geomask-lane.sh":       "geomask-lane.sh",
     "geomask-module-update.py": "geomask-module-update.py",
     "geomask-doctor.py":     "geomask-doctor.py",
+    "ai-doh.init":           "ai-doh.init",
+    "dnsmasq-ai.init":       "dnsmasq-ai.init",
+    "99-geomask-guard":      "99-geomask-guard",
     "module-index.json":     "../modules/index.json",
     "geomask-dnscheck.sh":   "geomask-dnscheck.sh",
 }

@@ -1,10 +1,10 @@
 {
   "id": "core",
-  "name": "Geomask Core",
-  "version": "1.0.0",
+  "name": "geomask (ядро)",
+  "version": "1.30.0",
   "schema_version": 1,
   "type": "core",
-  "description": "Core infrastructure: safe_write, backup, RPC framework",
+  "description": "Ядро geomask: синк MagiTrickle→mihomo, node-audit, лейн, сторож, списки, сидер, обновление модулей",
   "author": "geomask",
   "license": "MIT",
   "dependencies": [],

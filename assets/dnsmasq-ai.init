@@ -1,0 +1,10 @@
+#!/bin/sh /etc/rc.common
+# geomask: dnsmasq for AI-mode devices (upstream = AI DoH worker in the AI tunnel)
+START=61
+USE_PROCD=1
+start_service() {
+  procd_open_instance
+  procd_set_param command /usr/sbin/dnsmasq -C /etc/dnsmasq-ai.conf -k
+  procd_set_param respawn
+  procd_close_instance
+}

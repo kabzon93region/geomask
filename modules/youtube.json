@@ -1,7 +1,7 @@
 {
   "id": "youtube",
   "name": "YouTube Edge Watchdog",
-  "version": "1.0.0",
+  "version": "1.22.5",
   "schema_version": 1,
   "type": "feature",
   "description": "YouTube stalled-edge detection and pinning",

@@ -1,7 +1,7 @@
 {
   "id": "diagnostic",
   "name": "Diagnostic Services",
-  "version": "1.0.0",
+  "version": "1.23.1",
   "schema_version": 1,
   "type": "diagnostic",
   "description": "Morning check, DNS check, VPN watch, admission proof service",

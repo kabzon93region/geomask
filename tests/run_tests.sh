@@ -1439,7 +1439,7 @@ echo "=== S51e: interactive module picker (no tty, driven by GM_MODULES_ASK) ===
 R="$HERE/root_picker"
 rm -rf "$R"; mkdir -p "$R/tmp"
 export GM_PREFIX="$R"
-printf '5\n' | GM_MODULES_ASK=1 sh "$SCRIPT" --step 2 --yes >"$HERE/last_out.txt" 2>&1
+printf '7\n' | GM_MODULES_ASK=1 sh "$SCRIPT" --step 2 --yes >"$HERE/last_out.txt" 2>&1
 if grep -qF '"ai_dns"' "$R/etc/geomask/modules.json" 2>/dev/null; then
   echo "PASS: S51e the picked module is recorded"; pass=$((pass+1))
 else
@@ -1478,7 +1478,8 @@ else
   echo "PASS: S51e Enter on a configured router keeps the stored selection"; pass=$((pass+1))
 fi
 # Narrowing the selection cannot delete files, so the installer has to say so out loud.
-rm -f "$R/usr/libexec/rpcd/geo-sync"
+# Drop a core file so step 2 really applies whatever the panel module was set to.
+rm -f "$R/usr/lib/geomask/geomask-slot-patch.py"
 t "S51e narrowing the selection still installs" 0 sh "$SCRIPT" --step 2 --yes --modules=core,path_vpn
 contains "$HERE/last_out.txt" 'снят с выбора' "S51e files of a dropped module are reported as left behind"
 lacks "$R/etc/geomask/modules.json" '"ai_dns"' "S51e the narrowed selection is recorded"

@@ -11,3 +11,5 @@ tests/last_out.txt
 tests/s10_out.txt
 tests/state/
 tests/root_*/
+tests/freshbin/
+tests/root_fresh/

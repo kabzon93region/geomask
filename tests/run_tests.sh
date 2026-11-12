@@ -1599,6 +1599,7 @@ if grep -qF 'apk add $_missing' "$HERE/../assets/../../geomask.sh" 2>/dev/null \
    || grep -qF 'apk add $_missing' "$SCRIPT"; then
   echo "PASS: S54 установка пакетов есть в собранном скрипте"; pass=$((pass+1))
 else echo "FAIL: S54 установки пакетов нет в собранном скрипте"; failn=$((failn+1)); fi
+rm -rf "$R" "$B"      # the scenario builds a throwaway package manager
 
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

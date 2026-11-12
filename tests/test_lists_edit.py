@@ -131,6 +131,27 @@ class ListsEditTests(unittest.TestCase):
             self.tool.validate(lines, 3, 3)
         self.assertIn('rules changed', str(caught.exception))
 
+    def test_move_takes_the_domain_out_of_the_old_group(self):
+        lines, moved = self.tool.plan_move(self.tool.read_lines(), 'Torrents', ['youtube.com'])
+        self.assertEqual(moved, ['youtube.com'])
+        text = ''.join(lines)
+        blocks = self.tool.group_blocks(lines)
+        by_name = {b['name']: b for b in blocks}
+        self.assertEqual(len(by_name['Torrents']['rules']), 2)
+        self.assertEqual(len(by_name['GoogleVideo VPN']['rules']), 1)
+        self.assertIn('rule: youtube.com', text)
+        self.tool.validate(lines, 3, 3)
+
+    def test_move_into_the_same_group_changes_nothing(self):
+        with self.assertRaises(self.tool.EditError) as caught:
+            self.tool.plan_move(self.tool.read_lines(), 'GoogleVideo VPN', ['youtube.com'])
+        self.assertIn('already in', str(caught.exception))
+
+    def test_move_adds_a_domain_that_is_nowhere(self):
+        lines, moved = self.tool.plan_move(self.tool.read_lines(), 'Empty', ['plati.market'])
+        self.assertEqual(moved, ['plati.market'])
+        self.tool.validate(lines, 3, 4)
+
     def test_dry_run_writes_nothing(self):
         before = self.read()
         lines, added = self.tool.plan_add(self.tool.read_lines(), 'Torrents', ['plati.market'])

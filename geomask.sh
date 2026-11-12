@@ -7203,6 +7203,32 @@ def plan_add(lines, group_name, domains):
     return lines[:position] + new_lines + lines[position:], added
 
 
+def plan_move(lines, group_name, domains):
+    """Take a domain out of whatever group holds it and put it into the target group.
+
+    A domain that stays in two groups has no defined path, so "move" is one edit, not a
+    remove followed by an add: either both halves land or neither does.
+    """
+    moved = []
+    for domain in domains:
+        block, index = find_domain(lines, domain)
+        if index is not None:
+            if block['name'] == group_name:
+                continue
+            end = index + 1
+            while end < len(lines) and lines[end].startswith(' ') \
+                    and not re.match(r'^\s*-\s*id:', lines[end]):
+                end += 1
+            del lines[index:end]
+            moved.append(domain)
+        lines, added = plan_add(lines, group_name, [domain])
+        if added and domain not in moved:
+            moved.append(domain)
+    if not moved:
+        raise EditError('nothing to move: already in %r' % group_name)
+    return lines, moved
+
+
 def plan_remove(lines, domains):
     for domain in domains:
         block, index = find_domain(lines, domain)
@@ -7276,7 +7302,7 @@ def apply(lines, expected_rules, dry_run=False):
 # --------------------------------------------------------------------------- cli
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='geomask-lists-edit')
-    parser.add_argument('command', choices=['groups', 'add', 'remove'])
+    parser.add_argument('command', choices=['groups', 'add', 'remove', 'move'])
     parser.add_argument('--group', default='')
     parser.add_argument('--domain', action='append', default=[])
     parser.add_argument('--dry-run', action='store_true')
@@ -7297,12 +7323,17 @@ def main(argv=None):
             if not re.match(r'^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$', domain):
                 raise EditError('not a domain: %r' % domain)
         before_rules = sum(len(block['rules']) for block in blocks)
-        if args.command == 'add':
+        if args.command in ('add', 'move'):
             if not args.group:
                 raise EditError('--group is required')
-            updated, changed = plan_add(lines, args.group, domains)
-            print('add to %r: %s' % (args.group, ', '.join(changed)))
-            expected = before_rules + len(changed)
+            if args.command == 'add':
+                updated, changed = plan_add(lines, args.group, domains)
+                print('add to %r: %s' % (args.group, ', '.join(changed)))
+                expected = before_rules + len(changed)
+            else:
+                updated, changed = plan_move(lines, args.group, domains)
+                print('move to %r: %s' % (args.group, ', '.join(changed)))
+                expected = sum(len(block['rules']) for block in group_blocks(updated))
         else:
             updated, changed = plan_remove(lines, domains)
             print('remove: %s' % ', '.join(changed))
@@ -8754,7 +8785,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-lists-edit.py",
           "source": "assets/geomask-lists-edit.py",
           "mode": 755,
-          "sha256": "5d78c8cbf9919a0ea15ff36ef4211c74fe56a839a7a1723cd86531222f3c2c13"
+          "sha256": "058aec0a08d350d590f09bc01379a0f6f87a2e8855ba7d1cafb8334f31696a62"
         },
         {
           "path": "/usr/lib/geomask/geomask-node-audit.py",

@@ -155,7 +155,7 @@
           "path": "/usr/lib/geomask/geomask-lists-edit.py",
           "source": "assets/geomask-lists-edit.py",
           "mode": 755,
-          "sha256": "5d78c8cbf9919a0ea15ff36ef4211c74fe56a839a7a1723cd86531222f3c2c13"
+          "sha256": "058aec0a08d350d590f09bc01379a0f6f87a2e8855ba7d1cafb8334f31696a62"
         },
         {
           "path": "/usr/lib/geomask/geomask-node-audit.py",

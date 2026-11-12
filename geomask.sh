@@ -8584,7 +8584,7 @@ def host_route(host):
     hit = mihomo_route(host, [])
     policy = (hit or {}).get('policy', 'GLOBAL')
     cc = country = ''
-    if policy in ('VPN', 'VPN-noP2P', 'AI'):
+    if policy in ('VPN', 'VPN-noP2P', 'AI', 'GLOBAL'):
         info = group_state(policy) or {}
         cc, country = info.get('cc', ''), info.get('country', '')
     elif policy == 'DIRECT':
@@ -8678,6 +8678,19 @@ def trace_domain(domain, live=False):
         else:
             step('Выход', 'warn', 'группа %s не отвечает через API' % policy,
                  'Mihomo не отвечает на 127.0.0.1:9090: /etc/init.d/mihomo restart.')
+    elif policy == 'GLOBAL':
+        info = group_state('GLOBAL')
+        if info and info['now']:
+            step('Выход', 'warn', 'GLOBAL → узел «%s»%s (домен не покрыт правилами)'
+                 % (info['now'],
+                    (', страна ' + info['country'] + ' (' + info['cc'] + ')') if info['country'] else ''),
+                 'Домен попадает в MATCH,GLOBAL: путь зависит от того, что выбрано в GLOBAL. '
+                 'Чтобы он был предсказуем, добавьте домен в группу MagiTrickle: '
+                 'geomask-lists-edit.py add --group "<группа>" --domain %s' % domain)
+        else:
+            step('Выход', 'warn', 'GLOBAL не выбрал узел (домен не покрыт правилами)',
+                 'Добавьте домен в группу MagiTrickle: geomask-lists-edit.py add '
+                 '--group "<группа>" --domain %s' % domain)
     else:
         step('Выход', 'warn', 'политика %s — уточните вручную' % policy,
              'Проверьте правило в /etc/mihomo/config.yaml.')
@@ -9071,7 +9084,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "2e1176f76fe5ff0646a3b0f3bec458d78e5aa98b2cdba10a02437213262b5c98"
+          "sha256": "35e8be4a1562acf4cf7ce30f8e6e03536d3fb79e4add0ef6a1c9bf987d49c0d6"
         }
       ]
     },

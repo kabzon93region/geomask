@@ -1,7 +1,7 @@
 {
   "id": "path_vpn",
   "name": "VPN Path",
-  "version": "1.30.4",
+  "version": "1.30.5",
   "schema_version": 1,
   "type": "path",
   "description": "Standard VPN path with NL/DE/FR/SE countries",

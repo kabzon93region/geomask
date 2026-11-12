@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.5"
+GM_VERSION="1.30.6"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -342,7 +342,7 @@ step1_check() {
   if have magitrickled || [ -x "$(P /etc/init.d/magitrickle)" ]; then info "magitrickle: present"
   else bad "magitrickle: MISSING - domain lists and per-domain routing live there; install magitrickle first"; _need=1; fi
   for c in python3 curl; do
-    if have "$c"; then info "$c: present"; else warn "$c: MISSING (needed for magitrickle->mihomo sync)"; _need=1; fi
+    if have "$c"; then info "$c: present"; else warn "$c: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
   done
   _tmp=$(df -m "$(P /tmp)" 2>/dev/null | awk 'NR==2{print $4}')
   if [ -n "${_tmp:-}" ] && [ "$_tmp" -ge 20 ] 2>/dev/null; then info "/tmp free: ${_tmp}MB"; else warn "/tmp free low or unknown"; _need=1; fi
@@ -352,7 +352,37 @@ step1_check() {
   if [ "$_code" = "204" ]; then info "internet: OK (204 via router path)"; else warn "internet check: HTTP ${_code:-none} (WAN may be down)"; _need=1; fi
   return $_need
 }
-step1_apply() { warn "env issues cannot be auto-fixed here - fix manually, then re-run"; }
+# v1.30.6: python3 and curl are installed by the installer itself. A reset router has
+# neither, and the owner should not have to know package names - the rest of geomask
+# (sync, module updater, doctor, backend) does not run without python3.
+step1_apply() {
+  _missing=""
+  for _c in python3 curl; do have "$_c" || _missing="$_missing $_c"; done
+  if [ -z "$_missing" ]; then
+    info "packages: python3 and curl already present"
+    return 0
+  fi
+  _missing=$(echo "$_missing" | sed 's/^ *//')
+  if have apk; then
+    info "installing: $_missing (apk)"
+    apk update >/dev/null 2>&1 || warn "apk update failed - trying the current index"
+    if apk add $_missing >/dev/null 2>&1; then info "installed: $_missing"
+    else bad "apk add $_missing failed - check the internet and free space"; return 1; fi
+  elif have opkg; then
+    info "installing: $_missing (opkg)"
+    opkg update >/dev/null 2>&1 || warn "opkg update failed - trying the current index"
+    if opkg install $_missing >/dev/null 2>&1; then info "installed: $_missing"
+    else bad "opkg install $_missing failed - check the internet and free space"; return 1; fi
+  else
+    bad "no apk/opkg - install $_missing manually, then re-run"
+    return 1
+  fi
+  for _c in python3 curl; do
+    have "$_c" || { bad "$_c still missing after install"; return 1; }
+  done
+  info "packages: python3 and curl ready"
+  return 0
+}
 step1_verify() { step1_check; }
 
 # ============================================================ STEP 2: geo overlay (ours)

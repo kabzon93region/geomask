@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.5"
+GM_VERSION="1.30.6"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -383,7 +383,7 @@ step1_check() {
   if have magitrickled || [ -x "$(P /etc/init.d/magitrickle)" ]; then info "magitrickle: present"
   else bad "magitrickle: MISSING - domain lists and per-domain routing live there; install magitrickle first"; _need=1; fi
   for c in python3 curl; do
-    if have "$c"; then info "$c: present"; else warn "$c: MISSING (needed for magitrickle->mihomo sync)"; _need=1; fi
+    if have "$c"; then info "$c: present"; else warn "$c: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
   done
   _tmp=$(df -m "$(P /tmp)" 2>/dev/null | awk 'NR==2{print $4}')
   if [ -n "${_tmp:-}" ] && [ "$_tmp" -ge 20 ] 2>/dev/null; then info "/tmp free: ${_tmp}MB"; else warn "/tmp free low or unknown"; _need=1; fi
@@ -393,7 +393,37 @@ step1_check() {
   if [ "$_code" = "204" ]; then info "internet: OK (204 via router path)"; else warn "internet check: HTTP ${_code:-none} (WAN may be down)"; _need=1; fi
   return $_need
 }
-step1_apply() { warn "env issues cannot be auto-fixed here - fix manually, then re-run"; }
+# v1.30.6: python3 and curl are installed by the installer itself. A reset router has
+# neither, and the owner should not have to know package names - the rest of geomask
+# (sync, module updater, doctor, backend) does not run without python3.
+step1_apply() {
+  _missing=""
+  for _c in python3 curl; do have "$_c" || _missing="$_missing $_c"; done
+  if [ -z "$_missing" ]; then
+    info "packages: python3 and curl already present"
+    return 0
+  fi
+  _missing=$(echo "$_missing" | sed 's/^ *//')
+  if have apk; then
+    info "installing: $_missing (apk)"
+    apk update >/dev/null 2>&1 || warn "apk update failed - trying the current index"
+    if apk add $_missing >/dev/null 2>&1; then info "installed: $_missing"
+    else bad "apk add $_missing failed - check the internet and free space"; return 1; fi
+  elif have opkg; then
+    info "installing: $_missing (opkg)"
+    opkg update >/dev/null 2>&1 || warn "opkg update failed - trying the current index"
+    if opkg install $_missing >/dev/null 2>&1; then info "installed: $_missing"
+    else bad "opkg install $_missing failed - check the internet and free space"; return 1; fi
+  else
+    bad "no apk/opkg - install $_missing manually, then re-run"
+    return 1
+  fi
+  for _c in python3 curl; do
+    have "$_c" || { bad "$_c still missing after install"; return 1; }
+  done
+  info "packages: python3 and curl ready"
+  return 0
+}
 step1_verify() { step1_check; }
 
 # ============================================================ STEP 2: geo overlay (ours)
@@ -5075,7 +5105,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.5"
+BACKEND_VERSION="1.30.6"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6643,7 +6673,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.5', '1.30.5', '1.30.5')
+VERSION_MARKERS = ('1.30.6', '1.30.6', '1.30.6')
 
 
 def stamp_versions(data, version):
@@ -8902,10 +8932,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.5",
+  "core_version": "1.30.6",
   "modules": {
     "admission_service": {
-      "version": "1.30.4",
+      "version": "1.30.5",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -8937,7 +8967,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.4",
+      "version": "1.30.5",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9086,7 +9116,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.4",
+      "version": "1.30.5",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9162,7 +9192,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "3bc4647fcaeab0868377cd8765edb3ae3e7337bf684906dee03a1e50148117f9"
+          "sha256": "e0943255077f66425b2f1db8afe025865df31acb8783ac6c2bf5c79b10003252"
         }
       ]
     },
@@ -9178,7 +9208,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "413681e44975229ee545330c4bb7e6cc439d2f370ae62aa7e1a1171554870529"
+          "sha256": "379e331f57b382f5ee2b0ba070f523f14319177a20120071f2aac64ef791f6b8"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9202,12 +9232,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "d67f99f46e2d3886bf2615877f55716ca7003d5df311a1f3a446a75177c1699a"
+          "sha256": "dc90385b9ea437633281ca95426409beb0dc91df87a308db027762d6076fe087"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.4",
+      "version": "1.30.5",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9218,7 +9248,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.4",
+      "version": "1.30.5",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9228,7 +9258,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.4",
+      "version": "1.30.5",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9238,7 +9268,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.4",
+      "version": "1.30.5",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9587,7 +9617,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.5';
+var PANEL_VERSION = '1.30.6';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -30900,7 +30930,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.5"
+GUARD_VERSION="1.30.6"
 
 log() { logger -t geomask-guard "$*"; }
 

@@ -1568,5 +1568,37 @@ else
 fi
 
 echo ""
+# ---------- scenario 54: fresh router - the installer installs python3/curl itself (v1.30.6) ----------
+echo "=== S54: голый роутер с apk: python3/curl ставит сам установщик ==="
+R="$HERE/root_fresh"; B="$HERE/freshbin"
+rm -rf "$R" "$B"; mkdir -p "$R/etc/init.d" "$R/usr/bin" "$R/tmp" "$B"
+printf "DISTRIB_RELEASE='25.12'\n" > "$R/etc/openwrt_release"
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/mihomo"; chmod +x "$R/usr/bin/mihomo"
+printf '#!/bin/sh\nexit 0\n' > "$R/etc/init.d/magitrickle"; chmod +x "$R/etc/init.d/magitrickle"
+cat > "$B/apk" <<'APKEOF'
+#!/bin/sh
+[ "$1" = "add" ] || exit 0
+shift
+for pkg in "$@"; do
+  case "$pkg" in
+    curl) printf '#!/bin/sh\necho 204\n' > "$APK_TARGET/$pkg" ;;
+    *)    printf '#!/bin/sh\nexit 0\n' > "$APK_TARGET/$pkg" ;;
+  esac
+  chmod +x "$APK_TARGET/$pkg"
+done
+exit 0
+APKEOF
+chmod +x "$B/apk"
+APK_TARGET="$B" GM_PREFIX="$R" PATH="$B:$R/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  sh "$SCRIPT" --step 1 --yes >"$HERE/last_out.txt" 2>&1
+if [ -x "$B/python3" ] && [ -x "$B/curl" ]; then
+  echo "PASS: S54 установщик сам поставил python3 и curl"; pass=$((pass+1))
+else echo "FAIL: S54 python3/curl не установлены"; sed 's/^/    | /' "$HERE/last_out.txt" | tail -12; failn=$((failn+1)); fi
+contains "$HERE/last_out.txt" 'verify: PASS' "S54 после установки пакетов шаг 1 проходит"
+if grep -qF 'apk add $_missing' "$HERE/../assets/../../geomask.sh" 2>/dev/null \
+   || grep -qF 'apk add $_missing' "$SCRIPT"; then
+  echo "PASS: S54 установка пакетов есть в собранном скрипте"; pass=$((pass+1))
+else echo "FAIL: S54 установки пакетов нет в собранном скрипте"; failn=$((failn+1)); fi
+
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

@@ -1,0 +1,11 @@
+#!/bin/sh
+[ "$1" = "add" ] || exit 0
+shift
+for pkg in "$@"; do
+  case "$pkg" in
+    curl) printf '#!/bin/sh\necho 204\n' > "$APK_TARGET/$pkg" ;;
+    *)    printf '#!/bin/sh\nexit 0\n' > "$APK_TARGET/$pkg" ;;
+  esac
+  chmod +x "$APK_TARGET/$pkg"
+done
+exit 0

@@ -7376,6 +7376,7 @@ import re
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 from datetime import datetime, timedelta
 
 VERSION = '1.0.0'
@@ -8478,6 +8479,121 @@ def list_checks():
 
 
 # --------------------------------------------------------------------------- domain
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) geomask-doctor'
+
+
+def node_delay(name, timeout=5000):
+    """Round-trip of one node in ms, or None when it does not answer at all."""
+    if not name:
+        return None
+    data = api_get('/proxies/%s/delay?timeout=%d&url=%s'
+                   % (quote(name, safe=''), timeout,
+                      quote('https://www.gstatic.com/generate_204', safe='')))
+    if isinstance(data, dict) and isinstance(data.get('delay'), int):
+        return data['delay']
+    return None
+
+
+def http_probe(domain, timeout=20):
+    """One HTTPS request from the router, explained instead of just "rc=28".
+
+    curl exit codes carry the answer: 28 means nothing came back in time, 6 is DNS,
+    35 is TLS, 56 is a reset. A timeout is the interesting one - it can be the exit node
+    or the site refusing that exit, and the owner needs to know which.
+    """
+    rc, out = run(['curl', '-m', str(timeout), '--connect-timeout', '8', '-sS',
+                   '-o', '/dev/null', '-A', USER_AGENT,
+                   '-w', '%{http_code} %{time_total} %{remote_ip}', 'https://' + domain],
+                  timeout=timeout + 8)
+    parts = (out or '').split()
+    code = parts[0] if parts else ''
+    took = parts[1] if len(parts) > 1 else ''
+    ip = parts[2] if len(parts) > 2 else ''
+    if rc == 0 and code and code != '000':
+        good = code.startswith(('2', '3'))
+        return {'ok': good, 'code': code, 'took': took, 'ip': ip, 'rc': 0,
+                'kind': '' if good else 'http',
+                'detail': 'HTTP %s за %s с%s' % (code, took, (', адрес ' + ip) if ip else '')}
+    kinds = {28: 'timeout', 6: 'dns', 7: 'refused', 35: 'tls', 52: 'empty', 56: 'reset',
+             60: 'cert'}
+    kind = kinds.get(rc, 'other')
+    words = {'timeout': 'нет ответа за %d с' % timeout, 'dns': 'имя не разрешилось',
+             'refused': 'соединение отклонено', 'tls': 'TLS не поднялся',
+             'empty': 'сервер закрыл соединение без ответа', 'reset': 'соединение сброшено',
+             'cert': 'сертификат не проверен', 'other': 'сбой запроса'}
+    return {'ok': False, 'code': code, 'took': took, 'ip': ip, 'rc': rc, 'kind': kind,
+            'detail': '%s (curl rc=%s)' % (words.get(kind, 'сбой запроса'), rc)}
+
+
+def host_of(url):
+    """Hostname of a URL or of a bare host, '' for anything relative or non-http."""
+    url = (url or '').strip().strip('\'"')
+    match = re.match(r'^(?:https?:)?//([^/:?#]+)', url)
+    if match:
+        return match.group(1).lower().rstrip('.')
+    if re.match(r'^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:[:/?#]|$)', url, re.I):
+        return url.split('/')[0].split(':')[0].split('?')[0].lower().rstrip('.')
+    return ''
+
+
+def related_hosts(domain, limit=12):
+    """Hosts the page itself depends on: redirect hops, forms, scripts, iframes, cert SANs.
+
+    A shop is rarely one host: the catalogue answers from one domain and the payment
+    processor from another, and the second one decides whether the page works. This finds
+    the ones the HTML and the certificate mention. Requests made later by JavaScript are
+    invisible from here - that page has to be loaded in a browser.
+    """
+    page = '/tmp/geomask-doctor-page.html'
+    hops = '/tmp/geomask-doctor-hops.txt'
+    found = []
+
+    def add(host, why):
+        host = (host or '').lower().rstrip('.')
+        if not host or host == domain or host.endswith('.' + domain):
+            return
+        if not re.match(r'^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$', host):
+            return
+        for known, _ in found:
+            if known == host:
+                return
+        found.append((host, why))
+
+    run(['curl', '-sS', '-L', '--max-time', '20', '-A', USER_AGENT,
+         '-D', hops, '-o', page, 'https://' + domain], timeout=26)
+    for line in read_text(hops).splitlines():
+        if line.lower().startswith('location:'):
+            add(host_of(line.split(':', 1)[1]), 'редирект')
+    html = read_text(page)[:600000]
+    for match in re.finditer(r"""(?:href|src|action)\s*=\s*["']([^"']{4,300})""", html, re.I):
+        add(host_of(match.group(1)), 'ссылка')
+    rc, out = run(['sh', '-c',
+                   'echo | timeout 8 openssl s_client -connect %s:443 -servername %s 2>/dev/null '
+                   '| openssl x509 -noout -text 2>/dev/null' % (domain, domain)], timeout=12)
+    for match in re.finditer(r'DNS:([^,\n]+)', out or ''):
+        name = match.group(1).strip()
+        if name.startswith('*.'):
+            continue
+        add(name, 'сертификат')
+    return found[:limit]
+
+
+def host_route(host):
+    """Where one host goes: group, mihomo policy and the country of that exit."""
+    route = magitrickle_route(host)
+    hit = mihomo_route(host, [])
+    policy = (hit or {}).get('policy', 'GLOBAL')
+    cc = country = ''
+    if policy in ('VPN', 'VPN-noP2P', 'AI'):
+        info = group_state(policy) or {}
+        cc, country = info.get('cc', ''), info.get('country', '')
+    elif policy == 'DIRECT':
+        cc, country = 'RU', 'Россия'
+    return {'host': host, 'group': (route[0]['name'] if route else ''),
+            'policy': policy, 'cc': cc, 'country': country,
+            'rule': (hit or {}).get('rule', '')}
+
+
 def trace_domain(domain, live=False):
     domain = (domain or '').strip().lower()
     domain = re.sub(r'^[a-z]+://', '', domain).split('/')[0].split('?')[0].rstrip('.')
@@ -8566,20 +8682,78 @@ def trace_domain(domain, live=False):
         step('Выход', 'warn', 'политика %s — уточните вручную' % policy,
              'Проверьте правило в /etc/mihomo/config.yaml.')
 
-    # 5. live probe
+    # 5. live probe - and the reason when it fails
     if live:
-        rc, out = run(['curl', '-m', '10', '-s', '-o', '/dev/null',
-                       '-w', '%{http_code} %{time_total}', 'https://' + domain], timeout=14)
-        if rc == 0 and out:
-            code = out.split()[0]
-            took = out.split()[1] if len(out.split()) > 1 else '?'
-            step('Проверка HTTP', 'ok' if code.startswith(('2', '3')) else 'warn',
-                 'HTTP %s за %s с (с роутера)' % (code, took),
-                 '' if code.startswith(('2', '3')) else
-                 'Сайт ответил HTTP %s: это ответ самого сайта, а не блокировка роутера.' % code)
+        probe = http_probe(domain)
+        if probe['ok']:
+            step('Проверка HTTP', 'ok', probe['detail'] + ' (с роутера)')
+        elif probe['kind'] == 'http':
+            step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                 'Сайт ответил HTTP %s — это ответ самого сайта, путь верный; '
+                 'проверьте страницу в браузере.' % probe['code'])
         else:
-            step('Проверка HTTP', 'warn', 'нет ответа (rc=%s)' % rc,
-                 'Проверьте путь: панель → Обзор (узел группы) и Диагностика → «Сеть».')
+            node = ''
+            if policy in ('VPN', 'VPN-noP2P', 'AI'):
+                state = group_state(policy) or {}
+                node = state.get('now') or ''
+            delay = node_delay(node) if node else None
+            if probe['kind'] == 'timeout' and delay is not None:
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'Узел «%s» живой (отклик %d мс), но сайт не ответил за 20 с — обычно это '
+                     'блокировка выходного адреса сайтом или его антибот. Смените узел в группе '
+                     '%s (панель → Обзор) или проверьте сайт с телефона через тот же VPN.'
+                     % (node, delay, policy))
+            elif probe['kind'] == 'timeout':
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'Узел «%s» не ответил даже на служебный запрос — смените узел в группе %s '
+                     '(панель → Обзор → «Сменить»), затем повторите трассу.' % (node or '?', policy or 'VPN'))
+            elif probe['kind'] in ('tls', 'cert'):
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'TLS не поднялся: сайт мог отклонить выходной адрес или подменить сертификат. '
+                     'Проверьте тот же адрес в браузере через VPN; если там всё открывается — '
+                     'дело в проверке TLS у сайта, а не в маршруте.')
+            elif probe['kind'] in ('reset', 'empty'):
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'Соединение сбросили: чаще всего сайт блокирует выходной адрес. '
+                     'Смените узел в группе %s и повторите.' % (policy or 'VPN'))
+            else:
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'Запрос не прошёл (%s). Повторите трассу; если повторяется — '
+                     'Диагностика → «Сеть».' % probe['kind'])
+
+    # 6. the hosts this page depends on (v1.30.2): the second domain is the one that matters
+    if live:
+        related = related_hosts(domain)
+        if related:
+            main_policy = (hit or {}).get('policy', 'GLOBAL')
+            rows = []
+            off = []
+            for host, why in related:
+                info = host_route(host)
+                rows.append('%s (%s) → %s%s' % (
+                    host, why, info['policy'],
+                    (' · ' + info['country']) if info['country'] else ''))
+                if info['policy'] != main_policy:
+                    off.append((host, info))
+            detail = 'найдено %d: %s' % (len(rows), '; '.join(rows))
+            # a CDN on another path is normal; it only matters when the page itself failed
+            if off and not probe['ok']:
+                names = ', '.join('%s (%s)' % (host, info['policy']) for host, info in off)
+                step('Связанные хосты', 'warn', detail,
+                     'Страница зависит от %s — путь другой, чем у %s (%s). Такой обработчик и '
+                     'решает, откроется ли сайт: перенесите его в ту же группу: '
+                     'geomask-lists-edit.py move --group "<группа %s>" --domain %s'
+                     % (names, domain, main_policy, main_policy, off[0][0]))
+            elif off:
+                step('Связанные хосты', 'ok', detail,
+                     'Часть хостов идёт другим путём, но страница ответила — это нормально '
+                     '(CDN, статика). Трогать не нужно.')
+            else:
+                step('Связанные хосты', 'ok', detail)
+        else:
+            step('Связанные хосты', 'warn', 'не найдено (страница не отдала ссылок)',
+                 'Проверьте вручную: откройте сайт в браузере, DevTools → Network и посмотрите, '
+                 'на какие домены он ходит; их и добавляйте в группу.')
 
     lines.append('')
     lines.append('Итог: %s' % (steps[2]['detail'] if len(steps) > 2 else ''))
@@ -8897,7 +9071,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "c359e2e949375cba76f3b6254e632fee3a639d90c36bf76f564bf83b56b2a884"
+          "sha256": "2e1176f76fe5ff0646a3b0f3bec458d78e5aa98b2cdba10a02437213262b5c98"
         }
       ]
     },

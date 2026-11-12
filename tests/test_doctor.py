@@ -450,5 +450,94 @@ class DoctorCheckTests(unittest.TestCase):
         self.assertEqual(doctor.fetch_country(None), '')
 
 
+class DoctorRelatedHostsTests(unittest.TestCase):
+    """The page's own dependencies: redirect hops, links, forms and the certificate."""
+
+    def setUp(self):
+        self._saved = {name: getattr(doctor, name)
+                       for name in ('run', 'read_text', 'magitrickle_route',
+                                    'mihomo_route', 'group_state')}
+        self.addCleanup(lambda: [setattr(doctor, name, value)
+                                 for name, value in self._saved.items()])
+
+    def test_host_of_handles_the_shapes_html_produces(self):
+        cases = {
+            'https://digiseller.ru/pay?x=1': 'digiseller.ru',
+            '//cdn.example.com/a.js': 'cdn.example.com',
+            'http://example.com:8080/x': 'example.com',
+            'digiseller.ru': 'digiseller.ru',
+            '/local/path': '',
+            'mailto:help@example.com': '',
+            '#anchor': '',
+            '': '',
+        }
+        for url, expected in cases.items():
+            self.assertEqual(doctor.host_of(url), expected, url)
+
+    def test_related_hosts_reads_hops_links_and_certificate(self):
+        page = Path(tempfile.mkdtemp()) / 'page.html'
+        page.write_text(
+            '<a href="https://digiseller.ru/cart">cart</a>'
+            '<script src="//static.plati.io/app.js"></script>'
+            '<form action="https://pay.plati.io/submit"></form>'
+            '<a href="/local">local</a>'
+            '<a href="https://plati.market/self">self</a>', encoding='utf-8')
+        hops = Path(tempfile.mkdtemp()) / 'hops.txt'
+        hops.write_text('HTTP/2 301\r\nlocation: https://www.plati.market/\r\n', encoding='utf-8')
+        answers = {
+            'curl': (0, ''),
+            'sh': (0, 'X509v3 Subject Alternative Name:\n    DNS:plati.market, DNS:*.digiseller.ru, DNS:digiseller.com\n'),
+        }
+
+        def fake_run(cmd, timeout=8, stdin=None):
+            if cmd[0] == 'curl' and '-D' in cmd:
+                return 0, ''
+            return answers.get(cmd[0], (0, ''))
+
+        doctor.run = fake_run
+        doctor.read_text = lambda path, default='': (
+            page.read_text(encoding='utf-8') if path.endswith('.html')
+            else hops.read_text(encoding='utf-8') if path.endswith('.txt')
+            else default)
+        hosts = dict(doctor.related_hosts('plati.market'))
+        self.assertIn('digiseller.ru', hosts)
+        self.assertIn('static.plati.io', hosts)
+        self.assertIn('pay.plati.io', hosts)
+        self.assertIn('digiseller.com', hosts)      # from the certificate
+        self.assertNotIn('plati.market', hosts)     # the domain itself is not a dependency
+        self.assertNotIn('www.plati.market', hosts)
+
+    def test_http_probe_names_a_timeout_instead_of_rc_28(self):
+        doctor.run = lambda cmd, timeout=8, stdin=None: (28, '')
+        probe = doctor.http_probe('plati.market')
+        self.assertFalse(probe['ok'])
+        self.assertEqual(probe['kind'], 'timeout')
+        self.assertIn('нет ответа за 20 с', probe['detail'])
+
+    def test_http_probe_keeps_the_status_of_a_real_answer(self):
+        doctor.run = lambda cmd, timeout=8, stdin=None: (0, '403 0.4 1.2.3.4')
+        probe = doctor.http_probe('plati.market')
+        self.assertFalse(probe['ok'])
+        self.assertEqual(probe['kind'], 'http')
+        self.assertEqual(probe['code'], '403')
+        self.assertIn('1.2.3.4', probe['detail'])
+
+    def test_host_route_reports_a_direct_exit_as_russia(self):
+        doctor.magitrickle_route = lambda host: None
+        doctor.mihomo_route = lambda host, ips: {'policy': 'DIRECT', 'rule': 'MATCH'}
+        info = doctor.host_route('example.com')
+        self.assertEqual(info['policy'], 'DIRECT')
+        self.assertEqual(info['cc'], 'RU')
+
+    def test_host_route_follows_the_group_of_a_tunnelled_host(self):
+        doctor.magitrickle_route = lambda host: ({'name': 'To VPN'}, {'rule': host}, '')
+        doctor.mihomo_route = lambda host, ips: {'policy': 'VPN', 'rule': 'RULE-SET,mtrickle,VPN'}
+        doctor.group_state = lambda name: {'now': 'NL-1', 'cc': 'NL', 'country': 'Нидерланды'}
+        info = doctor.host_route('digiseller.ru')
+        self.assertEqual(info['group'], 'To VPN')
+        self.assertEqual(info['cc'], 'NL')
+        self.assertEqual(info['country'], 'Нидерланды')
+
+
 if __name__ == '__main__':
     unittest.main()

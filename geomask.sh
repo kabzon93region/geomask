@@ -8800,9 +8800,11 @@ def trace_domain(domain, live=False):
                      % (item['host'], '/'.join(item['kinds']), main_policy))
             elif off:
                 names = ', '.join(item['host'] for item, _ in off)
-                step('Связанные хосты', 'ok', detail,
-                     'Другим путём идут только статика и картинки (%s) — на работу сайта это не '
-                     'влияет, сессия идёт тем же путём, что и сам домен.' % names)
+                # the explanation belongs in the line itself: an "ok" step's advice is not
+                # printed at the bottom, and this is exactly the question the owner asks
+                step('Связанные хосты', 'ok',
+                     detail + ' — другим путём только статика (%s), на работу сайта не влияет'
+                     % names)
             else:
                 step('Связанные хосты', 'ok', detail)
         else:
@@ -9126,7 +9128,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "4f9a7a20aa34ea8f3a2a562958a9875cf795417bd882dd2d41fccef6ed91aab8"
+          "sha256": "f48ea0d1bc7163e3a7609868f32c73977e6d1ac8eec3e7ff3a9c1fcfcb6e6678"
         }
       ]
     },

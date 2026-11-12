@@ -8,7 +8,7 @@
 
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-SCRIPT="$HERE/../geomask.sh"
+SCRIPT="${GM_SCRIPT:-$HERE/../geomask.sh}"
 STUB="$HERE/bin"
 export PATH="$STUB:$PATH"
 

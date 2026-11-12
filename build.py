@@ -55,6 +55,7 @@ MAP = {
     "ai-doh.init":           "ai-doh.init",
     "dnsmasq-ai.init":       "dnsmasq-ai.init",
     "99-geomask-guard":      "99-geomask-guard",
+    "geomask-lists-edit.py": "geomask-lists-edit.py",
     "module-index.json":     "../modules/index.json",
     "geomask-dnscheck.sh":   "geomask-dnscheck.sh",
 }

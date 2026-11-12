@@ -238,7 +238,7 @@
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "08c30bbaca608c59126714dd2d2a310205571bedd1d0533daba070e5469ce679"
+          "sha256": "4f9a7a20aa34ea8f3a2a562958a9875cf795417bd882dd2d41fccef6ed91aab8"
         }
       ]
     },

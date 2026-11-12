@@ -499,12 +499,16 @@ class DoctorRelatedHostsTests(unittest.TestCase):
             page.read_text(encoding='utf-8') if path.endswith('.html')
             else hops.read_text(encoding='utf-8') if path.endswith('.txt')
             else default)
-        hosts = dict(doctor.related_hosts('plati.market'))
+        hosts = {item['host']: item for item in doctor.related_hosts('plati.market')}
         self.assertIn('digiseller.ru', hosts)
+        self.assertIn('a', hosts['digiseller.ru']['kinds'])
         self.assertIn('static.plati.io', hosts)
+        self.assertIn('script', hosts['static.plati.io']['kinds'])
         self.assertIn('pay.plati.io', hosts)
-        self.assertIn('digiseller.com', hosts)      # from the certificate
-        self.assertNotIn('plati.market', hosts)     # the domain itself is not a dependency
+        self.assertTrue(hosts['pay.plati.io']['session'])     # a form carries the session
+        self.assertFalse(hosts['static.plati.io']['session'])  # a script does not
+        self.assertIn('digiseller.com', hosts)                 # from the certificate
+        self.assertNotIn('plati.market', hosts)                # the domain itself is not a dependency
         self.assertNotIn('www.plati.market', hosts)
 
     def test_http_probe_names_a_timeout_instead_of_rc_28(self):

@@ -8536,37 +8536,47 @@ def host_of(url):
     return ''
 
 
+SESSION_KINDS = {'form', 'iframe'}
+
+
 def related_hosts(domain, limit=12):
-    """Hosts the page itself depends on: redirect hops, forms, scripts, iframes, cert SANs.
+    """Hosts the page itself depends on, with the kind of reference that found them.
 
     A shop is rarely one host: the catalogue answers from one domain and the payment
     processor from another, and the second one decides whether the page works. This finds
     the ones the HTML and the certificate mention. Requests made later by JavaScript are
     invisible from here - that page has to be loaded in a browser.
+
+    The kind matters: pictures and stylesheets on another path are harmless, a form or an
+    iframe on another path carries the session and can be rejected by the site.
     """
     page = '/tmp/geomask-doctor-page.html'
     hops = '/tmp/geomask-doctor-hops.txt'
     found = []
 
-    def add(host, why):
+    def add(host, kind):
         host = (host or '').lower().rstrip('.')
         if not host or host == domain or host.endswith('.' + domain):
             return
         if not re.match(r'^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$', host):
             return
-        for known, _ in found:
-            if known == host:
+        for item in found:
+            if item['host'] == host:
+                if kind not in item['kinds']:
+                    item['kinds'].append(kind)
                 return
-        found.append((host, why))
+        found.append({'host': host, 'kinds': [kind], 'session': kind in SESSION_KINDS})
 
     run(['curl', '-sS', '-L', '--max-time', '20', '-A', USER_AGENT,
          '-D', hops, '-o', page, 'https://' + domain], timeout=26)
     for line in read_text(hops).splitlines():
         if line.lower().startswith('location:'):
-            add(host_of(line.split(':', 1)[1]), 'редирект')
+            add(host_of(line.split(':', 1)[1]), 'redirect')
     html = read_text(page)[:600000]
-    for match in re.finditer(r"""(?:href|src|action)\s*=\s*["']([^"']{4,300})""", html, re.I):
-        add(host_of(match.group(1)), 'ссылка')
+    for tag in ('img', 'script', 'iframe', 'link', 'form', 'a'):
+        pattern = r'<%s\b[^>]{0,400}?(?:src|href|action)\s*=\s*["\']([^"\']{4,300})' % tag
+        for match in re.finditer(pattern, html, re.I):
+            add(host_of(match.group(1)), tag)
     rc, out = run(['sh', '-c',
                    'echo | timeout 8 openssl s_client -connect %s:443 -servername %s 2>/dev/null '
                    '| openssl x509 -noout -text 2>/dev/null' % (domain, domain)], timeout=12)
@@ -8574,7 +8584,7 @@ def related_hosts(domain, limit=12):
         name = match.group(1).strip()
         if name.startswith('*.'):
             continue
-        add(name, 'сертификат')
+        add(name, 'cert')
     return found[:limit]
 
 
@@ -8763,26 +8773,36 @@ def trace_domain(domain, live=False):
             main_policy = (hit or {}).get('policy', 'GLOBAL')
             rows = []
             off = []
-            for host, why in related:
-                info = host_route(host)
+            for item in related:
+                info = host_route(item['host'])
+                kinds = '/'.join(item['kinds'])
                 rows.append('%s (%s) → %s%s' % (
-                    host, why, info['policy'],
+                    item['host'], kinds, info['policy'],
                     (' · ' + info['country']) if info['country'] else ''))
                 if info['policy'] != main_policy:
-                    off.append((host, info))
+                    off.append((item, info))
             detail = 'найдено %d: %s' % (len(rows), '; '.join(rows))
-            # a CDN on another path is normal; it only matters when the page itself failed
-            if off and not probe['ok']:
-                names = ', '.join('%s (%s)' % (host, info['policy']) for host, info in off)
+            # a picture on another path is fine; a form or an iframe carries the session
+            session_off = [pair for pair in off if pair[0]['session']]
+            if session_off and not probe['ok']:
+                item, info = session_off[0]
                 step('Связанные хосты', 'warn', detail,
-                     'Страница зависит от %s — путь другой, чем у %s (%s). Такой обработчик и '
-                     'решает, откроется ли сайт: перенесите его в ту же группу: '
+                     '%s — это %s, он несёт сессию, а идёт другим путём (%s), чем %s (%s). '
+                     'Если сайт не пускает или сбрасывает вход, перенесите его в ту же группу: '
                      'geomask-lists-edit.py move --group "<группа %s>" --domain %s'
-                     % (names, domain, main_policy, main_policy, off[0][0]))
-            elif off:
+                     % (item['host'], '/'.join(item['kinds']), info['policy'], domain,
+                        main_policy, main_policy, item['host']))
+            elif session_off:
+                item, info = session_off[0]
                 step('Связанные хосты', 'ok', detail,
-                     'Часть хостов идёт другим путём, но страница ответила — это нормально '
-                     '(CDN, статика). Трогать не нужно.')
+                     '%s (%s) идёт другим путём, но страница ответила. Если вход или оплата '
+                     'начнут сбрасываться — перенесите его в группу «%s».'
+                     % (item['host'], '/'.join(item['kinds']), main_policy))
+            elif off:
+                names = ', '.join(item['host'] for item, _ in off)
+                step('Связанные хосты', 'ok', detail,
+                     'Другим путём идут только статика и картинки (%s) — на работу сайта это не '
+                     'влияет, сессия идёт тем же путём, что и сам домен.' % names)
             else:
                 step('Связанные хосты', 'ok', detail)
         else:
@@ -9106,7 +9126,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "08c30bbaca608c59126714dd2d2a310205571bedd1d0533daba070e5469ce679"
+          "sha256": "4f9a7a20aa34ea8f3a2a562958a9875cf795417bd882dd2d41fccef6ed91aab8"
         }
       ]
     },

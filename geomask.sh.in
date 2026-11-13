@@ -339,7 +339,7 @@ step1_check() {
   # installing the panel and only then reporting "mihomo binary missing" at step 3.
   if have mihomo; then info "mihomo: present"
   else bad "mihomo: MISSING - geomask is an overlay over mihomo; install mihomo first (its config, subscriptions and TUN come from it)"; _need=1; fi
-  if have magitrickled || [ -x "$(P /etc/init.d/magitrickle)" ]; then info "magitrickle: present"
+  if have magitrickled || [ -f "$(P /etc/init.d/magitrickle)" ]; then info "magitrickle: present"
   else bad "magitrickle: MISSING - domain lists and per-domain routing live there; install magitrickle first"; _need=1; fi
   for c in python3 curl; do
     if have "$c"; then info "$c: present"; else warn "$c: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi

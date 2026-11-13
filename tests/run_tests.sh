@@ -62,6 +62,7 @@ echo x > "$R/www/luci-static/resources/zapret-manager/common.js"
 mkdir -p "$R/etc/init.d"
 for s in magitrickle mihomo zapret hev-socks5-tunnel dnsmasq; do
   printf '#!/bin/sh\nexit 0\n' > "$R/etc/init.d/$s"
+  chmod +x "$R/etc/init.d/$s"   # a real init script is executable; [ -x ] on Linux needs it
 done
 # AI-DNS step deps (v1.5.7): DoH binary + rc.common for the services it installs
 mkdir -p "$R/usr/sbin"

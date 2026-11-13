@@ -684,6 +684,21 @@ class DoctorExitHonestyTests(unittest.TestCase):
         self.assertEqual(doctor.direct_country(True), 'DE')
         self.assertTrue(any('--interface' in cmd for cmd in calls), calls)
 
+    def test_the_wan_device_is_the_one_on_the_default_route(self):
+        # on PPPoE the uci name is `wan` but the traffic leaves through `pppoe-wan`;
+        # curl --interface wan fails and the country silently became "not measured"
+        def fake(cmd, timeout=8, stdin=None):
+            if cmd[:3] == ['ip', 'route', 'show']:
+                return 0, 'default via 10.0.0.1 dev pppoe-wan proto static'
+            if cmd[:2] == ['uci', '-q']:
+                return 0, 'wan'
+            return 1, ''
+
+        original = doctor.run
+        self.addCleanup(lambda: setattr(doctor, 'run', original))
+        doctor.run = fake
+        self.assertEqual(doctor.wan_iface(), 'pppoe-wan')
+
 
 class DoctorZapretTests(unittest.TestCase):
     """Whether zapret (nfqws) processes a domain - the trace used to stop before this."""

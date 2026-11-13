@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.20"
+GM_VERSION="1.30.21"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -89,14 +89,19 @@ lan_ip() {
 }
 
 wan_iface() {
-  for _k in network.wan.device network.wan.ifname network.wan6.device; do
-    _i=$(uci -q get "$_k" 2>/dev/null)
-    case "$_i" in ''|*[!a-zA-Z0-9._-]*) continue ;; esac
-    printf '%s' "$_i"; return 0
-  done
-  # DHCP/PPPoE on a dynamically named device: report what actually carries the default route
+  # The device that actually carries the default route comes first: on PPPoE the uci name
+  # is `wan` while the device is `pppoe-wan`, and every consumer here (MagiTrickle group
+  # interface, curl --interface) needs the device.
   _i=$(ip route show default 2>/dev/null | sed -n 's/.*dev \([a-zA-Z0-9._-]*\).*/\1/p' | head -1)
-  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i=pppoe-wan ;; esac
+  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i="" ;; esac
+  if [ -z "$_i" ]; then
+    for _k in network.wan.device network.wan.ifname network.wan6.device; do
+      _i=$(uci -q get "$_k" 2>/dev/null)
+      case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i="" ; continue ;; esac
+      break
+    done
+  fi
+  [ -n "$_i" ] || _i=pppoe-wan
   printf '%s' "$_i"
 }
 

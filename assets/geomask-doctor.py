@@ -946,14 +946,20 @@ _DIRECT_CACHE = {}
 
 
 def wan_iface():
-    """The interface that carries the default route: the provider exit."""
+    """The device that carries the default route: the provider exit.
+
+    The uci name is not the device: on PPPoE `network.wan.device` is `wan` while the
+    traffic leaves through `pppoe-wan`, and `curl --interface wan` simply fails.
+    """
+    rc, out = run(['ip', 'route', 'show', 'default'], timeout=5)
+    match = re.search(r'dev\s+([A-Za-z0-9._-]+)', out or '')
+    if match:
+        return match.group(1)
     for key in ('network.wan.device', 'network.wan.ifname', 'network.wan6.device'):
         rc, out = run(['uci', '-q', 'get', key], timeout=5)
         if rc == 0 and (out or '').strip():
             return out.strip()
-    rc, out = run(['ip', 'route', 'show', 'default'], timeout=5)
-    match = re.search(r'dev\s+([A-Za-z0-9._-]+)', out or '')
-    return match.group(1) if match else ''
+    return ''
 
 
 def direct_country(live):

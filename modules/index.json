@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "core_version": "1.30.20",
+  "core_version": "1.30.21",
   "modules": {
     "admission_service": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -35,7 +35,7 @@
       ]
     },
     "backup_share": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -193,7 +193,7 @@
       ]
     },
     "device_modes": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -248,7 +248,7 @@
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": "0755",
-          "sha256": "a1fffe5daae340d2294183b5a18789c4d611cdb1c64532d3573a998810a3a0c4"
+          "sha256": "38f3aed34bf47352c6e657d09e44d867d9f58f2386962ca5e41574fa985a459f"
         }
       ]
     },
@@ -270,7 +270,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "e7efd38d5b70963529b8a0224cc2088e04790866127eb6e0e97b21ec25bd589f"
+          "sha256": "c4fac34d484d3c41d5ba8ae0118cb70eafaa846efbdb80116b9010fc8429f4bc"
         }
       ]
     },
@@ -286,7 +286,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "255192f5e9625caedb64ecb93de87e060ad0fd93802ed7eaea8cbf421da22757"
+          "sha256": "5f451fd1b28119ead37cd5b5b3d593ebcf34b9872d1cb8624e45bba58482a7b1"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -310,12 +310,12 @@
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "4a1f5cde47405120dd8dbd0c89252b8641e2d58637a5a2f15dd3d5b0e5f115b5"
+          "sha256": "e2bb1939a88ac78510783440082ceae3dd1c724a05c6fb5343e07bfa8bd352a9"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -326,7 +326,7 @@
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -336,7 +336,7 @@
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -346,7 +346,7 @@
       "files": []
     },
     "self_update": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "service",
       "name": "Self Update",
       "dependencies": [

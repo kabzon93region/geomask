@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.20"
+GM_VERSION="1.30.21"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -89,14 +89,19 @@ lan_ip() {
 }
 
 wan_iface() {
-  for _k in network.wan.device network.wan.ifname network.wan6.device; do
-    _i=$(uci -q get "$_k" 2>/dev/null)
-    case "$_i" in ''|*[!a-zA-Z0-9._-]*) continue ;; esac
-    printf '%s' "$_i"; return 0
-  done
-  # DHCP/PPPoE on a dynamically named device: report what actually carries the default route
+  # The device that actually carries the default route comes first: on PPPoE the uci name
+  # is `wan` while the device is `pppoe-wan`, and every consumer here (MagiTrickle group
+  # interface, curl --interface) needs the device.
   _i=$(ip route show default 2>/dev/null | sed -n 's/.*dev \([a-zA-Z0-9._-]*\).*/\1/p' | head -1)
-  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i=pppoe-wan ;; esac
+  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i="" ;; esac
+  if [ -z "$_i" ]; then
+    for _k in network.wan.device network.wan.ifname network.wan6.device; do
+      _i=$(uci -q get "$_k" 2>/dev/null)
+      case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i="" ; continue ;; esac
+      break
+    done
+  fi
+  [ -n "$_i" ] || _i=pppoe-wan
   printf '%s' "$_i"
 }
 
@@ -5284,7 +5289,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.20"
+BACKEND_VERSION="1.30.21"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6900,7 +6905,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.20', '1.30.20', '1.30.20')
+VERSION_MARKERS = ('1.30.21', '1.30.21', '1.30.21')
 
 
 def stamp_versions(data, version):
@@ -8606,14 +8611,20 @@ _DIRECT_CACHE = {}
 
 
 def wan_iface():
-    """The interface that carries the default route: the provider exit."""
+    """The device that carries the default route: the provider exit.
+
+    The uci name is not the device: on PPPoE `network.wan.device` is `wan` while the
+    traffic leaves through `pppoe-wan`, and `curl --interface wan` simply fails.
+    """
+    rc, out = run(['ip', 'route', 'show', 'default'], timeout=5)
+    match = re.search(r'dev\s+([A-Za-z0-9._-]+)', out or '')
+    if match:
+        return match.group(1)
     for key in ('network.wan.device', 'network.wan.ifname', 'network.wan6.device'):
         rc, out = run(['uci', '-q', 'get', key], timeout=5)
         if rc == 0 and (out or '').strip():
             return out.strip()
-    rc, out = run(['ip', 'route', 'show', 'default'], timeout=5)
-    match = re.search(r'dev\s+([A-Za-z0-9._-]+)', out or '')
-    return match.group(1) if match else ''
+    return ''
 
 
 def direct_country(live):
@@ -9448,10 +9459,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.20",
+  "core_version": "1.30.21",
   "modules": {
     "admission_service": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9483,7 +9494,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9641,7 +9652,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9696,7 +9707,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": "0755",
-          "sha256": "a1fffe5daae340d2294183b5a18789c4d611cdb1c64532d3573a998810a3a0c4"
+          "sha256": "38f3aed34bf47352c6e657d09e44d867d9f58f2386962ca5e41574fa985a459f"
         }
       ]
     },
@@ -9718,7 +9729,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "e7efd38d5b70963529b8a0224cc2088e04790866127eb6e0e97b21ec25bd589f"
+          "sha256": "c4fac34d484d3c41d5ba8ae0118cb70eafaa846efbdb80116b9010fc8429f4bc"
         }
       ]
     },
@@ -9734,7 +9745,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "255192f5e9625caedb64ecb93de87e060ad0fd93802ed7eaea8cbf421da22757"
+          "sha256": "5f451fd1b28119ead37cd5b5b3d593ebcf34b9872d1cb8624e45bba58482a7b1"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9758,12 +9769,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "4a1f5cde47405120dd8dbd0c89252b8641e2d58637a5a2f15dd3d5b0e5f115b5"
+          "sha256": "e2bb1939a88ac78510783440082ceae3dd1c724a05c6fb5343e07bfa8bd352a9"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9774,7 +9785,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9784,7 +9795,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9794,7 +9805,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.19",
+      "version": "1.30.20",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -10150,7 +10161,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.20';
+var PANEL_VERSION = '1.30.21';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -31761,7 +31772,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.20"
+GUARD_VERSION="1.30.21"
 
 log() { logger -t geomask-guard "$*"; }
 

@@ -23,7 +23,7 @@
 | [OPERATIONS.md](OPERATIONS.md) | Режимы запуска, шаги, бэкапы, безопасность |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Типовые проблемы и что смотреть |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Сборка, песочница, тесты |
-| [releases/](releases/) | Release notes по версиям |
+| [releases/](releases/) | Release notes до v1.9.6 (архив); начиная с v1.10 заметки живут в [GitHub Releases](https://github.com/kabzon93region/geomask/releases) |
 
 ## Историческое (не описывает текущее поведение)
 

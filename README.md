@@ -143,7 +143,8 @@ python-тесты и песочницу.
 - [Модули](docs/MODULES.md), [диагностика](docs/DIAGNOSTICS.md), [списки](docs/LISTS.md),
   [релизы](docs/RELEASING.md).
 - [Эксплуатация](docs/OPERATIONS.md), [типовые проблемы](docs/TROUBLESHOOTING.md),
-  [разработка](docs/DEVELOPMENT.md), [release notes](docs/releases/).
+  [разработка](docs/DEVELOPMENT.md), [архив заметок до v1.9.6](docs/releases/),
+  [GitHub Releases](https://github.com/kabzon93region/geomask/releases) (актуальные).
 - Исторические документы (планы и SPEC эпохи v2) лежат в `docs/` и помечены в индексе как
   исторические: они описывают требования, а не текущее поведение.
 

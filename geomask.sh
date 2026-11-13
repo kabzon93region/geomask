@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.17"
+GM_VERSION="1.30.18"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -5272,7 +5272,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.17"
+BACKEND_VERSION="1.30.18"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6904,7 +6904,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.17', '1.30.17', '1.30.17')
+VERSION_MARKERS = ('1.30.18', '1.30.18', '1.30.18')
 
 
 def stamp_versions(data, version):
@@ -9406,10 +9406,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.17",
+  "core_version": "1.30.18",
   "modules": {
     "admission_service": {
-      "version": "1.30.16",
+      "version": "1.30.17",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9441,7 +9441,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.16",
+      "version": "1.30.17",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9593,7 +9593,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.16",
+      "version": "1.30.17",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9670,7 +9670,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "97fbe2287a6bd331e0425e46a7dfd61f32d606ed42f6b1d17baf829b39c15b59"
+          "sha256": "87f51bb752cc36fc1bb9735d9a5f1b0a1f867424be9618ff208fb17e002e3169"
         }
       ]
     },
@@ -9686,7 +9686,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "6651d5c6425d3ea219246046ab5a4eb81dbe6ee6ea86181df69ede189bcf89eb"
+          "sha256": "49b43dc1b5d7f67dcd2d4507773045b476a2fbbc8e0725fb7fe36148844f464e"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9710,12 +9710,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "8affb5acf3afa790f08e35c1fba54f45871045980bfa5dfefb0209f2064c7a37"
+          "sha256": "d89019ebedf37e652beec16dde2335c29d4859df47e611ef2c3e05fb19e54996"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.16",
+      "version": "1.30.17",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9726,7 +9726,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.16",
+      "version": "1.30.17",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9736,7 +9736,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.16",
+      "version": "1.30.17",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9746,7 +9746,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.16",
+      "version": "1.30.17",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9817,6 +9817,9 @@ ASSET_EOF
   }
 }
 ASSET_EOF
+  # the updater caches the catalogue for an hour; right after an install that cache still
+  # describes the previous release, so every file looked locally modified. Drop it here.
+  rm -f "$(P /tmp)/geomask-modules-index.json" 2>/dev/null || true
   save_stream /usr/libexec/rpcd/geo-sync 755 <<'ASSET_EOF'
 #!/bin/sh
 # rpcd plugin for geo-sync (LuCI "Гео-маскировка и AI")
@@ -10099,7 +10102,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.17';
+var PANEL_VERSION = '1.30.18';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -31589,7 +31592,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.17"
+GUARD_VERSION="1.30.18"
 
 log() { logger -t geomask-guard "$*"; }
 

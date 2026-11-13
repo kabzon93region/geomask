@@ -54,7 +54,7 @@ def install_layout():
         text = handle.read()
     layout = {}
     for path, mode, asset in STREAM.findall(text):
-        layout[path] = (int(mode), asset.strip())
+        layout[path] = ('%04o' % int(mode, 8), asset.strip())
     return layout
 
 
@@ -74,6 +74,15 @@ def source_path(repo_file):
 # are NOT the bytes in the repository. The catalogue hashes what the router gets -
 # otherwise the panel and the backend would look locally modified after every install.
 VERSION_MARKERS = ('@@PANEL_VERSION@@', '@@BACKEND_VERSION@@', '@@GUARD_VERSION@@')
+
+# Files the installer deliberately keeps when they already exist (owner settings, not code).
+# The updater needs the same rule, or a reinstall + core update silently resets them.
+CONFIG_PATHS = (
+    '/etc/geomask-nodes.conf',
+    '/etc/geomask/vpnwatch.conf',
+    '/etc/geomask/zapret-force-keep.txt',
+    '/etc/geomask/zapret-always-exclude.txt',
+)
 
 
 def sha256_installed(path, version):
@@ -151,12 +160,15 @@ def main():
             problems.append('%s: repository file %s missing' % (path, repo_file))
             continue
         entry = catalogue.setdefault(module_id, {'files': [], 'restart': []})
-        entry['files'].append({
+        record = {
             'path': path,
             'source': os.path.relpath(source, ROOT).replace(os.sep, '/'),
             'mode': mode,
             'sha256': sha256_installed(source, version),
-        })
+        }
+        if path in CONFIG_PATHS:
+            record['config'] = True
+        entry['files'].append(record)
 
     index = {
         'schema': 1,

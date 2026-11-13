@@ -618,6 +618,41 @@ class DoctorStalePageTests(unittest.TestCase):
         self.assertEqual([item['host'] for item in hosts], ['cdn.example.net'])
 
 
+class DoctorExitHonestyTests(unittest.TestCase):
+    """The trace must not invent a country it never measured (audit F15)."""
+
+    def test_direct_without_a_live_probe_says_not_measured(self):
+        self.assertEqual(doctor.country_label(''), '')
+        self.assertIn('не измерялась', doctor.exit_country_text(''))
+        self.assertNotIn('Россия', doctor.exit_country_text(''))
+
+    def test_a_measured_country_is_named_with_its_code(self):
+        self.assertEqual(doctor.country_label('DE'), 'Германия (DE)')
+        self.assertIn('измерено', doctor.exit_country_text('DE'))
+
+    def test_zapret_reports_whether_the_queues_exist(self):
+        def fake(cmd, timeout=8, stdin=None):
+            if cmd[0] == 'pidof':
+                return 0, '571 572'
+            if cmd[0] == 'nft':
+                return 0, 'table inet zapret { queue to 200 }'
+            return 1, ''
+        original = doctor.run
+        self.addCleanup(lambda: setattr(doctor, 'run', original))
+        doctor.run = fake
+        info = doctor.zapret_route('example.com')
+        self.assertTrue(info['running'])
+        self.assertTrue(info['queues'])
+
+    def test_a_running_daemon_without_queues_is_not_confirmed(self):
+        def fake(cmd, timeout=8, stdin=None):
+            return (0, '571') if cmd[0] == 'pidof' else (1, '')
+        original = doctor.run
+        self.addCleanup(lambda: setattr(doctor, 'run', original))
+        doctor.run = fake
+        self.assertFalse(doctor.zapret_route('example.com')['queues'])
+
+
 class DoctorZapretTests(unittest.TestCase):
     """Whether zapret (nfqws) processes a domain - the trace used to stop before this."""
 

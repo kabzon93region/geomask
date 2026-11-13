@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -38,6 +39,69 @@ DEFAULT_CONFIG = '/etc/geomask/module-update.json'
 DEFAULT_STATE = '/etc/geomask/modules-state.json'
 DEFAULT_SELECTION = '/etc/geomask/modules.json'
 CACHE = '/tmp/geomask-modules-index.json'
+# The catalogue stores modes as zero-padded octal strings ("0755"). A JSON integer 755
+# passed to os.chmod is 0o1363 - a world-writable executable - and 644 is 0o1204.
+SAFE_MODES = {0o755, 0o750, 0o700, 0o644, 0o640, 0o600}
+MIHOMO_CONF = '/etc/mihomo/config.yaml'
+
+
+def parse_mode(value, path=''):
+    """Mode from the catalogue, in octal, refusing anything outside the allow-list."""
+    try:
+        if isinstance(value, str):
+            text = value.strip()
+            mode = int(text, 8) if text else 0o644
+        elif isinstance(value, int):
+            # legacy catalogues stored a decimal integer: 755 meant "0755" to the author
+            mode = int(str(value), 8) if value in (644, 755, 600, 640, 700, 750) else value
+        else:
+            mode = 0o644
+    except ValueError:
+        raise UpdateError('invalid mode %r for %s' % (value, path or '?')) from None
+    if mode not in SAFE_MODES:
+        raise UpdateError('refusing mode %04o for %s' % (mode, path or '?'))
+    return mode
+
+
+def provider_names(conf_path=None):
+    """Providers declared in the mihomo config (proxy-providers section)."""
+    conf_path = conf_path or MIHOMO_CONF
+    names = set()
+    section = ''
+    try:
+        with open(conf_path, encoding='utf-8', errors='replace') as handle:
+            for line in handle:
+                if line[:1] not in (' ', '\t', '\n'):
+                    match = re.match(r'^([A-Za-z0-9_-]+):', line)
+                    section = match.group(1) if match else ''
+                    continue
+                if section != 'proxy-providers':
+                    continue
+                match = re.match(r'^  ([A-Za-z0-9_-]+):\s*$', line.rstrip('\n'))
+                if match:
+                    names.add(match.group(1))
+    except OSError:
+        return set()
+    return names
+
+
+def capability_ready(dependency):
+    """A non-module dependency such as `subscription:sub`.
+
+    These used to be looked up in index.modules, where they never exist, so every path
+    module reported "dependencies not ready" no matter how healthy the router was.
+    """
+    kind, _, name = dependency.partition(':')
+    if kind != 'subscription':
+        return False
+    providers = provider_names()
+    if not providers:
+        return False
+    if name in providers:
+        return True
+    # `de5` was retired in v1.23.0: AI and the restricted lane ride `sub` now, so a config
+    # that still names de5 in a manifest is satisfied by any working provider.
+    return name == 'de5' and 'sub' in providers
 BACKUP_ROOT = '/tmp/geomask-module-backup'
 RAW = 'https://raw.githubusercontent.com/{repo}/{ref}/{path}'
 INDEX_PATH = 'modules/index.json'
@@ -203,6 +267,7 @@ def status(index, state, module_id=None, selected=None):
         files = []
         modified = []
         missing = []
+        stale = []
         for entry in module.get('files') or []:
             path = entry['path']
             actual = digest_file(path)
@@ -212,7 +277,11 @@ def status(index, state, module_id=None, selected=None):
                 recorded_hash = recorded['files'].get(path)
                 if recorded_hash and actual != recorded_hash:
                     modified.append(path)
-                elif not recorded_hash:
+                elif recorded_hash and actual == recorded_hash:
+                    # the release changed the file without bumping the version: the bytes on
+                    # disk are the old release, not a local edit, so this is an update
+                    stale.append(path)
+                else:
                     modified.append(path)
             files.append({'path': path, 'sha256': entry['sha256'], 'installed': actual})
         if not chosen:
@@ -221,7 +290,7 @@ def status(index, state, module_id=None, selected=None):
             state_name = 'incomplete'
         elif modified:
             state_name = 'modified'
-        elif version_tuple(available) > version_tuple(installed):
+        elif stale or version_tuple(available) > version_tuple(installed):
             state_name = 'update-available'
         else:
             state_name = 'current'
@@ -245,6 +314,10 @@ def dependencies_ready(index, state, module_id):
     module = (index.get('modules') or {}).get(module_id) or {}
     problems = []
     for dependency in module.get('dependencies') or []:
+        if ':' in dependency:
+            if not capability_ready(dependency):
+                problems.append('%s is not available on this router' % dependency)
+            continue
         other = (index.get('modules') or {}).get(dependency)
         if other is None:
             problems.append('%s is not in the index' % dependency)
@@ -274,6 +347,12 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
         current = digest_file(path)
         if current is not None and current != entry['sha256']:
             known = recorded['files'].get(path)
+            if entry.get('config') and not force:
+                # an owner-edited config (nodes.conf, vpnwatch.conf, zapret lists) is kept by
+                # the installer; the updater must not replace it just because the baseline
+                # recorded those same bytes as "installed"
+                raise UpdateError('%s is a configuration file; use --force to replace it'
+                                  % path)
             if not force and current != known:
                 raise UpdateError('%s was modified locally; use --force to overwrite' % path)
         url = RAW.format(repo=config['repo'], ref=config['ref'], path=entry['source'])
@@ -284,7 +363,7 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
                               % (path, entry['sha256'][:12], actual[:12]))
         if current != actual:
             changed = True
-        staged.append({'path': path, 'mode': entry.get('mode', 644),
+        staged.append({'path': path, 'mode': parse_mode(entry.get('mode', '0644'), path),
                        'data': data, 'sha256': actual})
     return module, staged, changed
 
@@ -436,6 +515,15 @@ def main(argv=None):
             module, staged, changed = download_module(index, state, args.module, config,
                                                       force=args.force)
             if not changed:
+                # A manifest-only module (files: []) never stages anything, so its version
+                # used to stay at the old value and the panel offered the same update forever.
+                recorded = module_state(state, args.module)['version']
+                if version_tuple(module.get('version')) > version_tuple(recorded):
+                    install_staged(args.module, [], state, module.get('version', ''), args.state)
+                    print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
+                                      'version': module.get('version'), 'source': source,
+                                      'metadata': True}, ensure_ascii=False))
+                    return 0
                 print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
                                   'version': module.get('version'), 'source': source},
                                  ensure_ascii=False))

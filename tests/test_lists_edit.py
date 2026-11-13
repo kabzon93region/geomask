@@ -58,6 +58,35 @@ def load_tool():
     return module
 
 
+class SeederSafetyTests(unittest.TestCase):
+    """Auto-seed must never read a valid config as empty (audit F11)."""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            'seed_lists', ROOT / 'assets' / 'geomask-seed-lists.py')
+        cls.seed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.seed)
+
+    def test_an_indented_group_is_counted(self):
+        lines = ['groups:', '  - id: custom', '    name: mine', '    rules: []', '']
+        self.assertEqual(self.seed.count_groups(lines), 1)
+
+    def test_an_empty_block_is_empty(self):
+        self.assertEqual(self.seed.count_groups(['groups:', '']), 0)
+
+    def test_an_unparseable_config_is_not_treated_as_empty(self):
+        lines = ['groups:', '  - id: [broken', '   name: x']
+        self.assertEqual(self.seed.count_groups(lines), -1)
+
+    def test_the_wan_interface_is_remapped(self):
+        lines = ['groups:', '  - id: a', '    interface: pppoe-wan', '  - id: b']
+        out = self.seed.remap_wan(lines, 'eth1')
+        self.assertIn('    interface: eth1', out)
+        self.assertNotIn('    interface: pppoe-wan', out)
+        self.assertEqual(self.seed.remap_wan(lines, ''), lines)
+
+
 class ListsEditTests(unittest.TestCase):
     def setUp(self):
         self.tool = load_tool()

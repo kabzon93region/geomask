@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / 'assets' / 'geomask-module-update.py'
@@ -30,6 +31,90 @@ updater = load_helper()
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+class ModuleUpdaterSafetyTests(unittest.TestCase):
+    """Regressions for the audit of 13.11.2026 (F09, F10, F14)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_modes_from_the_catalogue_are_octal(self):
+        # JSON 755 as a decimal int is 0o1363 - a world-writable root script
+        self.assertEqual(updater.parse_mode('0755'), 0o755)
+        self.assertEqual(updater.parse_mode('0644'), 0o644)
+        self.assertEqual(updater.parse_mode(755), 0o755)   # legacy decimal catalogue
+        self.assertEqual(updater.parse_mode(644), 0o644)
+        with self.assertRaises(updater.UpdateError):
+            updater.parse_mode('0777')
+        with self.assertRaises(updater.UpdateError):
+            updater.parse_mode(0o777)
+
+    def test_the_shipped_catalogue_stores_octal_modes(self):
+        index = json.loads((ROOT / 'modules/index.json').read_text(encoding='utf-8'))
+        modes = {entry['mode'] for module in index['modules'].values()
+                 for entry in module.get('files') or []}
+        self.assertTrue(modes)
+        for mode in modes:
+            self.assertRegex(mode, r'^0[0-7]{3}$')
+
+    def test_a_config_file_is_not_replaced_without_force(self):
+        conf = self.root / 'geomask-nodes.conf'
+        conf.write_text('ai_expect=DE\n', encoding='utf-8')
+        body = b'ai_expect=US\n'
+        index = {'modules': {'core': {'version': '2', 'dependencies': [], 'files': [
+            {'path': str(conf), 'source': 'assets/geomask-nodes.conf', 'mode': '0644',
+             'config': True, 'sha256': updater.digest_bytes(body)}]}}}
+        state = {'modules': {'core': {'version': '1',
+                                      'files': {str(conf): updater.digest_bytes(body)}}}}
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.download_module(index, state, 'core', {'repo': 'r', 'ref': 'm'},
+                                    fetcher=lambda url: body)
+        self.assertIn('configuration file', str(caught.exception))
+        staged = updater.download_module(index, state, 'core', {'repo': 'r', 'ref': 'm'},
+                                         force=True, fetcher=lambda url: body)[1]
+        self.assertEqual(staged[0]['mode'], 0o644)
+
+    def test_subscription_dependencies_are_capabilities_not_modules(self):
+        conf = self.root / 'config.yaml'
+        conf.write_text('proxy-providers:\n  sub:\n    type: http\n    url: "https://x"\n',
+                        encoding='utf-8')
+        index = {'modules': {'core': {'version': '1', 'files': [], 'dependencies': []},
+                             'path_vpn': {'version': '1', 'files': [],
+                                          'dependencies': ['core', 'subscription:sub']}}}
+        state = {'modules': {'core': {'version': '1', 'files': {}}}}
+        with mock.patch.object(updater, 'MIHOMO_CONF', str(conf)):
+            self.assertEqual(updater.dependencies_ready(index, state, 'path_vpn'), [])
+            self.assertEqual(updater.provider_names(), {'sub'})
+        with mock.patch.object(updater, 'MIHOMO_CONF', str(self.root / 'missing.yaml')):
+            problems = updater.dependencies_ready(index, state, 'path_vpn')
+            self.assertTrue(problems)
+            self.assertIn('subscription:sub', problems[0])
+
+    def test_changed_bytes_with_the_same_version_are_an_update(self):
+        script = self.root / 'script.sh'
+        old, new = b'old\n', b'new\n'
+        script.write_bytes(old)
+        index = {'modules': {'core': {'version': '1', 'files': [
+            {'path': str(script), 'source': 's', 'mode': '0755',
+             'sha256': updater.digest_bytes(new)}]}}}
+        state = {'modules': {'core': {'version': '1',
+                                      'files': {str(script): updater.digest_bytes(old)}}}}
+        report = updater.status(index, state)[0]
+        self.assertEqual(report['state'], 'update-available')
+        self.assertEqual(report['modified'], [])
+
+    def test_a_local_edit_is_still_modified(self):
+        script = self.root / 'script.sh'
+        script.write_bytes(b'edited\n')
+        index = {'modules': {'core': {'version': '1', 'files': [
+            {'path': str(script), 'source': 's', 'mode': '0755',
+             'sha256': updater.digest_bytes(b'shipped\n')}]}}}
+        state = {'modules': {'core': {'version': '1',
+                                      'files': {str(script): updater.digest_bytes(b'baseline\n')}}}}
+        self.assertEqual(updater.status(index, state)[0]['state'], 'modified')
 
 
 class ModuleUpdateTests(unittest.TestCase):

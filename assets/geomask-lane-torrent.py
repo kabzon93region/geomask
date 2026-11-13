@@ -24,6 +24,27 @@ CFG = Path('/etc/mihomo/config.yaml')
 class LaneTorrentError(Exception):
     pass
 
+def _lan_ip():
+    """LAN address of this router (uci), never the owner's hardcoded 192.168.0.1."""
+    dev = ''
+    for key in ('network.lan.device', 'network.lan.ifname'):
+        try:
+            dev = subprocess.run(['uci', '-q', 'get', key], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+        except Exception:
+            dev = ''
+        if dev:
+            break
+    dev = dev or 'br-lan'
+    try:
+        out = subprocess.run(['ip', '-4', 'addr', 'show', dev], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return ''
+    match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/', out)
+    return match.group(1) if match else ''
+
+
 def _read_config():
     """Read and parse mihomo config."""
     with open(CFG, encoding='utf-8') as f:
@@ -216,7 +237,7 @@ def _torrent_listener_changes(enable):
             listener_block = f'''  - name: torrent-direct
     type: mixed
     port: 7894
-    listen: 192.168.0.1
+    listen: {_lan_ip() or '127.0.0.1'}
     proxy: VPN'''
             if 'ai-devices' in config:
                 # Insert before ai-devices

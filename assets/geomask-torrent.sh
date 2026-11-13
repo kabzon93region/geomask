@@ -148,8 +148,29 @@ def build_ruleset():
 #   P2P-TOLERANT lane: "proxy: VPN" (the sub2/vlessi group). If that lane is absent, fall back to
 #   "proxy: DIRECT" (real IP, but off the forbidden subscription). It is NEVER left rule-based
 #   (that let AI domains through) and NEVER pinned to AI (node-relay = instant ban).
+def lan_ip():
+    """The router's own LAN address - 192.168.0.1 is only the owner's network."""
+    dev = ''
+    for key in ('network.lan.device', 'network.lan.ifname'):
+        try:
+            dev = subprocess.run(['uci', '-q', 'get', key], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+        except Exception:
+            dev = ''
+        if dev:
+            break
+    dev = dev or 'br-lan'
+    try:
+        out = subprocess.run(['ip', '-4', 'addr', 'show', dev], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return ''
+    match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/', out)
+    return match.group(1) if match else ''
+
+
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
-                '    listen: 192.168.0.1']
+                '    listen: %s' % (lan_ip() or '127.0.0.1')]
 
 def tolerant_lane():
     """The P2P-tolerant mihomo group: 'VPN' (sub2). Absent on a single-lane box."""
@@ -241,7 +262,7 @@ def status():
         'provider_loaded': prov,
         'extras': sorted(extras()),
         'sources': sources(),
-        'proxy_hint': 'socks5h://192.168.0.1:%s' % LISTENER_PORT,
+        'proxy_hint': 'socks5h://%s:%s' % (lan_ip() or '<LAN IP>', LISTENER_PORT),
     }
 
 args=sys.argv[1:]

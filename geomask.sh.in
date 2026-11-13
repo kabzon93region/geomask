@@ -15,6 +15,7 @@
 #   sh geomask.sh --seed-lists  restore MagiTrickle domain lists from the bundled template (all groups)
 #   sh geomask.sh --list-modules   what is mandatory and what is optional
 #   sh geomask.sh --modules=core,path_vpn   install only the modules this router needs
+#   sh geomask.sh --adopt-config  take an existing (non-geomask) mihomo config under management
 #   sh geomask.sh --help
 #
 # Install (jsDelivr CDN - fast, shows download progress):
@@ -35,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.14"
+GM_VERSION="1.30.15"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -44,6 +45,7 @@ GM_RESTART=0
 GM_BACKUP=0
 GM_REINSTALL=0
 GM_SEED_LISTS=0
+GM_ADOPT=0
 GM_STEP=""
 GM_VPN_URL=""
 GM_AI_URL=""
@@ -68,6 +70,51 @@ ask() { # ask "question" -> 0=yes  (auto/yes modes never block)
 }
 
 P() { printf '%s%s' "$GM_PREFIX" "$1"; }
+
+# ---- discovered names: nothing below may assume br-lan / pppoe-wan / 192.168.0.x ----
+LAN_IF_CACHE=""
+lan_iface() {
+  [ -n "$LAN_IF_CACHE" ] && { printf '%s' "$LAN_IF_CACHE"; return 0; }
+  _i=$(uci -q get network.lan.device 2>/dev/null)
+  [ -n "$_i" ] || _i=$(uci -q get network.lan.ifname 2>/dev/null)
+  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i="" ;; esac
+  [ -n "$_i" ] || _i=br-lan
+  LAN_IF_CACHE="$_i"
+  printf '%s' "$_i"
+}
+
+lan_ip() {
+  ip -4 addr show "$(lan_iface)" 2>/dev/null \
+    | sed -n 's/.*inet \([0-9][0-9.]*\)\/.*/\1/p' | head -1
+}
+
+wan_iface() {
+  for _k in network.wan.device network.wan.ifname network.wan6.device; do
+    _i=$(uci -q get "$_k" 2>/dev/null)
+    case "$_i" in ''|*[!a-zA-Z0-9._-]*) continue ;; esac
+    printf '%s' "$_i"; return 0
+  done
+  # DHCP/PPPoE on a dynamically named device: report what actually carries the default route
+  _i=$(ip route show default 2>/dev/null | sed -n 's/.*dev \([a-zA-Z0-9._-]*\).*/\1/p' | head -1)
+  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i=pppoe-wan ;; esac
+  printf '%s' "$_i"
+}
+
+mihomo_tun() { # the TUN device mihomo is configured to create
+  _d=$(awk '/^tun:/{f=1;next} f&&/^[^ ]/{exit} f&&/^[[:space:]]*device:/{gsub(/^[[:space:]]*device:[[:space:]]*/,"");print;exit}' \
+       "$(P /etc/mihomo/config.yaml)" 2>/dev/null)
+  case "$_d" in ''|*[!a-zA-Z0-9._-]*) _d=Mihomo ;; esac
+  printf '%s' "$_d"
+}
+
+# Address for the second (AI) dnsmasq: same subnet as the LAN, host part .53
+aidns_ip() {
+  _ip=$(lan_ip)
+  case "$_ip" in
+    *.*.*.*) printf '%s.53' "$(printf '%s' "$_ip" | cut -d. -f1-3)" ;;
+    *) printf '' ;;
+  esac
+}
 
 # Keep authentication out of curl argv and diagnostics; read the active config on each call.
 controller_curl() {
@@ -113,6 +160,35 @@ except Exception:
     print('Controller request failed (configuration or transport error)', file=sys.stderr)
     sys.exit(1)
 GM_CONTROLLER_PY
+}
+
+# ---- mihomo config: ownership, validation, provider discovery -----------------
+# A config that already carries geomask's layout (provider + the two groups it manages) can
+# be patched in place. Anything else belongs to the owner: it is never overwritten silently,
+# because a rewrite drops tun/dns/secret and every custom rule with it.
+geomask_config_shaped() { # geomask_config_shaped <file>
+  _f="$1"
+  [ -s "$_f" ] || return 1
+  grep -q '^proxy-providers:' "$_f" 2>/dev/null || return 1
+  grep -qE '^  - name: (AI|VPN-noP2P)$' "$_f" 2>/dev/null || return 1
+  return 0
+}
+
+any_provider_url() { # first http provider url in the config (any provider name)
+  awk '
+    /^proxy-providers:/ {p=1; next}
+    p && /^[A-Za-z]/ {exit}
+    p && /^  [A-Za-z0-9_-]+:/ {name=$0; sub(/:.*/,"",name); sub(/^  /,"",name)}
+    p && /^[[:space:]]+url:/ {
+      line=$0; sub(/^[[:space:]]*url:[[:space:]]*/,"",line);
+      gsub(/^"|"$/,"",line); gsub(/^'"'"'|'"'"'$/,"",line);
+      if (line != "") {print line; exit}
+    }' "$1" 2>/dev/null | head -1
+}
+
+mihomo_validate() { # mihomo_validate <config-file>  - the CANDIDATE, never the live file
+  [ -s "$1" ] || return 1
+  mihomo -d "$(P /etc/mihomo)" -f "$1" -t >/dev/null 2>&1
 }
 
 # extract provider url from mihomo config: _prov_url <file> <provider-name>
@@ -314,7 +390,13 @@ modules_maybe_prompt() { # ask at most once per run, and only when the run can i
   [ "${GM_MODULES_ASKED:-0}" = 1 ] && return 0
   # GM_MODULES_ASK=1 lets the sandbox harness drive the picker without a tty.
   if [ "${GM_MODULES_ASK:-0}" != 1 ]; then
-    if [ "$GM_YES" = 1 ] || [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then return 0; fi
+    if [ "$GM_YES" = 1 ] || [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
+      # unattended runs keep the router's own selection; "no --modules" used to mean "all",
+      # which made an update re-install modules the owner had deliberately left out
+      _stored=$(modules_state_read 2>/dev/null || true)
+      [ -n "$_stored" ] && GM_MODULES="$_stored"
+      return 0
+    fi
     [ -t 0 ] || return 0
   fi
   GM_MODULES_ASKED=1
@@ -327,6 +409,35 @@ svc_alive() { pidof "$1" >/dev/null 2>&1; }
 
 initd() { # initd <svc> <action>  - respects GM_PREFIX for tests
   "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+}
+
+# ============================================================ PREFLIGHT
+# Everything that can only fail later is checked here, before the first byte is written:
+# a reset router must not end up with a panel and no working mihomo config.
+preflight() {
+  _need=0
+  _c="$(P $MIHOMO_CONF)"
+  if [ -z "$GM_VPN_URL" ]; then
+    _u=""
+    [ -s "$_c" ] && _u=$(_prov_url "$_c" sub)
+    if [ -z "$_u" ] && [ -s "$_c" ]; then _u=$(any_provider_url "$_c"); fi
+    if [ -z "$_u" ]; then
+      if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ]; then
+        bad "preflight: на роутере свой конфиг mihomo, подписка не задана"
+        info "  Либо --vpn-url '<ссылка>' (геомаск перепишет конфиг по шаблону),"
+        info "  либо --adopt-config (взять текущий конфиг под управление, сохранив его)."
+      else
+        bad "preflight: не задана ссылка VPN-подписки"
+        info "  Запустите: sh $0 --vpn-url 'https://...' --auto"
+      fi
+      _need=1
+    fi
+  fi
+  if have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    have apk || have opkg || { bad "preflight: нет apk/opkg - python3-yaml не поставить"; _need=1; }
+  fi
+  [ -n "$(lan_ip)" ] || { bad "preflight: не определён адрес LAN ($(lan_iface)) - слушатели некуда привязать"; _need=1; }
+  return $_need
 }
 
 # ============================================================ STEP 1: env
@@ -344,6 +455,19 @@ step1_check() {
   for c in python3 curl; do
     if have "$c"; then info "$c: present"; else warn "$c: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
   done
+  # v1.30.15: PyYAML is a hard runtime dependency (slot patcher, audit state, node audit).
+  # CI installed it on the runner, so a reset router without python3-yaml was never tested.
+  if have python3; then
+    if python3 -c 'import yaml' >/dev/null 2>&1; then info "python3-yaml: present"
+    else warn "python3-yaml: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
+  fi
+  # the AI lane is a second hev-socks5-tunnel instance; without the binary it cannot exist
+  if module_selected path_ai || module_selected ai_dns; then
+    if have hev-socks5-tunnel || [ -x "$(P /usr/bin/hev-socks5-tunnel)" ]; then info "hev-socks5-tunnel: present"
+    else warn "hev-socks5-tunnel: MISSING - нужен для AI-пути и AI-DNS; в фидах его нет, ставится с базовым стеком"; fi
+  else
+    info "hev-socks5-tunnel: не требуется выбранными модулями"
+  fi
   _tmp=$(df -m "$(P /tmp)" 2>/dev/null | awk 'NR==2{print $4}')
   if [ -n "${_tmp:-}" ] && [ "$_tmp" -ge 20 ] 2>/dev/null; then info "/tmp free: ${_tmp}MB"; else warn "/tmp free low or unknown"; _need=1; fi
   _root=$(df -m "$(P /)" 2>/dev/null | awk 'NR==2{print $4}')
@@ -358,6 +482,8 @@ step1_check() {
 step1_apply() {
   _missing=""
   for _c in python3 curl; do have "$_c" || _missing="$_missing $_c"; done
+  # package name differs from the import name: python3-yaml provides `import yaml`
+  have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1 && _missing="$_missing python3-yaml"
   if [ -z "$_missing" ]; then
     info "packages: python3 and curl already present"
     return 0
@@ -380,7 +506,11 @@ step1_apply() {
   for _c in python3 curl; do
     have "$_c" || { bad "$_c still missing after install"; return 1; }
   done
-  info "packages: python3 and curl ready"
+  if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    bad "python3-yaml still missing after install - панель не сможет назначать подписки"
+    return 1
+  fi
+  info "packages: python3, python3-yaml and curl ready"
   return 0
 }
 step1_verify() { step1_check; }
@@ -563,7 +693,7 @@ step3_check() {
       *)      bad "torrent listener policy '$_tp' - expected VPN or DIRECT (never AI)"; _need=1 ;;
     esac
   else warn "torrent-direct listener missing (torrent clients cannot be pinned away from node-relay)"; fi
-  grep -qE '^  - SRC-PORT,41552,(VPN|DIRECT)$' "$_c" 2>/dev/null \
+  grep -qE '^  - SRC-PORT,41552,(VPN|VPN-noP2P|DIRECT)$' "$_c" 2>/dev/null \
     && info "torrent peer guard (SRC-PORT -> tolerant/DIRECT): present" \
     || warn "SRC-PORT,41552 guard absent or not on VPN-DIRECT - incoming peers may reach node-relay"
   # R01/P1 (v1.23.2): node-relay (VPN-noP2P) MagiTrickle groups must carry NO static IP
@@ -593,7 +723,7 @@ step3_check() {
   grep -qE 'RULE-SET,torrentsites,DIRECT' "$_c" 2>/dev/null \
     && info "torrent sites -> DIRECT (Cloudflare rejects the VPN exit)" \
     || warn "torrentsites rule missing - forum sites may return 502 through the VPN lane"
-  grep -qE 'RULE-SET,torrentdirect,(DIRECT|VPN)' "$_c" 2>/dev/null \
+  grep -qE 'RULE-SET,torrentdirect,(DIRECT|VPN|VPN-noP2P)' "$_c" 2>/dev/null \
     && info "torrentdirect rule: present ($(awk -F, '/RULE-SET,torrentdirect/{print $3; exit}' "$_c"))" \
     || warn "torrentdirect rule missing (tracker domains can still go to the wrong subscription)"
   # v1.17.0: lane invariant. A torrent peer is always a bare IP, so no IP rule may reach the
@@ -639,9 +769,20 @@ step3_check() {
 }
 step3_apply() {
   _c="$(P $MIHOMO_CONF)"
+  # v1.30.15: a foreign config is not "an existing config" - rewriting it loses tun, dns,
+  # secret and every custom rule. Taking it over must be an explicit decision.
+  if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ]; then
+    bad "на роутере свой конфиг mihomo, и он не от geomask"
+    info "  Перезапись шаблоном потеряет tun/dns/secret и ваши правила - этого не будет."
+    info "  Варианты:"
+    info "    sh $0 --adopt-config --vpn-url '<ссылка>' --auto   взять конфиг под управление"
+    info "    или перенесите подписку/группы вручную и запустите без --adopt-config"
+    return 1
+  fi
   _vpnu="$GM_VPN_URL"
   if [ -s "$_c" ]; then
     [ -z "$_vpnu" ] && _vpnu=$(_prov_url "$_c" sub)
+    [ -z "$_vpnu" ] && _vpnu=$(any_provider_url "$_c")
   fi
   # v1.23.0: AI no longer has its own subscription - it borrows node-relay (sub) and keeps only
   # USA nodes (v1.22.8). Only the VPN subscription URL is required; the old AI sub (de5) is retired.
@@ -676,6 +817,19 @@ step3_verify() { step3_check; }
 write_mihomo_config() {
   _c="$(P $MIHOMO_CONF)"
   _vpnu="$1"; _aiu="$2"
+  # The rollback source must be the file as it was BEFORE this run touched it. The old code
+  # copied the already-replaced file in safe_mihomo_restart, so "rollback" restored the
+  # broken candidate.
+  _lanip=$(lan_ip)
+  if [ -z "$_lanip" ]; then
+    bad "не удалось определить адрес LAN ($(lan_iface)) - listener некуда привязать"
+    info "  Проверьте: uci show network.lan; ip -4 addr show $(lan_iface)"
+    return 1
+  fi
+  if [ -s "$_c" ] && [ -z "${GM_PRE_CONFIG:-}" ]; then
+    GM_PRE_CONFIG="$_c.pre-run-$(date +%s 2>/dev/null || echo pre)"
+    cp -p "$_c" "$GM_PRE_CONFIG" 2>/dev/null || GM_PRE_CONFIG=""
+  fi
   # --- existing 2-subscription config: keep it as-is (custom rules, headers, sniffer)
   #     and only patch provider urls / ensure the ai-devices listener ---
   # --- existing config: keep it as-is (custom rules, headers, sniffer) and only patch
@@ -686,7 +840,7 @@ write_mihomo_config() {
     if grep -q '^  de5:' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
       awk 'BEGIN{d=0} /^  de5:/{d=1;next} d&&/^  [A-Za-z0-9_-]+:/{d=0} d&&!/^    /{d=0} !d{print}' "$_c" > "$_c.de5rm" \
-        && mihomo -d /etc/mihomo -t >/dev/null 2>&1 && mv -f "$_c.de5rm" "$_c" && rm -f "$_c.de5rm" \
+        && mihomo_validate "$_c.de5rm" && mv -f "$_c.de5rm" "$_c" && rm -f "$_c.de5rm" \
         && info "retired de5 provider removed from config" || { rm -f "$_c.de5rm"; warn "de5 removal skipped (validation)"; }
     fi
     _curv=$(_prov_url "$_c" sub)
@@ -702,15 +856,15 @@ write_mihomo_config() {
         END{exit done?0:1}' "$_c" > "$_c.urlnew"; then
         rm -f "$_c.urlnew"; bad "provider url patch failed"; return 1
       fi
-      mihomo -d /etc/mihomo -t >/dev/null 2>&1 && mv -f "$_c.urlnew" "$_c" || { rm -f "$_c.urlnew"; bad "mihomo -t failed - config kept"; return 1; }
+      mihomo_validate "$_c.urlnew" && mv -f "$_c.urlnew" "$_c" || { rm -f "$_c.urlnew"; bad "mihomo -t failed - config kept"; return 1; }
       info "provider url updated in place (sub)"
     fi
     if ! grep -q 'ai-devices' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
-      awk 'BEGIN{d=0}
-        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: 192.168.0.1";print "";d=1}
+      awk -v L="$_lanip" 'BEGIN{d=0}
+        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: " L;print "";d=1}
         {print}' "$_c" > "$_c.zmnew" || return 1
-      if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+      if mihomo_validate "$_c.zmnew"; then
         mv -f "$_c.zmnew" "$_c"; info "listeners block added to existing config (custom rules preserved)"
       else
         rm -f "$_c.zmnew"; bad "mihomo -t failed after adding listeners - config kept"; return 1
@@ -719,10 +873,10 @@ write_mihomo_config() {
       # v1.14.4: config already had listeners - make sure the torrent DIRECT one exists
       if ! grep -q 'torrent-direct' "$_c"; then
         cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
-        awk 'BEGIN{d=0} {print} (!d && $0 ~ /^    proxy: AI$/) {
+        awk -v L="$_lanip" 'BEGIN{d=0} {print} (!d && $0 ~ /^    proxy: AI$/) {
               print "  - name: torrent-direct"; print "    type: mixed"; print "    port: 7894";
-              print "    listen: 192.168.0.1"; d=1 }' "$_c" > "$_c.tdnew" || return 1
-        if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+              print "    listen: " L; d=1 }' "$_c" > "$_c.tdnew" || return 1
+        if mihomo_validate "$_c.tdnew"; then
           mv -f "$_c.tdnew" "$_c"; info "torrent-direct listener added (listeners already present)"
         else
           rm -f "$_c.tdnew"; bad "mihomo -t failed after adding torrent-direct - config kept"; return 1
@@ -765,7 +919,7 @@ write_mihomo_config() {
     printf '%s\n' '  - name: torrent-direct'
     printf '%s\n' '    type: mixed'
     printf '%s\n' '    port: 7894'
-    printf '%s\n' '    listen: 192.168.0.1'
+    printf '%s\n' '    listen: %s' "$_lanip"
     printf '%s\n' '    proxy: DIRECT'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
@@ -865,10 +1019,10 @@ write_mihomo_config() {
     printf '%s\n' '  # v1.22.0: forum/catalog sites stay DIRECT - Cloudflare rejects the VPN exit'
     printf '%s\n' '  # IPs, so routing them to a VPN makes them unreachable (measured 502 vs 301).'
     printf '%s\n' '  - RULE-SET,torrentsites,DIRECT'
-    printf '%s\n' '  - RULE-SET,torrentdirect,VPN'
+    printf '%s\n' '  - RULE-SET,torrentdirect,VPN-noP2P'
     printf '%s\n' '  # torrent client listening port: peers that dial US must not reach the VPN slot;'
     printf '%s\n' '  # with a RESERVE/VPN lane configured geomask repoints this to that lane'
-    printf '%s\n' '  - SRC-PORT,41552,AI'
+    printf '%s\n' '  - SRC-PORT,41552,DIRECT'
     printf '%s\n' '  - RULE-SET,mtrickle,VPN-noP2P'
     printf '%s\n' '  # STUN: stop WebRTC leaking the real (RU) IP, keep calls working'
     printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN-noP2P'
@@ -890,10 +1044,10 @@ write_mihomo_config() {
   } > "$_tmpconf" || { bad "cannot write $_tmpconf"; return 1; }
   # ruleset files must exist before mihomo -t
   mkdir -p "$(P /etc/mihomo/ruleset)"
-  for rf in mtrickle ai ytdirect ytvpn; do
+  for rf in mtrickle ai ytdirect ytvpn torrentdirect torrentsites; do
     [ -s "$(P /etc/mihomo/ruleset/$rf.yaml)" ] || printf 'payload: []\n' > "$(P /etc/mihomo/ruleset/$rf.yaml)"
   done
-  if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+  if mihomo_validate "$_tmpconf"; then
     info "mihomo -t on new config: PASS"
   else
     bad "mihomo -t FAILED on new config - keeping old"; rm -f "$_tmpconf"; return 1
@@ -921,32 +1075,84 @@ api_refresh_provider() { # api_refresh_provider <name> <url>
 #         must not be present while the new one is created (that nesting bloated archives in
 #         v1.6-1.8). The folder is published read-only over SMB (share 'geomask-backups',
 #         see ensure_smb_share) and linked from the panel.
-ensure_backup() { # -> path on stdout, rc=1 on failure
+BACKUP_KEEP=1          # freshest copy on the router; full history lives on the PC
+
+ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
+  # v1.30.15: the previous archive is no longer deleted before the new one exists, and a
+  # reduced tar is never passed off as a sysupgrade backup. Old copies are parked outside
+  # /root while sysupgrade archives /root (that nesting was the reason for the old delete),
+  # and they come back untouched if creation fails.
+  _mode="${1:-full}"
   _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
   _dir="$(P /root/geomask-backups)"
   mkdir -p "$_dir" 2>/dev/null
-  # remove previous copies BEFORE creating: they live under /root, which sysupgrade -b
-  # archives - leaving them in place embeds them into the new archive (observed 19->28 MB).
-  # If creation then fails there is no on-router copy; caller aborts the change and the PC
-  # history (fetch_backup.ps1) remains.
-  rm -f "$_dir"/router-backup-*.tar.gz 2>/dev/null
-  _out=""
-  if have sysupgrade; then
-    _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
-    if sysupgrade -b "$_tmp" >/dev/null 2>&1 && [ -s "$_tmp" ]; then _out="$_tmp"; fi
+  _park="$(P /tmp)/geomask-bk-park-$$"
+  rm -rf "$_park"; mkdir -p "$_park"
+  _parked=0
+  for _old in "$_dir"/router-backup-*.tar.gz; do
+    [ -f "$_old" ] || continue
+    mv -f "$_old" "$_park/" 2>/dev/null && _parked=$((_parked+1))
+  done
+  _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
+  rm -f "$_tmp"
+  _full=0
+  if have sysupgrade && sysupgrade -b "$_tmp" >/dev/null 2>&1 && [ -s "$_tmp" ]; then
+    _full=1
   fi
-  if [ -z "$_out" ]; then
-    _out="$(P /tmp)/geomask-bk-$_ts-min.tar.gz"
-    tar czf "$_out" -C "$(P /)" etc 2>/dev/null || _out=""
+  if [ "$_full" = 0 ]; then
+    rm -f "$_tmp"
+    if [ "$_mode" = full ]; then
+      # put the parked copies back: a failed run must not cost the router its only backup
+      for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
+      rm -rf "$_park"
+      bad "полный бэкап (sysupgrade -b) не создан"
+      return 1
+    fi
+    _tmp="$(P /tmp)/geomask-bk-$_ts-partial.tar.gz"
+    if ! tar czf "$_tmp" -C "$(P /)" etc root >/dev/null 2>&1 || [ ! -s "$_tmp" ]; then
+      rm -f "$_tmp"
+      for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
+      rm -rf "$_park"
+      bad "cannot create backup"
+      return 1
+    fi
+    warn "полный бэкап не создан - сохранена частичная копия (etc + root)"
   fi
-  if [ -z "$_out" ] || [ ! -s "$_out" ]; then
-    bad "cannot create backup"
+  if [ "$_full" = 1 ]; then
+    _dest="$_dir/router-backup-$_ts.tar.gz"
+  else
+    _dest="$_dir/router-backup-$_ts-partial.tar.gz"
+  fi
+  if ! mv -f "$_tmp" "$_dest"; then
+    rm -f "$_tmp"
+    for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
+    rm -rf "$_park"
+    bad "cannot store backup into $_dir"
     return 1
   fi
-  _dest="$_dir/router-backup-$_ts.tar.gz"
-  mv -f "$_out" "$_dest" || { bad "cannot store backup into $_dir"; return 1; }
   chmod 644 "$_dest" 2>/dev/null
+  # rotation happens only now, and never touches the copy just written
+  _n=0
+  for _old in $(ls -1t "$_dir"/router-backup-*.tar.gz 2>/dev/null); do
+    _n=$((_n+1))
+    [ "$_n" -gt "$BACKUP_KEEP" ] && [ "$_old" != "$_dest" ] && rm -f "$_old"
+  done
+  rm -rf "$_park"
   printf '%s' "$_dest"
+  return 0
+}
+
+backup_gate() { # a verified full backup before the first write of this run
+  [ "${GM_BACKUP_DONE:-0}" = 1 ] && return 0
+  _bk=$(ensure_backup full) || {
+    bad "нет полного бэкапа - изменения на роутере не начинаются"
+    info "  Причина выше. Освободите место (df -h /) или сделайте бэкап вручную:"
+    info "  LuCI -> Система -> Резервная копия / Обновление прошивки -> Создать архив"
+    return 1
+  }
+  GM_BACKUP_DONE=1
+  GM_BACKUP_PATH="$_bk"
+  info "полный бэкап: $_bk"
   return 0
 }
 
@@ -1086,9 +1292,12 @@ safe_mihomo_restart() {
     warn "restart skipped (no --restart); will apply at next mihomo start"
     return 0
   fi
-  _bk=$(ensure_backup) || { bad "no backup - restart ABORTED"; return 1; }
+  _bk=$(ensure_backup full) || { bad "no full backup - restart ABORTED"; return 1; }
   info "backup: $_bk"
-  cp -p "$_c" "$_c.pre-restart" 2>/dev/null || true
+  # the pre-image is the file as it was BEFORE this run; copying the current file here (the
+  # old behaviour) made the "rollback" restore the candidate that had just failed
+  _pre="${GM_PRE_CONFIG:-}"
+  [ -s "$_pre" ] || _pre=$(ls -1t "$_c".bak_geomask_* 2>/dev/null | head -1)
   if ! mihomo_trial_run; then
     bad "trial failed - live mihomo NOT restarted; config left for manual review"
     return 1
@@ -1098,17 +1307,17 @@ safe_mihomo_restart() {
     return 0
   fi
   bad "restart FAILED - rolling back config and re-starting"
-  if [ -s "$_c.pre-restart" ]; then
-    cp -p "$_c.pre-restart" "$_c"
+  if [ -n "$_pre" ] && [ -s "$_pre" ]; then
+    cp -p "$_pre" "$_c"
     /etc/init.d/mihomo restart >/dev/null 2>&1
     sleep 3
-    if svc_alive mihomo; then
-      info "rollback OK: previous config restored, mihomo running"
+    if svc_alive mihomo && controller_curl -s -m3 "http://127.0.0.1:9090/version" 2>/dev/null | grep -qi 'mihomo\|meta'; then
+      info "rollback OK: предыдущий конфиг восстановлен, mihomo отвечает ($_pre)"
     else
       bad "rollback FAILED - RESTORE FROM BACKUP: $_bk"
     fi
   else
-    bad "no pre-restart copy; RESTORE FROM BACKUP: $_bk"
+    bad "нет копии прежнего конфига; RESTORE FROM BACKUP: $_bk"
   fi
   return 1
 }
@@ -1167,6 +1376,8 @@ aidns_generate_nft() { # (re)write the nft include from the current ai device li
 step4_check() {
   _need=0
   mod_skipped ai_dns && return 0
+  _aip=$(aidns_ip)
+  [ -n "$_aip" ] && AIDNS_IP="$_aip"
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then
     info "AI-DNS: disabled (/etc/geomask-aidns.off present)"
     return 0
@@ -1210,20 +1421,34 @@ step4_check() {
 step4_apply() {
   mod_skipped ai_dns && return 0
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then info "AI-DNS disabled by flag - nothing to do"; return 0; fi
+  _aip=$(aidns_ip)
+  if [ -z "$_aip" ]; then
+    bad "не определён адрес LAN - AI-DNS некуда привязать (проверьте uci show network.lan)"
+    return 1
+  fi
+  AIDNS_IP="$_aip"
   # v1.30.7: same rule as step 1 - what is installable from the feeds is installed here,
   # not left to the owner. https-dns-proxy is the DoH worker this step configures.
   if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
     if have apk; then
       info "installing: https-dns-proxy (apk)"
       apk add https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
-        || warn "apk add https-dns-proxy failed - AI-DNS will not start until it is installed"
+        || warn "apk add https-dns-proxy failed"
     elif have opkg; then
       info "installing: https-dns-proxy (opkg)"
       opkg install https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
-        || warn "opkg install https-dns-proxy failed - AI-DNS will not start until it is installed"
+        || warn "opkg install https-dns-proxy failed"
     fi
   fi
-  _bk=$(ensure_backup) || { bad "no backup - ABORTED"; return 1; }
+  # v1.30.15: no worker - no DNS/network rewrite. The step used to warn and continue,
+  # sending AI devices to a dnsmasq whose upstream does not exist.
+  if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
+    bad "https-dns-proxy не установлен - AI-DNS не настраивается (DNS и сеть не менялись)"
+    info "  Поставьте пакет и повторите шаг: apk add https-dns-proxy (или opkg install)"
+    info "  Либо откажитесь от AI-DNS: touch /etc/geomask-aidns.off"
+    return 1
+  fi
+  _bk=$(ensure_backup full) || { bad "no full backup - ABORTED"; return 1; }
   info "backup: $_bk"
   # 1) dedicated user for the AI DoH worker (sockets get marked by uid)
   if ! aidns_user_exists; then
@@ -1313,7 +1538,7 @@ seed_lists() {
   fi
   info "lists: seeding MagiTrickle groups from template (mode=${_force:-ifempty})..."
   initd magitrickle stop >/dev/null 2>&1 || true
-  _out=$(python3 "$_py" --config="$_cfg" --template="$_tpl" 2>&1); _rc=$?
+  _out=$(python3 "$_py" --config="$_cfg" --template="$_tpl" --wan-iface="$(wan_iface)" 2>&1); _rc=$?
   initd magitrickle start >/dev/null 2>&1 || true
   sleep 2
   svc_alive magitrickled || warn "magitrickle did not come back after seed"
@@ -1679,7 +1904,7 @@ SVC_LIST="dnsmasq magitrickled mihomo hev-socks5-tunnel rpcd ai-doh dnsmasq-ai"
 aidns_svc_ok() {
   case "$1" in
     ai-doh)     netstat -ltnu 2>/dev/null | grep -q '127.0.0.1:5055 ' ;;
-    dnsmasq-ai) netstat -ltnu 2>/dev/null | grep -q '192.168.0.53:5353 ' ;;
+    dnsmasq-ai) netstat -ltnu 2>/dev/null | grep -q "${AIDNS_IP:-192.168.0.53}:5353 " ;;
   esac
 }
 step6_check() {
@@ -1694,6 +1919,9 @@ step6_check() {
     fi
     if ! module_selected ai_dns && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
       info "$s: модуль ai_dns не выбран - skipped"; continue
+    fi
+    if [ "$s" = hev-socks5-tunnel ] && ! module_selected path_ai && ! module_selected ai_dns; then
+      info "$s: не нужен выбранным модулям - skipped"; continue
     fi
     case "$s" in
       ai-doh|dnsmasq-ai)
@@ -1713,6 +1941,9 @@ step6_apply() {
     fi
     if ! module_selected ai_dns && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
       info "$s: модуль ai_dns не выбран - skipped"; continue
+    fi
+    if [ "$s" = hev-socks5-tunnel ] && ! module_selected path_ai && ! module_selected ai_dns; then
+      info "$s: не нужен выбранным модулям - skipped"; continue
     fi
     case "$s" in
       ai-doh|dnsmasq-ai)
@@ -1749,8 +1980,10 @@ step7_check() {
   else
     bad "mihomo controller request failed (check authentication/connectivity)"; _need=1
   fi
-  if have ubus; then
+  if have ubus && module_selected luci; then
     ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
+  elif ! module_selected luci; then
+    info "geo ubus: панель (модуль luci) не выбрана - проверка пропущена"
   fi
   if ip rule show 2>/dev/null | grep -q 'iif br-lan ipproto icmp'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule absent - LAN ping may die in TUN"; fi
   # AI-DNS: DNS of AI devices must exit through the AI tunnel (mark -> table 101)
@@ -1818,6 +2051,10 @@ run_step() { # run_step N  (interactive/auto common logic)
     return 1
   fi
   if [ "$GM_AUTO" = 1 ] || [ "$GM_YES" = 1 ] || ask "Apply step $_n ($_name)?"; then
+    # every step below writes to the router: one verified full backup per run, before it
+    case "$_n" in
+      2|3|4|5) backup_gate || return 1 ;;
+    esac
     # v1.29.0: an installing step is the right moment to ask which modules to carry.
     case "$_n" in 2|4|5) modules_maybe_prompt ;; esac
     if step_fn "$_n" apply; then
@@ -2065,6 +2302,7 @@ menu_reinstall() {
   _curv=""
   if [ -s "$_c" ]; then _curv=$(_prov_url "$_c" sub); fi
   ask "Продолжить переустановку?" || { warn "отменено"; return 1; }
+  backup_gate || return 1
   modules_maybe_prompt
   _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
   hdr "1/6" "удаление geomask"; geomask_uninstall noreload || true
@@ -2117,6 +2355,7 @@ while [ $# -gt 0 ]; do
     --restart) GM_RESTART=1 ;;
     --backup) GM_BACKUP=1 ;;
     --reinstall) GM_REINSTALL=1 ;;
+    --adopt-config) GM_ADOPT=1 ;;
     --step) shift; GM_STEP="${1:-}" ;;
     --vpn-url) shift; GM_VPN_URL="${1:-}" ;;
     --ai-url) shift; GM_AI_URL="${1:-}" ;;
@@ -2155,15 +2394,21 @@ fi
 
 RC=0
 if [ "$GM_BACKUP" = 1 ]; then
-  _b=$(ensure_backup) && { info "full backup created: $_b"; info "SMB (freshest one): \\\\$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)\\geomask-backups ; history on PC: geomask\\fetch_backup.ps1"; RC=0; } || RC=1
+  _b=$(ensure_backup full) && { info "полный бэкап: $_b"; info "SMB (свежая копия): \\\\$(lan_ip)\\geomask-backups ; история на ПК: geomask\\fetch_backup.ps1"; RC=0; } || { bad "полный бэкап не создан"; RC=1; }
 elif [ "$GM_REINSTALL" = 1 ]; then
   menu_reinstall || RC=1
 elif [ "$GM_SEED_LISTS" = 1 ]; then
-  write_lists_assets && seed_lists force || RC=1
+  if backup_gate; then write_lists_assets && seed_lists force || RC=1; else RC=1; fi
 elif [ -n "$GM_STEP" ]; then
   run_step "$GM_STEP" || RC=1
 elif [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
   log "geomask v$GM_VERSION  mode: $([ "$GM_CHECK_ONLY" = 1 ] && echo check || echo auto)"
+  if [ "$GM_CHECK_ONLY" != 1 ] && ! preflight; then
+    bad "preflight не пройден - ничего не изменено"
+    log ""
+    log "== SUMMARY: pass=$PASS fail=$FAILCNT skipped_steps=$SKIP =="
+    exit 1
+  fi
   for n in 1 2 3 4 5 6 7; do
     if [ "$GM_CHECK_ONLY" = 1 ]; then
       run_step "$n" || true

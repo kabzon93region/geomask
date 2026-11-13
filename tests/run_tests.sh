@@ -66,6 +66,7 @@ for s in magitrickle mihomo zapret hev-socks5-tunnel dnsmasq; do
 done
 # AI-DNS step deps (v1.5.7): DoH binary + rc.common for the services it installs
 mkdir -p "$R/usr/sbin"
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/hev-socks5-tunnel"; chmod +x "$R/usr/bin/hev-socks5-tunnel"
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/sbin/https-dns-proxy"; chmod +x "$R/usr/sbin/https-dns-proxy"
 printf '#!/bin/sh\nexit 0\n' > "$R/etc/rc.common"; chmod +x "$R/etc/rc.common"
 echo x > "$R/usr/bin/geo-backend.sh"
@@ -375,10 +376,10 @@ if grep -qF 'read_only=yes' "$SCRIPT" && ! grep -qE "read_only='1'" "$SCRIPT"; t
 else
   echo "FAIL: S13 quoted uci values present"; failn=$((failn+1))
 fi
-if grep -qF 'rm -f "$_dir"/router-backup-*.tar.gz 2>/dev/null' "$SCRIPT" && grep -qF 'rm -f /tmp/router-backup-*.tar.gz "$BKD"/router-backup-*.tar.gz' "$SCRIPT"; then
-  echo "PASS: S13 old copies purged before sysupgrade (no embedding)"; pass=$((pass+1))
+if grep -qF 'geomask-bk-park' "$SCRIPT" && grep -qF 'for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done' "$SCRIPT"; then
+  echo "PASS: S13 old copies parked outside /root and restored on failure"; pass=$((pass+1))
 else
-  echo "FAIL: S13 purge order wrong"; failn=$((failn+1))
+  echo "FAIL: S13 old copies are not preserved on a failed backup"; failn=$((failn+1))
 fi
 # v1.9.3: section enumeration must accept 'ksmbd.@share[N]' (uci show format) + dedupe
 if grep -qF 's/^\(ksmbd\.[^=]*\)=share$/\1/p' "$SCRIPT" && grep -qF 'duplicate sections removed' "$SCRIPT"; then
@@ -435,7 +436,7 @@ else
   echo "FAIL: S13 SMB auth setup missing"; failn=$((failn+1))
 fi
 # backup must be built in /tmp then moved (never let an older /root copy nest into sysupgrade -b)
-if grep -qF 'geomask-bk-$' "$SCRIPT" && grep -qF 'mv -f "$_out" "$_dest"' "$SCRIPT"; then
+if grep -qF 'geomask-bk-$_ts.tar.gz' "$SCRIPT" && grep -qF 'mv -f "$_tmp" "$_dest"' "$SCRIPT"; then
   echo "PASS: S13 ensure_backup: build in tmp + move (no nesting)"; pass=$((pass+1))
 else
   echo "FAIL: S13 ensure_backup does not build-then-move"; failn=$((failn+1))
@@ -623,7 +624,7 @@ if grep -qE 'x-hwid|token|password|secret|/sub' "$HERE/../assets/torrentdirect.y
   echo "FAIL: S23 ruleset asset contains a secret-looking string"; failn=$((failn+1))
 else echo "PASS: S23 ruleset asset has no secrets"; pass=$((pass+1)); fi
 grep -qF '"torrentdirect.yaml"' "$HERE/../build.py" && { echo "PASS: S23 wired into build MAP"; pass=$((pass+1)); } || { echo "FAIL: S23 not in build MAP"; failn=$((failn+1)); }
-for _p in '/etc/mihomo/ruleset/torrentdirect.yaml' 'RULE-SET,torrentdirect,(DIRECT|VPN)' 'torrentdirect rule: present' 'no blanket P2P port rules'; do
+for _p in '/etc/mihomo/ruleset/torrentdirect.yaml' 'RULE-SET,torrentdirect,(DIRECT|VPN|VPN-noP2P)' 'torrentdirect rule: present' 'no blanket P2P port rules'; do
   if grep -qF -- "$_p" "$SCRIPT"; then echo "PASS: S23 installer has: $_p"; pass=$((pass+1))
   else echo "FAIL: S23 installer missing: $_p"; failn=$((failn+1)); fi
 done
@@ -698,7 +699,7 @@ else echo "FAIL: S24 --check does not reject AI listener (ban vector)"; failn=$(
 if grep -qF 'no fixed policy - peers can reach node-relay' "$HERE/../geomask.sh.in"; then
   echo "PASS: S24 --check rejects a policy-less listener"; pass=$((pass+1))
 else echo "FAIL: S24 lost the no-policy safety branch"; failn=$((failn+1)); fi
-if grep -qE 'SRC-PORT,41552,\(VPN\|DIRECT\)' "$HERE/../geomask.sh.in"; then
+if grep -qE 'SRC-PORT,41552,\(VPN\|VPN-noP2P\|DIRECT\)' "$HERE/../geomask.sh.in"; then
   echo "PASS: S24 peer-reply guard is VPN/DIRECT only (not AI)"; pass=$((pass+1))
 else echo "FAIL: S24 peer-reply guard still allows AI"; failn=$((failn+1)); fi
 if grep -qF 'def tolerant_lane' "$HERE/../assets/geomask-torrent.sh" && grep -qF "return tolerant_lane() or 'DIRECT'" "$HERE/../assets/geomask-torrent.sh"; then
@@ -1041,7 +1042,7 @@ grep -qF 'def is_group_traffic' "$HERE/../assets/geomask-vpnwatch.sh" \
   && { echo "PASS: S35 multicast is excluded from the peer-shaped signal"; pass=$((pass+1)); } \
   || { echo "FAIL: S35 mDNS traffic is reported as P2P"; failn=$((failn+1)); }
 # torrentdirect may legitimately target either lane now; the checker must not cry over it
-grep -qF 'RULE-SET,torrentdirect,(DIRECT|VPN)' "$HERE/../geomask.sh.in" \
+grep -qF 'RULE-SET,torrentdirect,(DIRECT|VPN|VPN-noP2P)' "$HERE/../geomask.sh.in" \
   && { echo "PASS: S35 --check accepts torrentdirect on either lane"; pass=$((pass+1)); } \
   || { echo "FAIL: S35 --check still demands the retired DIRECT target"; failn=$((failn+1)); }
 grep -qF "TUNNELED_IFACES = {'Mihomo', 'AI', 'VPN-noP2P'}" "$HERE/../assets/sync_mtrickle_mihomo.sh" \
@@ -1613,6 +1614,7 @@ else
 fi
 # the fixture's mihomo lives under the fake root, not on PATH
 _s54_path="$_s54_path:$R/usr/bin"
+printf '#!/bin/sh\necho 204\n' > "$B/curl"; chmod +x "$B/curl"
 APK_TARGET="$B" GM_PREFIX="$R" PATH="$_s54_path" \
   sh "$SCRIPT" --step 1 --yes >"$HERE/last_out.txt" 2>&1
 # curl may already be present (Git Bash ships it), python3 usually is not: what matters is
@@ -1634,6 +1636,74 @@ if grep -qF 'apk add $_missing' "$HERE/../assets/../../geomask.sh" 2>/dev/null \
   echo "PASS: S54 установка пакетов есть в собранном скрипте"; pass=$((pass+1))
 else echo "FAIL: S54 установки пакетов нет в собранном скрипте"; failn=$((failn+1)); fi
 rm -rf "$R" "$B"      # the scenario builds a throwaway package manager
+
+# ---------- scenario 55: чужой конфиг mihomo не перезаписывается (v1.30.15) ----------
+echo "=== S55: чужой конфиг mihomo, --auto без --adopt-config ==="
+R="$HERE/root_foreign"; rm -rf "$R"; mkdir -p "$R/etc/mihomo" "$R/tmp"
+cp -a "$HERE/root_healthy/." "$R/" 2>/dev/null || true
+cat > "$R/etc/mihomo/config.yaml" <<'FOREIGN'
+mixed-port: 7891
+secret: "owner-secret"
+tun:
+  enable: true
+  device: mihomo0
+proxy-providers:
+  myprovider:
+    type: http
+    url: "https://example.invalid/mine"
+proxy-groups:
+  - name: MyGroup
+    type: select
+    use: [myprovider]
+rules:
+  - MATCH,MyGroup
+FOREIGN
+_before=$(cksum "$R/etc/mihomo/config.yaml" | awk '{print $1}')
+GM_PREFIX="$R" t "S55 auto refuses a foreign config" 1 sh "$SCRIPT" --auto --yes
+contains "$HERE/last_out.txt" 'свой конфиг mihomo' "S55 explains why it stopped"
+_after=$(cksum "$R/etc/mihomo/config.yaml" | awk '{print $1}')
+if [ "$_before" = "$_after" ] && grep -qF 'owner-secret' "$R/etc/mihomo/config.yaml"; then
+  echo "PASS: S55 чужой конфиг не тронут"; pass=$((pass+1))
+else echo "FAIL: S55 чужой конфиг изменён"; failn=$((failn+1)); fi
+
+# ---------- scenario 56: нет DoH - шаг 4 не трогает DNS и сеть (v1.30.15) ----------
+echo "=== S56: https-dns-proxy не ставится - шаг 4 отказывается ==="
+R="$HERE/root_nodoh"; rm -rf "$R"; mkdir -p "$R/tmp"
+cp -a "$HERE/root_healthy/." "$R/" 2>/dev/null || true
+rm -f "$R/usr/sbin/https-dns-proxy"
+mkdir -p "$R/usr/bin"; printf '#!/bin/sh\nexit 1\n' > "$R/usr/bin/apk"; chmod +x "$R/usr/bin/apk"
+# the stub package manager must win over tests/bin for this scenario
+GM_PREFIX="$R" PATH="$R/usr/bin:$STUB:$PATH" t "S56 step 4 aborts without the DoH worker" 1 \
+  sh "$SCRIPT" --step 4 --yes
+contains "$HERE/last_out.txt" 'https-dns-proxy не установлен' "S56 names the missing package"
+if [ ! -e "$R/etc/dnsmasq-ai.conf" ] && [ ! -e "$R/usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft" ]; then
+  echo "PASS: S56 DNS и nft не изменены"; pass=$((pass+1))
+else echo "FAIL: S56 шаг продолжил менять DNS/nft"; failn=$((failn+1)); fi
+
+# ---------- scenario 57: минимальный набор без LuCI проходит verify (v1.30.15) ----------
+echo "=== S57: --modules=core,path_vpn без панели ==="
+R="$HERE/root_minimal"; rm -rf "$R"; mkdir -p "$R/tmp"
+cp -a "$HERE/root_healthy/." "$R/" 2>/dev/null || true
+: > "$HERE/state/ubus_objects"     # панель не установлена -> geo-sync нет
+GM_PREFIX="$R" t "S57 minimal modules verify without geo-sync" 0 \
+  sh "$SCRIPT" --step 7 --yes --modules=core,path_vpn
+contains "$HERE/last_out.txt" 'проверка пропущена' "S57 says the panel check was skipped"
+printf 'zapret-manager\ngeo-sync\n' > "$HERE/state/ubus_objects"
+
+# ---------- scenario 58: нет полного бэкапа - изменения не начинаются (v1.30.15) ----------
+echo "=== S58: sysupgrade -b не работает ==="
+R="$HERE/root_nobackup"; rm -rf "$R"; mkdir -p "$R/tmp" "$R/usr/bin"
+cp -a "$HERE/root_healthy/." "$R/" 2>/dev/null || true
+printf '#!/bin/sh\nexit 1\n' > "$R/usr/bin/sysupgrade"; chmod +x "$R/usr/bin/sysupgrade"
+rm -rf "$R/usr/lib/geomask" "$R/usr/libexec/rpcd/geo-sync"
+rm -f "$R/etc/mihomo/config.yaml"
+GM_PREFIX="$R" PATH="$R/usr/bin:$STUB:$PATH" t "S58 apply stops without a full backup" 1 \
+  sh "$SCRIPT" --step 2 --yes
+contains "$HERE/last_out.txt" 'нет полного бэкапа' "S58 says the backup is missing"
+if [ ! -s "$R/usr/lib/geomask/geomask-doctor.py" ]; then
+  echo "PASS: S58 файлы не записаны без бэкапа"; pass=$((pass+1))
+else echo "FAIL: S58 файлы записаны без полного бэкапа"; failn=$((failn+1)); fi
+rm -rf "$R"
 
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

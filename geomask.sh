@@ -15,6 +15,7 @@
 #   sh geomask.sh --seed-lists  restore MagiTrickle domain lists from the bundled template (all groups)
 #   sh geomask.sh --list-modules   what is mandatory and what is optional
 #   sh geomask.sh --modules=core,path_vpn   install only the modules this router needs
+#   sh geomask.sh --adopt-config  take an existing (non-geomask) mihomo config under management
 #   sh geomask.sh --help
 #
 # Install (jsDelivr CDN - fast, shows download progress):
@@ -35,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.14"
+GM_VERSION="1.30.15"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -44,6 +45,7 @@ GM_RESTART=0
 GM_BACKUP=0
 GM_REINSTALL=0
 GM_SEED_LISTS=0
+GM_ADOPT=0
 GM_STEP=""
 GM_VPN_URL=""
 GM_AI_URL=""
@@ -68,6 +70,51 @@ ask() { # ask "question" -> 0=yes  (auto/yes modes never block)
 }
 
 P() { printf '%s%s' "$GM_PREFIX" "$1"; }
+
+# ---- discovered names: nothing below may assume br-lan / pppoe-wan / 192.168.0.x ----
+LAN_IF_CACHE=""
+lan_iface() {
+  [ -n "$LAN_IF_CACHE" ] && { printf '%s' "$LAN_IF_CACHE"; return 0; }
+  _i=$(uci -q get network.lan.device 2>/dev/null)
+  [ -n "$_i" ] || _i=$(uci -q get network.lan.ifname 2>/dev/null)
+  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i="" ;; esac
+  [ -n "$_i" ] || _i=br-lan
+  LAN_IF_CACHE="$_i"
+  printf '%s' "$_i"
+}
+
+lan_ip() {
+  ip -4 addr show "$(lan_iface)" 2>/dev/null \
+    | sed -n 's/.*inet \([0-9][0-9.]*\)\/.*/\1/p' | head -1
+}
+
+wan_iface() {
+  for _k in network.wan.device network.wan.ifname network.wan6.device; do
+    _i=$(uci -q get "$_k" 2>/dev/null)
+    case "$_i" in ''|*[!a-zA-Z0-9._-]*) continue ;; esac
+    printf '%s' "$_i"; return 0
+  done
+  # DHCP/PPPoE on a dynamically named device: report what actually carries the default route
+  _i=$(ip route show default 2>/dev/null | sed -n 's/.*dev \([a-zA-Z0-9._-]*\).*/\1/p' | head -1)
+  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i=pppoe-wan ;; esac
+  printf '%s' "$_i"
+}
+
+mihomo_tun() { # the TUN device mihomo is configured to create
+  _d=$(awk '/^tun:/{f=1;next} f&&/^[^ ]/{exit} f&&/^[[:space:]]*device:/{gsub(/^[[:space:]]*device:[[:space:]]*/,"");print;exit}' \
+       "$(P /etc/mihomo/config.yaml)" 2>/dev/null)
+  case "$_d" in ''|*[!a-zA-Z0-9._-]*) _d=Mihomo ;; esac
+  printf '%s' "$_d"
+}
+
+# Address for the second (AI) dnsmasq: same subnet as the LAN, host part .53
+aidns_ip() {
+  _ip=$(lan_ip)
+  case "$_ip" in
+    *.*.*.*) printf '%s.53' "$(printf '%s' "$_ip" | cut -d. -f1-3)" ;;
+    *) printf '' ;;
+  esac
+}
 
 # Keep authentication out of curl argv and diagnostics; read the active config on each call.
 controller_curl() {
@@ -113,6 +160,35 @@ except Exception:
     print('Controller request failed (configuration or transport error)', file=sys.stderr)
     sys.exit(1)
 GM_CONTROLLER_PY
+}
+
+# ---- mihomo config: ownership, validation, provider discovery -----------------
+# A config that already carries geomask's layout (provider + the two groups it manages) can
+# be patched in place. Anything else belongs to the owner: it is never overwritten silently,
+# because a rewrite drops tun/dns/secret and every custom rule with it.
+geomask_config_shaped() { # geomask_config_shaped <file>
+  _f="$1"
+  [ -s "$_f" ] || return 1
+  grep -q '^proxy-providers:' "$_f" 2>/dev/null || return 1
+  grep -qE '^  - name: (AI|VPN-noP2P)$' "$_f" 2>/dev/null || return 1
+  return 0
+}
+
+any_provider_url() { # first http provider url in the config (any provider name)
+  awk '
+    /^proxy-providers:/ {p=1; next}
+    p && /^[A-Za-z]/ {exit}
+    p && /^  [A-Za-z0-9_-]+:/ {name=$0; sub(/:.*/,"",name); sub(/^  /,"",name)}
+    p && /^[[:space:]]+url:/ {
+      line=$0; sub(/^[[:space:]]*url:[[:space:]]*/,"",line);
+      gsub(/^"|"$/,"",line); gsub(/^'"'"'|'"'"'$/,"",line);
+      if (line != "") {print line; exit}
+    }' "$1" 2>/dev/null | head -1
+}
+
+mihomo_validate() { # mihomo_validate <config-file>  - the CANDIDATE, never the live file
+  [ -s "$1" ] || return 1
+  mihomo -d "$(P /etc/mihomo)" -f "$1" -t >/dev/null 2>&1
 }
 
 # extract provider url from mihomo config: _prov_url <file> <provider-name>
@@ -355,7 +431,13 @@ modules_maybe_prompt() { # ask at most once per run, and only when the run can i
   [ "${GM_MODULES_ASKED:-0}" = 1 ] && return 0
   # GM_MODULES_ASK=1 lets the sandbox harness drive the picker without a tty.
   if [ "${GM_MODULES_ASK:-0}" != 1 ]; then
-    if [ "$GM_YES" = 1 ] || [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then return 0; fi
+    if [ "$GM_YES" = 1 ] || [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
+      # unattended runs keep the router's own selection; "no --modules" used to mean "all",
+      # which made an update re-install modules the owner had deliberately left out
+      _stored=$(modules_state_read 2>/dev/null || true)
+      [ -n "$_stored" ] && GM_MODULES="$_stored"
+      return 0
+    fi
     [ -t 0 ] || return 0
   fi
   GM_MODULES_ASKED=1
@@ -368,6 +450,35 @@ svc_alive() { pidof "$1" >/dev/null 2>&1; }
 
 initd() { # initd <svc> <action>  - respects GM_PREFIX for tests
   "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+}
+
+# ============================================================ PREFLIGHT
+# Everything that can only fail later is checked here, before the first byte is written:
+# a reset router must not end up with a panel and no working mihomo config.
+preflight() {
+  _need=0
+  _c="$(P $MIHOMO_CONF)"
+  if [ -z "$GM_VPN_URL" ]; then
+    _u=""
+    [ -s "$_c" ] && _u=$(_prov_url "$_c" sub)
+    if [ -z "$_u" ] && [ -s "$_c" ]; then _u=$(any_provider_url "$_c"); fi
+    if [ -z "$_u" ]; then
+      if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ]; then
+        bad "preflight: на роутере свой конфиг mihomo, подписка не задана"
+        info "  Либо --vpn-url '<ссылка>' (геомаск перепишет конфиг по шаблону),"
+        info "  либо --adopt-config (взять текущий конфиг под управление, сохранив его)."
+      else
+        bad "preflight: не задана ссылка VPN-подписки"
+        info "  Запустите: sh $0 --vpn-url 'https://...' --auto"
+      fi
+      _need=1
+    fi
+  fi
+  if have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    have apk || have opkg || { bad "preflight: нет apk/opkg - python3-yaml не поставить"; _need=1; }
+  fi
+  [ -n "$(lan_ip)" ] || { bad "preflight: не определён адрес LAN ($(lan_iface)) - слушатели некуда привязать"; _need=1; }
+  return $_need
 }
 
 # ============================================================ STEP 1: env
@@ -385,6 +496,19 @@ step1_check() {
   for c in python3 curl; do
     if have "$c"; then info "$c: present"; else warn "$c: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
   done
+  # v1.30.15: PyYAML is a hard runtime dependency (slot patcher, audit state, node audit).
+  # CI installed it on the runner, so a reset router without python3-yaml was never tested.
+  if have python3; then
+    if python3 -c 'import yaml' >/dev/null 2>&1; then info "python3-yaml: present"
+    else warn "python3-yaml: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
+  fi
+  # the AI lane is a second hev-socks5-tunnel instance; without the binary it cannot exist
+  if module_selected path_ai || module_selected ai_dns; then
+    if have hev-socks5-tunnel || [ -x "$(P /usr/bin/hev-socks5-tunnel)" ]; then info "hev-socks5-tunnel: present"
+    else warn "hev-socks5-tunnel: MISSING - нужен для AI-пути и AI-DNS; в фидах его нет, ставится с базовым стеком"; fi
+  else
+    info "hev-socks5-tunnel: не требуется выбранными модулями"
+  fi
   _tmp=$(df -m "$(P /tmp)" 2>/dev/null | awk 'NR==2{print $4}')
   if [ -n "${_tmp:-}" ] && [ "$_tmp" -ge 20 ] 2>/dev/null; then info "/tmp free: ${_tmp}MB"; else warn "/tmp free low or unknown"; _need=1; fi
   _root=$(df -m "$(P /)" 2>/dev/null | awk 'NR==2{print $4}')
@@ -399,6 +523,8 @@ step1_check() {
 step1_apply() {
   _missing=""
   for _c in python3 curl; do have "$_c" || _missing="$_missing $_c"; done
+  # package name differs from the import name: python3-yaml provides `import yaml`
+  have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1 && _missing="$_missing python3-yaml"
   if [ -z "$_missing" ]; then
     info "packages: python3 and curl already present"
     return 0
@@ -421,7 +547,11 @@ step1_apply() {
   for _c in python3 curl; do
     have "$_c" || { bad "$_c still missing after install"; return 1; }
   done
-  info "packages: python3 and curl ready"
+  if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    bad "python3-yaml still missing after install - панель не сможет назначать подписки"
+    return 1
+  fi
+  info "packages: python3, python3-yaml and curl ready"
   return 0
 }
 step1_verify() { step1_check; }
@@ -3963,6 +4093,27 @@ CFG = Path('/etc/mihomo/config.yaml')
 class LaneTorrentError(Exception):
     pass
 
+def _lan_ip():
+    """LAN address of this router (uci), never the owner's hardcoded 192.168.0.1."""
+    dev = ''
+    for key in ('network.lan.device', 'network.lan.ifname'):
+        try:
+            dev = subprocess.run(['uci', '-q', 'get', key], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+        except Exception:
+            dev = ''
+        if dev:
+            break
+    dev = dev or 'br-lan'
+    try:
+        out = subprocess.run(['ip', '-4', 'addr', 'show', dev], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return ''
+    match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/', out)
+    return match.group(1) if match else ''
+
+
 def _read_config():
     """Read and parse mihomo config."""
     with open(CFG, encoding='utf-8') as f:
@@ -4155,7 +4306,7 @@ def _torrent_listener_changes(enable):
             listener_block = f'''  - name: torrent-direct
     type: mixed
     port: 7894
-    listen: 192.168.0.1
+    listen: {_lan_ip() or '127.0.0.1'}
     proxy: VPN'''
             if 'ai-devices' in config:
                 # Insert before ai-devices
@@ -5121,7 +5272,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.14"
+BACKEND_VERSION="1.30.15"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6659,6 +6810,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -6670,6 +6822,69 @@ DEFAULT_CONFIG = '/etc/geomask/module-update.json'
 DEFAULT_STATE = '/etc/geomask/modules-state.json'
 DEFAULT_SELECTION = '/etc/geomask/modules.json'
 CACHE = '/tmp/geomask-modules-index.json'
+# The catalogue stores modes as zero-padded octal strings ("0755"). A JSON integer 755
+# passed to os.chmod is 0o1363 - a world-writable executable - and 644 is 0o1204.
+SAFE_MODES = {0o755, 0o750, 0o700, 0o644, 0o640, 0o600}
+MIHOMO_CONF = '/etc/mihomo/config.yaml'
+
+
+def parse_mode(value, path=''):
+    """Mode from the catalogue, in octal, refusing anything outside the allow-list."""
+    try:
+        if isinstance(value, str):
+            text = value.strip()
+            mode = int(text, 8) if text else 0o644
+        elif isinstance(value, int):
+            # legacy catalogues stored a decimal integer: 755 meant "0755" to the author
+            mode = int(str(value), 8) if value in (644, 755, 600, 640, 700, 750) else value
+        else:
+            mode = 0o644
+    except ValueError:
+        raise UpdateError('invalid mode %r for %s' % (value, path or '?')) from None
+    if mode not in SAFE_MODES:
+        raise UpdateError('refusing mode %04o for %s' % (mode, path or '?'))
+    return mode
+
+
+def provider_names(conf_path=None):
+    """Providers declared in the mihomo config (proxy-providers section)."""
+    conf_path = conf_path or MIHOMO_CONF
+    names = set()
+    section = ''
+    try:
+        with open(conf_path, encoding='utf-8', errors='replace') as handle:
+            for line in handle:
+                if line[:1] not in (' ', '\t', '\n'):
+                    match = re.match(r'^([A-Za-z0-9_-]+):', line)
+                    section = match.group(1) if match else ''
+                    continue
+                if section != 'proxy-providers':
+                    continue
+                match = re.match(r'^  ([A-Za-z0-9_-]+):\s*$', line.rstrip('\n'))
+                if match:
+                    names.add(match.group(1))
+    except OSError:
+        return set()
+    return names
+
+
+def capability_ready(dependency):
+    """A non-module dependency such as `subscription:sub`.
+
+    These used to be looked up in index.modules, where they never exist, so every path
+    module reported "dependencies not ready" no matter how healthy the router was.
+    """
+    kind, _, name = dependency.partition(':')
+    if kind != 'subscription':
+        return False
+    providers = provider_names()
+    if not providers:
+        return False
+    if name in providers:
+        return True
+    # `de5` was retired in v1.23.0: AI and the restricted lane ride `sub` now, so a config
+    # that still names de5 in a manifest is satisfied by any working provider.
+    return name == 'de5' and 'sub' in providers
 BACKUP_ROOT = '/tmp/geomask-module-backup'
 RAW = 'https://raw.githubusercontent.com/{repo}/{ref}/{path}'
 INDEX_PATH = 'modules/index.json'
@@ -6689,7 +6904,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.14', '1.30.14', '1.30.14')
+VERSION_MARKERS = ('1.30.15', '1.30.15', '1.30.15')
 
 
 def stamp_versions(data, version):
@@ -6835,6 +7050,7 @@ def status(index, state, module_id=None, selected=None):
         files = []
         modified = []
         missing = []
+        stale = []
         for entry in module.get('files') or []:
             path = entry['path']
             actual = digest_file(path)
@@ -6844,7 +7060,11 @@ def status(index, state, module_id=None, selected=None):
                 recorded_hash = recorded['files'].get(path)
                 if recorded_hash and actual != recorded_hash:
                     modified.append(path)
-                elif not recorded_hash:
+                elif recorded_hash and actual == recorded_hash:
+                    # the release changed the file without bumping the version: the bytes on
+                    # disk are the old release, not a local edit, so this is an update
+                    stale.append(path)
+                else:
                     modified.append(path)
             files.append({'path': path, 'sha256': entry['sha256'], 'installed': actual})
         if not chosen:
@@ -6853,7 +7073,7 @@ def status(index, state, module_id=None, selected=None):
             state_name = 'incomplete'
         elif modified:
             state_name = 'modified'
-        elif version_tuple(available) > version_tuple(installed):
+        elif stale or version_tuple(available) > version_tuple(installed):
             state_name = 'update-available'
         else:
             state_name = 'current'
@@ -6877,6 +7097,10 @@ def dependencies_ready(index, state, module_id):
     module = (index.get('modules') or {}).get(module_id) or {}
     problems = []
     for dependency in module.get('dependencies') or []:
+        if ':' in dependency:
+            if not capability_ready(dependency):
+                problems.append('%s is not available on this router' % dependency)
+            continue
         other = (index.get('modules') or {}).get(dependency)
         if other is None:
             problems.append('%s is not in the index' % dependency)
@@ -6906,6 +7130,12 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
         current = digest_file(path)
         if current is not None and current != entry['sha256']:
             known = recorded['files'].get(path)
+            if entry.get('config') and not force:
+                # an owner-edited config (nodes.conf, vpnwatch.conf, zapret lists) is kept by
+                # the installer; the updater must not replace it just because the baseline
+                # recorded those same bytes as "installed"
+                raise UpdateError('%s is a configuration file; use --force to replace it'
+                                  % path)
             if not force and current != known:
                 raise UpdateError('%s was modified locally; use --force to overwrite' % path)
         url = RAW.format(repo=config['repo'], ref=config['ref'], path=entry['source'])
@@ -6916,7 +7146,7 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
                               % (path, entry['sha256'][:12], actual[:12]))
         if current != actual:
             changed = True
-        staged.append({'path': path, 'mode': entry.get('mode', 644),
+        staged.append({'path': path, 'mode': parse_mode(entry.get('mode', '0644'), path),
                        'data': data, 'sha256': actual})
     return module, staged, changed
 
@@ -7068,6 +7298,15 @@ def main(argv=None):
             module, staged, changed = download_module(index, state, args.module, config,
                                                       force=args.force)
             if not changed:
+                # A manifest-only module (files: []) never stages anything, so its version
+                # used to stay at the old value and the panel offered the same update forever.
+                recorded = module_state(state, args.module)['version']
+                if version_tuple(module.get('version')) > version_tuple(recorded):
+                    install_staged(args.module, [], state, module.get('version', ''), args.state)
+                    print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
+                                      'version': module.get('version'), 'source': source,
+                                      'metadata': True}, ensure_ascii=False))
+                    return 0
                 print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
                                   'version': module.get('version'), 'source': source},
                                  ensure_ascii=False))
@@ -7723,12 +7962,15 @@ def zapret_route(domain):
     """
     rc, out = run(['pidof', 'nfqws'])
     pids = (out or '').strip() if rc == 0 else ''
+    # a running nfqws means nothing if nothing queues packets to it
+    nrc, nout = run(['nft', 'list', 'table', 'inet', 'zapret'])
+    queues = nrc == 0 and 'queue' in (nout or '')
     mode = ''
     for line in read_text(ZAPRET_CONF).splitlines():
         if line.strip().startswith('MODE_FILTER='):
             mode = line.split('=', 1)[1].strip().strip('"').strip("'")
             break
-    return {'running': bool(pids), 'pids': pids, 'mode': mode,
+    return {'running': bool(pids), 'pids': pids, 'mode': mode, 'queues': queues,
             'listed': _hostlist_match(domain, ZAPRET_HOSTLIST),
             'excluded': _hostlist_match(domain, ZAPRET_EXCLUDE),
             'auto': bool(_hostlist_match(domain, ZAPRET_AUTO))}
@@ -8351,6 +8593,29 @@ def parse_listeners(text):
     return listeners
 
 
+def direct_country(live):
+    """Country of the provider exit, measured from this router - '' when not measured.
+
+    The trace used to print "Россия (RU)" for every DIRECT domain without looking, which is
+    simply wrong on a router whose WAN is somewhere else.
+    """
+    if not live:
+        return ''
+    return fetch_country('') or ''
+
+
+def country_label(code):
+    if not code:
+        return ''
+    return '%s (%s)' % (COUNTRIES.get(code, code), code)
+
+
+def exit_country_text(code):
+    if not code:
+        return 'страна выхода не измерялась (включите живую проверку)'
+    return 'страна %s — измерено с роутера' % country_label(code)
+
+
 EGRESS_ENDPOINTS = (
     ('https://ipinfo.io/json', ('country',)),
     ('https://api.myip.com', ('country', 'cc')),
@@ -8854,9 +9119,10 @@ def trace_domain(domain, live=False):
     policy = (hit or {}).get('policy', 'GLOBAL')
     if mt_iface and mt_iface not in TUNNELED_IFACES:
         route_path.append('интернет, мимо mihomo')
-        route_country = 'Россия (RU)'
-        step('Выход', 'ok', 'напрямую в интернет через %s — так решила группа «%s»; страна Россия (RU)'
-             % (mt_iface, (group['name'] if route else '')),
+        _cc = direct_country(live)
+        route_country = country_label(_cc)
+        step('Выход', 'ok', 'напрямую в интернет через %s — так решила группа «%s»; %s'
+             % (mt_iface, (group['name'] if route else ''), exit_country_text(_cc)),
              'Направление задаётся группой «%s»: вкладка «Списки и синк».' % (group['name'] if route else ''))
     elif policy in ('DIRECT', 'REJECT'):
         if policy == 'REJECT':
@@ -8872,8 +9138,10 @@ def trace_domain(domain, live=False):
                      'Правило REJECT блокирует домен: найдите его в правилах mihomo и уберите или смените политику.')
         else:
             route_path.append('интернет через провайдера')
-            route_country = 'Россия (RU)'
-            step('Выход', 'ok', 'напрямую в интернет через провайдера; страна Россия (RU)')
+            _cc = direct_country(live)
+            route_country = country_label(_cc)
+            step('Выход', 'ok', 'напрямую в интернет через провайдера; %s'
+                 % exit_country_text(_cc))
     elif policy in ('VPN', 'VPN-noP2P', 'AI'):
         info = group_state(policy)
         if info and info['now']:
@@ -8894,14 +9162,16 @@ def trace_domain(domain, live=False):
         info = group_state('GLOBAL')
         now = (info or {}).get('now') or ''
         if now:
-            where = ('напрямую в интернет через провайдера; страна Россия (RU)'
-                     if now.upper() == 'DIRECT'
-                     else 'через узел «%s»%s' % (now, ('; страна ' + info['country'])
-                                                if info.get('country') else ''))
+            if now.upper() == 'DIRECT':
+                _cc = direct_country(live)
+                where = 'напрямую в интернет через провайдера; %s' % exit_country_text(_cc)
+            else:
+                where = 'через узел «%s»%s' % (now, ('; страна ' + info['country'])
+                                               if info.get('country') else '')
             route_path.append('группа GLOBAL')
-            route_path.append(where.replace('; страна Россия (RU)', '').strip())
-            route_country = 'Россия (RU)' if now.upper() == 'DIRECT' else (
-                info.get('country') or '')
+            route_path.append(where.split('; страна ')[0].strip())
+            route_country = (country_label(direct_country(live)) if now.upper() == 'DIRECT'
+                             else (info.get('country') or ''))
             step('Выход', 'warn',
                  'группа GLOBAL отправляет %s — домен не попал ни в одно правило' % where,
                  'Домен не попал ни в одно правило, поэтому работает группа GLOBAL, а её '
@@ -8937,9 +9207,17 @@ def trace_domain(domain, live=False):
              'и перезапустите zapret: /etc/init.d/zapret restart')
     elif zap['listed']:
         route_path.insert(0, 'zapret (запрос маскируется)')
-        step('Запрет (DPI)', 'ok',
-             'включён: домен в списке zapret (строка «%s») — запрос к сайту маскируется от '
-             'провайдера (nfqws работает, режим %s)' % (zap['listed'], zap['mode'] or '?'))
+        if zap.get('queues'):
+            step('Запрет (DPI)', 'ok',
+                 'включён: домен в списке zapret (строка «%s»), nfqws работает и правила '
+                 'очередей в nft есть — запрос идёт через обход DPI (режим %s)'
+                 % (zap['listed'], zap['mode'] or '?'))
+        else:
+            step('Запрет (DPI)', 'warn',
+                 'настроен, но не подтверждён: домен в списке, nfqws работает, а правил '
+                 'очередей в nft не видно (строка «%s»)' % zap['listed'],
+                 'Проверьте, что таблица inet zapret загружена: nft list table inet zapret; '
+                 'перезапустите запрет: /etc/init.d/zapret restart')
     elif zap['auto']:
         route_path.insert(0, 'zapret (запрос маскируется)')
         step('Запрет (DPI)', 'ok',
@@ -9126,10 +9404,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.14",
+  "core_version": "1.30.15",
   "modules": {
     "admission_service": {
-      "version": "1.30.13",
+      "version": "1.30.14",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9149,19 +9427,19 @@ ASSET_EOF
         {
           "path": "/etc/init.d/ai-doh",
           "source": "assets/ai-doh.init",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "33ec8738fb82b8a0f5c78caed8ff3c32b79eb298e2680b1817967d865422a02a"
         },
         {
           "path": "/etc/init.d/dnsmasq-ai",
           "source": "assets/dnsmasq-ai.init",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "7ffa1f7edd43f69509a26c3c0c8f8bf984f49ce3b623fbc14622f7fedd93cccc"
         }
       ]
     },
     "backup_share": {
-      "version": "1.30.13",
+      "version": "1.30.14",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9178,139 +9456,142 @@ ASSET_EOF
         {
           "path": "/etc/geomask-nodes.conf",
           "source": "assets/geomask-nodes.conf",
-          "mode": 644,
-          "sha256": "d6d3175d1471eea9d9f04ea40aa00c455662e43135f5012948deb059d4e0bf2b"
+          "mode": "0644",
+          "sha256": "d6d3175d1471eea9d9f04ea40aa00c455662e43135f5012948deb059d4e0bf2b",
+          "config": true
         },
         {
           "path": "/etc/geomask/lists/magitrickle-groups.yaml",
           "source": "assets/magitrickle-groups.yaml",
-          "mode": 644,
+          "mode": "0644",
           "sha256": "83930270200598d330da330108d51f213f057be52d85187913ce2712a02ac415"
         },
         {
           "path": "/etc/geomask/zapret-always-exclude.txt",
           "source": "assets/zapret-always-exclude.txt",
-          "mode": 644,
-          "sha256": "3d604dcf252b70c9470d7b727e46d05a43d08dde7909bfce0f53d1198523f77a"
+          "mode": "0644",
+          "sha256": "3d604dcf252b70c9470d7b727e46d05a43d08dde7909bfce0f53d1198523f77a",
+          "config": true
         },
         {
           "path": "/etc/geomask/zapret-force-keep.txt",
           "source": "assets/zapret-force-keep.txt",
-          "mode": 644,
-          "sha256": "3501ef5760ebb95f68c4dc0432f0275e086572fa48446ac8d9ff49fa3fb97034"
+          "mode": "0644",
+          "sha256": "3501ef5760ebb95f68c4dc0432f0275e086572fa48446ac8d9ff49fa3fb97034",
+          "config": true
         },
         {
           "path": "/etc/hotplug.d/iface/99-default-vpn-route",
           "source": "assets/99-default-vpn-route",
-          "mode": 755,
-          "sha256": "4a3cf3e0acb010ddcc550ddd6f0d2eca8bf193d915dbfcf3c1516b86ff3f3e74"
+          "mode": "0755",
+          "sha256": "b363d670c599bcd2067053419298d6f111b0d225ede9057b167769a17a9bc4f0"
         },
         {
           "path": "/etc/init.d/geomask-syncd",
           "source": "assets/geomask-syncd.init",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "35ea7b468fd1fa11a3050fa1ce10233c94ecec7c415ac85f73ac98067784a8fa"
         },
         {
           "path": "/root/sync_mtrickle_mihomo.sh",
           "source": "assets/sync_mtrickle_mihomo.sh",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "5ac6ec58fd32ed3b24b8949e16b577eedb2e48ab2cc54ea0d5f34695f356cb0b"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
           "source": "assets/geomask-lane.sh",
-          "mode": 755,
-          "sha256": "2661cfe575a0431aeb92520dd8fbcabadee557d3fce84a9e476d22cf3840012d"
+          "mode": "0755",
+          "sha256": "4dfd552076ec30dfbb6c54fd45134401fd1a1a3e52dfe701ff02a71df8cdb471"
         },
         {
           "path": "/usr/bin/geomask-node-scan.sh",
           "source": "assets/geomask-node-scan.sh",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "6e15ca7d85f9e4ff1c844c866ad08ae2a4d21874d2bc09c52a97839842f2a5b6"
         },
         {
           "path": "/usr/bin/geomask-seed-lists.py",
           "source": "assets/geomask-seed-lists.py",
-          "mode": 755,
-          "sha256": "7f1a197235893e45de978b21a38fd31cad7dd4c1d50239e154f9e0e6b2f70b31"
+          "mode": "0755",
+          "sha256": "9cbf473f3b3a7ff68bdf2cec0c821d79827dd7785987a003b2eca02997b51ed1"
         },
         {
           "path": "/usr/bin/geomask-syncd.sh",
           "source": "assets/geomask-syncd.sh",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "74632f8406412a18bdc9b63979d2f7efd2a6874269795d23f3fafa973ad0a882"
         },
         {
           "path": "/usr/lib/geomask/geomask-apply.py",
           "source": "assets/geomask-apply.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "532d02d66727b682ab35471e02bbbe56239f3e277c95da016a4cc2698a4bdec9"
         },
         {
           "path": "/usr/lib/geomask/geomask-audit-scheduler.py",
           "source": "assets/geomask-audit-scheduler.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "a0ebf8a335e8d5bfb9cbb47dcef776b4f941546364567989d47589c794577726"
         },
         {
           "path": "/usr/lib/geomask/geomask-audit-state.py",
           "source": "assets/geomask-audit-state.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "76a19490b446d24aac3c8e674c7033bec429c81689ea6d66489edae0c5409817"
         },
         {
           "path": "/usr/lib/geomask/geomask-config-owner.py",
           "source": "assets/geomask-config-owner.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "b7e10c607a4d03af4c5a80a377657325d7a15880af47ab82a5050390eae2335b"
         },
         {
           "path": "/usr/lib/geomask/geomask-config-tx.py",
           "source": "assets/geomask-config-tx.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "c9bd2e8cee49dc9989d24d3f9998063b420120033f2987076412fd490b3d09dd"
         },
         {
           "path": "/usr/lib/geomask/geomask-lane-torrent.py",
           "source": "assets/geomask-lane-torrent.py",
-          "mode": 755,
-          "sha256": "561779de905c37d46b9d76fa08eaf363c195c8dea10dbf126c4ec6908b9f6939"
+          "mode": "0755",
+          "sha256": "f7ba7bfc412ae929a7a464b085ac405c62fb4e44043adf0a80a04354a6ee484a"
         },
         {
           "path": "/usr/lib/geomask/geomask-lists-edit.py",
           "source": "assets/geomask-lists-edit.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "058aec0a08d350d590f09bc01379a0f6f87a2e8855ba7d1cafb8334f31696a62"
         },
         {
           "path": "/usr/lib/geomask/geomask-node-audit.py",
           "source": "assets/geomask-node-audit.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "c650ba7ba920339833290619846a738148bc7bee31c4780dcf5a85acdc4b5acb"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
           "source": "assets/geomask-slot-patch.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "7ba5225b0b7973699379842d5012b61528618bb1e22f5fa9bda68e7719e31e6d"
         },
         {
           "path": "/usr/lib/geomask/geomask-subscription-status.py",
           "source": "assets/geomask-subscription-status.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "d67de5d7d38d3c1d032d1591f4b09341cf42d30a3749dc6b818dcfc9bb834f23"
         },
         {
           "path": "/usr/lib/geomask/geomask-sync-youtube.py",
           "source": "assets/geomask-sync-youtube.py",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "22b4a2e34ed05045e5304c11fb0e1a98f2c5346cbd58122f5fea1e4c040db6b2"
         }
       ]
     },
     "device_modes": {
-      "version": "1.30.13",
+      "version": "1.30.14",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9329,31 +9610,32 @@ ASSET_EOF
         {
           "path": "/etc/geomask/vpnwatch.conf",
           "source": "assets/geomask-vpnwatch.conf",
-          "mode": 644,
-          "sha256": "dc5f9c5ebbe5153a4b7115c95133cfd8431f1381870cf677ccec6961025540e8"
+          "mode": "0644",
+          "sha256": "dc5f9c5ebbe5153a4b7115c95133cfd8431f1381870cf677ccec6961025540e8",
+          "config": true
         },
         {
           "path": "/usr/bin/geomask-dnscheck.sh",
           "source": "assets/geomask-dnscheck.sh",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "ed78c6663368aa1d7154a8ce2afbbceb29cd8d863f03623738a4b32e707d1b70"
         },
         {
           "path": "/usr/bin/geomask-morning-check.sh",
           "source": "assets/geomask-morning-check.sh",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "73f986b6b2ca91fa2f4f4c9b1a73446a6efe1adf8c909587650f9761ac2d6f06"
         },
         {
           "path": "/usr/bin/geomask-vpnwatch.sh",
           "source": "assets/geomask-vpnwatch.sh",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "6068ec5d08d91b65e53aabe4ae879cac9cd50175fa5b3c1e3d3cfd441f531014"
         }
       ]
     },
     "doctor": {
-      "version": "1.30.13",
+      "version": "1.30.14",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -9363,8 +9645,8 @@ ASSET_EOF
         {
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
-          "mode": 755,
-          "sha256": "9738ac92fff7bb34952523b05f7cb7318023f5bb502a0b2de6d4fd641fe55d6f"
+          "mode": "0755",
+          "sha256": "8172029edf97be743964d578f270f808ff3bd0a3218b2171c95f85f1dc984bc0"
         }
       ]
     },
@@ -9379,14 +9661,14 @@ ASSET_EOF
         {
           "path": "/etc/hotplug.d/iface/99-geomask-guard",
           "source": "assets/99-geomask-guard",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "ba8d2a40c4aec007314a8c78fbc80da712afcc773fd7961b17dff575dbd22b64"
         },
         {
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
-          "mode": 755,
-          "sha256": "4f6b995eb57ba69482afe1a7d982198b978e0d5cc5506094a92f96fca74abf49"
+          "mode": "0755",
+          "sha256": "2c146a3826be307d816fe14b51b3fb3b6e927c475b6c2464d3ed43da51db35c2"
         }
       ]
     },
@@ -9401,37 +9683,37 @@ ASSET_EOF
         {
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
-          "mode": 755,
-          "sha256": "a190f6a6f040a073033ff177221315676384d353843bc03db6f53eb83a19c397"
+          "mode": "0755",
+          "sha256": "8ad639a95c39ee04bebbe1993fdff59db68ba23e4fd0feb4cba2fac28e1cce81"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "4ae46bc291b39815ccd5054a6dc65e3d9a379debec9e363d232b3d691353f395"
         },
         {
           "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
           "source": "assets/menu-geo-sync.json",
-          "mode": 644,
+          "mode": "0644",
           "sha256": "6cc1c916cfd9e03403ece2d7c98924836404c24631e8d553b77466fd6f4aa8dd"
         },
         {
           "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
           "source": "assets/acl-geo-sync.json",
-          "mode": 644,
+          "mode": "0644",
           "sha256": "091ca0d7251664ae2a972aa86ecd2608b4efb85e27f17f7deebd6a70381020b3"
         },
         {
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
-          "mode": 644,
-          "sha256": "5faf025462432ddefbbc9df8e0b15d323a031c46e2e762957c48c5d3ddcca792"
+          "mode": "0644",
+          "sha256": "0079be90da3c80151f5de1d5802b5bbd12fce4eb1d0985d81621d44bc1d65b67"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.13",
+      "version": "1.30.14",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9442,7 +9724,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.13",
+      "version": "1.30.14",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9452,7 +9734,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.13",
+      "version": "1.30.14",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9462,7 +9744,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.13",
+      "version": "1.30.14",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9481,14 +9763,14 @@ ASSET_EOF
         {
           "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
           "source": "assets/torrentdirect.yaml",
-          "mode": 644,
+          "mode": "0644",
           "sha256": "d241713f5947370412d97b3657d370d1cff87892c4e2dcb1fbcaf9557ff37c0e"
         },
         {
           "path": "/usr/bin/geomask-torrent.sh",
           "source": "assets/geomask-torrent.sh",
-          "mode": 755,
-          "sha256": "999b54d99c27e70c34497b69d20b8ef2de414a5f2eeb34ed0af71829021c3ef9"
+          "mode": "0755",
+          "sha256": "e9dab1c3d8d58896fcedfe4b54d0e73ee3e55bdf38a74943a4b019068cbf7d5f"
         }
       ]
     },
@@ -9503,25 +9785,25 @@ ASSET_EOF
         {
           "path": "/etc/geomask-ytwatch.conf",
           "source": "assets/geomask-ytwatch.conf",
-          "mode": 644,
+          "mode": "0644",
           "sha256": "ff14d9912cc17d3abbeeae006e0bbff1de436ae456e986a397837b9c95c94fd3"
         },
         {
           "path": "/etc/mihomo/ruleset/ytdirect.yaml",
           "source": "assets/ytdirect.yaml",
-          "mode": 644,
+          "mode": "0644",
           "sha256": "736a8256a8773c226acef4520f5299b3a98b5ee84c3a66767061ecacdb2fc986"
         },
         {
           "path": "/etc/mihomo/ruleset/ytvpn.yaml",
           "source": "assets/ytvpn.yaml",
-          "mode": 644,
+          "mode": "0644",
           "sha256": "0eeb40254c0fb429776711a0acee828667c6d11d6a7cf342440489e988315494"
         },
         {
           "path": "/usr/bin/geomask-ytwatch.sh",
           "source": "assets/geomask-ytwatch.sh",
-          "mode": 755,
+          "mode": "0755",
           "sha256": "3a42d78f10a6c26b1c0da984bc1506b9bae2d7b49299782b3b613f37695887c9"
         }
       ]
@@ -9811,7 +10093,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.14';
+var PANEL_VERSION = '1.30.15';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -11587,7 +11869,7 @@ step3_check() {
       *)      bad "torrent listener policy '$_tp' - expected VPN or DIRECT (never AI)"; _need=1 ;;
     esac
   else warn "torrent-direct listener missing (torrent clients cannot be pinned away from node-relay)"; fi
-  grep -qE '^  - SRC-PORT,41552,(VPN|DIRECT)$' "$_c" 2>/dev/null \
+  grep -qE '^  - SRC-PORT,41552,(VPN|VPN-noP2P|DIRECT)$' "$_c" 2>/dev/null \
     && info "torrent peer guard (SRC-PORT -> tolerant/DIRECT): present" \
     || warn "SRC-PORT,41552 guard absent or not on VPN-DIRECT - incoming peers may reach node-relay"
   # R01/P1 (v1.23.2): node-relay (VPN-noP2P) MagiTrickle groups must carry NO static IP
@@ -11617,7 +11899,7 @@ step3_check() {
   grep -qE 'RULE-SET,torrentsites,DIRECT' "$_c" 2>/dev/null \
     && info "torrent sites -> DIRECT (Cloudflare rejects the VPN exit)" \
     || warn "torrentsites rule missing - forum sites may return 502 through the VPN lane"
-  grep -qE 'RULE-SET,torrentdirect,(DIRECT|VPN)' "$_c" 2>/dev/null \
+  grep -qE 'RULE-SET,torrentdirect,(DIRECT|VPN|VPN-noP2P)' "$_c" 2>/dev/null \
     && info "torrentdirect rule: present ($(awk -F, '/RULE-SET,torrentdirect/{print $3; exit}' "$_c"))" \
     || warn "torrentdirect rule missing (tracker domains can still go to the wrong subscription)"
   # v1.17.0: lane invariant. A torrent peer is always a bare IP, so no IP rule may reach the
@@ -11663,9 +11945,20 @@ step3_check() {
 }
 step3_apply() {
   _c="$(P $MIHOMO_CONF)"
+  # v1.30.15: a foreign config is not "an existing config" - rewriting it loses tun, dns,
+  # secret and every custom rule. Taking it over must be an explicit decision.
+  if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ]; then
+    bad "на роутере свой конфиг mihomo, и он не от geomask"
+    info "  Перезапись шаблоном потеряет tun/dns/secret и ваши правила - этого не будет."
+    info "  Варианты:"
+    info "    sh $0 --adopt-config --vpn-url '<ссылка>' --auto   взять конфиг под управление"
+    info "    или перенесите подписку/группы вручную и запустите без --adopt-config"
+    return 1
+  fi
   _vpnu="$GM_VPN_URL"
   if [ -s "$_c" ]; then
     [ -z "$_vpnu" ] && _vpnu=$(_prov_url "$_c" sub)
+    [ -z "$_vpnu" ] && _vpnu=$(any_provider_url "$_c")
   fi
   # v1.23.0: AI no longer has its own subscription - it borrows node-relay (sub) and keeps only
   # USA nodes (v1.22.8). Only the VPN subscription URL is required; the old AI sub (de5) is retired.
@@ -11700,6 +11993,19 @@ step3_verify() { step3_check; }
 write_mihomo_config() {
   _c="$(P $MIHOMO_CONF)"
   _vpnu="$1"; _aiu="$2"
+  # The rollback source must be the file as it was BEFORE this run touched it. The old code
+  # copied the already-replaced file in safe_mihomo_restart, so "rollback" restored the
+  # broken candidate.
+  _lanip=$(lan_ip)
+  if [ -z "$_lanip" ]; then
+    bad "не удалось определить адрес LAN ($(lan_iface)) - listener некуда привязать"
+    info "  Проверьте: uci show network.lan; ip -4 addr show $(lan_iface)"
+    return 1
+  fi
+  if [ -s "$_c" ] && [ -z "${GM_PRE_CONFIG:-}" ]; then
+    GM_PRE_CONFIG="$_c.pre-run-$(date +%s 2>/dev/null || echo pre)"
+    cp -p "$_c" "$GM_PRE_CONFIG" 2>/dev/null || GM_PRE_CONFIG=""
+  fi
   # --- existing 2-subscription config: keep it as-is (custom rules, headers, sniffer)
   #     and only patch provider urls / ensure the ai-devices listener ---
   # --- existing config: keep it as-is (custom rules, headers, sniffer) and only patch
@@ -11710,7 +12016,7 @@ write_mihomo_config() {
     if grep -q '^  de5:' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
       awk 'BEGIN{d=0} /^  de5:/{d=1;next} d&&/^  [A-Za-z0-9_-]+:/{d=0} d&&!/^    /{d=0} !d{print}' "$_c" > "$_c.de5rm" \
-        && mihomo -d /etc/mihomo -t >/dev/null 2>&1 && mv -f "$_c.de5rm" "$_c" && rm -f "$_c.de5rm" \
+        && mihomo_validate "$_c.de5rm" && mv -f "$_c.de5rm" "$_c" && rm -f "$_c.de5rm" \
         && info "retired de5 provider removed from config" || { rm -f "$_c.de5rm"; warn "de5 removal skipped (validation)"; }
     fi
     _curv=$(_prov_url "$_c" sub)
@@ -11726,15 +12032,15 @@ write_mihomo_config() {
         END{exit done?0:1}' "$_c" > "$_c.urlnew"; then
         rm -f "$_c.urlnew"; bad "provider url patch failed"; return 1
       fi
-      mihomo -d /etc/mihomo -t >/dev/null 2>&1 && mv -f "$_c.urlnew" "$_c" || { rm -f "$_c.urlnew"; bad "mihomo -t failed - config kept"; return 1; }
+      mihomo_validate "$_c.urlnew" && mv -f "$_c.urlnew" "$_c" || { rm -f "$_c.urlnew"; bad "mihomo -t failed - config kept"; return 1; }
       info "provider url updated in place (sub)"
     fi
     if ! grep -q 'ai-devices' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
-      awk 'BEGIN{d=0}
-        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: 192.168.0.1";print "";d=1}
+      awk -v L="$_lanip" 'BEGIN{d=0}
+        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: " L;print "";d=1}
         {print}' "$_c" > "$_c.zmnew" || return 1
-      if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+      if mihomo_validate "$_c.zmnew"; then
         mv -f "$_c.zmnew" "$_c"; info "listeners block added to existing config (custom rules preserved)"
       else
         rm -f "$_c.zmnew"; bad "mihomo -t failed after adding listeners - config kept"; return 1
@@ -11743,10 +12049,10 @@ write_mihomo_config() {
       # v1.14.4: config already had listeners - make sure the torrent DIRECT one exists
       if ! grep -q 'torrent-direct' "$_c"; then
         cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
-        awk 'BEGIN{d=0} {print} (!d && $0 ~ /^    proxy: AI$/) {
+        awk -v L="$_lanip" 'BEGIN{d=0} {print} (!d && $0 ~ /^    proxy: AI$/) {
               print "  - name: torrent-direct"; print "    type: mixed"; print "    port: 7894";
-              print "    listen: 192.168.0.1"; d=1 }' "$_c" > "$_c.tdnew" || return 1
-        if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+              print "    listen: " L; d=1 }' "$_c" > "$_c.tdnew" || return 1
+        if mihomo_validate "$_c.tdnew"; then
           mv -f "$_c.tdnew" "$_c"; info "torrent-direct listener added (listeners already present)"
         else
           rm -f "$_c.tdnew"; bad "mihomo -t failed after adding torrent-direct - config kept"; return 1
@@ -11789,7 +12095,7 @@ write_mihomo_config() {
     printf '%s\n' '  - name: torrent-direct'
     printf '%s\n' '    type: mixed'
     printf '%s\n' '    port: 7894'
-    printf '%s\n' '    listen: 192.168.0.1'
+    printf '%s\n' '    listen: %s' "$_lanip"
     printf '%s\n' '    proxy: DIRECT'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
@@ -11889,10 +12195,10 @@ write_mihomo_config() {
     printf '%s\n' '  # v1.22.0: forum/catalog sites stay DIRECT - Cloudflare rejects the VPN exit'
     printf '%s\n' '  # IPs, so routing them to a VPN makes them unreachable (measured 502 vs 301).'
     printf '%s\n' '  - RULE-SET,torrentsites,DIRECT'
-    printf '%s\n' '  - RULE-SET,torrentdirect,VPN'
+    printf '%s\n' '  - RULE-SET,torrentdirect,VPN-noP2P'
     printf '%s\n' '  # torrent client listening port: peers that dial US must not reach the VPN slot;'
     printf '%s\n' '  # with a RESERVE/VPN lane configured geomask repoints this to that lane'
-    printf '%s\n' '  - SRC-PORT,41552,AI'
+    printf '%s\n' '  - SRC-PORT,41552,DIRECT'
     printf '%s\n' '  - RULE-SET,mtrickle,VPN-noP2P'
     printf '%s\n' '  # STUN: stop WebRTC leaking the real (RU) IP, keep calls working'
     printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN-noP2P'
@@ -11914,10 +12220,10 @@ write_mihomo_config() {
   } > "$_tmpconf" || { bad "cannot write $_tmpconf"; return 1; }
   # ruleset files must exist before mihomo -t
   mkdir -p "$(P /etc/mihomo/ruleset)"
-  for rf in mtrickle ai ytdirect ytvpn; do
+  for rf in mtrickle ai ytdirect ytvpn torrentdirect torrentsites; do
     [ -s "$(P /etc/mihomo/ruleset/$rf.yaml)" ] || printf 'payload: []\n' > "$(P /etc/mihomo/ruleset/$rf.yaml)"
   done
-  if mihomo -d /etc/mihomo -t >/dev/null 2>&1; then
+  if mihomo_validate "$_tmpconf"; then
     info "mihomo -t on new config: PASS"
   else
     bad "mihomo -t FAILED on new config - keeping old"; rm -f "$_tmpconf"; return 1
@@ -11945,32 +12251,84 @@ api_refresh_provider() { # api_refresh_provider <name> <url>
 #         must not be present while the new one is created (that nesting bloated archives in
 #         v1.6-1.8). The folder is published read-only over SMB (share 'geomask-backups',
 #         see ensure_smb_share) and linked from the panel.
-ensure_backup() { # -> path on stdout, rc=1 on failure
+BACKUP_KEEP=1          # freshest copy on the router; full history lives on the PC
+
+ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
+  # v1.30.15: the previous archive is no longer deleted before the new one exists, and a
+  # reduced tar is never passed off as a sysupgrade backup. Old copies are parked outside
+  # /root while sysupgrade archives /root (that nesting was the reason for the old delete),
+  # and they come back untouched if creation fails.
+  _mode="${1:-full}"
   _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
   _dir="$(P /root/geomask-backups)"
   mkdir -p "$_dir" 2>/dev/null
-  # remove previous copies BEFORE creating: they live under /root, which sysupgrade -b
-  # archives - leaving them in place embeds them into the new archive (observed 19->28 MB).
-  # If creation then fails there is no on-router copy; caller aborts the change and the PC
-  # history (fetch_backup.ps1) remains.
-  rm -f "$_dir"/router-backup-*.tar.gz 2>/dev/null
-  _out=""
-  if have sysupgrade; then
-    _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
-    if sysupgrade -b "$_tmp" >/dev/null 2>&1 && [ -s "$_tmp" ]; then _out="$_tmp"; fi
+  _park="$(P /tmp)/geomask-bk-park-$$"
+  rm -rf "$_park"; mkdir -p "$_park"
+  _parked=0
+  for _old in "$_dir"/router-backup-*.tar.gz; do
+    [ -f "$_old" ] || continue
+    mv -f "$_old" "$_park/" 2>/dev/null && _parked=$((_parked+1))
+  done
+  _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
+  rm -f "$_tmp"
+  _full=0
+  if have sysupgrade && sysupgrade -b "$_tmp" >/dev/null 2>&1 && [ -s "$_tmp" ]; then
+    _full=1
   fi
-  if [ -z "$_out" ]; then
-    _out="$(P /tmp)/geomask-bk-$_ts-min.tar.gz"
-    tar czf "$_out" -C "$(P /)" etc 2>/dev/null || _out=""
+  if [ "$_full" = 0 ]; then
+    rm -f "$_tmp"
+    if [ "$_mode" = full ]; then
+      # put the parked copies back: a failed run must not cost the router its only backup
+      for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
+      rm -rf "$_park"
+      bad "полный бэкап (sysupgrade -b) не создан"
+      return 1
+    fi
+    _tmp="$(P /tmp)/geomask-bk-$_ts-partial.tar.gz"
+    if ! tar czf "$_tmp" -C "$(P /)" etc root >/dev/null 2>&1 || [ ! -s "$_tmp" ]; then
+      rm -f "$_tmp"
+      for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
+      rm -rf "$_park"
+      bad "cannot create backup"
+      return 1
+    fi
+    warn "полный бэкап не создан - сохранена частичная копия (etc + root)"
   fi
-  if [ -z "$_out" ] || [ ! -s "$_out" ]; then
-    bad "cannot create backup"
+  if [ "$_full" = 1 ]; then
+    _dest="$_dir/router-backup-$_ts.tar.gz"
+  else
+    _dest="$_dir/router-backup-$_ts-partial.tar.gz"
+  fi
+  if ! mv -f "$_tmp" "$_dest"; then
+    rm -f "$_tmp"
+    for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
+    rm -rf "$_park"
+    bad "cannot store backup into $_dir"
     return 1
   fi
-  _dest="$_dir/router-backup-$_ts.tar.gz"
-  mv -f "$_out" "$_dest" || { bad "cannot store backup into $_dir"; return 1; }
   chmod 644 "$_dest" 2>/dev/null
+  # rotation happens only now, and never touches the copy just written
+  _n=0
+  for _old in $(ls -1t "$_dir"/router-backup-*.tar.gz 2>/dev/null); do
+    _n=$((_n+1))
+    [ "$_n" -gt "$BACKUP_KEEP" ] && [ "$_old" != "$_dest" ] && rm -f "$_old"
+  done
+  rm -rf "$_park"
   printf '%s' "$_dest"
+  return 0
+}
+
+backup_gate() { # a verified full backup before the first write of this run
+  [ "${GM_BACKUP_DONE:-0}" = 1 ] && return 0
+  _bk=$(ensure_backup full) || {
+    bad "нет полного бэкапа - изменения на роутере не начинаются"
+    info "  Причина выше. Освободите место (df -h /) или сделайте бэкап вручную:"
+    info "  LuCI -> Система -> Резервная копия / Обновление прошивки -> Создать архив"
+    return 1
+  }
+  GM_BACKUP_DONE=1
+  GM_BACKUP_PATH="$_bk"
+  info "полный бэкап: $_bk"
   return 0
 }
 
@@ -12110,9 +12468,12 @@ safe_mihomo_restart() {
     warn "restart skipped (no --restart); will apply at next mihomo start"
     return 0
   fi
-  _bk=$(ensure_backup) || { bad "no backup - restart ABORTED"; return 1; }
+  _bk=$(ensure_backup full) || { bad "no full backup - restart ABORTED"; return 1; }
   info "backup: $_bk"
-  cp -p "$_c" "$_c.pre-restart" 2>/dev/null || true
+  # the pre-image is the file as it was BEFORE this run; copying the current file here (the
+  # old behaviour) made the "rollback" restore the candidate that had just failed
+  _pre="${GM_PRE_CONFIG:-}"
+  [ -s "$_pre" ] || _pre=$(ls -1t "$_c".bak_geomask_* 2>/dev/null | head -1)
   if ! mihomo_trial_run; then
     bad "trial failed - live mihomo NOT restarted; config left for manual review"
     return 1
@@ -12122,17 +12483,17 @@ safe_mihomo_restart() {
     return 0
   fi
   bad "restart FAILED - rolling back config and re-starting"
-  if [ -s "$_c.pre-restart" ]; then
-    cp -p "$_c.pre-restart" "$_c"
+  if [ -n "$_pre" ] && [ -s "$_pre" ]; then
+    cp -p "$_pre" "$_c"
     /etc/init.d/mihomo restart >/dev/null 2>&1
     sleep 3
-    if svc_alive mihomo; then
-      info "rollback OK: previous config restored, mihomo running"
+    if svc_alive mihomo && controller_curl -s -m3 "http://127.0.0.1:9090/version" 2>/dev/null | grep -qi 'mihomo\|meta'; then
+      info "rollback OK: предыдущий конфиг восстановлен, mihomo отвечает ($_pre)"
     else
       bad "rollback FAILED - RESTORE FROM BACKUP: $_bk"
     fi
   else
-    bad "no pre-restart copy; RESTORE FROM BACKUP: $_bk"
+    bad "нет копии прежнего конфига; RESTORE FROM BACKUP: $_bk"
   fi
   return 1
 }
@@ -12191,6 +12552,8 @@ aidns_generate_nft() { # (re)write the nft include from the current ai device li
 step4_check() {
   _need=0
   mod_skipped ai_dns && return 0
+  _aip=$(aidns_ip)
+  [ -n "$_aip" ] && AIDNS_IP="$_aip"
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then
     info "AI-DNS: disabled (/etc/geomask-aidns.off present)"
     return 0
@@ -12234,20 +12597,34 @@ step4_check() {
 step4_apply() {
   mod_skipped ai_dns && return 0
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then info "AI-DNS disabled by flag - nothing to do"; return 0; fi
+  _aip=$(aidns_ip)
+  if [ -z "$_aip" ]; then
+    bad "не определён адрес LAN - AI-DNS некуда привязать (проверьте uci show network.lan)"
+    return 1
+  fi
+  AIDNS_IP="$_aip"
   # v1.30.7: same rule as step 1 - what is installable from the feeds is installed here,
   # not left to the owner. https-dns-proxy is the DoH worker this step configures.
   if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
     if have apk; then
       info "installing: https-dns-proxy (apk)"
       apk add https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
-        || warn "apk add https-dns-proxy failed - AI-DNS will not start until it is installed"
+        || warn "apk add https-dns-proxy failed"
     elif have opkg; then
       info "installing: https-dns-proxy (opkg)"
       opkg install https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
-        || warn "opkg install https-dns-proxy failed - AI-DNS will not start until it is installed"
+        || warn "opkg install https-dns-proxy failed"
     fi
   fi
-  _bk=$(ensure_backup) || { bad "no backup - ABORTED"; return 1; }
+  # v1.30.15: no worker - no DNS/network rewrite. The step used to warn and continue,
+  # sending AI devices to a dnsmasq whose upstream does not exist.
+  if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
+    bad "https-dns-proxy не установлен - AI-DNS не настраивается (DNS и сеть не менялись)"
+    info "  Поставьте пакет и повторите шаг: apk add https-dns-proxy (или opkg install)"
+    info "  Либо откажитесь от AI-DNS: touch /etc/geomask-aidns.off"
+    return 1
+  fi
+  _bk=$(ensure_backup full) || { bad "no full backup - ABORTED"; return 1; }
   info "backup: $_bk"
   # 1) dedicated user for the AI DoH worker (sockets get marked by uid)
   if ! aidns_user_exists; then
@@ -28934,20 +29311,27 @@ ASSET_EOF
 #   --force         same as default; used by the shell to express intent (this tool always overwrites).
 #   --template P    template path (default /etc/geomask/lists/magitrickle-groups.yaml)
 #   --config P      config path  (default /etc/magitrickle/state/config.yaml)
+#   --wan-iface N   interface to write instead of the template's pppoe-wan (DHCP WAN, etc.)
 import sys, os, re, time
+
+try:  # PyYAML is the honest parser; the line scan below is only a fallback
+    import yaml
+except Exception:
+    yaml = None
 
 TEMPLATE = '/etc/geomask/lists/magitrickle-groups.yaml'
 CONFIG = '/etc/magitrickle/state/config.yaml'
 
 def parse_args():
     mode = 'write'
-    tpl, cfg = TEMPLATE, CONFIG
+    tpl, cfg, wan = TEMPLATE, CONFIG, ''
     for a in sys.argv[1:]:
         if a == '--check-empty': mode = 'check'
         elif a == '--force': mode = 'write'
         elif a.startswith('--template='): tpl = a.split('=', 1)[1]
         elif a.startswith('--config='): cfg = a.split('=', 1)[1]
-    return mode, tpl, cfg
+        elif a.startswith('--wan-iface='): wan = a.split('=', 1)[1]
+    return mode, tpl, cfg, wan
 
 def read_lines(p):
     with open(p, encoding='utf-8') as f:
@@ -28970,20 +29354,44 @@ def groups_region(lines):
     return gi, si
 
 def count_groups(lines):
+    """Groups in the `groups:` block, whatever the indentation.
+
+    A line scan that only counted `- id:` in column 0 read a perfectly valid config with
+    indented entries as "empty" and auto-seed then replaced the owner's groups with the
+    template. The block is parsed as YAML when PyYAML is present; the scan below matches
+    any indentation and refuses to guess when the file does not parse.
+    """
+    text = '\n'.join(lines)
+    if yaml is not None:
+        try:
+            data = yaml.safe_load(text) or {}
+        except Exception:
+            # unreadable is not empty: never let auto-seed overwrite it
+            return -1
+        groups = data.get('groups') if isinstance(data, dict) else None
+        return len(groups) if isinstance(groups, list) else 0
     gi, si = groups_region(lines)
     if gi is None:
         return 0
-    return sum(1 for l in lines[gi + 1:si] if l.startswith('- id:'))
+    return sum(1 for l in lines[gi + 1:si] if re.match(r'^\s*-\s*id:', l))
+
+
+def remap_wan(lines, wan_iface):
+    """Point the template's direct groups at the interface this router actually has."""
+    if not wan_iface:
+        return lines
+    return [re.sub(r'^(\s*interface:\s*)pppoe-wan\s*$', r'\g<1>' + wan_iface, line)
+            for line in lines]
 
 def main():
-    mode, tpl, cfg = parse_args()
+    mode, tpl, cfg, wan = parse_args()
     if not os.path.exists(tpl):
         print('ERR template missing: %s' % tpl); return 2
     tlines = read_lines(tpl)
     ti, _ = groups_region(tlines)
     if ti is None:
         print('ERR template has no `groups:` section'); return 2
-    groups_lines = tlines[ti:]
+    groups_lines = remap_wan(tlines[ti:], wan)
     while groups_lines and groups_lines[-1].strip() == '':
         groups_lines.pop()
     if not any(l.startswith('- id:') for l in groups_lines):
@@ -28993,7 +29401,7 @@ def main():
     ng = count_groups(cur) if cur else 0
 
     if mode == 'check':
-        # exit 0 if empty (auto-seed is safe), 1 if it already has groups
+        # exit 0 only when the live config is certainly empty; -1 (unparseable) is not empty
         sys.exit(0 if ng == 0 else 1)
 
     if cur is None:
@@ -29042,7 +29450,7 @@ seed_lists() {
   fi
   info "lists: seeding MagiTrickle groups from template (mode=${_force:-ifempty})..."
   initd magitrickle stop >/dev/null 2>&1 || true
-  _out=$(python3 "$_py" --config="$_cfg" --template="$_tpl" 2>&1); _rc=$?
+  _out=$(python3 "$_py" --config="$_cfg" --template="$_tpl" --wan-iface="$(wan_iface)" 2>&1); _rc=$?
   initd magitrickle start >/dev/null 2>&1 || true
   sleep 2
   svc_alive magitrickled || warn "magitrickle did not come back after seed"
@@ -30140,8 +30548,29 @@ def build_ruleset():
 #   P2P-TOLERANT lane: "proxy: VPN" (the sub2/vlessi group). If that lane is absent, fall back to
 #   "proxy: DIRECT" (real IP, but off the forbidden subscription). It is NEVER left rule-based
 #   (that let AI domains through) and NEVER pinned to AI (node-relay = instant ban).
+def lan_ip():
+    """The router's own LAN address - 192.168.0.1 is only the owner's network."""
+    dev = ''
+    for key in ('network.lan.device', 'network.lan.ifname'):
+        try:
+            dev = subprocess.run(['uci', '-q', 'get', key], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+        except Exception:
+            dev = ''
+        if dev:
+            break
+    dev = dev or 'br-lan'
+    try:
+        out = subprocess.run(['ip', '-4', 'addr', 'show', dev], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return ''
+    match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/', out)
+    return match.group(1) if match else ''
+
+
 LISTENER_BLOCK=['  - name: torrent-direct','    type: mixed','    port: %s' % LISTENER_PORT,
-                '    listen: 192.168.0.1']
+                '    listen: %s' % (lan_ip() or '127.0.0.1')]
 
 def tolerant_lane():
     """The P2P-tolerant mihomo group: 'VPN' (sub2). Absent on a single-lane box."""
@@ -30233,7 +30662,7 @@ def status():
         'provider_loaded': prov,
         'extras': sorted(extras()),
         'sources': sources(),
-        'proxy_hint': 'socks5h://192.168.0.1:%s' % LISTENER_PORT,
+        'proxy_hint': 'socks5h://%s:%s' % (lan_ip() or '<LAN IP>', LISTENER_PORT),
     }
 
 args=sys.argv[1:]
@@ -30494,6 +30923,9 @@ INITD=/etc/init.d/hev-nop2p
 CFG=/etc/mihomo/config.yaml
 LNAME=nop2p-lane
 NFT=/usr/share/nftables.d/ruleset-post/99-lane-accept.nft
+LAN_DEV=$(uci -q get network.lan.device 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=$(uci -q get network.lan.ifname 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=br-lan
 
 die() { echo "lane: $*" >&2; exit 1; }
 
@@ -30538,7 +30970,7 @@ _provision_netfw() {
   cat > "$NFT" <<EOF
 table inet fw4 {
     chain accept_to_$LANE_NAME {
-        iifname "br-lan" oifname "$LANE_NAME" counter accept comment "geomask-lane: LAN clients to $LANE_NAME tunnel"
+        iifname "$LAN_DEV" oifname "$LANE_NAME" counter accept comment "geomask-lane: LAN clients to $LANE_NAME tunnel"
         iifname "Wireguard" oifname "$LANE_NAME" counter accept comment "geomask-lane: WG peers to $LANE_NAME tunnel"
     }
 }
@@ -31049,14 +31481,22 @@ ASSET_EOF
 # NOTE: runs inside netifd's ifup path -> MUST NOT block here (would stall PPPoE auth / WAN).
 [ "$ACTION" = "ifup" ] || exit 0
 
+# This router's names, not the owner's: LAN device from uci, mihomo TUN from its config.
+LAN_DEV=$(uci -q get network.lan.device 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=$(uci -q get network.lan.ifname 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=br-lan
+TUN_DEV=$(awk '/^tun:/{f=1;next} f&&/^[^ ]/{exit} f&&/^[[:space:]]*device:/{gsub(/^[[:space:]]*device:[[:space:]]*/,"");print;exit}' \
+          /etc/mihomo/config.yaml 2>/dev/null)
+case "$TUN_DEV" in ''|*[!a-zA-Z0-9._-]*) TUN_DEV=Mihomo ;; esac
+
 apply_routes() {
   if ! ip route show table 100 | grep -q '^default'; then
     ip route show table main | grep -v '^default' | while IFS= read -r r; do
       ip route replace table 100 $r 2>/dev/null
     done
-    ip route replace table 100 default dev Mihomo 2>/dev/null
+    ip route replace table 100 default dev "$TUN_DEV" 2>/dev/null
   fi
-  ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
+  ip rule show | grep -q '32760:' || ip rule add priority 32760 iif "$LAN_DEV" lookup 100
   # --- WireGuard peers are remote LAN clients (10.10.0.0/24). Without this rule their
   #     traffic falls through to main (real WAN IP), so anything blocked for the ISP -
   #     YouTube first of all - fails on the phone while local network still works.
@@ -31071,7 +31511,7 @@ apply_routes() {
   #     inside the TUN. Direct via pppoe-wan. Guard reseats the rule to
   #     (base - 100) when the base drifts, so presence is checked by SEMANTICS,
   #     never by the 19901 prefix (v1.6.2: ifup never adds a duplicate). ---
-  ip rule show | grep -q 'iif br-lan ipproto icmp lookup main' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
+  ip rule show | grep -q "iif $LAN_DEV ipproto icmp lookup main" || ip rule add priority 19901 iif "$LAN_DEV" ipproto icmp lookup main
   # --- AI-DNS: DNS of AI-mode devices exits through the AI tunnel (no DNS leak).
   #     The DoH worker runs as user dnsai; its sockets are marked 0x64 by the
   #     nft table geomask_ai_dns, and this rule sends the marked traffic to
@@ -31110,12 +31550,12 @@ apply_routes() {
   fi
 }
 
-if ip link show Mihomo >/dev/null 2>&1; then
+if ip link show "$TUN_DEV" >/dev/null 2>&1; then
   apply_routes
 else
   # Mihomo TUN not up yet: retry in BACKGROUND so netifd is never stalled (fixes PPPoE hangs).
   ( i=0; while [ $i -lt 20 ]; do
-      ip link show Mihomo >/dev/null 2>&1 && { sleep 1; apply_routes; exit 0; }
+      ip link show "$TUN_DEV" >/dev/null 2>&1 && { sleep 1; apply_routes; exit 0; }
       i=$((i+1)); sleep 1
     done ) >/dev/null 2>&1 &
 fi
@@ -31137,7 +31577,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.14"
+GUARD_VERSION="1.30.15"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -32591,7 +33031,7 @@ SVC_LIST="dnsmasq magitrickled mihomo hev-socks5-tunnel rpcd ai-doh dnsmasq-ai"
 aidns_svc_ok() {
   case "$1" in
     ai-doh)     netstat -ltnu 2>/dev/null | grep -q '127.0.0.1:5055 ' ;;
-    dnsmasq-ai) netstat -ltnu 2>/dev/null | grep -q '192.168.0.53:5353 ' ;;
+    dnsmasq-ai) netstat -ltnu 2>/dev/null | grep -q "${AIDNS_IP:-192.168.0.53}:5353 " ;;
   esac
 }
 step6_check() {
@@ -32606,6 +33046,9 @@ step6_check() {
     fi
     if ! module_selected ai_dns && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
       info "$s: модуль ai_dns не выбран - skipped"; continue
+    fi
+    if [ "$s" = hev-socks5-tunnel ] && ! module_selected path_ai && ! module_selected ai_dns; then
+      info "$s: не нужен выбранным модулям - skipped"; continue
     fi
     case "$s" in
       ai-doh|dnsmasq-ai)
@@ -32625,6 +33068,9 @@ step6_apply() {
     fi
     if ! module_selected ai_dns && { [ "$s" = ai-doh ] || [ "$s" = dnsmasq-ai ]; }; then
       info "$s: модуль ai_dns не выбран - skipped"; continue
+    fi
+    if [ "$s" = hev-socks5-tunnel ] && ! module_selected path_ai && ! module_selected ai_dns; then
+      info "$s: не нужен выбранным модулям - skipped"; continue
     fi
     case "$s" in
       ai-doh|dnsmasq-ai)
@@ -32661,8 +33107,10 @@ step7_check() {
   else
     bad "mihomo controller request failed (check authentication/connectivity)"; _need=1
   fi
-  if have ubus; then
+  if have ubus && module_selected luci; then
     ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
+  elif ! module_selected luci; then
+    info "geo ubus: панель (модуль luci) не выбрана - проверка пропущена"
   fi
   if ip rule show 2>/dev/null | grep -q 'iif br-lan ipproto icmp'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule absent - LAN ping may die in TUN"; fi
   # AI-DNS: DNS of AI devices must exit through the AI tunnel (mark -> table 101)
@@ -32730,6 +33178,10 @@ run_step() { # run_step N  (interactive/auto common logic)
     return 1
   fi
   if [ "$GM_AUTO" = 1 ] || [ "$GM_YES" = 1 ] || ask "Apply step $_n ($_name)?"; then
+    # every step below writes to the router: one verified full backup per run, before it
+    case "$_n" in
+      2|3|4|5) backup_gate || return 1 ;;
+    esac
     # v1.29.0: an installing step is the right moment to ask which modules to carry.
     case "$_n" in 2|4|5) modules_maybe_prompt ;; esac
     if step_fn "$_n" apply; then
@@ -32977,6 +33429,7 @@ menu_reinstall() {
   _curv=""
   if [ -s "$_c" ]; then _curv=$(_prov_url "$_c" sub); fi
   ask "Продолжить переустановку?" || { warn "отменено"; return 1; }
+  backup_gate || return 1
   modules_maybe_prompt
   _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
   hdr "1/6" "удаление geomask"; geomask_uninstall noreload || true
@@ -33029,6 +33482,7 @@ while [ $# -gt 0 ]; do
     --restart) GM_RESTART=1 ;;
     --backup) GM_BACKUP=1 ;;
     --reinstall) GM_REINSTALL=1 ;;
+    --adopt-config) GM_ADOPT=1 ;;
     --step) shift; GM_STEP="${1:-}" ;;
     --vpn-url) shift; GM_VPN_URL="${1:-}" ;;
     --ai-url) shift; GM_AI_URL="${1:-}" ;;
@@ -33067,15 +33521,21 @@ fi
 
 RC=0
 if [ "$GM_BACKUP" = 1 ]; then
-  _b=$(ensure_backup) && { info "full backup created: $_b"; info "SMB (freshest one): \\\\$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)\\geomask-backups ; history on PC: geomask\\fetch_backup.ps1"; RC=0; } || RC=1
+  _b=$(ensure_backup full) && { info "полный бэкап: $_b"; info "SMB (свежая копия): \\\\$(lan_ip)\\geomask-backups ; история на ПК: geomask\\fetch_backup.ps1"; RC=0; } || { bad "полный бэкап не создан"; RC=1; }
 elif [ "$GM_REINSTALL" = 1 ]; then
   menu_reinstall || RC=1
 elif [ "$GM_SEED_LISTS" = 1 ]; then
-  write_lists_assets && seed_lists force || RC=1
+  if backup_gate; then write_lists_assets && seed_lists force || RC=1; else RC=1; fi
 elif [ -n "$GM_STEP" ]; then
   run_step "$GM_STEP" || RC=1
 elif [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
   log "geomask v$GM_VERSION  mode: $([ "$GM_CHECK_ONLY" = 1 ] && echo check || echo auto)"
+  if [ "$GM_CHECK_ONLY" != 1 ] && ! preflight; then
+    bad "preflight не пройден - ничего не изменено"
+    log ""
+    log "== SUMMARY: pass=$PASS fail=$FAILCNT skipped_steps=$SKIP =="
+    exit 1
+  fi
   for n in 1 2 3 4 5 6 7; do
     if [ "$GM_CHECK_ONLY" = 1 ]; then
       run_step "$n" || true

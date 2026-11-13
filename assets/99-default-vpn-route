@@ -5,14 +5,22 @@
 # NOTE: runs inside netifd's ifup path -> MUST NOT block here (would stall PPPoE auth / WAN).
 [ "$ACTION" = "ifup" ] || exit 0
 
+# This router's names, not the owner's: LAN device from uci, mihomo TUN from its config.
+LAN_DEV=$(uci -q get network.lan.device 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=$(uci -q get network.lan.ifname 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=br-lan
+TUN_DEV=$(awk '/^tun:/{f=1;next} f&&/^[^ ]/{exit} f&&/^[[:space:]]*device:/{gsub(/^[[:space:]]*device:[[:space:]]*/,"");print;exit}' \
+          /etc/mihomo/config.yaml 2>/dev/null)
+case "$TUN_DEV" in ''|*[!a-zA-Z0-9._-]*) TUN_DEV=Mihomo ;; esac
+
 apply_routes() {
   if ! ip route show table 100 | grep -q '^default'; then
     ip route show table main | grep -v '^default' | while IFS= read -r r; do
       ip route replace table 100 $r 2>/dev/null
     done
-    ip route replace table 100 default dev Mihomo 2>/dev/null
+    ip route replace table 100 default dev "$TUN_DEV" 2>/dev/null
   fi
-  ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
+  ip rule show | grep -q '32760:' || ip rule add priority 32760 iif "$LAN_DEV" lookup 100
   # --- WireGuard peers are remote LAN clients (10.10.0.0/24). Without this rule their
   #     traffic falls through to main (real WAN IP), so anything blocked for the ISP -
   #     YouTube first of all - fails on the phone while local network still works.
@@ -27,7 +35,7 @@ apply_routes() {
   #     inside the TUN. Direct via pppoe-wan. Guard reseats the rule to
   #     (base - 100) when the base drifts, so presence is checked by SEMANTICS,
   #     never by the 19901 prefix (v1.6.2: ifup never adds a duplicate). ---
-  ip rule show | grep -q 'iif br-lan ipproto icmp lookup main' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
+  ip rule show | grep -q "iif $LAN_DEV ipproto icmp lookup main" || ip rule add priority 19901 iif "$LAN_DEV" ipproto icmp lookup main
   # --- AI-DNS: DNS of AI-mode devices exits through the AI tunnel (no DNS leak).
   #     The DoH worker runs as user dnsai; its sockets are marked 0x64 by the
   #     nft table geomask_ai_dns, and this rule sends the marked traffic to
@@ -66,12 +74,12 @@ apply_routes() {
   fi
 }
 
-if ip link show Mihomo >/dev/null 2>&1; then
+if ip link show "$TUN_DEV" >/dev/null 2>&1; then
   apply_routes
 else
   # Mihomo TUN not up yet: retry in BACKGROUND so netifd is never stalled (fixes PPPoE hangs).
   ( i=0; while [ $i -lt 20 ]; do
-      ip link show Mihomo >/dev/null 2>&1 && { sleep 1; apply_routes; exit 0; }
+      ip link show "$TUN_DEV" >/dev/null 2>&1 && { sleep 1; apply_routes; exit 0; }
       i=$((i+1)); sleep 1
     done ) >/dev/null 2>&1 &
 fi

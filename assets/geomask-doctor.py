@@ -311,12 +311,15 @@ def zapret_route(domain):
     """
     rc, out = run(['pidof', 'nfqws'])
     pids = (out or '').strip() if rc == 0 else ''
+    # a running nfqws means nothing if nothing queues packets to it
+    nrc, nout = run(['nft', 'list', 'table', 'inet', 'zapret'])
+    queues = nrc == 0 and 'queue' in (nout or '')
     mode = ''
     for line in read_text(ZAPRET_CONF).splitlines():
         if line.strip().startswith('MODE_FILTER='):
             mode = line.split('=', 1)[1].strip().strip('"').strip("'")
             break
-    return {'running': bool(pids), 'pids': pids, 'mode': mode,
+    return {'running': bool(pids), 'pids': pids, 'mode': mode, 'queues': queues,
             'listed': _hostlist_match(domain, ZAPRET_HOSTLIST),
             'excluded': _hostlist_match(domain, ZAPRET_EXCLUDE),
             'auto': bool(_hostlist_match(domain, ZAPRET_AUTO))}
@@ -939,6 +942,29 @@ def parse_listeners(text):
     return listeners
 
 
+def direct_country(live):
+    """Country of the provider exit, measured from this router - '' when not measured.
+
+    The trace used to print "Россия (RU)" for every DIRECT domain without looking, which is
+    simply wrong on a router whose WAN is somewhere else.
+    """
+    if not live:
+        return ''
+    return fetch_country('') or ''
+
+
+def country_label(code):
+    if not code:
+        return ''
+    return '%s (%s)' % (COUNTRIES.get(code, code), code)
+
+
+def exit_country_text(code):
+    if not code:
+        return 'страна выхода не измерялась (включите живую проверку)'
+    return 'страна %s — измерено с роутера' % country_label(code)
+
+
 EGRESS_ENDPOINTS = (
     ('https://ipinfo.io/json', ('country',)),
     ('https://api.myip.com', ('country', 'cc')),
@@ -1442,9 +1468,10 @@ def trace_domain(domain, live=False):
     policy = (hit or {}).get('policy', 'GLOBAL')
     if mt_iface and mt_iface not in TUNNELED_IFACES:
         route_path.append('интернет, мимо mihomo')
-        route_country = 'Россия (RU)'
-        step('Выход', 'ok', 'напрямую в интернет через %s — так решила группа «%s»; страна Россия (RU)'
-             % (mt_iface, (group['name'] if route else '')),
+        _cc = direct_country(live)
+        route_country = country_label(_cc)
+        step('Выход', 'ok', 'напрямую в интернет через %s — так решила группа «%s»; %s'
+             % (mt_iface, (group['name'] if route else ''), exit_country_text(_cc)),
              'Направление задаётся группой «%s»: вкладка «Списки и синк».' % (group['name'] if route else ''))
     elif policy in ('DIRECT', 'REJECT'):
         if policy == 'REJECT':
@@ -1460,8 +1487,10 @@ def trace_domain(domain, live=False):
                      'Правило REJECT блокирует домен: найдите его в правилах mihomo и уберите или смените политику.')
         else:
             route_path.append('интернет через провайдера')
-            route_country = 'Россия (RU)'
-            step('Выход', 'ok', 'напрямую в интернет через провайдера; страна Россия (RU)')
+            _cc = direct_country(live)
+            route_country = country_label(_cc)
+            step('Выход', 'ok', 'напрямую в интернет через провайдера; %s'
+                 % exit_country_text(_cc))
     elif policy in ('VPN', 'VPN-noP2P', 'AI'):
         info = group_state(policy)
         if info and info['now']:
@@ -1482,14 +1511,16 @@ def trace_domain(domain, live=False):
         info = group_state('GLOBAL')
         now = (info or {}).get('now') or ''
         if now:
-            where = ('напрямую в интернет через провайдера; страна Россия (RU)'
-                     if now.upper() == 'DIRECT'
-                     else 'через узел «%s»%s' % (now, ('; страна ' + info['country'])
-                                                if info.get('country') else ''))
+            if now.upper() == 'DIRECT':
+                _cc = direct_country(live)
+                where = 'напрямую в интернет через провайдера; %s' % exit_country_text(_cc)
+            else:
+                where = 'через узел «%s»%s' % (now, ('; страна ' + info['country'])
+                                               if info.get('country') else '')
             route_path.append('группа GLOBAL')
-            route_path.append(where.replace('; страна Россия (RU)', '').strip())
-            route_country = 'Россия (RU)' if now.upper() == 'DIRECT' else (
-                info.get('country') or '')
+            route_path.append(where.split('; страна ')[0].strip())
+            route_country = (country_label(direct_country(live)) if now.upper() == 'DIRECT'
+                             else (info.get('country') or ''))
             step('Выход', 'warn',
                  'группа GLOBAL отправляет %s — домен не попал ни в одно правило' % where,
                  'Домен не попал ни в одно правило, поэтому работает группа GLOBAL, а её '
@@ -1525,9 +1556,17 @@ def trace_domain(domain, live=False):
              'и перезапустите zapret: /etc/init.d/zapret restart')
     elif zap['listed']:
         route_path.insert(0, 'zapret (запрос маскируется)')
-        step('Запрет (DPI)', 'ok',
-             'включён: домен в списке zapret (строка «%s») — запрос к сайту маскируется от '
-             'провайдера (nfqws работает, режим %s)' % (zap['listed'], zap['mode'] or '?'))
+        if zap.get('queues'):
+            step('Запрет (DPI)', 'ok',
+                 'включён: домен в списке zapret (строка «%s»), nfqws работает и правила '
+                 'очередей в nft есть — запрос идёт через обход DPI (режим %s)'
+                 % (zap['listed'], zap['mode'] or '?'))
+        else:
+            step('Запрет (DPI)', 'warn',
+                 'настроен, но не подтверждён: домен в списке, nfqws работает, а правил '
+                 'очередей в nft не видно (строка «%s»)' % zap['listed'],
+                 'Проверьте, что таблица inet zapret загружена: nft list table inet zapret; '
+                 'перезапустите запрет: /etc/init.d/zapret restart')
     elif zap['auto']:
         route_path.insert(0, 'zapret (запрос маскируется)')
         step('Запрет (DPI)', 'ok',

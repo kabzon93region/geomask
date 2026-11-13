@@ -37,8 +37,8 @@ python tools/check_build.py         # geomask.sh == сборка из исход
 ## Тесты
 
 ```sh
-python -m unittest discover -s tests -p 'test_*.py'   # ~490 unit-тестов
-bash tests/run_tests.sh                               # песочница: 419 проверок
+python -m unittest discover -s tests -p 'test_*.py'   # 521 unit-тест
+bash tests/run_tests.sh                               # песочница: 430 проверок
 ```
 
 Песочница — fake root со стабами `pidof/ubus/mihomo/curl/crontab/nslookup/ip/wget/apk`:
@@ -48,6 +48,18 @@ bash tests/run_tests.sh                               # песочница: 419 
 
 Сценарий `S54` проверяет установку на голом роутере: пустой корень с `apk`, `mihomo` и
 `magitrickle`, но без `python3`/`curl` — шаг 1 должен поставить их сам.
+
+Сценарии безопасности установки (v1.30.15):
+
+- `S55` — на роутере чужой конфиг mihomo: `--auto` останавливается и файл не меняется;
+- `S56` — `https-dns-proxy` не ставится: шаг 4 не трогает DNS, сеть и nft;
+- `S57` — `--modules=core,path_vpn` без панели: verify проходит без `geo-sync`;
+- `S58` — `sysupgrade -b` не работает: apply не начинается, файлы не пишутся.
+
+Заглушки, которые нельзя считать доказательством: `mihomo` отвечает по state-файлу и не
+читает YAML, `netstat` всегда показывает слушателей AI-DNS, `sysupgrade` пишет пустой
+архив. Поэтому поведение проверяется ещё и по извлечённым функциям и по содержимому
+файлов, а не только по коду возврата.
 
 Перед добавлением файлов в `tests/` — проверка на секреты:
 `grep -riE 'x-hwid|subscription|proxy-provider|http://sub|token|key' tests/`.

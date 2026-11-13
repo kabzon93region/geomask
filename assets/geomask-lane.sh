@@ -23,6 +23,9 @@ INITD=/etc/init.d/hev-nop2p
 CFG=/etc/mihomo/config.yaml
 LNAME=nop2p-lane
 NFT=/usr/share/nftables.d/ruleset-post/99-lane-accept.nft
+LAN_DEV=$(uci -q get network.lan.device 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=$(uci -q get network.lan.ifname 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=br-lan
 
 die() { echo "lane: $*" >&2; exit 1; }
 
@@ -67,7 +70,7 @@ _provision_netfw() {
   cat > "$NFT" <<EOF
 table inet fw4 {
     chain accept_to_$LANE_NAME {
-        iifname "br-lan" oifname "$LANE_NAME" counter accept comment "geomask-lane: LAN clients to $LANE_NAME tunnel"
+        iifname "$LAN_DEV" oifname "$LANE_NAME" counter accept comment "geomask-lane: LAN clients to $LANE_NAME tunnel"
         iifname "Wireguard" oifname "$LANE_NAME" counter accept comment "geomask-lane: WG peers to $LANE_NAME tunnel"
     }
 }

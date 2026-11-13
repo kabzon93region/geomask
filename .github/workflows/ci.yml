@@ -37,6 +37,8 @@ jobs:
 
       # One module per process with its own timeout: a hang used to freeze the whole job
       # for as long as GitHub allowed, and the log never said which test it was.
+      # Several modules exercise the real /etc/geomask and /root paths (that is what the
+      # router has), so they run as root here - without it they fail with PermissionError.
       - name: Unit tests
         run: |
           set -u
@@ -44,7 +46,8 @@ jobs:
           for file in tests/test_*.py; do
             module=$(basename "$file" .py)
             start=$(date +%s)
-            if timeout --kill-after=10 180 python -m unittest discover -s tests -p "$module.py" \
+            if timeout --kill-after=10 180 sudo -E env "PATH=$PATH" "HOME=$HOME" \
+                 python -m unittest discover -s tests -p "$module.py" \
                  > "/tmp/$module.log" 2>&1; then
               echo "ok   $module ($(( $(date +%s) - start ))s)"
             else

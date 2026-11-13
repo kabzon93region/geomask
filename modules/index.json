@@ -143,7 +143,7 @@
           "path": "/usr/lib/geomask/geomask-config-tx.py",
           "source": "assets/geomask-config-tx.py",
           "mode": 755,
-          "sha256": "268884f05788b6bd6bbb720ec32b5e1f99e0d5ead716cfacb29a28e42c4899e8"
+          "sha256": "c9bd2e8cee49dc9989d24d3f9998063b420120033f2987076412fd490b3d09dd"
         },
         {
           "path": "/usr/lib/geomask/geomask-lane-torrent.py",

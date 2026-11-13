@@ -2089,6 +2089,8 @@ TX_JOURNAL = DEFAULT_STATE_DIR / 'config-tx-journal.jsonl'
 TX_LOCK = DEFAULT_STATE_DIR / '.config-tx.lock'
 TX_STATE_DIR = DEFAULT_STATE_DIR / 'tx-work'
 TX_PREIMAGES_DIR = DEFAULT_STATE_DIR / 'tx-preimages'
+# how long a second transaction waits for the lock before reporting that it is busy
+TX_LOCK_TIMEOUT = 30.0
 
 class TxError(Exception):
     pass
@@ -2123,16 +2125,30 @@ def strict_json(data: bytes):
         raise TxError('invalid JSON') from None
 
 @contextlib.contextmanager
-def tx_lock():
-    """Process-wide transaction lock using flock (Unix) or file-based lock (Windows)."""
+def tx_lock(timeout=None):
+    """Process-wide transaction lock using flock (Unix) or file-based lock (Windows).
+
+    The Unix path used a blocking flock: a second transaction (or a test that leaked the
+    descriptor) waited forever instead of reporting anything. It now polls with LOCK_NB and
+    gives up after TX_LOCK_TIMEOUT, so a stuck transaction fails loudly.
+    """
     TX_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    
+    timeout = TX_LOCK_TIMEOUT if timeout is None else timeout
+
     if hasattr(os, 'O_NOFOLLOW'):  # Unix
         import fcntl
         fd = None
         try:
             fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TxError('config transaction lock is busy for %gs' % timeout)
+                    time.sleep(0.1)
             yield
         finally:
             if fd is not None:
@@ -9075,7 +9091,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-config-tx.py",
           "source": "assets/geomask-config-tx.py",
           "mode": 755,
-          "sha256": "268884f05788b6bd6bbb720ec32b5e1f99e0d5ead716cfacb29a28e42c4899e8"
+          "sha256": "c9bd2e8cee49dc9989d24d3f9998063b420120033f2987076412fd490b3d09dd"
         },
         {
           "path": "/usr/lib/geomask/geomask-lane-torrent.py",

@@ -1601,8 +1601,11 @@ def trace_domain(domain, live=False):
         else:
             # a 404 page or a non-HTML host simply has nothing to list: that is not a fault,
             # and the route above already answered the question
-            step('Связанные хосты', 'ok',
-                 'не найдено — страница не ссылается на другие домены (например, отдала 404)')
+            if not probe['ok']:
+                step('Связанные хосты', 'ok', 'не проверялось — сайт не ответил')
+            else:
+                step('Связанные хосты', 'ok',
+                     'не найдено — страница не ссылается на другие домены')
 
     lines.append('')
     exit_step = next((item for item in steps if item['stage'] == 'Выход'), None)

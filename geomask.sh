@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.12"
+GM_VERSION="1.30.13"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -5121,7 +5121,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.12"
+BACKEND_VERSION="1.30.13"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6689,7 +6689,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.12', '1.30.12', '1.30.12')
+VERSION_MARKERS = ('1.30.13', '1.30.13', '1.30.13')
 
 
 def stamp_versions(data, version):
@@ -9013,8 +9013,11 @@ def trace_domain(domain, live=False):
         else:
             # a 404 page or a non-HTML host simply has nothing to list: that is not a fault,
             # and the route above already answered the question
-            step('Связанные хосты', 'ok',
-                 'не найдено — страница не ссылается на другие домены (например, отдала 404)')
+            if not probe['ok']:
+                step('Связанные хосты', 'ok', 'не проверялось — сайт не ответил')
+            else:
+                step('Связанные хосты', 'ok',
+                     'не найдено — страница не ссылается на другие домены')
 
     lines.append('')
     exit_step = next((item for item in steps if item['stage'] == 'Выход'), None)
@@ -9095,10 +9098,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.12",
+  "core_version": "1.30.13",
   "modules": {
     "admission_service": {
-      "version": "1.30.11",
+      "version": "1.30.12",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9130,7 +9133,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.11",
+      "version": "1.30.12",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9279,7 +9282,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.11",
+      "version": "1.30.12",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9322,7 +9325,7 @@ ASSET_EOF
       ]
     },
     "doctor": {
-      "version": "1.30.11",
+      "version": "1.30.12",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -9333,7 +9336,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "194704179b085ff56cd1a0608c267937a0a82d53550f3bb98feddc2123fbe3d1"
+          "sha256": "81f51f247e074a94a4061ba2975f214f9fe9ad385740c4a881f7412a32e6bd9a"
         }
       ]
     },
@@ -9355,7 +9358,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "4ac453b136302222e10138138a50c7af1fb3346cea1ba509b0cbd9aadc5a2a30"
+          "sha256": "d3a3da99be8ae42f634d6a281568f745cbbbb1ea85a7a905c48fb085e542318c"
         }
       ]
     },
@@ -9371,7 +9374,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "91166e592d8fa97438788d503dea83e94bf345d6129ea4a697a565ee38dfc3b8"
+          "sha256": "cbde19a354d6fd4193f50f6a1222377458bcb9100573524e25bc32d2bf0a3dcf"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9395,12 +9398,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "b0a0e753d1096c827741e9f3c2be22a5a47e0146b55b3dcb9d7a3b9fc4c5219a"
+          "sha256": "3cc46e0684cf3ce2e136fe07122ef84eb51397b371b571c0809471a01d0c926e"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.11",
+      "version": "1.30.12",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9411,7 +9414,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.11",
+      "version": "1.30.12",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9421,7 +9424,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.11",
+      "version": "1.30.12",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9431,7 +9434,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.11",
+      "version": "1.30.12",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9780,7 +9783,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.12';
+var PANEL_VERSION = '1.30.13';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -31106,7 +31109,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.12"
+GUARD_VERSION="1.30.13"
 
 log() { logger -t geomask-guard "$*"; }
 

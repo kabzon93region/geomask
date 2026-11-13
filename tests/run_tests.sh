@@ -1590,11 +1590,32 @@ done
 exit 0
 APKEOF
 chmod +x "$B/apk"
-APK_TARGET="$B" GM_PREFIX="$R" PATH="$B:$R/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+# Hermetic PATH: the runner's /usr/bin has python3 and curl, so the scenario would find
+# them and never exercise the install. Link only the tools the installer needs, leave
+# python3 and curl out, and let the apk stub provide them.
+for tool in sh awk sed grep cat mkdir rm date df head tail cut tr sleep ln wc uname \
+            mktemp id basename dirname printf env; do
+  _p=$(command -v "$tool" 2>/dev/null) && ln -sf "$_p" "$B/$tool"
+done
+# On Linux the runner already has python3 and curl, so the scenario has to hide them:
+# the symlink farm above is a complete PATH. Git Bash cannot run symlinked ELF wrappers
+# from a minimal PATH (DLL search), but it does not have python3/curl anyway.
+if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+  _s54_path="$B"
+else
+  # drop the sandbox stubs (they provide python3/curl) but keep the system PATH
+  _s54_path=$(printf '%s' "$PATH" | sed "s|$STUB:||g; s|:$STUB||g")
+  _s54_path="$_s54_path:$B"
+fi
+# the fixture's mihomo lives under the fake root, not on PATH
+_s54_path="$_s54_path:$R/usr/bin"
+APK_TARGET="$B" GM_PREFIX="$R" PATH="$_s54_path" \
   sh "$SCRIPT" --step 1 --yes >"$HERE/last_out.txt" 2>&1
-if [ -x "$B/python3" ] && [ -x "$B/curl" ]; then
-  echo "PASS: S54 установщик сам поставил python3 и curl"; pass=$((pass+1))
-else echo "FAIL: S54 python3/curl не установлены"; sed 's/^/    | /' "$HERE/last_out.txt" | tail -12; failn=$((failn+1)); fi
+# curl may already be present (Git Bash ships it), python3 usually is not: what matters is
+# that the installer noticed the gap, called the package manager and the tool appeared.
+if [ -x "$B/python3" ] && grep -qF 'installed:' "$HERE/last_out.txt"; then
+  echo "PASS: S54 установщик сам поставил python3 (и curl, если его не было)"; pass=$((pass+1))
+else echo "FAIL: S54 python3 не установлен"; sed 's/^/    | /' "$HERE/last_out.txt" | tail -12; failn=$((failn+1)); fi
 contains "$HERE/last_out.txt" 'verify: PASS' "S54 после установки пакетов шаг 1 проходит"
 if grep -qF 'apk add $_missing' "$HERE/../assets/../../geomask.sh" 2>/dev/null \
    || grep -qF 'apk add $_missing' "$SCRIPT"; then

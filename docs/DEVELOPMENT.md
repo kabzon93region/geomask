@@ -37,8 +37,8 @@ python tools/check_build.py         # geomask.sh == сборка из исход
 ## Тесты
 
 ```sh
-python -m unittest discover -s tests -p 'test_*.py'   # 521 unit-тест
-bash tests/run_tests.sh                               # песочница: 430 проверок
+python -m unittest discover -s tests -p 'test_*.py'   # 534 unit-теста
+bash tests/run_tests.sh                               # песочница: 438 проверок
 ```
 
 Песочница — fake root со стабами `pidof/ubus/mihomo/curl/crontab/nslookup/ip/wget/apk`:
@@ -48,6 +48,16 @@ bash tests/run_tests.sh                               # песочница: 430 
 
 Сценарий `S54` проверяет установку на голом роутере: пустой корень с `apk`, `mihomo` и
 `magitrickle`, но без `python3`/`curl` — шаг 1 должен поставить их сам.
+
+Сценарий `S59` (v1.30.19) проверяет, что переносимость переживает действия панели: бэкенд
+больше не перезаписывает hotplug-скрипт, AI-DNS берёт адрес из установленного конфига,
+а self-update не удаляет бэкапы до создания нового.
+
+`tests/test_install_safety.py` (v1.30.19) извлекает настоящие функции из `geomask.sh.in` и
+прогоняет их в bash: шаблон свежего конфига парсится PyYAML, `python3-yaml` попадает в
+список пакетов на голом роутере, чужой конфиг не перезаписывается, `save_stream` чинит
+потерянный бит запуска, провал trial-запуска возвращает прежний конфиг, `--modules`
+дополняется обязательными модулями, а мусорный файл не считается бэкапом.
 
 Сценарии безопасности установки (v1.30.15):
 

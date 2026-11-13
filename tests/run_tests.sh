@@ -1578,14 +1578,17 @@ printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/mihomo"; chmod +x "$R/usr/bin/mihomo"
 printf '#!/bin/sh\nexit 0\n' > "$R/etc/init.d/magitrickle"; chmod +x "$R/etc/init.d/magitrickle"
 cat > "$B/apk" <<'APKEOF'
 #!/bin/sh
+# install into the directory this stub lives in: no environment variable to lose
 [ "$1" = "add" ] || exit 0
 shift
+target=$(dirname "$0")
+[ -n "$target" ] || target="${APK_TARGET:-.}"
 for pkg in "$@"; do
   case "$pkg" in
-    curl) printf '#!/bin/sh\necho 204\n' > "$APK_TARGET/$pkg" ;;
-    *)    printf '#!/bin/sh\nexit 0\n' > "$APK_TARGET/$pkg" ;;
+    curl) printf '#!/bin/sh\necho 204\n' > "$target/$pkg" ;;
+    *)    printf '#!/bin/sh\nexit 0\n' > "$target/$pkg" ;;
   esac
-  chmod +x "$APK_TARGET/$pkg"
+  chmod +x "$target/$pkg"
 done
 exit 0
 APKEOF

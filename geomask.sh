@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.8"
+GM_VERSION="1.30.9"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -5121,7 +5121,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.8"
+BACKEND_VERSION="1.30.9"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6689,7 +6689,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.8', '1.30.8', '1.30.8')
+VERSION_MARKERS = ('1.30.9', '1.30.9', '1.30.9')
 
 
 def stamp_versions(data, version):
@@ -9030,7 +9030,7 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.8",
+  "core_version": "1.30.9",
   "modules": {
     "admission_service": {
       "version": "1.30.8",
@@ -9290,7 +9290,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "4dd3665e6069ee90e107bbd2b0443010f31c02f35f652a5abfa20ceefcffbd0c"
+          "sha256": "f2d1ddbfa7e60f1cc8e89e0c7c762cb93af3f7217f83678a93522ba88ca5f0bd"
         }
       ]
     },
@@ -9306,7 +9306,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "c20ce2fa4d719e67919e61884645f53fd086136a285602ea0be89e3d2a75c0b5"
+          "sha256": "394c4ee9a0878f9cf47a644a31f9717b2b7f6c414bd3f60e3d99aa59262b1da5"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9330,7 +9330,7 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "59b74e9860d3d1e97abb15bfa313b0d1d9ae067028805f88c411032fb57e1f3f"
+          "sha256": "d7f6f182eb1890ce0c28fec49395a0e553a68f52ff673e98aa12a7e907055dbb"
         }
       ]
     },
@@ -9715,7 +9715,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.8';
+var PANEL_VERSION = '1.30.9';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -31041,7 +31041,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.8"
+GUARD_VERSION="1.30.9"
 
 log() { logger -t geomask-guard "$*"; }
 

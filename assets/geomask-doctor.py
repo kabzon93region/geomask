@@ -241,6 +241,8 @@ def group_state(name):
 
 
 # --------------------------------------------------------------------------- parsers
+TUNNELED_IFACES = {'Mihomo', 'AI', 'VPN-noP2P'}
+
 ZAPRET_CONF = '/opt/zapret/config'
 ZAPRET_HOSTLIST = '/opt/zapret/ipset/zapret-hosts-user.txt'
 ZAPRET_EXCLUDE = '/opt/zapret/ipset/zapret-hosts-user-exclude.txt'
@@ -1302,6 +1304,7 @@ def trace_domain(domain, live=False):
     if not re.match(r'^[a-z0-9.*_-]+\.[a-z0-9._-]+$', domain):
         return {'ok': False, 'error': 'похоже, это не домен: %r' % domain}
     steps = []
+    mt_iface = ''
     lines = ['Домен: %s' % domain, '']
 
     def step(stage, verdict, detail, fix=''):
@@ -1340,6 +1343,7 @@ def trace_domain(domain, live=False):
                  'geomask-lists-edit.py add --group "<группа>" --domain %s' % domain)
     else:
         group, rule, _ = route
+        mt_iface = group['interface'] or ''
         step('MagiTrickle', 'ok', 'группа «%s» (интерфейс %s), правило %s:%s'
              % (group['name'], group['interface'] or '?', rule.get('type') or 'namespace',
                 rule.get('rule')),
@@ -1347,7 +1351,12 @@ def trace_domain(domain, live=False):
 
     # 3. mihomo rule
     hit = mihomo_route(domain, ips)
-    if hit is None:
+    if mt_iface and mt_iface not in TUNNELED_IFACES:
+        # a group bound to a physical interface hands the packet to the WAN directly:
+        # mihomo never sees it, so its rules cannot be "missing"
+        step('Правило mihomo', 'ok',
+             'не участвует — MagiTrickle уводит трафик в %s мимо mihomo' % mt_iface)
+    elif hit is None:
         step('Правило mihomo', 'warn', 'ни одно правило не совпало — сработает MATCH',
              'Домен не покрыт ни одним списком mihomo: добавьте его в список нужной группы.')
     else:
@@ -1376,7 +1385,10 @@ def trace_domain(domain, live=False):
 
     # 4. exit
     policy = (hit or {}).get('policy', 'GLOBAL')
-    if policy in ('DIRECT', 'REJECT'):
+    if mt_iface and mt_iface not in TUNNELED_IFACES:
+        step('Выход', 'ok', 'напрямую через %s — так решил MagiTrickle (страна Россия, RU)' % mt_iface,
+             'Направление задаётся группой «%s»: вкладка «Списки и синк».' % (group['name'] if route else ''))
+    elif policy in ('DIRECT', 'REJECT'):
         if policy == 'REJECT':
             # a QUIC reject is the deliberate policy for video hosts: UDP/443 is dropped,
             # the same page loads fine over TCP, so this is not a broken route

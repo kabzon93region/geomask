@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.19"
+GM_VERSION="1.30.20"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -170,7 +170,7 @@ geomask_config_shaped() { # geomask_config_shaped <file>
   _f="$1"
   [ -s "$_f" ] || return 1
   grep -q '^proxy-providers:' "$_f" 2>/dev/null || return 1
-  grep -qE '^  - name: (AI|VPN-noP2P)$' "$_f" 2>/dev/null || return 1
+  grep -qE '^[[:space:]]*- name: (AI|VPN-noP2P)$' "$_f" 2>/dev/null || return 1
   return 0
 }
 
@@ -857,7 +857,7 @@ write_mihomo_config() {
   # --- existing config: keep it as-is (custom rules, headers, sniffer) and only patch
   #     provider urls / ensure the ai-devices listener. v1.23.0: de5 (the retired un1.pro AI
   #     sub) is no longer required and is stripped if still present; AI rides `sub`.
-  if [ -s "$_c" ] && grep -q '^  sub:' "$_c" \
+  if [ -s "$_c" ] && grep -qE '^[[:space:]]*sub:' "$_c" \
      && grep -q 'name: VPN' "$_c" && grep -q 'name: AI' "$_c"; then
     if grep -q '^  de5:' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true

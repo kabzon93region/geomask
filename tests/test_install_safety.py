@@ -232,6 +232,29 @@ sysupgrade() { printf 'garbage' > "$2"; return 0; }
         self.assertEqual(sorted(p.name for p in backups.iterdir()),
                          ['router-backup-20260101-000000.tar.gz'])
 
+    # ---------------------------------------------------------------- B5b
+    def test_both_yaml_list_styles_count_as_a_geomask_config(self):
+        """mihomo and panel tools write groups at column 0; the template uses two spaces."""
+        indented = self.case / 'indented.yaml'
+        indented.write_text('proxy-providers:\n  sub:\n    type: http\n'
+                            'proxy-groups:\n  - name: AI\n  - name: VPN-noP2P\n',
+                            encoding='utf-8')
+        flat = self.case / 'flat.yaml'
+        flat.write_text('proxy-providers:\n  sub:\n    type: http\n'
+                        'proxy-groups:\n- name: AI\n- name: VPN-noP2P\n', encoding='utf-8')
+        foreign = self.case / 'foreign.yaml'
+        foreign.write_text('proxy-providers:\n  mine:\n    type: http\n'
+                           'proxy-groups:\n- name: MyGroup\n', encoding='utf-8')
+        result = self.run_script(
+            'for f in %s %s %s; do '
+            'geomask_config_shaped "$f" && printf "%%s SHAPED\\n" "$f" '
+            '|| printf "%%s FOREIGN\\n" "$f"; done'
+            % (posix(indented), posix(flat), posix(foreign)),
+            functions=['geomask_config_shaped'])
+        self.assertIn('indented.yaml SHAPED', result.stdout)
+        self.assertIn('flat.yaml SHAPED', result.stdout)
+        self.assertIn('foreign.yaml FOREIGN', result.stdout)
+
     # ---------------------------------------------------------------- B11
     def test_required_modules_are_added_to_a_cli_selection(self):
         body = r'''

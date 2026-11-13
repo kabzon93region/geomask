@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.19"
+GM_VERSION="1.30.20"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -170,7 +170,7 @@ geomask_config_shaped() { # geomask_config_shaped <file>
   _f="$1"
   [ -s "$_f" ] || return 1
   grep -q '^proxy-providers:' "$_f" 2>/dev/null || return 1
-  grep -qE '^  - name: (AI|VPN-noP2P)$' "$_f" 2>/dev/null || return 1
+  grep -qE '^[[:space:]]*- name: (AI|VPN-noP2P)$' "$_f" 2>/dev/null || return 1
   return 0
 }
 
@@ -5284,7 +5284,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.19"
+BACKEND_VERSION="1.30.20"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6900,7 +6900,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.19', '1.30.19', '1.30.19')
+VERSION_MARKERS = ('1.30.20', '1.30.20', '1.30.20')
 
 
 def stamp_versions(data, version):
@@ -9448,10 +9448,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.19",
+  "core_version": "1.30.20",
   "modules": {
     "admission_service": {
-      "version": "1.30.18",
+      "version": "1.30.19",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9483,7 +9483,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.18",
+      "version": "1.30.19",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9641,7 +9641,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.18",
+      "version": "1.30.19",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9685,7 +9685,7 @@ ASSET_EOF
       ]
     },
     "doctor": {
-      "version": "1.30.15",
+      "version": "1.30.19",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -9718,12 +9718,12 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "124e35314dc1cc4991820ff875290db2da478fabd0d8d25973e012f4df35b578"
+          "sha256": "e7efd38d5b70963529b8a0224cc2088e04790866127eb6e0e97b21ec25bd589f"
         }
       ]
     },
     "luci": {
-      "version": "1.30.0",
+      "version": "1.30.19",
       "type": "core",
       "name": "Админка LuCI",
       "dependencies": [
@@ -9734,7 +9734,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "7925a500f87e87df29c54f21531f80080fe09ffa7b021a6b5a51d62d3190f82c"
+          "sha256": "255192f5e9625caedb64ecb93de87e060ad0fd93802ed7eaea8cbf421da22757"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9758,12 +9758,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "d11fb51644fd91146fadbfa265b46765766e1c23a1d458c4c53dabb2ccf09af5"
+          "sha256": "4a1f5cde47405120dd8dbd0c89252b8641e2d58637a5a2f15dd3d5b0e5f115b5"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.18",
+      "version": "1.30.19",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9774,7 +9774,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.18",
+      "version": "1.30.19",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9784,7 +9784,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.18",
+      "version": "1.30.19",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9794,7 +9794,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.18",
+      "version": "1.30.19",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -10150,7 +10150,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.19';
+var PANEL_VERSION = '1.30.20';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -12076,7 +12076,7 @@ write_mihomo_config() {
   # --- existing config: keep it as-is (custom rules, headers, sniffer) and only patch
   #     provider urls / ensure the ai-devices listener. v1.23.0: de5 (the retired un1.pro AI
   #     sub) is no longer required and is stripped if still present; AI rides `sub`.
-  if [ -s "$_c" ] && grep -q '^  sub:' "$_c" \
+  if [ -s "$_c" ] && grep -qE '^[[:space:]]*sub:' "$_c" \
      && grep -q 'name: VPN' "$_c" && grep -q 'name: AI' "$_c"; then
     if grep -q '^  de5:' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
@@ -31761,7 +31761,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.19"
+GUARD_VERSION="1.30.20"
 
 log() { logger -t geomask-guard "$*"; }
 

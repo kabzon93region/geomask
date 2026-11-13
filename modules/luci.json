@@ -1,7 +1,7 @@
 {
   "id": "luci",
   "name": "Админка LuCI",
-  "version": "1.30.0",
+  "version": "1.30.19",
   "schema_version": 1,
   "type": "core",
   "description": "Панель «Гео-маскировка и AI»: бэкенд, RPC-обёртка, ACL, меню и страница",

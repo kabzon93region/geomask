@@ -1597,7 +1597,7 @@ chmod +x "$B/apk"
 # Hermetic PATH: the runner's /usr/bin has python3 and curl, so the scenario would find
 # them and never exercise the install. Link only the tools the installer needs, leave
 # python3 and curl out, and let the apk stub provide them.
-for tool in sh awk sed grep cat mkdir rm date df head tail cut tr sleep ln wc uname \
+for tool in sh awk sed grep cat mkdir rm date df head tail cut tr sleep ln wc uname chmod \
             mktemp id basename dirname printf env; do
   _p=$(command -v "$tool" 2>/dev/null) && ln -sf "$_p" "$B/$tool"
 done

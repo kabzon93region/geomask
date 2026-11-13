@@ -1619,7 +1619,15 @@ APK_TARGET="$B" GM_PREFIX="$R" PATH="$_s54_path" \
 # that the installer noticed the gap, called the package manager and the tool appeared.
 if [ -x "$B/python3" ] && grep -qF 'installed:' "$HERE/last_out.txt"; then
   echo "PASS: S54 установщик сам поставил python3 (и curl, если его не было)"; pass=$((pass+1))
-else echo "FAIL: S54 python3 не установлен"; sed 's/^/    | /' "$HERE/last_out.txt" | tail -12; failn=$((failn+1)); fi
+else
+  echo "FAIL: S54 python3 не установлен"
+  sed 's/^/    | /' "$HERE/last_out.txt" | tail -12
+  echo "    | --- диагностика:"
+  ls -la "$B" 2>&1 | sed 's/^/    | /'
+  echo "    | apk stub:"; sed 's/^/    | /' "$B/apk" 2>&1
+  echo "    | PATH: $_s54_path"
+  failn=$((failn+1))
+fi
 contains "$HERE/last_out.txt" 'verify: PASS' "S54 после установки пакетов шаг 1 проходит"
 if grep -qF 'apk add $_missing' "$HERE/../assets/../../geomask.sh" 2>/dev/null \
    || grep -qF 'apk add $_missing' "$SCRIPT"; then

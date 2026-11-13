@@ -331,8 +331,14 @@ def dependencies_ready(index, state, module_id):
     return problems
 
 
-def download_module(index, state, module_id, config, force=False, fetcher=None):
-    """Stage every file in memory. Returns (files, changed) without writing."""
+def download_module(index, state, module_id, config, force=False, fetcher=None,
+                    skipped=None):
+    """Stage every file in memory. Returns (module, files, changed) without writing.
+
+    Files the release does not own the bytes of (owner configs, sync-generated rulesets)
+    are left alone and reported through `skipped`: aborting the whole module because one
+    config differs made every core update impossible without --force.
+    """
     fetcher = fetcher or fetch
     module = (index.get('modules') or {}).get(module_id)
     if module is None:
@@ -350,11 +356,12 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
         if current is not None and current != entry['sha256']:
             known = recorded['files'].get(path)
             if (entry.get('config') or entry.get('generated')) and not force:
-                # an owner-edited config (nodes.conf, vpnwatch.conf, zapret lists) is kept by
-                # the installer; the updater must not replace it just because the baseline
-                # recorded those same bytes as "installed"
-                raise UpdateError('%s is a configuration file; use --force to replace it'
-                                  % path)
+                # an owner-edited config (nodes.conf, vpnwatch.conf, zapret lists) or a
+                # ruleset the sync rewrites is kept as-is; the rest of the module still
+                # updates. --force is the explicit way to replace it.
+                if skipped is not None:
+                    skipped.append(path)
+                continue
             if not force and current != known:
                 raise UpdateError('%s was modified locally; use --force to overwrite' % path)
         url = RAW.format(repo=config['repo'], ref=config['ref'], path=entry['source'])
@@ -408,7 +415,9 @@ def install_staged(module_id, staged, state, version, state_path=DEFAULT_STATE):
     entry = modules.setdefault(module_id, {})
     entry['version'] = version or entry.get('version', '')
     entry['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    entry['files'] = {item['path']: item['sha256'] for item in staged}
+    # merge, never replace: a skipped config keeps the baseline that makes a later local
+    # edit detectable
+    entry.setdefault('files', {}).update({item['path']: item['sha256'] for item in staged})
     write_json(state_path, state)
     return backup
 
@@ -514,8 +523,9 @@ def main(argv=None):
                     'change the selection with the installer: sh geomask.sh --modules=%s'
                     % (args.module, args.selection, args.module))
             index, source = load_index(config)
+            skipped = []
             module, staged, changed = download_module(index, state, args.module, config,
-                                                      force=args.force)
+                                                      force=args.force, skipped=skipped)
             if not changed:
                 # A manifest-only module (files: []) never stages anything, so its version
                 # used to stay at the old value and the panel offered the same update forever.
@@ -527,13 +537,14 @@ def main(argv=None):
                                       'metadata': True}, ensure_ascii=False))
                     return 0
                 print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
-                                  'version': module.get('version'), 'source': source},
-                                 ensure_ascii=False))
+                                  'version': module.get('version'), 'source': source,
+                                  'skipped': skipped}, ensure_ascii=False))
                 return 0
             backup = install_staged(args.module, staged, state, module.get('version', ''), args.state)
             print(json.dumps({'ok': True, 'module': args.module, 'changed': True,
                               'version': module.get('version'), 'files': len(staged),
-                              'backup': backup, 'source': source}, ensure_ascii=False))
+                              'backup': backup, 'source': source,
+                              'skipped': skipped}, ensure_ascii=False))
             return 0
     except UpdateError as exc:
         print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))

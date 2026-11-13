@@ -334,7 +334,10 @@ for _m in upd_check upd_apply upd_status; do
   else echo "FAIL: S12 $_m refs=$_c (want >=3)"; failn=$((failn+1)); fi
 done
 # 4) update runner sanity: backup first, digest check, no-restart install
-for _p in 'sysupgrade -b' 'sha256 mismatch' 'reinstall --yes' 'rpcd reload' 'wc -c < "$BK"' 'rm -f /tmp/router-backup-'; do
+# v1.30.19: the runner parks the previous copies instead of deleting them before
+# sysupgrade, and verifies the archive it just created
+for _p in 'sysupgrade -b' 'sha256 mismatch' 'reinstall --yes' 'rpcd reload' 'wc -c < "$BK"' \
+          'restore_old' 'tar -tzf "$BK"' 'geomask-bk-park-'; do
   if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S12 runner has: $_p"; pass=$((pass+1))
   else echo "FAIL: S12 runner missing: $_p"; failn=$((failn+1)); fi
 done
@@ -1704,6 +1707,30 @@ if [ ! -s "$R/usr/lib/geomask/geomask-doctor.py" ]; then
   echo "PASS: S58 файлы не записаны без бэкапа"; pass=$((pass+1))
 else echo "FAIL: S58 файлы записаны без полного бэкапа"; failn=$((failn+1)); fi
 rm -rf "$R"
+
+# ---------- scenario 59: portability survives the panel (v1.30.19) ----------
+echo "=== S59: переносимость hotplug и AI-DNS ==="
+_BK="$HERE/../assets/geo-backend.sh"
+if grep -qF 'cat > /etc/hotplug.d/iface/99-default-vpn-route' "$_BK"; then
+  echo "FAIL: S59 backend still rewrites the hotplug script"; failn=$((failn+1))
+else
+  echo "PASS: S59 backend does not overwrite the hotplug script"; pass=$((pass+1))
+fi
+if grep -qF '99-default-vpn-route.dist' "$_BK" && grep -qF '99-default-vpn-route.dist' "$HERE/../geomask.sh.in"; then
+  echo "PASS: S59 a shipped copy can restore a missing script"; pass=$((pass+1))
+else echo "FAIL: S59 no restore source for the hotplug script"; failn=$((failn+1)); fi
+if grep -qF 'dnat ip to 192.168.0.53' "$_BK"; then
+  echo "FAIL: S59 AI-DNS DNAT still hardcodes 192.168.0.53"; failn=$((failn+1))
+else echo "PASS: S59 AI-DNS DNAT uses the discovered address"; pass=$((pass+1)); fi
+if grep -qF '_gm_aidns_ip' "$_BK" && grep -qF 'listen-address=' "$_BK"; then
+  echo "PASS: S59 the AI-DNS address comes from the installed config"; pass=$((pass+1))
+else echo "FAIL: S59 no discovery for the AI-DNS address"; failn=$((failn+1)); fi
+if grep -qE "iif br-lan|'iif br-lan|device='br-lan'" "$HERE/../geomask.sh.in"; then
+  echo "FAIL: S59 installer still pins br-lan somewhere"; failn=$((failn+1))
+else echo "PASS: S59 installer has no br-lan pin left"; pass=$((pass+1)); fi
+if grep -qF 'restore_old' "$_BK" && ! grep -qF 'rm -f /tmp/router-backup-*.tar.gz "$BKD"' "$_BK"; then
+  echo "PASS: S59 self-update parks the old backup instead of deleting it"; pass=$((pass+1))
+else echo "FAIL: S59 self-update still deletes backups before sysupgrade"; failn=$((failn+1)); fi
 
 echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
 [ "$failn" -eq 0 ]

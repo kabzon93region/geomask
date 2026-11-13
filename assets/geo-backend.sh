@@ -407,6 +407,24 @@ cmd_dev_del() {
 # (/etc/geomask-aidns.off present). Firewall is reloaded only when the list changes.
 # NOTE: the AI dnsmasq listens on 192.168.0.53:5353 (NOT :53) - the main dnsmasq
 # rebinds every interface address including our alias, so :53 there is taken.
+# The AI-DNS address belongs to this router's LAN, not to one owner's network. Read it
+# from the config the installer wrote; only then derive it from the LAN address.
+_gm_aidns_ip() {
+  _a=$(sed -n 's/^listen-address=\([0-9.]*\).*/\1/p' /etc/dnsmasq-ai.conf 2>/dev/null | head -1)
+  if [ -z "$_a" ]; then
+    _l=$(ip -4 addr show "$(_gm_lan_iface)" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+    case "$_l" in *.*.*.*) _a=$(printf '%s' "$_l" | cut -d. -f1-3).53 ;; esac
+  fi
+  printf '%s' "$_a"
+}
+
+_gm_lan_iface() {
+  _i=$(uci -q get network.lan.device 2>/dev/null)
+  [ -n "$_i" ] || _i=$(uci -q get network.lan.ifname 2>/dev/null)
+  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i=br-lan ;; esac
+  printf '%s' "$_i"
+}
+
 _aidns_sync() {
   [ -f /etc/geomask-aidns.uid ] || return 0
   [ -f /etc/geomask-aidns.off ] && return 0
@@ -426,7 +444,8 @@ _aidns_sync() {
     printf 'add chain inet geomask_ai_dns out_mark { type route hook output priority -150; policy accept; }\n'
     printf 'add rule inet geomask_ai_dns out_mark meta skuid %s mark set 0x64\n' "$_uid"
     if [ -n "$_list" ]; then
-      printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to 192.168.0.53:5353\n' "$_list"
+      _aidns=$(_gm_aidns_ip)
+      [ -n "$_aidns" ] && printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to %s:5353\n' "$_list" "$_aidns"
     fi
   } > /tmp/geomask-aidns.nft 2>/dev/null || return 0
   if ! nft -c -f /tmp/geomask-aidns.nft >/dev/null 2>&1; then
@@ -554,7 +573,7 @@ EOF
       cat > /usr/share/nftables.d/ruleset-post/99-ai-accept.nft <<'EOF'
 table inet fw4 {
     chain accept_to_AI {
-        iifname "br-lan" oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
+        iifname { "br-lan", "br-lan.1" } oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
         iifname "Wireguard" oifname "AI" counter accept comment "custom: WG peers to AI tunnel"
     }
 }
@@ -573,7 +592,7 @@ EOF
     cat > "$_ai_drop" <<'EOF'
 table inet fw4 {
     chain accept_to_AI {
-        iifname "br-lan" oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
+        iifname { "br-lan", "br-lan.1" } oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
         iifname "Wireguard" oifname "AI" counter accept comment "custom: WG peers to AI tunnel"
     }
 }
@@ -589,69 +608,22 @@ EOF
 }
 
 _hotplug_sync() {
-  cat > /etc/hotplug.d/iface/99-default-vpn-route <<'EOF'
-#!/bin/sh
-# Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
-# Devices from /etc/geo-devices.list with mode=bypass go DIRECT (real IP), never via VPN.
-# Devices with mode=realtz follow normal mihomo routing (masked IP), only tz is real (PC-side).
-# NOTE: runs inside netifd's ifup path -> MUST NOT block here (would stall PPPoE auth / WAN).
-[ "$ACTION" = "ifup" ] || exit 0
-
-apply_routes() {
-  if ! ip route show table 100 | grep -q '^default'; then
-    ip route show table main | grep -v '^default' | while IFS= read -r r; do
-      ip route replace table 100 $r 2>/dev/null
-    done
-    ip route replace table 100 default dev Mihomo 2>/dev/null
-  fi
-  ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
-  # --- ICMP bypass: 19901 stays ABOVE the magitrickle fwmark rule base
-  #     (dynamic, observed 32558..32609) so ping to a marked IP never dies
-  #     inside the TUN. Direct via pppoe-wan. Guard reseats the rule to
-  #     (base - 100) when the base drifts, so presence is checked by SEMANTICS,
-  #     never by the 19901 prefix (v1.6.2: no duplicates after a reseat). ---
-  ip rule show | grep -q 'iif br-lan ipproto icmp lookup main' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
-  # --- bypass-mode devices (19900 is safely above the magitrickle fwmark base,
-  #     so marking cannot preempt a device rule; LAN stays local) ---
-  if [ -f /etc/geo-devices.list ]; then
-    while read -r dip dmode dname; do
-      case "$dip" in ''|'#'*) continue ;; esac
-      [ "$dmode" = "bypass" ] || continue
-      ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup main
-    done < /etc/geo-devices.list
-    # --- ai-mode devices (19900 is safely above the magitrickle fwmark base, so the whole
-    #     device goes through the AI tunnel; LAN routes stay local in table 101) ---
-    if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
-      if ip link show AI >/dev/null 2>&1; then
-        if ! ip route show table 101 | grep -q '^default'; then
-          ip route show table main | grep -v '^default' | while IFS= read -r r; do
-            ip route replace table 101 $r 2>/dev/null
-          done
-          ip route replace table 101 default dev AI 2>/dev/null
-        fi
-        while read -r dip dmode dname; do
-          case "$dip" in ''|'#'*) continue ;; esac
-          [ "$dmode" = "ai" ] || continue
-        ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
-        done < /etc/geo-devices.list
-      fi
+  # The installer owns this file: it is the only code that knows this router's LAN device
+  # and TUN name. Rewriting it here (as this function did until v1.30.19) replaced the
+  # portable version with a br-lan/Mihomo heredoc on every device add/delete, so the
+  # portability fix did not survive the first panel action.
+  _hp=/etc/hotplug.d/iface/99-default-vpn-route
+  if [ ! -s "$_hp" ]; then
+    if [ -s /usr/lib/geomask/99-default-vpn-route.dist ]; then
+      mkdir -p /etc/hotplug.d/iface 2>/dev/null
+      cp -f /usr/lib/geomask/99-default-vpn-route.dist "$_hp" 2>/dev/null
+      chmod 755 "$_hp" 2>/dev/null
+      echo "$(date +%FT%T) hotplug route script restored from the shipped copy" >> "$LOG"
+    else
+      echo "$(date +%FT%T) hotplug route script missing - re-run the geomask installer" >> "$LOG"
     fi
   fi
-}
-
-if ip link show Mihomo >/dev/null 2>&1; then
-  apply_routes
-else
-  # Mihomo TUN not up yet: retry in BACKGROUND so netifd is never stalled (fixes PPPoE hangs).
-  ( i=0; while [ $i -lt 20 ]; do
-      ip link show Mihomo >/dev/null 2>&1 && { sleep 1; apply_routes; exit 0; }
-      i=$((i+1)); sleep 1
-    done ) >/dev/null 2>&1 &
-fi
-exit 0
-EOF
-  sh -n /etc/hotplug.d/iface/99-default-vpn-route 2>/dev/null || \
-    echo '{"error":"hotplug syntax"}'
+  sh -n "$_hp" 2>/dev/null || echo '{"error":"hotplug syntax"}'
 }
 
 # ---- AI path (no own subscription since v1.23.0; rides the provider its group uses) ----
@@ -1138,19 +1110,31 @@ say queued "update to $TAG started"
 say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
 BKD=/root/geomask-backups
+PARK=/tmp/geomask-bk-park-$$
 BK=/tmp/geomask-bk-$TS.tar.gz
-# purge BEFORE creating: files under /root are embedded by sysupgrade -b (nesting),
-# and /tmp legacy copies bloat tmpfs. Retention on router: only the freshest backup.
-mkdir -p "$BKD" 2>/dev/null
-rm -f /tmp/router-backup-*.tar.gz "$BKD"/router-backup-*.tar.gz 2>/dev/null
-if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
-  say error "backup failed - update aborted"; exit 1
+# Park the previous copies instead of deleting them: they must not be inside /root while
+# sysupgrade archives it (nesting), but a failed sysupgrade must not cost the router its
+# only backup. The installer has behaved this way since v1.30.15; the updater did not.
+mkdir -p "$BKD" "$PARK" 2>/dev/null
+for _f in "$BKD"/router-backup-*.tar.gz /tmp/router-backup-*.tar.gz; do
+  [ -f "$_f" ] || continue
+  mv -f "$_f" "$PARK/" 2>/dev/null
+done
+restore_old() { for _f in "$PARK"/*.tar.gz; do [ -f "$_f" ] && mv -f "$_f" "$BKD/"; done; rm -rf "$PARK"; }
+# rc=0 and a non-empty file are not enough: verify the archive is readable before it
+# replaces the good copy
+if ! sysupgrade -b "$BK" >/dev/null 2>&1 || ! tar -tzf "$BK" >/dev/null 2>&1; then
+  rm -f "$BK"
+  restore_old
+  say error "backup failed - update aborted (previous backup kept)"; exit 1
 fi
 SZ=$(wc -c < "$BK")
 _md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
 BKF="$BKD/router-backup-$TS.tar.gz"
 mv -f "$BK" "$BKF" 2>/dev/null || BKF="$BK"
-[ -s "$BKF" ] || { say error "backup vanished after create - update aborted"; exit 1; }
+[ -s "$BKF" ] || { restore_old; say error "backup vanished after create - update aborted"; exit 1; }
+# the new archive is verified and in place: the parked copies are now superseded
+rm -rf "$PARK" 2>/dev/null
 echo "file=$BKF md5=$_md" > "$D/backup.info"
 LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
 say backup "backup OK: $BKF ($SZ bytes, md5 $_md)"

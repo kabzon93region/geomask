@@ -60,22 +60,35 @@ class ModuleUpdaterSafetyTests(unittest.TestCase):
         for mode in modes:
             self.assertRegex(mode, r'^0[0-7]{3}$')
 
-    def test_a_config_file_is_not_replaced_without_force(self):
+    def test_a_config_file_is_skipped_not_aborted(self):
+        # aborting the whole module because one config differs made every core update
+        # impossible without --force; the file is now left alone and reported
         conf = self.root / 'geomask-nodes.conf'
-        conf.write_text('ai_expect=DE\n', encoding='utf-8')
+        conf.write_bytes(b'ai_expect=DE\n')
+        other = self.root / 'script.sh'
+        other.write_bytes(b'old\n')
         body = b'ai_expect=US\n'
+        script = b'new\n'
         index = {'modules': {'core': {'version': '2', 'dependencies': [], 'files': [
             {'path': str(conf), 'source': 'assets/geomask-nodes.conf', 'mode': '0644',
-             'config': True, 'sha256': updater.digest_bytes(body)}]}}}
-        state = {'modules': {'core': {'version': '1',
-                                      'files': {str(conf): updater.digest_bytes(body)}}}}
-        with self.assertRaises(updater.UpdateError) as caught:
-            updater.download_module(index, state, 'core', {'repo': 'r', 'ref': 'm'},
-                                    fetcher=lambda url: body)
-        self.assertIn('configuration file', str(caught.exception))
-        staged = updater.download_module(index, state, 'core', {'repo': 'r', 'ref': 'm'},
-                                         force=True, fetcher=lambda url: body)[1]
-        self.assertEqual(staged[0]['mode'], 0o644)
+             'config': True, 'sha256': updater.digest_bytes(body)},
+            {'path': str(other), 'source': 'assets/script.sh', 'mode': '0755',
+             'sha256': updater.digest_bytes(script)}]}}}
+        state = {'modules': {'core': {'version': '1', 'files': {
+            str(conf): updater.digest_bytes(body), str(other): updater.digest_bytes(b'old\n')}}}}
+        skipped = []
+        _module, staged, changed = updater.download_module(
+            index, state, 'core', {'repo': 'r', 'ref': 'm'},
+            fetcher=lambda url: body if url.endswith('.conf') else script, skipped=skipped)
+        self.assertEqual(skipped, [str(conf)])
+        self.assertTrue(changed)
+        self.assertEqual([item['path'] for item in staged], [str(other)])
+        forced = updater.download_module(index, state, 'core', {'repo': 'r', 'ref': 'm'},
+                                         force=True,
+                                         fetcher=lambda url: body if url.endswith('.conf') else script)[1]
+        self.assertEqual(sorted(item['path'] for item in forced), sorted([str(conf), str(other)]))
+        self.assertEqual(forced[0]['mode'] if forced[0]['path'] == str(conf) else forced[1]['mode'],
+                         0o644)
 
     def test_subscription_dependencies_are_capabilities_not_modules(self):
         conf = self.root / 'config.yaml'

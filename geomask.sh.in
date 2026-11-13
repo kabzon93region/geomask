@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.18"
+GM_VERSION="1.30.19"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -254,8 +254,15 @@ save_stream() { # save_stream <target-path> <mode>  (content on stdin)
   mkdir -p "$(dirname "$_t")"
   _tmp="$_t.zmnew"
   cat > "$_tmp" || { rm -f "$_tmp"; return 1; }
+  if [ -f "$_t" ] && cmp -s "$_tmp" "$_t"; then
+    # identical bytes: keep the file, but repair a lost mode. Returning before chmod left an
+    # entrypoint non-executable forever after a restore or a botched copy.
+    chmod "$_m" "$_t" 2>/dev/null || true
+    rm -f "$_tmp"
+    info "unchanged: $1"
+    return 0
+  fi
   if [ -f "$_t" ]; then
-    if cmp -s "$_tmp" "$_t"; then rm -f "$_tmp"; info "unchanged: $1"; return 0; fi
     cp -p "$_t" "$_t.bak_geomask_$(date +%s 2>/dev/null || echo bak)" 2>/dev/null || true
   fi
   chmod "$_m" "$_tmp" 2>/dev/null || true
@@ -482,8 +489,12 @@ step1_check() {
 step1_apply() {
   _missing=""
   for _c in python3 curl; do have "$_c" || _missing="$_missing $_c"; done
-  # package name differs from the import name: python3-yaml provides `import yaml`
-  have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1 && _missing="$_missing python3-yaml"
+  # package name differs from the import name: python3-yaml provides `import yaml`.
+  # Checked even when python3 itself is absent: requiring python3 first installed python3
+  # and then failed the yaml verification on a bare router.
+  if ! have python3 || ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    _missing="$_missing python3-yaml"
+  fi
   if [ -z "$_missing" ]; then
     info "packages: python3 and curl already present"
     return 0
@@ -833,6 +844,14 @@ write_mihomo_config() {
     GM_PRE_CONFIG="$_c.pre-run-$(date +%s 2>/dev/null || echo pre)"
     cp -p "$_c" "$GM_PRE_CONFIG" 2>/dev/null || GM_PRE_CONFIG=""
   fi
+  # v1.30.19: the guard used to live only in step3_apply, so --reinstall (which calls this
+  # function directly) rewrote an owner's config with the template. It belongs here.
+  if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ]; then
+    bad "на роутере свой конфиг mihomo - шаблон поверх него не пишется"
+    info "  Взять его под управление, сохранив настройки: --adopt-config"
+    info "  Или укажите подписку и подтвердите перезапись: --vpn-url '<ссылка>' --adopt-config"
+    return 1
+  fi
   # --- existing 2-subscription config: keep it as-is (custom rules, headers, sniffer)
   #     and only patch provider urls / ensure the ai-devices listener ---
   # --- existing config: keep it as-is (custom rules, headers, sniffer) and only patch
@@ -922,7 +941,7 @@ write_mihomo_config() {
     printf '%s\n' '  - name: torrent-direct'
     printf '%s\n' '    type: mixed'
     printf '%s\n' '    port: 7894'
-    printf '%s\n' '    listen: %s' "$_lanip"
+    printf '    listen: %s\n' "$_lanip"
     printf '%s\n' '    proxy: DIRECT'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
@@ -1080,6 +1099,14 @@ api_refresh_provider() { # api_refresh_provider <name> <url>
 #         see ensure_smb_share) and linked from the panel.
 BACKUP_KEEP=1          # freshest copy on the router; full history lives on the PC
 
+# A non-empty file is not a backup: sysupgrade can return 0 and still leave a truncated or
+# empty archive, and that file used to replace the last good copy during rotation.
+archive_ok() { # archive_ok <file> -> 0 when it is a readable gzip/tar
+  [ -s "$1" ] || return 1
+  if have tar; then tar -tzf "$1" >/dev/null 2>&1 && return 0; fi
+  gzip -t "$1" >/dev/null 2>&1
+}
+
 ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
   # v1.30.15: the previous archive is no longer deleted before the new one exists, and a
   # reduced tar is never passed off as a sysupgrade backup. Old copies are parked outside
@@ -1101,7 +1128,7 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
   _full=0
   _su_err=""
   if have sysupgrade; then
-    _su_err=$(sysupgrade -b "$_tmp" 2>&1) && [ -s "$_tmp" ] && _full=1
+    _su_err=$(sysupgrade -b "$_tmp" 2>&1) && archive_ok "$_tmp" && _full=1
   else
     _su_err="sysupgrade not found"
   fi
@@ -1116,7 +1143,7 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
       return 1
     fi
     _tmp="$(P /tmp)/geomask-bk-$_ts-partial.tar.gz"
-    if ! tar czf "$_tmp" -C "$(P /)" etc root >/dev/null 2>&1 || [ ! -s "$_tmp" ]; then
+    if ! tar czf "$_tmp" -C "$(P /)" etc root >/dev/null 2>&1 || ! archive_ok "$_tmp"; then
       rm -f "$_tmp"
       for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
       rm -rf "$_park"
@@ -1240,7 +1267,7 @@ ensure_smb_share() {
     sleep 2
   fi
   if grep -qF "[$SMB_SHARE_NAME]" "$(P /etc/ksmbd/ksmbd.conf)" 2>/dev/null; then
-    info "SMB share present in ksmbd.conf: \\\\$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)\\$SMB_SHARE_NAME"
+    info "SMB share present in ksmbd.conf: \\\\$(lan_ip)\\$SMB_SHARE_NAME"
   else
     warn "share [$SMB_SHARE_NAME] not found in /etc/ksmbd/ksmbd.conf - check LuCI -> ksmbd"
   fi
@@ -1307,7 +1334,14 @@ safe_mihomo_restart() {
   _pre="${GM_PRE_CONFIG:-}"
   [ -s "$_pre" ] || _pre=$(ls -1t "$_c".bak_geomask_* 2>/dev/null | head -1)
   if ! mihomo_trial_run; then
-    bad "trial failed - live mihomo NOT restarted; config left for manual review"
+    # the candidate is already on disk at this point: leaving it there means the next
+    # restart picks up a config that does not start. Put the pre-run file back.
+    if [ -n "$_pre" ] && [ -s "$_pre" ]; then
+      cp -p "$_pre" "$_c" && info "прежний конфиг возвращён ($_pre)"
+    else
+      warn "копии прежнего конфига нет - проверьте $_c вручную"
+    fi
+    bad "trial failed - live mihomo NOT restarted"
     return 1
   fi
   if mihomo_restart_verified; then
@@ -1341,7 +1375,7 @@ safe_mihomo_restart() {
 #     --nft mark 0x64 (skuid)--> ip rule fwmark 0x64 table 101 -> dev AI (exit = AI node)
 # Permanent opt-out: touch /etc/geomask-aidns.off  (step becomes a no-op)
 
-AIDNS_IP=192.168.0.53
+AIDNS_IP=""          # discovered from the LAN (aidns_ip): 192.168.0.53 is one owner's net
 AIDNS_PORT=5055
 AIDNS_DNS_PORT=5353
 AIDNS_USER=dnsai
@@ -1385,7 +1419,11 @@ step4_check() {
   _need=0
   mod_skipped ai_dns && return 0
   _aip=$(aidns_ip)
-  [ -n "$_aip" ] && AIDNS_IP="$_aip"
+  if [ -z "$_aip" ]; then
+    bad "не определён адрес LAN - AI-DNS проверить нечем (uci show network.lan)"
+    return 1
+  fi
+  AIDNS_IP="$_aip"
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then
     info "AI-DNS: disabled (/etc/geomask-aidns.off present)"
     return 0
@@ -1398,13 +1436,14 @@ step4_check() {
   else
     warn "netstat unavailable - listener checks skipped"
   fi
-  _alias=$(ip -4 addr show br-lan 2>/dev/null)
+  _lanif=$(lan_iface)
+  _alias=$(ip -4 addr show "$_lanif" 2>/dev/null)
   if [ -z "$_alias" ]; then
-    warn "cannot read br-lan addresses (ip unavailable?)"
+    warn "cannot read $_lanif addresses (ip unavailable?)"
   elif printf '%s' "$_alias" | grep -q " $AIDNS_IP/"; then
-    info "alias $AIDNS_IP on br-lan: present"
+    info "alias $AIDNS_IP on $_lanif: present"
   else
-    warn "alias $AIDNS_IP missing on br-lan"; _need=1
+    warn "alias $AIDNS_IP missing on $_lanif"; _need=1
   fi
   ip rule show 2>/dev/null | grep -q "fwmark $AIDNS_MARK" && info "ip rule fwmark $AIDNS_MARK -> table 101: present" || { warn "ip rule fwmark $AIDNS_MARK -> 101 missing"; _need=1; }
   nft list table inet geomask_ai_dns >/dev/null 2>&1 && info "nft AI-DNS table: loaded" || { warn "nft AI-DNS table missing"; _need=1; }
@@ -1470,17 +1509,20 @@ $_uid
 ASSET_EOF
     info "user $AIDNS_USER created (uid $_uid)"
   fi
-  # 2) alias IP on br-lan for the AI dnsmasq
-  if ! ip -4 addr show br-lan 2>/dev/null | grep -q " $AIDNS_IP/"; then
+  # 2) alias IP on the LAN interface for the AI dnsmasq (device and prefix discovered)
+  _lanif=$(lan_iface)
+  _lanprefix=$(ip -4 addr show "$_lanif" 2>/dev/null | sed -n 's/.*inet [0-9.]*\/\([0-9][0-9]*\).*/\1/p' | head -1)
+  case "$_lanprefix" in ''|*[!0-9]*) _lanprefix=24 ;; esac
+  if ! ip -4 addr show "$_lanif" 2>/dev/null | grep -q " $AIDNS_IP/"; then
     if ! uci -q get network.lanai >/dev/null; then uci set network.lanai=interface; fi
     uci set network.lanai.proto='static'
-    uci set network.lanai.device='br-lan'
+    uci set network.lanai.device="$_lanif"
     uci set network.lanai.ipaddr="$AIDNS_IP"
-    uci set network.lanai.netmask='255.255.255.0'
+    uci set network.lanai.netmask="$_lanprefix"
     uci commit network
     /etc/init.d/network reload >/dev/null 2>&1 || warn "network reload rc!=0 - alias may need reboot"
     sleep 1
-    ip -4 addr show br-lan | grep -q " $AIDNS_IP/" && info "alias $AIDNS_IP: up" || warn "alias $AIDNS_IP: NOT up"
+    ip -4 addr show "$_lanif" | grep -q " $AIDNS_IP/" && info "alias $AIDNS_IP: up" || warn "alias $AIDNS_IP: NOT up"
   fi
   # 3) AI DoH worker (second https-dns-proxy instance, runs as dnsai)
   save_stream /etc/init.d/ai-doh 755 <<'ASSET_EOF'
@@ -1755,6 +1797,11 @@ ASSET_EOF
   save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
 @@ASSET:99-default-vpn-route@@
 ASSET_EOF
+  # pristine copy: the backend restores it if the live script ever goes missing, and it is
+  # the only place that knows this router's LAN device and TUN name
+  save_stream /usr/lib/geomask/99-default-vpn-route.dist 755 <<'ASSET_EOF'
+@@ASSET:99-default-vpn-route@@
+ASSET_EOF
   save_stream /usr/bin/geomask-guard.sh 755 <<'ASSET_EOF'
 @@ASSET:geomask-guard.sh@@
 ASSET_EOF
@@ -1913,7 +1960,9 @@ SVC_LIST="dnsmasq magitrickled mihomo hev-socks5-tunnel rpcd ai-doh dnsmasq-ai"
 aidns_svc_ok() {
   case "$1" in
     ai-doh)     netstat -ltnu 2>/dev/null | grep -q '127.0.0.1:5055 ' ;;
-    dnsmasq-ai) netstat -ltnu 2>/dev/null | grep -q "${AIDNS_IP:-192.168.0.53}:5353 " ;;
+    dnsmasq-ai)
+      _aiip=${AIDNS_IP:-$(aidns_ip)}
+      [ -n "$_aiip" ] && netstat -ltnu 2>/dev/null | grep -q "$_aiip:5353 " ;;
   esac
 }
 step6_check() {
@@ -1994,7 +2043,7 @@ step7_check() {
   elif ! module_selected luci; then
     info "geo ubus: панель (модуль luci) не выбрана - проверка пропущена"
   fi
-  if ip rule show 2>/dev/null | grep -q 'iif br-lan ipproto icmp'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule absent - LAN ping may die in TUN"; fi
+  if ip rule show 2>/dev/null | grep -q "iif $(lan_iface) ipproto icmp"; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule absent - LAN ping may die in TUN"; fi
   # AI-DNS: DNS of AI devices must exit through the AI tunnel (mark -> table 101)
   if [ -f "$(P /etc/geomask-aidns.off)" ] || [ ! -f "$(P /etc/geomask-aidns.uid)" ]; then
     info "AI-DNS: not installed (DNS of AI devices resolves via router - run the aidns step)"
@@ -2393,6 +2442,12 @@ if [ -n "$GM_MODULES" ]; then
     esac
   done
   GM_MODULES=$(printf '%s' "$_valid" | sed 's/^ *//;s/  */ /g')
+  # core and path_vpn are not optional: the interactive picker adds them, the CLI used to
+  # accept a set without them and install a product that cannot route anything.
+  for _m in $GM_REQUIRED_MODULES; do
+    case " $GM_MODULES " in *" $_m "*) ;; *) GM_MODULES="$GM_MODULES $_m" ;; esac
+  done
+  GM_MODULES=$(printf '%s' "$GM_MODULES" | sed 's/^ *//;s/  */ /g')
 fi
 
 # hard pin: router owner may forbid restarts permanently via flag file

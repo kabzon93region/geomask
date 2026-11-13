@@ -1,7 +1,12 @@
 #!/bin/sh
-# stub sysupgrade: `sysupgrade -b <file>` writes a small archive so the backup gate can pass
+# stub sysupgrade: `sysupgrade -b <file>` writes a REAL small archive.
+# It used to write a text line, which the installer now (correctly) rejects as not-a-backup
+# - that is exactly the audit case B4, so the stub has to be honest too.
 [ "$1" = "-b" ] || exit 0
 [ -n "${2:-}" ] || exit 1
 mkdir -p "$(dirname "$2")" 2>/dev/null
-printf 'fake sysupgrade archive\n' > "$2"
+_t=$(mktemp -d 2>/dev/null) || exit 1
+printf 'x\n' > "$_t/payload"
+tar czf "$2" -C "$_t" payload 2>/dev/null || { rm -rf "$_t"; exit 1; }
+rm -rf "$_t"
 exit 0

@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.18"
+GM_VERSION="1.30.19"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -246,6 +246,7 @@ module_owns_path() { # echoes the module id that owns an install path, if any
     "/usr/bin/geomask-node-scan.sh") GM_PATH_MODULE="core" ;;
     "/usr/bin/geomask-seed-lists.py") GM_PATH_MODULE="core" ;;
     "/usr/bin/geomask-syncd.sh") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/99-default-vpn-route.dist") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-apply.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-audit-scheduler.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-audit-state.py") GM_PATH_MODULE="core" ;;
@@ -295,8 +296,15 @@ save_stream() { # save_stream <target-path> <mode>  (content on stdin)
   mkdir -p "$(dirname "$_t")"
   _tmp="$_t.zmnew"
   cat > "$_tmp" || { rm -f "$_tmp"; return 1; }
+  if [ -f "$_t" ] && cmp -s "$_tmp" "$_t"; then
+    # identical bytes: keep the file, but repair a lost mode. Returning before chmod left an
+    # entrypoint non-executable forever after a restore or a botched copy.
+    chmod "$_m" "$_t" 2>/dev/null || true
+    rm -f "$_tmp"
+    info "unchanged: $1"
+    return 0
+  fi
   if [ -f "$_t" ]; then
-    if cmp -s "$_tmp" "$_t"; then rm -f "$_tmp"; info "unchanged: $1"; return 0; fi
     cp -p "$_t" "$_t.bak_geomask_$(date +%s 2>/dev/null || echo bak)" 2>/dev/null || true
   fi
   chmod "$_m" "$_tmp" 2>/dev/null || true
@@ -523,8 +531,12 @@ step1_check() {
 step1_apply() {
   _missing=""
   for _c in python3 curl; do have "$_c" || _missing="$_missing $_c"; done
-  # package name differs from the import name: python3-yaml provides `import yaml`
-  have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1 && _missing="$_missing python3-yaml"
+  # package name differs from the import name: python3-yaml provides `import yaml`.
+  # Checked even when python3 itself is absent: requiring python3 first installed python3
+  # and then failed the yaml verification on a bare router.
+  if ! have python3 || ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    _missing="$_missing python3-yaml"
+  fi
   if [ -z "$_missing" ]; then
     info "packages: python3 and curl already present"
     return 0
@@ -5272,7 +5284,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.18"
+BACKEND_VERSION="1.30.19"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -5647,6 +5659,24 @@ cmd_dev_del() {
 # (/etc/geomask-aidns.off present). Firewall is reloaded only when the list changes.
 # NOTE: the AI dnsmasq listens on 192.168.0.53:5353 (NOT :53) - the main dnsmasq
 # rebinds every interface address including our alias, so :53 there is taken.
+# The AI-DNS address belongs to this router's LAN, not to one owner's network. Read it
+# from the config the installer wrote; only then derive it from the LAN address.
+_gm_aidns_ip() {
+  _a=$(sed -n 's/^listen-address=\([0-9.]*\).*/\1/p' /etc/dnsmasq-ai.conf 2>/dev/null | head -1)
+  if [ -z "$_a" ]; then
+    _l=$(ip -4 addr show "$(_gm_lan_iface)" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+    case "$_l" in *.*.*.*) _a=$(printf '%s' "$_l" | cut -d. -f1-3).53 ;; esac
+  fi
+  printf '%s' "$_a"
+}
+
+_gm_lan_iface() {
+  _i=$(uci -q get network.lan.device 2>/dev/null)
+  [ -n "$_i" ] || _i=$(uci -q get network.lan.ifname 2>/dev/null)
+  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i=br-lan ;; esac
+  printf '%s' "$_i"
+}
+
 _aidns_sync() {
   [ -f /etc/geomask-aidns.uid ] || return 0
   [ -f /etc/geomask-aidns.off ] && return 0
@@ -5666,7 +5696,8 @@ _aidns_sync() {
     printf 'add chain inet geomask_ai_dns out_mark { type route hook output priority -150; policy accept; }\n'
     printf 'add rule inet geomask_ai_dns out_mark meta skuid %s mark set 0x64\n' "$_uid"
     if [ -n "$_list" ]; then
-      printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to 192.168.0.53:5353\n' "$_list"
+      _aidns=$(_gm_aidns_ip)
+      [ -n "$_aidns" ] && printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to %s:5353\n' "$_list" "$_aidns"
     fi
   } > /tmp/geomask-aidns.nft 2>/dev/null || return 0
   if ! nft -c -f /tmp/geomask-aidns.nft >/dev/null 2>&1; then
@@ -5794,7 +5825,7 @@ EOF
       cat > /usr/share/nftables.d/ruleset-post/99-ai-accept.nft <<'EOF'
 table inet fw4 {
     chain accept_to_AI {
-        iifname "br-lan" oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
+        iifname { "br-lan", "br-lan.1" } oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
         iifname "Wireguard" oifname "AI" counter accept comment "custom: WG peers to AI tunnel"
     }
 }
@@ -5813,7 +5844,7 @@ EOF
     cat > "$_ai_drop" <<'EOF'
 table inet fw4 {
     chain accept_to_AI {
-        iifname "br-lan" oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
+        iifname { "br-lan", "br-lan.1" } oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"
         iifname "Wireguard" oifname "AI" counter accept comment "custom: WG peers to AI tunnel"
     }
 }
@@ -5829,69 +5860,22 @@ EOF
 }
 
 _hotplug_sync() {
-  cat > /etc/hotplug.d/iface/99-default-vpn-route <<'EOF'
-#!/bin/sh
-# Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
-# Devices from /etc/geo-devices.list with mode=bypass go DIRECT (real IP), never via VPN.
-# Devices with mode=realtz follow normal mihomo routing (masked IP), only tz is real (PC-side).
-# NOTE: runs inside netifd's ifup path -> MUST NOT block here (would stall PPPoE auth / WAN).
-[ "$ACTION" = "ifup" ] || exit 0
-
-apply_routes() {
-  if ! ip route show table 100 | grep -q '^default'; then
-    ip route show table main | grep -v '^default' | while IFS= read -r r; do
-      ip route replace table 100 $r 2>/dev/null
-    done
-    ip route replace table 100 default dev Mihomo 2>/dev/null
-  fi
-  ip rule show | grep -q '32760:' || ip rule add priority 32760 iif br-lan lookup 100
-  # --- ICMP bypass: 19901 stays ABOVE the magitrickle fwmark rule base
-  #     (dynamic, observed 32558..32609) so ping to a marked IP never dies
-  #     inside the TUN. Direct via pppoe-wan. Guard reseats the rule to
-  #     (base - 100) when the base drifts, so presence is checked by SEMANTICS,
-  #     never by the 19901 prefix (v1.6.2: no duplicates after a reseat). ---
-  ip rule show | grep -q 'iif br-lan ipproto icmp lookup main' || ip rule add priority 19901 iif br-lan ipproto icmp lookup main
-  # --- bypass-mode devices (19900 is safely above the magitrickle fwmark base,
-  #     so marking cannot preempt a device rule; LAN stays local) ---
-  if [ -f /etc/geo-devices.list ]; then
-    while read -r dip dmode dname; do
-      case "$dip" in ''|'#'*) continue ;; esac
-      [ "$dmode" = "bypass" ] || continue
-      ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup main
-    done < /etc/geo-devices.list
-    # --- ai-mode devices (19900 is safely above the magitrickle fwmark base, so the whole
-    #     device goes through the AI tunnel; LAN routes stay local in table 101) ---
-    if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
-      if ip link show AI >/dev/null 2>&1; then
-        if ! ip route show table 101 | grep -q '^default'; then
-          ip route show table main | grep -v '^default' | while IFS= read -r r; do
-            ip route replace table 101 $r 2>/dev/null
-          done
-          ip route replace table 101 default dev AI 2>/dev/null
-        fi
-        while read -r dip dmode dname; do
-          case "$dip" in ''|'#'*) continue ;; esac
-          [ "$dmode" = "ai" ] || continue
-        ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
-        done < /etc/geo-devices.list
-      fi
+  # The installer owns this file: it is the only code that knows this router's LAN device
+  # and TUN name. Rewriting it here (as this function did until v1.30.19) replaced the
+  # portable version with a br-lan/Mihomo heredoc on every device add/delete, so the
+  # portability fix did not survive the first panel action.
+  _hp=/etc/hotplug.d/iface/99-default-vpn-route
+  if [ ! -s "$_hp" ]; then
+    if [ -s /usr/lib/geomask/99-default-vpn-route.dist ]; then
+      mkdir -p /etc/hotplug.d/iface 2>/dev/null
+      cp -f /usr/lib/geomask/99-default-vpn-route.dist "$_hp" 2>/dev/null
+      chmod 755 "$_hp" 2>/dev/null
+      echo "$(date +%FT%T) hotplug route script restored from the shipped copy" >> "$LOG"
+    else
+      echo "$(date +%FT%T) hotplug route script missing - re-run the geomask installer" >> "$LOG"
     fi
   fi
-}
-
-if ip link show Mihomo >/dev/null 2>&1; then
-  apply_routes
-else
-  # Mihomo TUN not up yet: retry in BACKGROUND so netifd is never stalled (fixes PPPoE hangs).
-  ( i=0; while [ $i -lt 20 ]; do
-      ip link show Mihomo >/dev/null 2>&1 && { sleep 1; apply_routes; exit 0; }
-      i=$((i+1)); sleep 1
-    done ) >/dev/null 2>&1 &
-fi
-exit 0
-EOF
-  sh -n /etc/hotplug.d/iface/99-default-vpn-route 2>/dev/null || \
-    echo '{"error":"hotplug syntax"}'
+  sh -n "$_hp" 2>/dev/null || echo '{"error":"hotplug syntax"}'
 }
 
 # ---- AI path (no own subscription since v1.23.0; rides the provider its group uses) ----
@@ -6378,19 +6362,31 @@ say queued "update to $TAG started"
 say backup "creating full router backup (sysupgrade -b)..."
 TS=$(date +%Y%m%d-%H%M%S)
 BKD=/root/geomask-backups
+PARK=/tmp/geomask-bk-park-$$
 BK=/tmp/geomask-bk-$TS.tar.gz
-# purge BEFORE creating: files under /root are embedded by sysupgrade -b (nesting),
-# and /tmp legacy copies bloat tmpfs. Retention on router: only the freshest backup.
-mkdir -p "$BKD" 2>/dev/null
-rm -f /tmp/router-backup-*.tar.gz "$BKD"/router-backup-*.tar.gz 2>/dev/null
-if ! sysupgrade -b "$BK" >/dev/null 2>&1 || [ ! -s "$BK" ]; then
-  say error "backup failed - update aborted"; exit 1
+# Park the previous copies instead of deleting them: they must not be inside /root while
+# sysupgrade archives it (nesting), but a failed sysupgrade must not cost the router its
+# only backup. The installer has behaved this way since v1.30.15; the updater did not.
+mkdir -p "$BKD" "$PARK" 2>/dev/null
+for _f in "$BKD"/router-backup-*.tar.gz /tmp/router-backup-*.tar.gz; do
+  [ -f "$_f" ] || continue
+  mv -f "$_f" "$PARK/" 2>/dev/null
+done
+restore_old() { for _f in "$PARK"/*.tar.gz; do [ -f "$_f" ] && mv -f "$_f" "$BKD/"; done; rm -rf "$PARK"; }
+# rc=0 and a non-empty file are not enough: verify the archive is readable before it
+# replaces the good copy
+if ! sysupgrade -b "$BK" >/dev/null 2>&1 || ! tar -tzf "$BK" >/dev/null 2>&1; then
+  rm -f "$BK"
+  restore_old
+  say error "backup failed - update aborted (previous backup kept)"; exit 1
 fi
 SZ=$(wc -c < "$BK")
 _md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
 BKF="$BKD/router-backup-$TS.tar.gz"
 mv -f "$BK" "$BKF" 2>/dev/null || BKF="$BK"
-[ -s "$BKF" ] || { say error "backup vanished after create - update aborted"; exit 1; }
+[ -s "$BKF" ] || { restore_old; say error "backup vanished after create - update aborted"; exit 1; }
+# the new archive is verified and in place: the parked copies are now superseded
+rm -rf "$PARK" 2>/dev/null
 echo "file=$BKF md5=$_md" > "$D/backup.info"
 LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
 say backup "backup OK: $BKF ($SZ bytes, md5 $_md)"
@@ -6904,7 +6900,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.18', '1.30.18', '1.30.18')
+VERSION_MARKERS = ('1.30.19', '1.30.19', '1.30.19')
 
 
 def stamp_versions(data, version):
@@ -7114,8 +7110,14 @@ def dependencies_ready(index, state, module_id):
     return problems
 
 
-def download_module(index, state, module_id, config, force=False, fetcher=None):
-    """Stage every file in memory. Returns (files, changed) without writing."""
+def download_module(index, state, module_id, config, force=False, fetcher=None,
+                    skipped=None):
+    """Stage every file in memory. Returns (module, files, changed) without writing.
+
+    Files the release does not own the bytes of (owner configs, sync-generated rulesets)
+    are left alone and reported through `skipped`: aborting the whole module because one
+    config differs made every core update impossible without --force.
+    """
     fetcher = fetcher or fetch
     module = (index.get('modules') or {}).get(module_id)
     if module is None:
@@ -7133,11 +7135,12 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
         if current is not None and current != entry['sha256']:
             known = recorded['files'].get(path)
             if (entry.get('config') or entry.get('generated')) and not force:
-                # an owner-edited config (nodes.conf, vpnwatch.conf, zapret lists) is kept by
-                # the installer; the updater must not replace it just because the baseline
-                # recorded those same bytes as "installed"
-                raise UpdateError('%s is a configuration file; use --force to replace it'
-                                  % path)
+                # an owner-edited config (nodes.conf, vpnwatch.conf, zapret lists) or a
+                # ruleset the sync rewrites is kept as-is; the rest of the module still
+                # updates. --force is the explicit way to replace it.
+                if skipped is not None:
+                    skipped.append(path)
+                continue
             if not force and current != known:
                 raise UpdateError('%s was modified locally; use --force to overwrite' % path)
         url = RAW.format(repo=config['repo'], ref=config['ref'], path=entry['source'])
@@ -7191,7 +7194,9 @@ def install_staged(module_id, staged, state, version, state_path=DEFAULT_STATE):
     entry = modules.setdefault(module_id, {})
     entry['version'] = version or entry.get('version', '')
     entry['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    entry['files'] = {item['path']: item['sha256'] for item in staged}
+    # merge, never replace: a skipped config keeps the baseline that makes a later local
+    # edit detectable
+    entry.setdefault('files', {}).update({item['path']: item['sha256'] for item in staged})
     write_json(state_path, state)
     return backup
 
@@ -7297,8 +7302,9 @@ def main(argv=None):
                     'change the selection with the installer: sh geomask.sh --modules=%s'
                     % (args.module, args.selection, args.module))
             index, source = load_index(config)
+            skipped = []
             module, staged, changed = download_module(index, state, args.module, config,
-                                                      force=args.force)
+                                                      force=args.force, skipped=skipped)
             if not changed:
                 # A manifest-only module (files: []) never stages anything, so its version
                 # used to stay at the old value and the panel offered the same update forever.
@@ -7310,13 +7316,14 @@ def main(argv=None):
                                       'metadata': True}, ensure_ascii=False))
                     return 0
                 print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
-                                  'version': module.get('version'), 'source': source},
-                                 ensure_ascii=False))
+                                  'version': module.get('version'), 'source': source,
+                                  'skipped': skipped}, ensure_ascii=False))
                 return 0
             backup = install_staged(args.module, staged, state, module.get('version', ''), args.state)
             print(json.dumps({'ok': True, 'module': args.module, 'changed': True,
                               'version': module.get('version'), 'files': len(staged),
-                              'backup': backup, 'source': source}, ensure_ascii=False))
+                              'backup': backup, 'source': source,
+                              'skipped': skipped}, ensure_ascii=False))
             return 0
     except UpdateError as exc:
         print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))
@@ -8595,15 +8602,42 @@ def parse_listeners(text):
     return listeners
 
 
-def direct_country(live):
-    """Country of the provider exit, measured from this router - '' when not measured.
+_DIRECT_CACHE = {}
 
-    The trace used to print "Россия (RU)" for every DIRECT domain without looking, which is
-    simply wrong on a router whose WAN is somewhere else.
+
+def wan_iface():
+    """The interface that carries the default route: the provider exit."""
+    for key in ('network.wan.device', 'network.wan.ifname', 'network.wan6.device'):
+        rc, out = run(['uci', '-q', 'get', key], timeout=5)
+        if rc == 0 and (out or '').strip():
+            return out.strip()
+    rc, out = run(['ip', 'route', 'show', 'default'], timeout=5)
+    match = re.search(r'dev\s+([A-Za-z0-9._-]+)', out or '')
+    return match.group(1) if match else ''
+
+
+def direct_country(live):
+    """Country of the provider exit, measured **through the WAN interface**.
+
+    A plain curl follows the router's routing table, which on a policy-routed box is the
+    VPN tunnel: the trace then reported the VPN's country as the provider's. The request is
+    bound to the WAN device, and the answer is cached for this run.
     """
     if not live:
         return ''
-    return fetch_country('') or ''
+    if 'cc' in _DIRECT_CACHE:
+        return _DIRECT_CACHE['cc']
+    device = wan_iface()
+    code = fetch_country('', interface=device) if device else ''
+    _DIRECT_CACHE['cc'] = code
+    return code
+
+
+def zapret_path_label(zap):
+    """One phrase for the route summary that matches what the check just concluded."""
+    if zap.get('queues'):
+        return 'zapret (запрос маскируется)'
+    return 'zapret (в списке, очереди не подтверждены)'
 
 
 def country_label(code):
@@ -8633,7 +8667,7 @@ def country_from_payload(payload, keys):
     return ''
 
 
-def fetch_country(proxy):
+def fetch_country(proxy, interface=''):
     """Country of the exit behind this proxy, from whichever geo service answers.
 
     One service is not enough: a lane's exit IP is often a datacenter range and the
@@ -8643,6 +8677,8 @@ def fetch_country(proxy):
         cmd = ['curl', '-m', '8', '-s']
         if proxy:
             cmd += ['--proxy', proxy]
+        if interface:
+            cmd += ['--interface', interface]
         cmd.append(url)
         rc, out = run(cmd, timeout=12)
         if rc != 0 or not out:
@@ -9007,8 +9043,12 @@ def related_hosts(domain, limit=12):
     return found[:limit]
 
 
-def host_route(host):
-    """Where one host goes: group, mihomo policy and the country of that exit."""
+def host_route(host, live=True):
+    """Where one host goes: group, mihomo policy and the country of that exit.
+
+    The country is only reported when it was measured: this used to answer "Россия (RU)"
+    for every DIRECT host without looking, which is wrong wherever the WAN is not in RU.
+    """
     route = magitrickle_route(host)
     hit = mihomo_route(host, [])
     policy = (hit or {}).get('policy', 'GLOBAL')
@@ -9017,9 +9057,11 @@ def host_route(host):
         info = group_state(policy) or {}
         cc, country = info.get('cc', ''), info.get('country', '')
         if not cc and (info.get('now') or '').upper() == 'DIRECT':
-            cc, country = 'RU', 'Россия'     # GLOBAL defaults to DIRECT on this router
+            cc = direct_country(live)
+            country = country_label(cc)
     elif policy == 'DIRECT':
-        cc, country = 'RU', 'Россия'
+        cc = direct_country(live)
+        country = country_label(cc)
     return {'host': host, 'group': (route[0]['name'] if route else ''),
             'policy': policy, 'cc': cc, 'country': country,
             'rule': (hit or {}).get('rule', '')}
@@ -9208,7 +9250,7 @@ def trace_domain(domain, live=False):
              'Уберите домен (или его родителя) из /opt/zapret/ipset/zapret-hosts-user-exclude.txt '
              'и перезапустите zapret: /etc/init.d/zapret restart')
     elif zap['listed']:
-        route_path.insert(0, 'zapret (запрос маскируется)')
+        route_path.insert(0, zapret_path_label(zap))
         if zap.get('queues'):
             step('Запрет (DPI)', 'ok',
                  'включён: домен в списке zapret (строка «%s»), nfqws работает и правила '
@@ -9221,7 +9263,7 @@ def trace_domain(domain, live=False):
                  'Проверьте, что таблица inet zapret загружена: nft list table inet zapret; '
                  'перезапустите запрет: /etc/init.d/zapret restart')
     elif zap['auto']:
-        route_path.insert(0, 'zapret (запрос маскируется)')
+        route_path.insert(0, zapret_path_label(zap))
         step('Запрет (DPI)', 'ok',
              'включён: zapret добавил домен сам после нескольких неудачных попыток — '
              'запрос к сайту маскируется от провайдера')
@@ -9406,10 +9448,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.18",
+  "core_version": "1.30.19",
   "modules": {
     "admission_service": {
-      "version": "1.30.17",
+      "version": "1.30.18",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9441,7 +9483,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.17",
+      "version": "1.30.18",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9525,6 +9567,12 @@ ASSET_EOF
           "sha256": "74632f8406412a18bdc9b63979d2f7efd2a6874269795d23f3fafa973ad0a882"
         },
         {
+          "path": "/usr/lib/geomask/99-default-vpn-route.dist",
+          "source": "assets/99-default-vpn-route",
+          "mode": "0755",
+          "sha256": "b363d670c599bcd2067053419298d6f111b0d225ede9057b167769a17a9bc4f0"
+        },
+        {
           "path": "/usr/lib/geomask/geomask-apply.py",
           "source": "assets/geomask-apply.py",
           "mode": "0755",
@@ -9593,7 +9641,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.17",
+      "version": "1.30.18",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9648,7 +9696,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": "0755",
-          "sha256": "8172029edf97be743964d578f270f808ff3bd0a3218b2171c95f85f1dc984bc0"
+          "sha256": "a1fffe5daae340d2294183b5a18789c4d611cdb1c64532d3573a998810a3a0c4"
         }
       ]
     },
@@ -9670,7 +9718,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "87f51bb752cc36fc1bb9735d9a5f1b0a1f867424be9618ff208fb17e002e3169"
+          "sha256": "124e35314dc1cc4991820ff875290db2da478fabd0d8d25973e012f4df35b578"
         }
       ]
     },
@@ -9686,7 +9734,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "49b43dc1b5d7f67dcd2d4507773045b476a2fbbc8e0725fb7fe36148844f464e"
+          "sha256": "7925a500f87e87df29c54f21531f80080fe09ffa7b021a6b5a51d62d3190f82c"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9710,12 +9758,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "d89019ebedf37e652beec16dde2335c29d4859df47e611ef2c3e05fb19e54996"
+          "sha256": "d11fb51644fd91146fadbfa265b46765766e1c23a1d458c4c53dabb2ccf09af5"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.17",
+      "version": "1.30.18",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9726,7 +9774,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.17",
+      "version": "1.30.18",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9736,7 +9784,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.17",
+      "version": "1.30.18",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9746,7 +9794,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.17",
+      "version": "1.30.18",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -10102,7 +10150,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.18';
+var PANEL_VERSION = '1.30.19';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -12015,6 +12063,14 @@ write_mihomo_config() {
     GM_PRE_CONFIG="$_c.pre-run-$(date +%s 2>/dev/null || echo pre)"
     cp -p "$_c" "$GM_PRE_CONFIG" 2>/dev/null || GM_PRE_CONFIG=""
   fi
+  # v1.30.19: the guard used to live only in step3_apply, so --reinstall (which calls this
+  # function directly) rewrote an owner's config with the template. It belongs here.
+  if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ]; then
+    bad "на роутере свой конфиг mihomo - шаблон поверх него не пишется"
+    info "  Взять его под управление, сохранив настройки: --adopt-config"
+    info "  Или укажите подписку и подтвердите перезапись: --vpn-url '<ссылка>' --adopt-config"
+    return 1
+  fi
   # --- existing 2-subscription config: keep it as-is (custom rules, headers, sniffer)
   #     and only patch provider urls / ensure the ai-devices listener ---
   # --- existing config: keep it as-is (custom rules, headers, sniffer) and only patch
@@ -12104,7 +12160,7 @@ write_mihomo_config() {
     printf '%s\n' '  - name: torrent-direct'
     printf '%s\n' '    type: mixed'
     printf '%s\n' '    port: 7894'
-    printf '%s\n' '    listen: %s' "$_lanip"
+    printf '    listen: %s\n' "$_lanip"
     printf '%s\n' '    proxy: DIRECT'
     printf '\n'
     printf '%s\n' 'proxy-providers:'
@@ -12262,6 +12318,14 @@ api_refresh_provider() { # api_refresh_provider <name> <url>
 #         see ensure_smb_share) and linked from the panel.
 BACKUP_KEEP=1          # freshest copy on the router; full history lives on the PC
 
+# A non-empty file is not a backup: sysupgrade can return 0 and still leave a truncated or
+# empty archive, and that file used to replace the last good copy during rotation.
+archive_ok() { # archive_ok <file> -> 0 when it is a readable gzip/tar
+  [ -s "$1" ] || return 1
+  if have tar; then tar -tzf "$1" >/dev/null 2>&1 && return 0; fi
+  gzip -t "$1" >/dev/null 2>&1
+}
+
 ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
   # v1.30.15: the previous archive is no longer deleted before the new one exists, and a
   # reduced tar is never passed off as a sysupgrade backup. Old copies are parked outside
@@ -12283,7 +12347,7 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
   _full=0
   _su_err=""
   if have sysupgrade; then
-    _su_err=$(sysupgrade -b "$_tmp" 2>&1) && [ -s "$_tmp" ] && _full=1
+    _su_err=$(sysupgrade -b "$_tmp" 2>&1) && archive_ok "$_tmp" && _full=1
   else
     _su_err="sysupgrade not found"
   fi
@@ -12298,7 +12362,7 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
       return 1
     fi
     _tmp="$(P /tmp)/geomask-bk-$_ts-partial.tar.gz"
-    if ! tar czf "$_tmp" -C "$(P /)" etc root >/dev/null 2>&1 || [ ! -s "$_tmp" ]; then
+    if ! tar czf "$_tmp" -C "$(P /)" etc root >/dev/null 2>&1 || ! archive_ok "$_tmp"; then
       rm -f "$_tmp"
       for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
       rm -rf "$_park"
@@ -12422,7 +12486,7 @@ ensure_smb_share() {
     sleep 2
   fi
   if grep -qF "[$SMB_SHARE_NAME]" "$(P /etc/ksmbd/ksmbd.conf)" 2>/dev/null; then
-    info "SMB share present in ksmbd.conf: \\\\$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)\\$SMB_SHARE_NAME"
+    info "SMB share present in ksmbd.conf: \\\\$(lan_ip)\\$SMB_SHARE_NAME"
   else
     warn "share [$SMB_SHARE_NAME] not found in /etc/ksmbd/ksmbd.conf - check LuCI -> ksmbd"
   fi
@@ -12489,7 +12553,14 @@ safe_mihomo_restart() {
   _pre="${GM_PRE_CONFIG:-}"
   [ -s "$_pre" ] || _pre=$(ls -1t "$_c".bak_geomask_* 2>/dev/null | head -1)
   if ! mihomo_trial_run; then
-    bad "trial failed - live mihomo NOT restarted; config left for manual review"
+    # the candidate is already on disk at this point: leaving it there means the next
+    # restart picks up a config that does not start. Put the pre-run file back.
+    if [ -n "$_pre" ] && [ -s "$_pre" ]; then
+      cp -p "$_pre" "$_c" && info "прежний конфиг возвращён ($_pre)"
+    else
+      warn "копии прежнего конфига нет - проверьте $_c вручную"
+    fi
+    bad "trial failed - live mihomo NOT restarted"
     return 1
   fi
   if mihomo_restart_verified; then
@@ -12523,7 +12594,7 @@ safe_mihomo_restart() {
 #     --nft mark 0x64 (skuid)--> ip rule fwmark 0x64 table 101 -> dev AI (exit = AI node)
 # Permanent opt-out: touch /etc/geomask-aidns.off  (step becomes a no-op)
 
-AIDNS_IP=192.168.0.53
+AIDNS_IP=""          # discovered from the LAN (aidns_ip): 192.168.0.53 is one owner's net
 AIDNS_PORT=5055
 AIDNS_DNS_PORT=5353
 AIDNS_USER=dnsai
@@ -12567,7 +12638,11 @@ step4_check() {
   _need=0
   mod_skipped ai_dns && return 0
   _aip=$(aidns_ip)
-  [ -n "$_aip" ] && AIDNS_IP="$_aip"
+  if [ -z "$_aip" ]; then
+    bad "не определён адрес LAN - AI-DNS проверить нечем (uci show network.lan)"
+    return 1
+  fi
+  AIDNS_IP="$_aip"
   if [ -f "$(P /etc/geomask-aidns.off)" ]; then
     info "AI-DNS: disabled (/etc/geomask-aidns.off present)"
     return 0
@@ -12580,13 +12655,14 @@ step4_check() {
   else
     warn "netstat unavailable - listener checks skipped"
   fi
-  _alias=$(ip -4 addr show br-lan 2>/dev/null)
+  _lanif=$(lan_iface)
+  _alias=$(ip -4 addr show "$_lanif" 2>/dev/null)
   if [ -z "$_alias" ]; then
-    warn "cannot read br-lan addresses (ip unavailable?)"
+    warn "cannot read $_lanif addresses (ip unavailable?)"
   elif printf '%s' "$_alias" | grep -q " $AIDNS_IP/"; then
-    info "alias $AIDNS_IP on br-lan: present"
+    info "alias $AIDNS_IP on $_lanif: present"
   else
-    warn "alias $AIDNS_IP missing on br-lan"; _need=1
+    warn "alias $AIDNS_IP missing on $_lanif"; _need=1
   fi
   ip rule show 2>/dev/null | grep -q "fwmark $AIDNS_MARK" && info "ip rule fwmark $AIDNS_MARK -> table 101: present" || { warn "ip rule fwmark $AIDNS_MARK -> 101 missing"; _need=1; }
   nft list table inet geomask_ai_dns >/dev/null 2>&1 && info "nft AI-DNS table: loaded" || { warn "nft AI-DNS table missing"; _need=1; }
@@ -12652,17 +12728,20 @@ $_uid
 ASSET_EOF
     info "user $AIDNS_USER created (uid $_uid)"
   fi
-  # 2) alias IP on br-lan for the AI dnsmasq
-  if ! ip -4 addr show br-lan 2>/dev/null | grep -q " $AIDNS_IP/"; then
+  # 2) alias IP on the LAN interface for the AI dnsmasq (device and prefix discovered)
+  _lanif=$(lan_iface)
+  _lanprefix=$(ip -4 addr show "$_lanif" 2>/dev/null | sed -n 's/.*inet [0-9.]*\/\([0-9][0-9]*\).*/\1/p' | head -1)
+  case "$_lanprefix" in ''|*[!0-9]*) _lanprefix=24 ;; esac
+  if ! ip -4 addr show "$_lanif" 2>/dev/null | grep -q " $AIDNS_IP/"; then
     if ! uci -q get network.lanai >/dev/null; then uci set network.lanai=interface; fi
     uci set network.lanai.proto='static'
-    uci set network.lanai.device='br-lan'
+    uci set network.lanai.device="$_lanif"
     uci set network.lanai.ipaddr="$AIDNS_IP"
-    uci set network.lanai.netmask='255.255.255.0'
+    uci set network.lanai.netmask="$_lanprefix"
     uci commit network
     /etc/init.d/network reload >/dev/null 2>&1 || warn "network reload rc!=0 - alias may need reboot"
     sleep 1
-    ip -4 addr show br-lan | grep -q " $AIDNS_IP/" && info "alias $AIDNS_IP: up" || warn "alias $AIDNS_IP: NOT up"
+    ip -4 addr show "$_lanif" | grep -q " $AIDNS_IP/" && info "alias $AIDNS_IP: up" || warn "alias $AIDNS_IP: NOT up"
   fi
   # 3) AI DoH worker (second https-dns-proxy instance, runs as dnsai)
   save_stream /etc/init.d/ai-doh 755 <<'ASSET_EOF'
@@ -31576,6 +31655,96 @@ else
 fi
 exit 0
 ASSET_EOF
+  # pristine copy: the backend restores it if the live script ever goes missing, and it is
+  # the only place that knows this router's LAN device and TUN name
+  save_stream /usr/lib/geomask/99-default-vpn-route.dist 755 <<'ASSET_EOF'
+#!/bin/sh
+# Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
+# Devices from /etc/geo-devices.list with mode=bypass go DIRECT (real IP), never via VPN.
+# Devices with mode=realtz follow normal mihomo routing (masked IP), only tz is real (PC-side).
+# NOTE: runs inside netifd's ifup path -> MUST NOT block here (would stall PPPoE auth / WAN).
+[ "$ACTION" = "ifup" ] || exit 0
+
+# This router's names, not the owner's: LAN device from uci, mihomo TUN from its config.
+LAN_DEV=$(uci -q get network.lan.device 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=$(uci -q get network.lan.ifname 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=br-lan
+TUN_DEV=$(awk '/^tun:/{f=1;next} f&&/^[^ ]/{exit} f&&/^[[:space:]]*device:/{gsub(/^[[:space:]]*device:[[:space:]]*/,"");print;exit}' \
+          /etc/mihomo/config.yaml 2>/dev/null)
+case "$TUN_DEV" in ''|*[!a-zA-Z0-9._-]*) TUN_DEV=Mihomo ;; esac
+
+apply_routes() {
+  if ! ip route show table 100 | grep -q '^default'; then
+    ip route show table main | grep -v '^default' | while IFS= read -r r; do
+      ip route replace table 100 $r 2>/dev/null
+    done
+    ip route replace table 100 default dev "$TUN_DEV" 2>/dev/null
+  fi
+  ip rule show | grep -q '32760:' || ip rule add priority 32760 iif "$LAN_DEV" lookup 100
+  # --- WireGuard peers are remote LAN clients (10.10.0.0/24). Without this rule their
+  #     traffic falls through to main (real WAN IP), so anything blocked for the ISP -
+  #     YouTube first of all - fails on the phone while local network still works.
+  #     Same table as br-lan, so LAN access and the tunnel policy both keep working.
+  #     The rule needs the device to exist: add it only once the link is up. ---
+  if ip link show Wireguard >/dev/null 2>&1; then
+    ip rule show | grep -q 'iif Wireguard lookup 100' || ip rule add priority 32759 iif Wireguard lookup 100
+  fi
+  # --- ICMP bypass: must stay ABOVE the magitrickle fwmark rule base. That base
+  #     is dynamic (drifts down as groups grow): observed 32558..32609 over time.
+  #     A low pref (19901) is always above it, so ping to a marked IP never dies
+  #     inside the TUN. Direct via pppoe-wan. Guard reseats the rule to
+  #     (base - 100) when the base drifts, so presence is checked by SEMANTICS,
+  #     never by the 19901 prefix (v1.6.2: ifup never adds a duplicate). ---
+  ip rule show | grep -q "iif $LAN_DEV ipproto icmp lookup main" || ip rule add priority 19901 iif "$LAN_DEV" ipproto icmp lookup main
+  # --- AI-DNS: DNS of AI-mode devices exits through the AI tunnel (no DNS leak).
+  #     The DoH worker runs as user dnsai; its sockets are marked 0x64 by the
+  #     nft table geomask_ai_dns, and this rule sends the marked traffic to
+  #     table 101 -> dev AI. pref 19902 stays ABOVE the magitrickle fwmark base
+  #     (dynamic, observed 32558..32609) so magitrickle marks never preempt it.
+  #     Opt-out: touch /etc/geomask-aidns.off ---
+  if [ ! -f /etc/geomask-aidns.off ] && [ -f /etc/geomask-aidns.uid ]; then
+    ip rule show | grep -q 'fwmark 0x64' || ip rule add pref 19902 fwmark 0x64 table 101
+  fi
+  # --- per-device rules: a low pref (19900) keeps a device rule ABOVE the
+  #     magitrickle fwmark base (dynamic, observed 32558..32609), so marking can
+  #     never preempt it; LAN stays local ---
+  # --- bypass-mode devices ---
+  if [ -f /etc/geo-devices.list ]; then
+    while read -r dip dmode dname; do
+      case "$dip" in ''|'#'*) continue ;; esac
+      [ "$dmode" = "bypass" ] || continue
+      ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup main
+    done < /etc/geo-devices.list
+    # --- ai-mode devices (the whole device goes through the AI tunnel; LAN stays local in table 101) ---
+    if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
+      if ip link show AI >/dev/null 2>&1; then
+        if ! ip route show table 101 | grep -q '^default'; then
+          ip route show table main | grep -v '^default' | while IFS= read -r r; do
+            ip route replace table 101 $r 2>/dev/null
+          done
+          ip route replace table 101 default dev AI 2>/dev/null
+        fi
+        while read -r dip dmode dname; do
+          case "$dip" in ''|'#'*) continue ;; esac
+          [ "$dmode" = "ai" ] || continue
+           ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
+        done < /etc/geo-devices.list
+      fi
+    fi
+  fi
+}
+
+if ip link show "$TUN_DEV" >/dev/null 2>&1; then
+  apply_routes
+else
+  # Mihomo TUN not up yet: retry in BACKGROUND so netifd is never stalled (fixes PPPoE hangs).
+  ( i=0; while [ $i -lt 20 ]; do
+      ip link show "$TUN_DEV" >/dev/null 2>&1 && { sleep 1; apply_routes; exit 0; }
+      i=$((i+1)); sleep 1
+    done ) >/dev/null 2>&1 &
+fi
+exit 0
+ASSET_EOF
   save_stream /usr/bin/geomask-guard.sh 755 <<'ASSET_EOF'
 #!/bin/sh
 # geomask-guard.sh - durable fix for the B-001 class bug (TD-01).
@@ -31592,7 +31761,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.18"
+GUARD_VERSION="1.30.19"
 
 log() { logger -t geomask-guard "$*"; }
 
@@ -33046,7 +33215,9 @@ SVC_LIST="dnsmasq magitrickled mihomo hev-socks5-tunnel rpcd ai-doh dnsmasq-ai"
 aidns_svc_ok() {
   case "$1" in
     ai-doh)     netstat -ltnu 2>/dev/null | grep -q '127.0.0.1:5055 ' ;;
-    dnsmasq-ai) netstat -ltnu 2>/dev/null | grep -q "${AIDNS_IP:-192.168.0.53}:5353 " ;;
+    dnsmasq-ai)
+      _aiip=${AIDNS_IP:-$(aidns_ip)}
+      [ -n "$_aiip" ] && netstat -ltnu 2>/dev/null | grep -q "$_aiip:5353 " ;;
   esac
 }
 step6_check() {
@@ -33127,7 +33298,7 @@ step7_check() {
   elif ! module_selected luci; then
     info "geo ubus: панель (модуль luci) не выбрана - проверка пропущена"
   fi
-  if ip rule show 2>/dev/null | grep -q 'iif br-lan ipproto icmp'; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule absent - LAN ping may die in TUN"; fi
+  if ip rule show 2>/dev/null | grep -q "iif $(lan_iface) ipproto icmp"; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule absent - LAN ping may die in TUN"; fi
   # AI-DNS: DNS of AI devices must exit through the AI tunnel (mark -> table 101)
   if [ -f "$(P /etc/geomask-aidns.off)" ] || [ ! -f "$(P /etc/geomask-aidns.uid)" ]; then
     info "AI-DNS: not installed (DNS of AI devices resolves via router - run the aidns step)"
@@ -33526,6 +33697,12 @@ if [ -n "$GM_MODULES" ]; then
     esac
   done
   GM_MODULES=$(printf '%s' "$_valid" | sed 's/^ *//;s/  */ /g')
+  # core and path_vpn are not optional: the interactive picker adds them, the CLI used to
+  # accept a set without them and install a product that cannot route anything.
+  for _m in $GM_REQUIRED_MODULES; do
+    case " $GM_MODULES " in *" $_m "*) ;; *) GM_MODULES="$GM_MODULES $_m" ;; esac
+  done
+  GM_MODULES=$(printf '%s' "$GM_MODULES" | sed 's/^ *//;s/  */ /g')
 fi
 
 # hard pin: router owner may forbid restarts permanently via flag file

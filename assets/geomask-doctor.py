@@ -942,15 +942,42 @@ def parse_listeners(text):
     return listeners
 
 
-def direct_country(live):
-    """Country of the provider exit, measured from this router - '' when not measured.
+_DIRECT_CACHE = {}
 
-    The trace used to print "Россия (RU)" for every DIRECT domain without looking, which is
-    simply wrong on a router whose WAN is somewhere else.
+
+def wan_iface():
+    """The interface that carries the default route: the provider exit."""
+    for key in ('network.wan.device', 'network.wan.ifname', 'network.wan6.device'):
+        rc, out = run(['uci', '-q', 'get', key], timeout=5)
+        if rc == 0 and (out or '').strip():
+            return out.strip()
+    rc, out = run(['ip', 'route', 'show', 'default'], timeout=5)
+    match = re.search(r'dev\s+([A-Za-z0-9._-]+)', out or '')
+    return match.group(1) if match else ''
+
+
+def direct_country(live):
+    """Country of the provider exit, measured **through the WAN interface**.
+
+    A plain curl follows the router's routing table, which on a policy-routed box is the
+    VPN tunnel: the trace then reported the VPN's country as the provider's. The request is
+    bound to the WAN device, and the answer is cached for this run.
     """
     if not live:
         return ''
-    return fetch_country('') or ''
+    if 'cc' in _DIRECT_CACHE:
+        return _DIRECT_CACHE['cc']
+    device = wan_iface()
+    code = fetch_country('', interface=device) if device else ''
+    _DIRECT_CACHE['cc'] = code
+    return code
+
+
+def zapret_path_label(zap):
+    """One phrase for the route summary that matches what the check just concluded."""
+    if zap.get('queues'):
+        return 'zapret (запрос маскируется)'
+    return 'zapret (в списке, очереди не подтверждены)'
 
 
 def country_label(code):
@@ -980,7 +1007,7 @@ def country_from_payload(payload, keys):
     return ''
 
 
-def fetch_country(proxy):
+def fetch_country(proxy, interface=''):
     """Country of the exit behind this proxy, from whichever geo service answers.
 
     One service is not enough: a lane's exit IP is often a datacenter range and the
@@ -990,6 +1017,8 @@ def fetch_country(proxy):
         cmd = ['curl', '-m', '8', '-s']
         if proxy:
             cmd += ['--proxy', proxy]
+        if interface:
+            cmd += ['--interface', interface]
         cmd.append(url)
         rc, out = run(cmd, timeout=12)
         if rc != 0 or not out:
@@ -1354,8 +1383,12 @@ def related_hosts(domain, limit=12):
     return found[:limit]
 
 
-def host_route(host):
-    """Where one host goes: group, mihomo policy and the country of that exit."""
+def host_route(host, live=True):
+    """Where one host goes: group, mihomo policy and the country of that exit.
+
+    The country is only reported when it was measured: this used to answer "Россия (RU)"
+    for every DIRECT host without looking, which is wrong wherever the WAN is not in RU.
+    """
     route = magitrickle_route(host)
     hit = mihomo_route(host, [])
     policy = (hit or {}).get('policy', 'GLOBAL')
@@ -1364,9 +1397,11 @@ def host_route(host):
         info = group_state(policy) or {}
         cc, country = info.get('cc', ''), info.get('country', '')
         if not cc and (info.get('now') or '').upper() == 'DIRECT':
-            cc, country = 'RU', 'Россия'     # GLOBAL defaults to DIRECT on this router
+            cc = direct_country(live)
+            country = country_label(cc)
     elif policy == 'DIRECT':
-        cc, country = 'RU', 'Россия'
+        cc = direct_country(live)
+        country = country_label(cc)
     return {'host': host, 'group': (route[0]['name'] if route else ''),
             'policy': policy, 'cc': cc, 'country': country,
             'rule': (hit or {}).get('rule', '')}
@@ -1555,7 +1590,7 @@ def trace_domain(domain, live=False):
              'Уберите домен (или его родителя) из /opt/zapret/ipset/zapret-hosts-user-exclude.txt '
              'и перезапустите zapret: /etc/init.d/zapret restart')
     elif zap['listed']:
-        route_path.insert(0, 'zapret (запрос маскируется)')
+        route_path.insert(0, zapret_path_label(zap))
         if zap.get('queues'):
             step('Запрет (DPI)', 'ok',
                  'включён: домен в списке zapret (строка «%s»), nfqws работает и правила '
@@ -1568,7 +1603,7 @@ def trace_domain(domain, live=False):
                  'Проверьте, что таблица inet zapret загружена: nft list table inet zapret; '
                  'перезапустите запрет: /etc/init.d/zapret restart')
     elif zap['auto']:
-        route_path.insert(0, 'zapret (запрос маскируется)')
+        route_path.insert(0, zapret_path_label(zap))
         step('Запрет (DPI)', 'ok',
              'включён: zapret добавил домен сам после нескольких неудачных попыток — '
              'запрос к сайту маскируется от провайдера')

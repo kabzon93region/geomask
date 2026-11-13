@@ -565,12 +565,24 @@ class DoctorRelatedHostsTests(unittest.TestCase):
         self.assertFalse(probe['ok'])
         self.assertEqual(probe['kind'], 'http')
 
-    def test_host_route_reports_a_direct_exit_as_russia(self):
+    def test_host_route_does_not_invent_a_country_for_direct(self):
+        # it used to answer "Россия (RU)" without looking, which is wrong off-RU
         doctor.magitrickle_route = lambda host: None
         doctor.mihomo_route = lambda host, ips: {'policy': 'DIRECT', 'rule': 'MATCH'}
+        doctor._DIRECT_CACHE.clear()
+        doctor.run = lambda cmd, timeout=8, stdin=None: (1, '')
         info = doctor.host_route('example.com')
         self.assertEqual(info['policy'], 'DIRECT')
-        self.assertEqual(info['cc'], 'RU')
+        self.assertEqual(info['cc'], '')
+
+    def test_host_route_reports_a_measured_direct_exit(self):
+        doctor.magitrickle_route = lambda host: None
+        doctor.mihomo_route = lambda host, ips: {'policy': 'DIRECT', 'rule': 'MATCH'}
+        doctor._DIRECT_CACHE.clear()
+        doctor.run = lambda cmd, timeout=8, stdin=None: (0, '{"country":"DE"}')
+        info = doctor.host_route('example.com')
+        self.assertEqual(info['cc'], 'DE')
+        self.assertEqual(info['country'], 'Германия (DE)')
 
     def test_host_route_follows_the_group_of_a_tunnelled_host(self):
         doctor.magitrickle_route = lambda host: ({'name': 'To VPN'}, {'rule': host}, '')
@@ -651,6 +663,26 @@ class DoctorExitHonestyTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(doctor, 'run', original))
         doctor.run = fake
         self.assertFalse(doctor.zapret_route('example.com')['queues'])
+
+    def test_the_route_summary_does_not_claim_masking_without_queues(self):
+        self.assertIn('не подтверждены', doctor.zapret_path_label({'queues': False}))
+        self.assertIn('маскируется', doctor.zapret_path_label({'queues': True}))
+
+    def test_the_provider_country_is_measured_through_the_wan(self):
+        # an unbound curl follows the routing table, which on this box is the VPN tunnel
+        calls = []
+
+        def fake(cmd, timeout=8, stdin=None):
+            calls.append(list(cmd))
+            return 0, '{"country":"DE"}'
+
+        original = doctor.run
+        self.addCleanup(lambda: setattr(doctor, 'run', original))
+        doctor.run = fake
+        doctor._DIRECT_CACHE.clear()
+        self.addCleanup(doctor._DIRECT_CACHE.clear)
+        self.assertEqual(doctor.direct_country(True), 'DE')
+        self.assertTrue(any('--interface' in cmd for cmd in calls), calls)
 
 
 class DoctorZapretTests(unittest.TestCase):

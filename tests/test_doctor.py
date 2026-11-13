@@ -549,6 +549,42 @@ class DoctorRelatedHostsTests(unittest.TestCase):
         self.assertEqual(info['country'], 'Нидерланды')
 
 
+class DoctorStalePageTests(unittest.TestCase):
+    """A failed fetch must not report the previous site's hosts as this domain's."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.saved = {name: getattr(doctor, name) for name in ('run', 'PAGE_FILE', 'HOPS_FILE')}
+        self.addCleanup(lambda: [setattr(doctor, name, value)
+                                 for name, value in self.saved.items()])
+        doctor.PAGE_FILE = str(base / 'page.html')
+        doctor.HOPS_FILE = str(base / 'hops.txt')
+        # what the previous trace left behind
+        Path(doctor.PAGE_FILE).write_text(
+            '<html><body><img src="https://shop.example.net/a.png">'
+            '<a href="https://pay.example.net/">pay</a></body></html>', encoding='utf-8')
+        Path(doctor.HOPS_FILE).write_text('HTTP/1.1 200 OK\n', encoding='utf-8')
+
+    def test_a_failed_request_reports_no_hosts(self):
+        doctor.run = lambda cmd, timeout=8, stdin=None: (6, '')
+        self.assertEqual(doctor.related_hosts('nope-not-in-any-list.org'), [])
+
+    def test_a_real_page_still_yields_its_hosts(self):
+        def fake(cmd, timeout=8, stdin=None):
+            if cmd[0] == 'curl':
+                Path(doctor.PAGE_FILE).write_text(
+                    '<html><body><img src="https://cdn.example.net/x.png"></body></html>',
+                    encoding='utf-8')
+                Path(doctor.HOPS_FILE).write_text('HTTP/1.1 200 OK\n', encoding='utf-8')
+                return 0, ''
+            return 0, ''
+        doctor.run = fake
+        hosts = doctor.related_hosts('shop.example.com')
+        self.assertEqual([item['host'] for item in hosts], ['cdn.example.net'])
+
+
 class DoctorZapretTests(unittest.TestCase):
     """Whether zapret (nfqws) processes a domain - the trace used to stop before this."""
 

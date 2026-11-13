@@ -1268,6 +1268,10 @@ def host_of(url):
 SESSION_KINDS = {'form', 'iframe'}
 
 
+PAGE_FILE = '/tmp/geomask-doctor-page.html'
+HOPS_FILE = '/tmp/geomask-doctor-hops.txt'
+
+
 def related_hosts(domain, limit=12):
     """Hosts the page itself depends on, with the kind of reference that found them.
 
@@ -1279,8 +1283,15 @@ def related_hosts(domain, limit=12):
     The kind matters: pictures and stylesheets on another path are harmless, a form or an
     iframe on another path carries the session and can be rejected by the site.
     """
-    page = '/tmp/geomask-doctor-page.html'
-    hops = '/tmp/geomask-doctor-hops.txt'
+    page = PAGE_FILE
+    hops = HOPS_FILE
+    # a failed request leaves the previous page behind, and the previous site's hosts were
+    # then reported as this domain's (a nonexistent host showed plati.market's six hosts)
+    for stale in (page, hops):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
     found = []
 
     def add(host, kind):

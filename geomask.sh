@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.11"
+GM_VERSION="1.30.12"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -5121,7 +5121,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.11"
+BACKEND_VERSION="1.30.12"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6689,7 +6689,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.11', '1.30.11', '1.30.11')
+VERSION_MARKERS = ('1.30.12', '1.30.12', '1.30.12')
 
 
 def stamp_versions(data, version):
@@ -8680,6 +8680,10 @@ def host_of(url):
 SESSION_KINDS = {'form', 'iframe'}
 
 
+PAGE_FILE = '/tmp/geomask-doctor-page.html'
+HOPS_FILE = '/tmp/geomask-doctor-hops.txt'
+
+
 def related_hosts(domain, limit=12):
     """Hosts the page itself depends on, with the kind of reference that found them.
 
@@ -8691,8 +8695,15 @@ def related_hosts(domain, limit=12):
     The kind matters: pictures and stylesheets on another path are harmless, a form or an
     iframe on another path carries the session and can be rejected by the site.
     """
-    page = '/tmp/geomask-doctor-page.html'
-    hops = '/tmp/geomask-doctor-hops.txt'
+    page = PAGE_FILE
+    hops = HOPS_FILE
+    # a failed request leaves the previous page behind, and the previous site's hosts were
+    # then reported as this domain's (a nonexistent host showed plati.market's six hosts)
+    for stale in (page, hops):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
     found = []
 
     def add(host, kind):
@@ -9084,10 +9095,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.11",
+  "core_version": "1.30.12",
   "modules": {
     "admission_service": {
-      "version": "1.30.10",
+      "version": "1.30.11",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9119,7 +9130,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.10",
+      "version": "1.30.11",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9268,7 +9279,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.10",
+      "version": "1.30.11",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9311,7 +9322,7 @@ ASSET_EOF
       ]
     },
     "doctor": {
-      "version": "1.30.10",
+      "version": "1.30.11",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -9322,7 +9333,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "302123eff3f5f063cca940b91ba64a8442a2d2b7872223957e39f0f9d23ae4a9"
+          "sha256": "194704179b085ff56cd1a0608c267937a0a82d53550f3bb98feddc2123fbe3d1"
         }
       ]
     },
@@ -9344,7 +9355,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "ae97a4eb524b1bb693fdf9e63d318aa800f4d417cc687c9f1e085b68eb8ed21b"
+          "sha256": "4ac453b136302222e10138138a50c7af1fb3346cea1ba509b0cbd9aadc5a2a30"
         }
       ]
     },
@@ -9360,7 +9371,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "8d38b59226e34b208c5d8d3dcbcb60a64ef6502d18ffda6b6bdcee9733e4afb0"
+          "sha256": "91166e592d8fa97438788d503dea83e94bf345d6129ea4a697a565ee38dfc3b8"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9384,12 +9395,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "00a7248101819491e84ba277b57395015ec4c91118fd442e3a857455bf6d2ce7"
+          "sha256": "b0a0e753d1096c827741e9f3c2be22a5a47e0146b55b3dcb9d7a3b9fc4c5219a"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.10",
+      "version": "1.30.11",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9400,7 +9411,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.10",
+      "version": "1.30.11",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9410,7 +9421,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.10",
+      "version": "1.30.11",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9420,7 +9431,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.10",
+      "version": "1.30.11",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9769,7 +9780,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.11';
+var PANEL_VERSION = '1.30.12';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -31095,7 +31106,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.11"
+GUARD_VERSION="1.30.12"
 
 log() { logger -t geomask-guard "$*"; }
 

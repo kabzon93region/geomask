@@ -1,7 +1,7 @@
 {
   "id": "doctor",
   "name": "Diagnostics Center",
-  "version": "1.30.10",
+  "version": "1.30.11",
   "schema_version": 1,
   "type": "diagnostic",
   "description": "Self-service checks for every module, the router, the network, the paths and a single domain; one log file per check with 7-day retention",

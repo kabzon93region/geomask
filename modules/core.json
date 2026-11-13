@@ -1,7 +1,7 @@
 {
   "id": "core",
   "name": "geomask (ядро)",
-  "version": "1.30.4",
+  "version": "1.30.7",
   "schema_version": 1,
   "type": "core",
   "description": "Ядро geomask: синк MagiTrickle→mihomo, node-audit, лейн, сторож, списки, сидер, обновление модулей",

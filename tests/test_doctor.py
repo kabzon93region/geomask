@@ -543,5 +543,61 @@ class DoctorRelatedHostsTests(unittest.TestCase):
         self.assertEqual(info['country'], 'Нидерланды')
 
 
+class DoctorZapretTests(unittest.TestCase):
+    """Whether zapret (nfqws) processes a domain - the trace used to stop before this."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+
+        def put(name, body):
+            path = base / name
+            path.write_text(body, encoding='utf-8')
+            return str(path)
+
+        self.saved = {name: getattr(doctor, name)
+                      for name in ('run', 'ZAPRET_CONF', 'ZAPRET_HOSTLIST',
+                                   'ZAPRET_EXCLUDE', 'ZAPRET_AUTO')}
+        self.addCleanup(lambda: [setattr(doctor, name, value)
+                                 for name, value in self.saved.items()])
+        doctor.ZAPRET_CONF = put('config', 'MODE_FILTER=autohostlist\n')
+        doctor.ZAPRET_HOSTLIST = put('hosts.txt', 'example.com\n'
+                                     'live.wardogs.bulkhead.pragmaengine.com\n')
+        doctor.ZAPRET_EXCLUDE = put('exclude.txt', '# nochange\nru\n')
+        doctor.ZAPRET_AUTO = put('auto.txt', '')
+
+    def running(self, pids='571 572'):
+        doctor.run = lambda cmd, timeout=8, stdin=None: (
+            (0, pids) if cmd[0] == 'pidof' else (127, ''))
+
+    def test_an_exact_host_from_the_hostlist_is_processed(self):
+        self.running()
+        info = doctor.zapret_route('live.wardogs.bulkhead.pragmaengine.com')
+        self.assertTrue(info['running'])
+        self.assertEqual(info['mode'], 'autohostlist')
+        self.assertEqual(info['listed'], 'live.wardogs.bulkhead.pragmaengine.com')
+
+    def test_a_subdomain_matches_its_parent_line(self):
+        self.running()
+        self.assertEqual(doctor.zapret_route('cdn.example.com')['listed'], 'example.com')
+
+    def test_a_tld_line_in_the_exclude_list_wins(self):
+        # the owner excludes `ru` on purpose: every .ru domain skips the desync
+        self.running()
+        info = doctor.zapret_route('plati.ru')
+        self.assertEqual(info['excluded'], 'ru')
+        self.assertEqual(info['listed'], '')
+
+    def test_an_unlisted_domain_is_reported_as_uncovered(self):
+        self.running()
+        info = doctor.zapret_route('nope.org')
+        self.assertEqual((info['listed'], info['excluded'], info['auto']), ('', '', False))
+
+    def test_stopped_nfqws_is_visible(self):
+        doctor.run = lambda cmd, timeout=8, stdin=None: (1, '')
+        self.assertFalse(doctor.zapret_route('example.com')['running'])
+
+
 if __name__ == '__main__':
     unittest.main()

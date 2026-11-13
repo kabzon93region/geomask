@@ -241,6 +241,49 @@ def group_state(name):
 
 
 # --------------------------------------------------------------------------- parsers
+ZAPRET_CONF = '/opt/zapret/config'
+ZAPRET_HOSTLIST = '/opt/zapret/ipset/zapret-hosts-user.txt'
+ZAPRET_EXCLUDE = '/opt/zapret/ipset/zapret-hosts-user-exclude.txt'
+ZAPRET_AUTO = '/opt/zapret/ipset/zapret-hosts-auto.txt'
+
+
+def _hostlist_match(domain, path):
+    """Which line of a zapret host list covers this domain, '' when none does.
+
+    zapret matches a line against the host itself and its subdomains, and the owner uses
+    that deliberately: a bare `ru` in the exclude list drops every .ru domain from the desync.
+    """
+    domain = (domain or '').lower().strip('.')
+    for raw in read_text(path).splitlines():
+        line = raw.strip().lower()
+        if not line or line.startswith('#'):
+            continue
+        line = line.lstrip('*').lstrip('.')
+        if domain == line or domain.endswith('.' + line):
+            return line
+    return ''
+
+
+def zapret_route(domain):
+    """Does zapret (nfqws) process this domain, and if not, why not.
+
+    The trace used to stop after the mihomo rule, so a domain going out directly looked like
+    it had no DPI handling at all - while the owner's wardogs host had been in zapret's
+    hostlist the whole time.
+    """
+    rc, out = run(['pidof', 'nfqws'])
+    pids = (out or '').strip() if rc == 0 else ''
+    mode = ''
+    for line in read_text(ZAPRET_CONF).splitlines():
+        if line.strip().startswith('MODE_FILTER='):
+            mode = line.split('=', 1)[1].strip().strip('"').strip("'")
+            break
+    return {'running': bool(pids), 'pids': pids, 'mode': mode,
+            'listed': _hostlist_match(domain, ZAPRET_HOSTLIST),
+            'excluded': _hostlist_match(domain, ZAPRET_EXCLUDE),
+            'auto': bool(_hostlist_match(domain, ZAPRET_AUTO))}
+
+
 def parse_magitrickle(text):
     """groups: [{name, interface, enable, rules:[{type, rule, enable}]}] from config.yaml."""
     groups = []
@@ -1373,6 +1416,30 @@ def trace_domain(domain, live=False):
     else:
         step('Выход', 'warn', 'политика %s — уточните вручную' % policy,
              'Проверьте правило в /etc/mihomo/config.yaml.')
+
+    # 4b. zapret: a direct domain is only protected from DPI if zapret processes it
+    zap = zapret_route(domain)
+    _policy = (hit or {}).get('policy', 'GLOBAL')
+    if not zap['running']:
+        step('Запрет (DPI)', 'warn', 'nfqws не запущен — обход DPI выключен',
+             'Запустите запрет: /etc/init.d/zapret restart; если не поднимается — '
+             'проверьте /opt/zapret/config и установлен ли zapret.')
+    elif _policy in ('VPN', 'VPN-noP2P', 'AI'):
+        step('Запрет (DPI)', 'ok',
+             'идёт через туннель (%s) — запрет не участвует, так и задумано' % _policy)
+    elif zap['excluded']:
+        step('Запрет (DPI)', 'warn', 'исключён из запрета строкой «%s»' % zap['excluded'],
+             'Уберите домен (или его родителя) из /opt/zapret/ipset/zapret-hosts-user-exclude.txt '
+             'и перезапустите zapret: /etc/init.d/zapret restart')
+    elif zap['listed']:
+        step('Запрет (DPI)', 'ok', 'в hostlist строкой «%s» — DPI обходится (nfqws %s, режим %s)'
+             % (zap['listed'], zap['pids'], zap['mode'] or '?'))
+    elif zap['auto']:
+        step('Запрет (DPI)', 'ok', 'в autohostlist — zapret добавил его сам после неудач, DPI обходится')
+    else:
+        step('Запрет (DPI)', 'warn', 'домена нет в hostlist — DPI не обходится',
+             'Добавьте домен в /opt/zapret/ipset/zapret-hosts-user.txt и перезапустите zapret: '
+             '/etc/init.d/zapret restart (или включите режим autohostlist).')
 
     # 5. live probe - and the reason when it fails
     if live:

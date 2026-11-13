@@ -35,7 +35,7 @@
 
 set -u
 
-GM_VERSION="1.30.7"
+GM_VERSION="1.30.8"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -5121,7 +5121,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.7"
+BACKEND_VERSION="1.30.8"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6689,7 +6689,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.7', '1.30.7', '1.30.7')
+VERSION_MARKERS = ('1.30.8', '1.30.8', '1.30.8')
 
 
 def stamp_versions(data, version):
@@ -7653,6 +7653,49 @@ def group_state(name):
 
 
 # --------------------------------------------------------------------------- parsers
+ZAPRET_CONF = '/opt/zapret/config'
+ZAPRET_HOSTLIST = '/opt/zapret/ipset/zapret-hosts-user.txt'
+ZAPRET_EXCLUDE = '/opt/zapret/ipset/zapret-hosts-user-exclude.txt'
+ZAPRET_AUTO = '/opt/zapret/ipset/zapret-hosts-auto.txt'
+
+
+def _hostlist_match(domain, path):
+    """Which line of a zapret host list covers this domain, '' when none does.
+
+    zapret matches a line against the host itself and its subdomains, and the owner uses
+    that deliberately: a bare `ru` in the exclude list drops every .ru domain from the desync.
+    """
+    domain = (domain or '').lower().strip('.')
+    for raw in read_text(path).splitlines():
+        line = raw.strip().lower()
+        if not line or line.startswith('#'):
+            continue
+        line = line.lstrip('*').lstrip('.')
+        if domain == line or domain.endswith('.' + line):
+            return line
+    return ''
+
+
+def zapret_route(domain):
+    """Does zapret (nfqws) process this domain, and if not, why not.
+
+    The trace used to stop after the mihomo rule, so a domain going out directly looked like
+    it had no DPI handling at all - while the owner's wardogs host had been in zapret's
+    hostlist the whole time.
+    """
+    rc, out = run(['pidof', 'nfqws'])
+    pids = (out or '').strip() if rc == 0 else ''
+    mode = ''
+    for line in read_text(ZAPRET_CONF).splitlines():
+        if line.strip().startswith('MODE_FILTER='):
+            mode = line.split('=', 1)[1].strip().strip('"').strip("'")
+            break
+    return {'running': bool(pids), 'pids': pids, 'mode': mode,
+            'listed': _hostlist_match(domain, ZAPRET_HOSTLIST),
+            'excluded': _hostlist_match(domain, ZAPRET_EXCLUDE),
+            'auto': bool(_hostlist_match(domain, ZAPRET_AUTO))}
+
+
 def parse_magitrickle(text):
     """groups: [{name, interface, enable, rules:[{type, rule, enable}]}] from config.yaml."""
     groups = []
@@ -8786,6 +8829,30 @@ def trace_domain(domain, live=False):
         step('Выход', 'warn', 'политика %s — уточните вручную' % policy,
              'Проверьте правило в /etc/mihomo/config.yaml.')
 
+    # 4b. zapret: a direct domain is only protected from DPI if zapret processes it
+    zap = zapret_route(domain)
+    _policy = (hit or {}).get('policy', 'GLOBAL')
+    if not zap['running']:
+        step('Запрет (DPI)', 'warn', 'nfqws не запущен — обход DPI выключен',
+             'Запустите запрет: /etc/init.d/zapret restart; если не поднимается — '
+             'проверьте /opt/zapret/config и установлен ли zapret.')
+    elif _policy in ('VPN', 'VPN-noP2P', 'AI'):
+        step('Запрет (DPI)', 'ok',
+             'идёт через туннель (%s) — запрет не участвует, так и задумано' % _policy)
+    elif zap['excluded']:
+        step('Запрет (DPI)', 'warn', 'исключён из запрета строкой «%s»' % zap['excluded'],
+             'Уберите домен (или его родителя) из /opt/zapret/ipset/zapret-hosts-user-exclude.txt '
+             'и перезапустите zapret: /etc/init.d/zapret restart')
+    elif zap['listed']:
+        step('Запрет (DPI)', 'ok', 'в hostlist строкой «%s» — DPI обходится (nfqws %s, режим %s)'
+             % (zap['listed'], zap['pids'], zap['mode'] or '?'))
+    elif zap['auto']:
+        step('Запрет (DPI)', 'ok', 'в autohostlist — zapret добавил его сам после неудач, DPI обходится')
+    else:
+        step('Запрет (DPI)', 'warn', 'домена нет в hostlist — DPI не обходится',
+             'Добавьте домен в /opt/zapret/ipset/zapret-hosts-user.txt и перезапустите zapret: '
+             '/etc/init.d/zapret restart (или включите режим autohostlist).')
+
     # 5. live probe - and the reason when it fails
     if live:
         probe = http_probe(domain)
@@ -8948,10 +9015,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.7",
+  "core_version": "1.30.8",
   "modules": {
     "admission_service": {
-      "version": "1.30.6",
+      "version": "1.30.7",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -8983,7 +9050,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.6",
+      "version": "1.30.7",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -8992,7 +9059,7 @@ ASSET_EOF
       "files": []
     },
     "core": {
-      "version": "1.30.4",
+      "version": "1.30.7",
       "type": "core",
       "name": "geomask (ядро)",
       "dependencies": [],
@@ -9132,7 +9199,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.6",
+      "version": "1.30.7",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9186,7 +9253,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "f48ea0d1bc7163e3a7609868f32c73977e6d1ac8eec3e7ff3a9c1fcfcb6e6678"
+          "sha256": "ec5a90a3a2f13a4bb0b41ed3cb04b477221998c266bd65746698d6dc2d01b87f"
         }
       ]
     },
@@ -9208,7 +9275,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "88b86fba23bc4bb32b0250a3c6763cece66ce8342ab5d231481d3bf84ecc0220"
+          "sha256": "4dd3665e6069ee90e107bbd2b0443010f31c02f35f652a5abfa20ceefcffbd0c"
         }
       ]
     },
@@ -9224,7 +9291,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "96d27788ed7b95cf9051190b9bac4184054d0f0d3275f29e25e7163cd444a7e2"
+          "sha256": "c20ce2fa4d719e67919e61884645f53fd086136a285602ea0be89e3d2a75c0b5"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9248,12 +9315,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "0ea715261a6851196e46424c8c452a81574df749f2c4f4ab5abb5bc3ca5ca9ff"
+          "sha256": "59b74e9860d3d1e97abb15bfa313b0d1d9ae067028805f88c411032fb57e1f3f"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.6",
+      "version": "1.30.7",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9264,7 +9331,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.6",
+      "version": "1.30.7",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9274,7 +9341,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.6",
+      "version": "1.30.7",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9284,7 +9351,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.6",
+      "version": "1.30.7",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9633,7 +9700,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.7';
+var PANEL_VERSION = '1.30.8';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -30959,7 +31026,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.7"
+GUARD_VERSION="1.30.8"
 
 log() { logger -t geomask-guard "$*"; }
 

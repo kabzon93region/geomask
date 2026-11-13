@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.16"
+GM_VERSION="1.30.17"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -5272,7 +5272,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.16"
+BACKEND_VERSION="1.30.17"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6904,7 +6904,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.16', '1.30.16', '1.30.16')
+VERSION_MARKERS = ('1.30.17', '1.30.17', '1.30.17')
 
 
 def stamp_versions(data, version):
@@ -7056,7 +7056,9 @@ def status(index, state, module_id=None, selected=None):
             actual = digest_file(path)
             if actual is None:
                 missing.append(path)
-            elif actual != entry['sha256']:
+            elif actual != entry['sha256'] and not (entry.get('config')
+                                                    or entry.get('generated')):
+                # configs and sync-generated rulesets are expected to differ from the asset
                 recorded_hash = recorded['files'].get(path)
                 if recorded_hash and actual != recorded_hash:
                     modified.append(path)
@@ -7130,7 +7132,7 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
         current = digest_file(path)
         if current is not None and current != entry['sha256']:
             known = recorded['files'].get(path)
-            if entry.get('config') and not force:
+            if (entry.get('config') or entry.get('generated')) and not force:
                 # an owner-edited config (nodes.conf, vpnwatch.conf, zapret lists) is kept by
                 # the installer; the updater must not replace it just because the baseline
                 # recorded those same bytes as "installed"
@@ -9404,10 +9406,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.16",
+  "core_version": "1.30.17",
   "modules": {
     "admission_service": {
-      "version": "1.30.15",
+      "version": "1.30.16",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9439,7 +9441,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.15",
+      "version": "1.30.16",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9591,7 +9593,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.15",
+      "version": "1.30.16",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9668,7 +9670,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "4258acc57f754127e4892c9f3abbb8b18af0a30a44a18bab272f632f782306e7"
+          "sha256": "97fbe2287a6bd331e0425e46a7dfd61f32d606ed42f6b1d17baf829b39c15b59"
         }
       ]
     },
@@ -9684,7 +9686,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "3fda0d9a2be17728040c99c01a96343418f731d0527e1444bb77b62239463dcd"
+          "sha256": "6651d5c6425d3ea219246046ab5a4eb81dbe6ee6ea86181df69ede189bcf89eb"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9708,12 +9710,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "8f7d293614b0ed83c6ab8069c4c1b51440d783b0768bd193d914c3a2dfc8be88"
+          "sha256": "8affb5acf3afa790f08e35c1fba54f45871045980bfa5dfefb0209f2064c7a37"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.15",
+      "version": "1.30.16",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9724,7 +9726,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.15",
+      "version": "1.30.16",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9734,7 +9736,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.15",
+      "version": "1.30.16",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9744,7 +9746,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.15",
+      "version": "1.30.16",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9764,7 +9766,8 @@ ASSET_EOF
           "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
           "source": "assets/torrentdirect.yaml",
           "mode": "0644",
-          "sha256": "d241713f5947370412d97b3657d370d1cff87892c4e2dcb1fbcaf9557ff37c0e"
+          "sha256": "d241713f5947370412d97b3657d370d1cff87892c4e2dcb1fbcaf9557ff37c0e",
+          "generated": true
         },
         {
           "path": "/usr/bin/geomask-torrent.sh",
@@ -9786,19 +9789,22 @@ ASSET_EOF
           "path": "/etc/geomask-ytwatch.conf",
           "source": "assets/geomask-ytwatch.conf",
           "mode": "0644",
-          "sha256": "ff14d9912cc17d3abbeeae006e0bbff1de436ae456e986a397837b9c95c94fd3"
+          "sha256": "ff14d9912cc17d3abbeeae006e0bbff1de436ae456e986a397837b9c95c94fd3",
+          "config": true
         },
         {
           "path": "/etc/mihomo/ruleset/ytdirect.yaml",
           "source": "assets/ytdirect.yaml",
           "mode": "0644",
-          "sha256": "736a8256a8773c226acef4520f5299b3a98b5ee84c3a66767061ecacdb2fc986"
+          "sha256": "736a8256a8773c226acef4520f5299b3a98b5ee84c3a66767061ecacdb2fc986",
+          "generated": true
         },
         {
           "path": "/etc/mihomo/ruleset/ytvpn.yaml",
           "source": "assets/ytvpn.yaml",
           "mode": "0644",
-          "sha256": "0eeb40254c0fb429776711a0acee828667c6d11d6a7cf342440489e988315494"
+          "sha256": "0eeb40254c0fb429776711a0acee828667c6d11d6a7cf342440489e988315494",
+          "generated": true
         },
         {
           "path": "/usr/bin/geomask-ytwatch.sh",
@@ -10093,7 +10099,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.16';
+var PANEL_VERSION = '1.30.17';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -31583,7 +31589,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.16"
+GUARD_VERSION="1.30.17"
 
 log() { logger -t geomask-guard "$*"; }
 

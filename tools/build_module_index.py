@@ -80,9 +80,14 @@ VERSION_MARKERS = ('@@PANEL_VERSION@@', '@@BACKEND_VERSION@@', '@@GUARD_VERSION@
 CONFIG_PATHS = (
     '/etc/geomask-nodes.conf',
     '/etc/geomask/vpnwatch.conf',
+    '/etc/geomask-ytwatch.conf',
     '/etc/geomask/zapret-force-keep.txt',
     '/etc/geomask/zapret-always-exclude.txt',
 )
+
+# Files the release does not own the bytes of: sync/scripts rewrite them, and a difference
+# from the shipped asset is normal, not a pending update.
+GENERATED_PREFIXES = ('/etc/mihomo/ruleset/',)
 
 
 def sha256_installed(path, version):
@@ -168,6 +173,8 @@ def main():
         }
         if path in CONFIG_PATHS:
             record['config'] = True
+        elif path.startswith(GENERATED_PREFIXES):
+            record['generated'] = True
         entry['files'].append(record)
 
     index = {

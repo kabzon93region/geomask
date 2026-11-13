@@ -273,7 +273,9 @@ def status(index, state, module_id=None, selected=None):
             actual = digest_file(path)
             if actual is None:
                 missing.append(path)
-            elif actual != entry['sha256']:
+            elif actual != entry['sha256'] and not (entry.get('config')
+                                                    or entry.get('generated')):
+                # configs and sync-generated rulesets are expected to differ from the asset
                 recorded_hash = recorded['files'].get(path)
                 if recorded_hash and actual != recorded_hash:
                     modified.append(path)
@@ -347,7 +349,7 @@ def download_module(index, state, module_id, config, force=False, fetcher=None):
         current = digest_file(path)
         if current is not None and current != entry['sha256']:
             known = recorded['files'].get(path)
-            if entry.get('config') and not force:
+            if (entry.get('config') or entry.get('generated')) and not force:
                 # an owner-edited config (nodes.conf, vpnwatch.conf, zapret lists) is kept by
                 # the installer; the updater must not replace it just because the baseline
                 # recorded those same bytes as "installed"

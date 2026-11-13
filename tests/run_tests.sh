@@ -1576,13 +1576,13 @@ rm -rf "$R" "$B"; mkdir -p "$R/etc/init.d" "$R/usr/bin" "$R/tmp" "$B"
 printf "DISTRIB_RELEASE='25.12'\n" > "$R/etc/openwrt_release"
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/mihomo"; chmod +x "$R/usr/bin/mihomo"
 printf '#!/bin/sh\nexit 0\n' > "$R/etc/init.d/magitrickle"; chmod +x "$R/etc/init.d/magitrickle"
+# the target directory is baked in: a script found through PATH gets a bare $0, and an
+# inherited variable proved unreliable across the shell/PATH combinations in this suite
 cat > "$B/apk" <<'APKEOF'
 #!/bin/sh
-# install into the directory this stub lives in: no environment variable to lose
 [ "$1" = "add" ] || exit 0
 shift
-target=$(dirname "$0")
-[ -n "$target" ] || target="${APK_TARGET:-.}"
+target="__APK_TARGET__"
 for pkg in "$@"; do
   case "$pkg" in
     curl) printf '#!/bin/sh\necho 204\n' > "$target/$pkg" ;;
@@ -1592,6 +1592,7 @@ for pkg in "$@"; do
 done
 exit 0
 APKEOF
+sed -i "s|__APK_TARGET__|$B|" "$B/apk"
 chmod +x "$B/apk"
 # Hermetic PATH: the runner's /usr/bin has python3 and curl, so the scenario would find
 # them and never exercise the install. Link only the tools the installer needs, leave

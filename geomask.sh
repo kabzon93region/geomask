@@ -8614,7 +8614,8 @@ def http_probe(domain, timeout=20):
     took = parts[1] if len(parts) > 1 else ''
     ip = parts[2] if len(parts) > 2 else ''
     if rc == 0 and code and code != '000':
-        good = code.startswith(('2', '3'))
+        # 4xx is the site answering (a 404 on a game host is normal): the path works
+        good = code.startswith(('2', '3', '4'))
         return {'ok': good, 'code': code, 'took': took, 'ip': ip, 'rc': 0,
                 'kind': '' if good else 'http',
                 'detail': 'HTTP %s за %s с%s' % (code, took, (', адрес ' + ip) if ip else '')}
@@ -8951,7 +8952,9 @@ def trace_domain(domain, live=False):
                  'на какие домены он ходит; их и добавляйте в группу.')
 
     lines.append('')
-    lines.append('Итог: %s' % (steps[2]['detail'] if len(steps) > 2 else ''))
+    exit_step = next((item for item in steps if item['stage'] == 'Выход'), None)
+    summary = exit_step['detail'] if exit_step else (steps[2]['detail'] if len(steps) > 2 else '')
+    lines.append('Итог: %s' % summary)
     fix = ''
     for wanted in ('fail', 'warn'):
         for item in steps:
@@ -9030,7 +9033,7 @@ ASSET_EOF
   "core_version": "1.30.8",
   "modules": {
     "admission_service": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9062,7 +9065,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9211,7 +9214,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9254,7 +9257,7 @@ ASSET_EOF
       ]
     },
     "doctor": {
-      "version": "1.30.0",
+      "version": "1.30.8",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -9265,7 +9268,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "914d6d205ea90c30279dcf7e20c4867e34f628ea3edc124bcc0bbab040e86d4f"
+          "sha256": "d8c97c01d11778bfaf0986a6f83fcb3c01f62daf418fc5a5027d837a7a30c8c4"
         }
       ]
     },
@@ -9332,7 +9335,7 @@ ASSET_EOF
       ]
     },
     "path_ai": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9343,7 +9346,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9353,7 +9356,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9363,7 +9366,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "service",
       "name": "Self Update",
       "dependencies": [

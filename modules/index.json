@@ -3,7 +3,7 @@
   "core_version": "1.30.8",
   "modules": {
     "admission_service": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -35,7 +35,7 @@
       ]
     },
     "backup_share": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -184,7 +184,7 @@
       ]
     },
     "device_modes": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -227,7 +227,7 @@
       ]
     },
     "doctor": {
-      "version": "1.30.0",
+      "version": "1.30.8",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -238,7 +238,7 @@
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "914d6d205ea90c30279dcf7e20c4867e34f628ea3edc124bcc0bbab040e86d4f"
+          "sha256": "d8c97c01d11778bfaf0986a6f83fcb3c01f62daf418fc5a5027d837a7a30c8c4"
         }
       ]
     },
@@ -305,7 +305,7 @@
       ]
     },
     "path_ai": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -316,7 +316,7 @@
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -326,7 +326,7 @@
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -336,7 +336,7 @@
       "files": []
     },
     "self_update": {
-      "version": "1.30.7",
+      "version": "1.30.8",
       "type": "service",
       "name": "Self Update",
       "dependencies": [

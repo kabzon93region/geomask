@@ -1202,7 +1202,8 @@ def http_probe(domain, timeout=20):
     took = parts[1] if len(parts) > 1 else ''
     ip = parts[2] if len(parts) > 2 else ''
     if rc == 0 and code and code != '000':
-        good = code.startswith(('2', '3'))
+        # 4xx is the site answering (a 404 on a game host is normal): the path works
+        good = code.startswith(('2', '3', '4'))
         return {'ok': good, 'code': code, 'took': took, 'ip': ip, 'rc': 0,
                 'kind': '' if good else 'http',
                 'detail': 'HTTP %s за %s с%s' % (code, took, (', адрес ' + ip) if ip else '')}
@@ -1539,7 +1540,9 @@ def trace_domain(domain, live=False):
                  'на какие домены он ходит; их и добавляйте в группу.')
 
     lines.append('')
-    lines.append('Итог: %s' % (steps[2]['detail'] if len(steps) > 2 else ''))
+    exit_step = next((item for item in steps if item['stage'] == 'Выход'), None)
+    summary = exit_step['detail'] if exit_step else (steps[2]['detail'] if len(steps) > 2 else '')
+    lines.append('Итог: %s' % summary)
     fix = ''
     for wanted in ('fail', 'warn'):
         for item in steps:

@@ -519,12 +519,18 @@ class DoctorRelatedHostsTests(unittest.TestCase):
         self.assertIn('нет ответа за 20 с', probe['detail'])
 
     def test_http_probe_keeps_the_status_of_a_real_answer(self):
+        # a 4xx is the site answering (404 on a game host is normal): the path works
         doctor.run = lambda cmd, timeout=8, stdin=None: (0, '403 0.4 1.2.3.4')
+        probe = doctor.http_probe('plati.market')
+        self.assertTrue(probe['ok'])
+        self.assertEqual(probe['code'], '403')
+        self.assertIn('1.2.3.4', probe['detail'])
+
+    def test_a_server_error_is_not_a_working_path(self):
+        doctor.run = lambda cmd, timeout=8, stdin=None: (0, '503 1.9 1.2.3.4')
         probe = doctor.http_probe('plati.market')
         self.assertFalse(probe['ok'])
         self.assertEqual(probe['kind'], 'http')
-        self.assertEqual(probe['code'], '403')
-        self.assertIn('1.2.3.4', probe['detail'])
 
     def test_host_route_reports_a_direct_exit_as_russia(self):
         doctor.magitrickle_route = lambda host: None

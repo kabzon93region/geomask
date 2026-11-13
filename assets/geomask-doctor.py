@@ -249,6 +249,42 @@ ZAPRET_EXCLUDE = '/opt/zapret/ipset/zapret-hosts-user-exclude.txt'
 ZAPRET_AUTO = '/opt/zapret/ipset/zapret-hosts-auto.txt'
 
 
+def plain_rule(rule):
+    """A mihomo rule line in words a person who has never read config.yaml understands."""
+    parts = [item.strip() for item in (rule or '').split(',') if item.strip()]
+    kind = parts[0].upper() if parts else ''
+    if kind == 'MATCH':
+        return 'любой другой домен'
+    if kind == 'RULE-SET':
+        return 'список %s' % (parts[1] if len(parts) > 1 else '?')
+    if kind == 'GEOSITE':
+        return 'геосписок %s' % (parts[1] if len(parts) > 1 else '?')
+    if kind == 'GEOIP':
+        return 'страна %s' % (parts[1] if len(parts) > 1 else '?')
+    if kind == 'DOMAIN-SUFFIX':
+        return 'домен и его поддомены'
+    if kind == 'DOMAIN':
+        return 'точный домен'
+    if kind.startswith('IP-CIDR'):
+        return 'диапазон адресов'
+    if kind in ('AND', 'OR', 'NOT'):
+        return 'составное правило %s' % kind
+    return rule or '?'
+
+
+def plain_iface(iface):
+    """Where a MagiTrickle group sends traffic, in words."""
+    if not iface:
+        return 'интерфейс не задан'
+    if iface == 'Mihomo':
+        return 'в mihomo (там выбирается узел VPN)'
+    if iface == 'AI':
+        return 'в AI-туннель'
+    if iface == 'VPN-noP2P':
+        return 'в VPN-туннель без P2P'
+    return 'напрямую в интернет через %s' % iface
+
+
 def _hostlist_match(domain, path):
     """Which line of a zapret host list covers this domain, '' when none does.
 
@@ -518,7 +554,7 @@ def mihomo_route(domain, ips):
                 ok, note = match_condition(entry, domain, ips)
                 if ok:
                     return {'index': index, 'rule': rule, 'policy': policy,
-                            'note': 'в списке %s: %s' % (name, note), 'ruleset': path}
+                            'note': 'строка «%s» в списке %s' % (note, name), 'ruleset': path}
             continue
         ok, note = match_condition(rule, domain, ips)
         if ok:
@@ -1315,7 +1351,7 @@ def trace_domain(domain, live=False):
     # 1. DNS
     probe = resolve(domain)
     if probe['blocked']:
-        step('DNS', 'fail', 'домен заблокирован (0.0.0.0) — adblock или hosts',
+        step('DNS', 'fail', '0.0.0.0 — домен заблокирован на роутере (adblock или hosts)',
              'Разрешите домен в LuCI → adblock-fast (список разрешённых) или уберите его из hosts.')
     elif probe['ips']:
         step('DNS', 'ok', '→ %s' % ', '.join(probe['ips'][:4]))
@@ -1323,7 +1359,7 @@ def trace_domain(domain, live=False):
         step('DNS', 'fail', 'домен не существует (NXDOMAIN)',
              'Проверьте написание домена. Если он только что появился — подождите обновления DNS.')
     else:
-        step('DNS', 'fail', 'не разрешается через 127.0.0.1',
+        step('DNS', 'fail', 'роутер не смог узнать адрес домена — DNS не отвечает',
              'DNS не отвечает: /etc/init.d/dnsmasq restart; upstream — LuCI → Сеть → DHCP/DNS.')
     ips = probe['ips']
 
@@ -1339,15 +1375,15 @@ def trace_domain(domain, live=False):
                  'в нужную группу: geomask-lists-edit.py move --group "<группа>" --domain %s'
                  % (off_rule.get('rule'), domain))
         else:
-            step('MagiTrickle', 'warn', 'домена нет ни в одной группе — пойдёт по общим правилам',
+            step('MagiTrickle', 'warn', 'домена нет ни в одной группе — сработает общее правило mihomo',
                  'Чтобы задать направление, добавьте домен в группу MagiTrickle: '
                  'geomask-lists-edit.py add --group "<группа>" --domain %s' % domain)
     else:
         group, rule, _ = route
         mt_iface = group['interface'] or ''
-        step('MagiTrickle', 'ok', 'группа «%s» (интерфейс %s), правило %s:%s'
-             % (group['name'], group['interface'] or '?', rule.get('type') or 'namespace',
-                rule.get('rule')),
+        step('MagiTrickle', 'ok', 'группа «%s» → %s; правило %s:%s'
+             % (group['name'], plain_iface(group['interface']),
+                rule.get('type') or 'namespace', rule.get('rule')),
              'Поменять направление: MagiTrickle → группа «%s» (вкладка «Списки и синк»).' % group['name'])
 
     # 3. mihomo rule
@@ -1356,14 +1392,14 @@ def trace_domain(domain, live=False):
         # a group bound to a physical interface hands the packet to the WAN directly:
         # mihomo never sees it, so its rules cannot be "missing"
         step('Правило mihomo', 'ok',
-             'не участвует — MagiTrickle уводит трафик в %s мимо mihomo' % mt_iface)
+             'не используется: трафик уходит %s, mihomo его не видит' % plain_iface(mt_iface))
     elif hit is None:
-        step('Правило mihomo', 'warn', 'ни одно правило не совпало — сработает MATCH',
+        step('Правило mihomo', 'warn', 'ни одно правило не подошло — сработает правило «любой другой домен»',
              'Домен не покрыт ни одним списком mihomo: добавьте его в список нужной группы.')
     else:
-        step('Правило mihomo', 'ok', '#%d %s → %s%s'
-             % (hit['index'], hit['rule'], hit['policy'],
-                (' (' + hit['note'] + ')') if hit.get('note') else ''))
+        step('Правило mihomo', 'ok', '№%d %s → группа %s%s'
+             % (hit['index'], plain_rule(hit['rule']), hit['policy'],
+                (' — %s' % hit['note']) if hit.get('note') else ''))
 
     # 3b. where that rule set comes from - the owner asked whether it duplicates MagiTrickle
     if hit and hit.get('ruleset'):
@@ -1377,35 +1413,37 @@ def trace_domain(domain, live=False):
         name = os.path.basename(ruleset_path)
         if 'AUTO-GENERATED' in head:
             step('Источник правила', 'ok',
-                 '%s (пересобран %s) — собран из групп MagiTrickle' % (name, stamp or '?'),
+                 '%s (собран %s из групп MagiTrickle)' % (name, stamp or '?'),
                  'Домен вписан один раз, в MagiTrickle; файл для mihomo делает '
                  'sync_mtrickle_mihomo.sh при каждом изменении групп.')
         else:
-            step('Источник правила', 'ok', '%s — отдельный список, не из MagiTrickle' % name,
+            step('Источник правила', 'ok', '%s — отдельный список, в MagiTrickle его нет' % name,
                  'Этот файл ведётся отдельно от групп MagiTrickle: смотрите его историю в git.')
 
     # 4. exit
     policy = (hit or {}).get('policy', 'GLOBAL')
     if mt_iface and mt_iface not in TUNNELED_IFACES:
-        step('Выход', 'ok', 'напрямую через %s — так решил MagiTrickle (страна Россия, RU)' % mt_iface,
+        step('Выход', 'ok', 'напрямую в интернет через %s — так решила группа «%s»; страна Россия (RU)'
+             % (mt_iface, (group['name'] if route else '')),
              'Направление задаётся группой «%s»: вкладка «Списки и синк».' % (group['name'] if route else ''))
     elif policy in ('DIRECT', 'REJECT'):
         if policy == 'REJECT':
             # a QUIC reject is the deliberate policy for video hosts: UDP/443 is dropped,
             # the same page loads fine over TCP, so this is not a broken route
             if 'UDP' in ((hit or {}).get('rule') or '').upper():
-                step('Выход', 'ok', 'QUIC (UDP/443) отбрасывается — видео идёт по TCP, это штатно')
+                step('Выход', 'ok', 'видео-запросы по QUIC (UDP/443) отбрасываются намеренно — '
+                     'то же видео идёт по TCP и работает')
             else:
-                step('Выход', 'fail', 'REJECT — трафик отбрасывается',
+                step('Выход', 'fail', 'REJECT — трафик к домену отбрасывается, сайт не откроется',
                      'Правило REJECT блокирует домен: найдите его в правилах mihomo и уберите или смените политику.')
         else:
-            step('Выход', 'ok', 'напрямую через провайдера — страна Россия (RU)')
+            step('Выход', 'ok', 'напрямую в интернет через провайдера; страна Россия (RU)')
     elif policy in ('VPN', 'VPN-noP2P', 'AI'):
         info = group_state(policy)
         if info and info['now']:
-            step('Выход', 'ok', '%s → узел «%s»%s' % (
+            step('Выход', 'ok', 'через туннель %s на узел «%s»%s' % (
                 policy, info['now'],
-                (', страна ' + info['country'] + ' (' + info['cc'] + ')') if info['country'] else ''))
+                ('; страна ' + info['country'] + ' (' + info['cc'] + ')') if info['country'] else ''))
         elif info:
             step('Выход', 'warn', '%s не выбрал узел (узлов: %d)' % (policy, info['nodes']),
                  'Группа %s пуста: панель → Подписки → «Обновить»; если узлов нет — проверьте провайдера.' % policy)
@@ -1416,14 +1454,18 @@ def trace_domain(domain, live=False):
         info = group_state('GLOBAL')
         now = (info or {}).get('now') or ''
         if now:
-            where = ('напрямую через провайдера, страна Россия (RU)' if now.upper() == 'DIRECT'
-                     else 'узел «%s»%s' % (now, (', страна ' + info['country']) if info.get('country') else ''))
-            step('Выход', 'warn', 'GLOBAL → %s (домен не покрыт правилами)' % where,
-                 'Домен попадает в MATCH,GLOBAL: путь зависит от того, что выбрано в GLOBAL. '
-                 'Чтобы он был предсказуем, добавьте домен в группу MagiTrickle: '
+            where = ('напрямую в интернет через провайдера; страна Россия (RU)'
+                     if now.upper() == 'DIRECT'
+                     else 'через узел «%s»%s' % (now, ('; страна ' + info['country'])
+                                                if info.get('country') else ''))
+            step('Выход', 'warn',
+                 'группа GLOBAL отправляет %s — домен не попал ни в одно правило' % where,
+                 'Домен не попал ни в одно правило, поэтому работает группа GLOBAL, а её '
+                 'выбор можно поменять в любой момент. Если нужен предсказуемый путь, '
+                 'добавьте домен в группу MagiTrickle: '
                  'geomask-lists-edit.py add --group "<группа>" --domain %s' % domain)
         else:
-            step('Выход', 'warn', 'GLOBAL не выбрал узел (домен не покрыт правилами)',
+            step('Выход', 'warn', 'группа GLOBAL не выбрала узел, а домен не попал ни в одно правило',
                  'Добавьте домен в группу MagiTrickle: geomask-lists-edit.py add '
                  '--group "<группа>" --domain %s' % domain)
     else:
@@ -1434,23 +1476,33 @@ def trace_domain(domain, live=False):
     zap = zapret_route(domain)
     _policy = (hit or {}).get('policy', 'GLOBAL')
     if not zap['running']:
-        step('Запрет (DPI)', 'warn', 'nfqws не запущен — обход DPI выключен',
+        step('Запрет (DPI)', 'warn',
+             'выключен: служба zapret не запущена — запросы идут как есть, '
+             'блокировки провайдера не обходятся',
              'Запустите запрет: /etc/init.d/zapret restart; если не поднимается — '
              'проверьте /opt/zapret/config и установлен ли zapret.')
     elif _policy in ('VPN', 'VPN-noP2P', 'AI'):
         step('Запрет (DPI)', 'ok',
-             'идёт через туннель (%s) — запрет не участвует, так и задумано' % _policy)
+             'не нужен: трафик идёт через туннель %s, провайдер видит только зашифрованный канал'
+             % _policy)
     elif zap['excluded']:
-        step('Запрет (DPI)', 'warn', 'исключён из запрета строкой «%s»' % zap['excluded'],
+        step('Запрет (DPI)', 'warn',
+             'выключен: домен (или его зона) «%s» в списке исключений zapret — '
+             'запрос идёт как есть, провайдер видит сайт' % zap['excluded'],
              'Уберите домен (или его родителя) из /opt/zapret/ipset/zapret-hosts-user-exclude.txt '
              'и перезапустите zapret: /etc/init.d/zapret restart')
     elif zap['listed']:
-        step('Запрет (DPI)', 'ok', 'в hostlist строкой «%s» — DPI обходится (nfqws %s, режим %s)'
-             % (zap['listed'], zap['pids'], zap['mode'] or '?'))
+        step('Запрет (DPI)', 'ok',
+             'включён: домен в списке zapret (строка «%s») — запрос к сайту маскируется от '
+             'провайдера (nfqws работает, режим %s)' % (zap['listed'], zap['mode'] or '?'))
     elif zap['auto']:
-        step('Запрет (DPI)', 'ok', 'в autohostlist — zapret добавил его сам после неудач, DPI обходится')
+        step('Запрет (DPI)', 'ok',
+             'включён: zapret добавил домен сам после нескольких неудачных попыток — '
+             'запрос к сайту маскируется от провайдера')
     else:
-        step('Запрет (DPI)', 'warn', 'домена нет в hostlist — DPI не обходится',
+        step('Запрет (DPI)', 'warn',
+             'выключен: домена нет в списке zapret — запрос идёт как есть, '
+             'провайдер видит сайт',
              'Добавьте домен в /opt/zapret/ipset/zapret-hosts-user.txt и перезапустите zapret: '
              '/etc/init.d/zapret restart (или включите режим autohostlist).')
 
@@ -1458,11 +1510,12 @@ def trace_domain(domain, live=False):
     if live:
         probe = http_probe(domain)
         if probe['ok']:
-            step('Проверка HTTP', 'ok', probe['detail'] + ' (с роутера)')
+            step('Проверка HTTP', 'ok', probe['detail'] + ' — сайт ответил (запрос с роутера)')
         elif probe['kind'] == 'http':
-            step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
-                 'Сайт ответил HTTP %s — это ответ самого сайта, путь верный; '
-                 'проверьте страницу в браузере.' % probe['code'])
+            step('Проверка HTTP', 'warn', probe['detail'] + ' — сайт ответил (запрос с роутера)',
+                 'Сайт ответил HTTP %s: соединение проходит, это ответ самого сайта. '
+                 'Откройте страницу в браузере — если и там та же ошибка, дело в сайте, '
+                 'а не в маршруте.' % probe['code'])
         else:
             node = ''
             if policy in ('VPN', 'VPN-noP2P', 'AI'):
@@ -1508,7 +1561,7 @@ def trace_domain(domain, live=False):
                     (' · ' + info['country']) if info['country'] else ''))
                 if info['policy'] != main_policy:
                     off.append((item, info))
-            detail = 'найдено %d: %s' % (len(rows), '; '.join(rows))
+            detail = 'страница тянет данные с %d домен(ов): %s' % (len(rows), '; '.join(rows))
             # a picture on another path is fine; a form or an iframe carries the session
             session_off = [pair for pair in off if pair[0]['session']]
             if session_off and not probe['ok']:
@@ -1537,7 +1590,8 @@ def trace_domain(domain, live=False):
         else:
             # a 404 page or a non-HTML host simply has nothing to list: that is not a fault,
             # and the route above already answered the question
-            step('Связанные хосты', 'ok', 'не найдено (страница не отдала ссылок)')
+            step('Связанные хосты', 'ok',
+                 'не найдено — страница не ссылается на другие домены (например, отдала 404)')
 
     lines.append('')
     exit_step = next((item for item in steps if item['stage'] == 'Выход'), None)

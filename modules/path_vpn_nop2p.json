@@ -1,7 +1,7 @@
 {
   "id": "path_vpn_nop2p",
   "name": "VPN-noP2P Path",
-  "version": "1.30.9",
+  "version": "1.30.10",
   "schema_version": 1,
   "type": "path",
   "description": "Restricted VPN path (DE, PL) without P2P",

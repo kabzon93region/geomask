@@ -87,29 +87,32 @@ def sha256_file(path: Path) -> str:
 
 
 def acquire_lock(lock_path: Path, timeout: float = 10.0) -> Optional[int]:
-    """Acquire flock on lock file. Returns fd on success, None on timeout."""
+    """Acquire flock on lock file. Returns fd on success, None on timeout.
+
+    The retry used to reopen the lock file with O_WRONLY: if the holder had already
+    unlinked it, that raised FileNotFoundError and killed the waiting writer, and a failed
+    flock leaked the descriptor. One loop, O_CREAT, close on every failure.
+    """
     if fcntl is None:
         # Windows: use file existence as simple lock
         if lock_path.exists():
             return None
         lock_path.write_text(f'{os.getpid()} {time.time()}')
         return 1  # dummy fd
-    fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.write(fd, f'{os.getpid()} {time.time()}'.encode())
-        return fd
-    except BlockingIOError:
-        os.close(fd)
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                fd = os.open(lock_path, os.O_WRONLY)
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                os.write(fd, f'{os.getpid()} {time.time()}'.encode())
-                return fd
-            except BlockingIOError:
-                time.sleep(0.1)
+    start = time.time()
+    while True:
+        fd = None
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.write(fd, f'{os.getpid()} {time.time()}'.encode())
+            return fd
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+            if time.time() - start >= timeout:
+                break
+            time.sleep(0.1)
     print(f'LOCK_TIMEOUT {lock_path}', file=sys.stderr)
     return None
 

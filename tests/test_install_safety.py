@@ -65,6 +65,9 @@ uci() { return 1; }
 
 def posix(path):
     text = str(Path(path).resolve()).replace('\\', '/')
+    # already a POSIX path (Linux CI): C:\x -> /c/x, but /tmp/x must stay /tmp/x
+    if text.startswith('/'):
+        return text
     return '/' + text[0].lower() + text[2:]
 
 

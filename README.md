@@ -2,15 +2,36 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/kabzon93region/geomask)](https://github.com/kabzon93region/geomask/releases/latest)
+[![CI](https://github.com/kabzon93region/geomask/actions/workflows/ci.yml/badge.svg)](https://github.com/kabzon93region/geomask/actions/workflows/ci.yml)
+
+[![OpenWrt](https://img.shields.io/badge/OpenWrt-24.10%20%7C%2025.12-00A2E8)](https://openwrt.org)
+[![Platform](https://img.shields.io/badge/platform-aarch64-informational)](#технические-характеристики)
+[![Modules](https://img.shields.io/badge/modules-15-blueviolet)](docs/MODULES.md)
+[![Shell](https://img.shields.io/badge/shell-POSIX%20sh-lightgrey)](geomask.sh.in)
+[![Python](https://img.shields.io/badge/python-3.7%2B-3776AB)](docs/DEVELOPMENT.md)
+[![JavaScript](https://img.shields.io/badge/javascript-ES5-f7df1e)](assets/geo-sync-page.js)
+[![LuCI](https://img.shields.io/badge/panel-LuCI-orange)](docs/README.md)
 
 Надстройка над OpenWrt, которая собирает и держит в порядке стек маршрутизации: **mihomo**
 (группы `VPN`, `VPN-noP2P`, `AI`), **MagiTrickle** (доменные группы → метки nftables →
 туннели), **hev-socks5-tunnel** (TUN → SOCKS), **zapret** (обход DPI) и панель LuCI
 «Гео-маскировка и AI» с центром диагностики.
 
-Целевой стенд — **wwGate AX3000 (MediaTek Filogic, aarch64)**, OpenWrt 25.12.x. Другие
-устройства не запрещены, но и не обещаны: установщик проверяет окружение и говорит, чего
-не хватает, вместо того чтобы делать вид, что всё хорошо.
+## Технические характеристики
+
+| | |
+|---|---|
+| Языки | установщик — **POSIX `sh`** (busybox ash), модули — **Python 3.7+**, панель — **JavaScript ES5** (LuCI view) |
+| Платформа | **OpenWrt 24.10+** (`opkg`) и **25.x** (`apk`); целевое железо — **MediaTek Filogic / aarch64** (wwGate AX3000) |
+| Модули | **15** частей, у каждой своя версия и отдельное обновление ([MODULES](docs/MODULES.md)) |
+| Панель | LuCI, **9 вкладок**; RPC через `ubus` (`geo-sync`), ACL и меню в комплекте |
+| Зависимости | `mihomo`, `magitrickle` — до установки; `python3`, `curl`, `https-dns-proxy` — ставит сам |
+| Тесты | **490** unit-тестов и **419** проверок песочницы, гоняются в CI на каждый push |
+| Обновления | релиз с GitHub, сверка `GM_VERSION` = тег и sha256 = digest ассета; бэкап перед установкой |
+| Лицензия | MIT |
+
+Другие устройства не запрещены, но и не обещаны: установщик проверяет окружение и говорит,
+чего не хватает, вместо того чтобы делать вид, что всё хорошо.
 
 ## Что нужно до установки
 

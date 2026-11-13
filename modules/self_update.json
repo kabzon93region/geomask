@@ -1,7 +1,7 @@
 {
   "id": "self_update",
   "name": "Self Update",
-  "version": "1.30.14",
+  "version": "1.30.15",
   "schema_version": 1,
   "type": "service",
   "description": "Automatic update from GitHub releases",

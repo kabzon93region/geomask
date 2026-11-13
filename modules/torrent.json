@@ -1,7 +1,7 @@
 {
   "id": "torrent",
   "name": "Torrent Admin",
-  "version": "1.23.1",
+  "version": "1.30.15",
   "schema_version": 1,
   "type": "feature",
   "description": "Torrent tracker ruleset and DIRECT listener",

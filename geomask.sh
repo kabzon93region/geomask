@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.15"
+GM_VERSION="1.30.16"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -5272,7 +5272,7 @@ TUN=http://127.0.0.1:7890
 SYNCLISTS=/root/sync_mtrickle_mihomo.sh
 AI_RULES=/etc/mihomo/ruleset/ai.yaml
 MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
-BACKEND_VERSION="1.30.15"
+BACKEND_VERSION="1.30.16"
 # self-update state (panel button): check cache, status file, detached runner
 UPD_DIR=/tmp/geomask-upd
 # safe_write resources
@@ -6904,7 +6904,7 @@ def digest_bytes(data):
 # the stamped bytes. The catalogue hashes the stamped bytes, so a download is stamped
 # before it is verified - otherwise the panel and the backend would always fail the
 # checksum. tools/build_module_index.py applies the same rule on the other side.
-VERSION_MARKERS = ('1.30.15', '1.30.15', '1.30.15')
+VERSION_MARKERS = ('1.30.16', '1.30.16', '1.30.16')
 
 
 def stamp_versions(data, version):
@@ -9404,10 +9404,10 @@ ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
   "schema": 1,
-  "core_version": "1.30.15",
+  "core_version": "1.30.16",
   "modules": {
     "admission_service": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -9439,7 +9439,7 @@ ASSET_EOF
       ]
     },
     "backup_share": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -9448,7 +9448,7 @@ ASSET_EOF
       "files": []
     },
     "core": {
-      "version": "1.30.7",
+      "version": "1.30.15",
       "type": "core",
       "name": "geomask (ядро)",
       "dependencies": [],
@@ -9591,7 +9591,7 @@ ASSET_EOF
       ]
     },
     "device_modes": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -9635,7 +9635,7 @@ ASSET_EOF
       ]
     },
     "doctor": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -9668,7 +9668,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "2c146a3826be307d816fe14b51b3fb3b6e927c475b6c2464d3ed43da51db35c2"
+          "sha256": "4258acc57f754127e4892c9f3abbb8b18af0a30a44a18bab272f632f782306e7"
         }
       ]
     },
@@ -9684,7 +9684,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "8ad639a95c39ee04bebbe1993fdff59db68ba23e4fd0feb4cba2fac28e1cce81"
+          "sha256": "3fda0d9a2be17728040c99c01a96343418f731d0527e1444bb77b62239463dcd"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -9708,12 +9708,12 @@ ASSET_EOF
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "0079be90da3c80151f5de1d5802b5bbd12fce4eb1d0985d81621d44bc1d65b67"
+          "sha256": "8f7d293614b0ed83c6ab8069c4c1b51440d783b0768bd193d914c3a2dfc8be88"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -9724,7 +9724,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -9734,7 +9734,7 @@ ASSET_EOF
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -9744,7 +9744,7 @@ ASSET_EOF
       "files": []
     },
     "self_update": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -9753,7 +9753,7 @@ ASSET_EOF
       "files": []
     },
     "torrent": {
-      "version": "1.23.1",
+      "version": "1.30.15",
       "type": "feature",
       "name": "Torrent Admin",
       "dependencies": [
@@ -10093,7 +10093,7 @@ var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtric
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
-var PANEL_VERSION = '1.30.15';
+var PANEL_VERSION = '1.30.16';
 
 /* Job observers, keyed by path id. They live outside the view because reload() builds a
    new instance while the old timer would otherwise keep polling. */
@@ -12272,8 +12272,11 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
   _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
   rm -f "$_tmp"
   _full=0
-  if have sysupgrade && sysupgrade -b "$_tmp" >/dev/null 2>&1 && [ -s "$_tmp" ]; then
-    _full=1
+  _su_err=""
+  if have sysupgrade; then
+    _su_err=$(sysupgrade -b "$_tmp" 2>&1) && [ -s "$_tmp" ] && _full=1
+  else
+    _su_err="sysupgrade not found"
   fi
   if [ "$_full" = 0 ]; then
     rm -f "$_tmp"
@@ -12282,6 +12285,7 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
       for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
       rm -rf "$_park"
       bad "полный бэкап (sysupgrade -b) не создан"
+      [ -n "$_su_err" ] && info "  sysupgrade: $(printf '%s' "$_su_err" | tail -2 | tr '\n' ' ')"
       return 1
     fi
     _tmp="$(P /tmp)/geomask-bk-$_ts-partial.tar.gz"
@@ -12468,7 +12472,8 @@ safe_mihomo_restart() {
     warn "restart skipped (no --restart); will apply at next mihomo start"
     return 0
   fi
-  _bk=$(ensure_backup full) || { bad "no full backup - restart ABORTED"; return 1; }
+  backup_gate || return 1
+  _bk="$GM_BACKUP_PATH"
   info "backup: $_bk"
   # the pre-image is the file as it was BEFORE this run; copying the current file here (the
   # old behaviour) made the "rollback" restore the candidate that had just failed
@@ -12624,7 +12629,8 @@ step4_apply() {
     info "  Либо откажитесь от AI-DNS: touch /etc/geomask-aidns.off"
     return 1
   fi
-  _bk=$(ensure_backup full) || { bad "no full backup - ABORTED"; return 1; }
+  backup_gate || return 1
+  _bk="$GM_BACKUP_PATH"
   info "backup: $_bk"
   # 1) dedicated user for the AI DoH worker (sockets get marked by uid)
   if ! aidns_user_exists; then
@@ -31577,7 +31583,7 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
-GUARD_VERSION="1.30.15"
+GUARD_VERSION="1.30.16"
 
 log() { logger -t geomask-guard "$*"; }
 

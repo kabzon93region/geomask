@@ -36,7 +36,7 @@
 
 set -u
 
-GM_VERSION="1.30.15"
+GM_VERSION="1.30.16"
 GM_PREFIX="${GM_PREFIX:-}"          # path prefix for tests (empty on real router)
 GM_YES=0
 GM_AUTO=0
@@ -1096,8 +1096,11 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
   _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
   rm -f "$_tmp"
   _full=0
-  if have sysupgrade && sysupgrade -b "$_tmp" >/dev/null 2>&1 && [ -s "$_tmp" ]; then
-    _full=1
+  _su_err=""
+  if have sysupgrade; then
+    _su_err=$(sysupgrade -b "$_tmp" 2>&1) && [ -s "$_tmp" ] && _full=1
+  else
+    _su_err="sysupgrade not found"
   fi
   if [ "$_full" = 0 ]; then
     rm -f "$_tmp"
@@ -1106,6 +1109,7 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
       for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done
       rm -rf "$_park"
       bad "полный бэкап (sysupgrade -b) не создан"
+      [ -n "$_su_err" ] && info "  sysupgrade: $(printf '%s' "$_su_err" | tail -2 | tr '\n' ' ')"
       return 1
     fi
     _tmp="$(P /tmp)/geomask-bk-$_ts-partial.tar.gz"
@@ -1292,7 +1296,8 @@ safe_mihomo_restart() {
     warn "restart skipped (no --restart); will apply at next mihomo start"
     return 0
   fi
-  _bk=$(ensure_backup full) || { bad "no full backup - restart ABORTED"; return 1; }
+  backup_gate || return 1
+  _bk="$GM_BACKUP_PATH"
   info "backup: $_bk"
   # the pre-image is the file as it was BEFORE this run; copying the current file here (the
   # old behaviour) made the "rollback" restore the candidate that had just failed
@@ -1448,7 +1453,8 @@ step4_apply() {
     info "  Либо откажитесь от AI-DNS: touch /etc/geomask-aidns.off"
     return 1
   fi
-  _bk=$(ensure_backup full) || { bad "no full backup - ABORTED"; return 1; }
+  backup_gate || return 1
+  _bk="$GM_BACKUP_PATH"
   info "backup: $_bk"
   # 1) dedicated user for the AI DoH worker (sockets get marked by uid)
   if ! aidns_user_exists; then

@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "core_version": "1.30.15",
+  "core_version": "1.30.16",
   "modules": {
     "admission_service": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -35,7 +35,7 @@
       ]
     },
     "backup_share": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -44,7 +44,7 @@
       "files": []
     },
     "core": {
-      "version": "1.30.7",
+      "version": "1.30.15",
       "type": "core",
       "name": "geomask (ядро)",
       "dependencies": [],
@@ -187,7 +187,7 @@
       ]
     },
     "device_modes": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -231,7 +231,7 @@
       ]
     },
     "doctor": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -264,7 +264,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "2c146a3826be307d816fe14b51b3fb3b6e927c475b6c2464d3ed43da51db35c2"
+          "sha256": "4258acc57f754127e4892c9f3abbb8b18af0a30a44a18bab272f632f782306e7"
         }
       ]
     },
@@ -280,7 +280,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "8ad639a95c39ee04bebbe1993fdff59db68ba23e4fd0feb4cba2fac28e1cce81"
+          "sha256": "3fda0d9a2be17728040c99c01a96343418f731d0527e1444bb77b62239463dcd"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -304,12 +304,12 @@
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "0079be90da3c80151f5de1d5802b5bbd12fce4eb1d0985d81621d44bc1d65b67"
+          "sha256": "8f7d293614b0ed83c6ab8069c4c1b51440d783b0768bd193d914c3a2dfc8be88"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -320,7 +320,7 @@
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -330,7 +330,7 @@
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -340,7 +340,7 @@
       "files": []
     },
     "self_update": {
-      "version": "1.30.14",
+      "version": "1.30.15",
       "type": "service",
       "name": "Self Update",
       "dependencies": [
@@ -349,7 +349,7 @@
       "files": []
     },
     "torrent": {
-      "version": "1.23.1",
+      "version": "1.30.15",
       "type": "feature",
       "name": "Torrent Admin",
       "dependencies": [

@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "core_version": "1.30.13",
+  "core_version": "1.30.14",
   "modules": {
     "admission_service": {
-      "version": "1.30.12",
+      "version": "1.30.13",
       "type": "service",
       "name": "AI Admission Service",
       "dependencies": [
@@ -35,7 +35,7 @@
       ]
     },
     "backup_share": {
-      "version": "1.30.12",
+      "version": "1.30.13",
       "type": "service",
       "name": "Backup SMB Share",
       "dependencies": [
@@ -184,7 +184,7 @@
       ]
     },
     "device_modes": {
-      "version": "1.30.12",
+      "version": "1.30.13",
       "type": "feature",
       "name": "Device Modes",
       "dependencies": [
@@ -227,7 +227,7 @@
       ]
     },
     "doctor": {
-      "version": "1.30.12",
+      "version": "1.30.13",
       "type": "diagnostic",
       "name": "Diagnostics Center",
       "dependencies": [
@@ -238,7 +238,7 @@
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": 755,
-          "sha256": "81f51f247e074a94a4061ba2975f214f9fe9ad385740c4a881f7412a32e6bd9a"
+          "sha256": "9738ac92fff7bb34952523b05f7cb7318023f5bb502a0b2de6d4fd641fe55d6f"
         }
       ]
     },
@@ -260,7 +260,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": 755,
-          "sha256": "d3a3da99be8ae42f634d6a281568f745cbbbb1ea85a7a905c48fb085e542318c"
+          "sha256": "4f6b995eb57ba69482afe1a7d982198b978e0d5cc5506094a92f96fca74abf49"
         }
       ]
     },
@@ -276,7 +276,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": 755,
-          "sha256": "cbde19a354d6fd4193f50f6a1222377458bcb9100573524e25bc32d2bf0a3dcf"
+          "sha256": "a190f6a6f040a073033ff177221315676384d353843bc03db6f53eb83a19c397"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -300,12 +300,12 @@
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": 644,
-          "sha256": "3cc46e0684cf3ce2e136fe07122ef84eb51397b371b571c0809471a01d0c926e"
+          "sha256": "5faf025462432ddefbbc9df8e0b15d323a031c46e2e762957c48c5d3ddcca792"
         }
       ]
     },
     "path_ai": {
-      "version": "1.30.12",
+      "version": "1.30.13",
       "type": "path",
       "name": "AI Path",
       "dependencies": [
@@ -316,7 +316,7 @@
       "files": []
     },
     "path_vpn": {
-      "version": "1.30.12",
+      "version": "1.30.13",
       "type": "path",
       "name": "VPN Path",
       "dependencies": [
@@ -326,7 +326,7 @@
       "files": []
     },
     "path_vpn_nop2p": {
-      "version": "1.30.12",
+      "version": "1.30.13",
       "type": "path",
       "name": "VPN-noP2P Path",
       "dependencies": [
@@ -336,7 +336,7 @@
       "files": []
     },
     "self_update": {
-      "version": "1.30.12",
+      "version": "1.30.13",
       "type": "service",
       "name": "Self Update",
       "dependencies": [

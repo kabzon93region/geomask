@@ -1352,6 +1352,8 @@ def trace_domain(domain, live=False):
     if not re.match(r'^[a-z0-9.*_-]+\.[a-z0-9._-]+$', domain):
         return {'ok': False, 'error': 'похоже, это не домен: %r' % domain}
     steps = []
+    route_path = []          # the path itself: zapret -> MagiTrickle -> mihomo -> internet
+    route_country = ''
     mt_iface = ''
     lines = ['Домен: %s' % domain, '']
 
@@ -1386,12 +1388,16 @@ def trace_domain(domain, live=False):
                  'в нужную группу: geomask-lists-edit.py move --group "<группа>" --domain %s'
                  % (off_rule.get('rule'), domain))
         else:
+            route_path.append('группы MagiTrickle нет')
             step('MagiTrickle', 'warn', 'домена нет ни в одной группе — сработает общее правило mihomo',
                  'Чтобы задать направление, добавьте домен в группу MagiTrickle: '
                  'geomask-lists-edit.py add --group "<группа>" --domain %s' % domain)
     else:
         group, rule, _ = route
         mt_iface = group['interface'] or ''
+        route_path.append('MagiTrickle: группа «%s»' % group['name'])
+        if mt_iface and mt_iface not in TUNNELED_IFACES:
+            route_path.append(mt_iface)
         step('MagiTrickle', 'ok', 'группа «%s» → %s; правило %s:%s'
              % (group['name'], plain_iface(group['interface']),
                 rule.get('type') or 'namespace', rule.get('rule')),
@@ -1408,6 +1414,7 @@ def trace_domain(domain, live=False):
         step('Правило mihomo', 'warn', 'ни одно правило не подошло — сработает правило «любой другой домен»',
              'Домен не покрыт ни одним списком mihomo: добавьте его в список нужной группы.')
     else:
+        route_path.append('mihomo: %s' % plain_rule(hit['rule']))
         step('Правило mihomo', 'ok', '№%d %s → группа %s%s'
              % (hit['index'], plain_rule(hit['rule']), hit['policy'],
                 (' — %s' % hit['note']) if hit.get('note') else ''))
@@ -1434,6 +1441,8 @@ def trace_domain(domain, live=False):
     # 4. exit
     policy = (hit or {}).get('policy', 'GLOBAL')
     if mt_iface and mt_iface not in TUNNELED_IFACES:
+        route_path.append('интернет, мимо mihomo')
+        route_country = 'Россия (RU)'
         step('Выход', 'ok', 'напрямую в интернет через %s — так решила группа «%s»; страна Россия (RU)'
              % (mt_iface, (group['name'] if route else '')),
              'Направление задаётся группой «%s»: вкладка «Списки и синк».' % (group['name'] if route else ''))
@@ -1442,16 +1451,24 @@ def trace_domain(domain, live=False):
             # a QUIC reject is the deliberate policy for video hosts: UDP/443 is dropped,
             # the same page loads fine over TCP, so this is not a broken route
             if 'UDP' in ((hit or {}).get('rule') or '').upper():
+                route_path.append('QUIC (UDP/443) отбрасывается, видео идёт по TCP')
                 step('Выход', 'ok', 'видео-запросы по QUIC (UDP/443) отбрасываются намеренно — '
                      'то же видео идёт по TCP и работает')
             else:
+                route_path.append('REJECT — трафик отбрасывается')
                 step('Выход', 'fail', 'REJECT — трафик к домену отбрасывается, сайт не откроется',
                      'Правило REJECT блокирует домен: найдите его в правилах mihomo и уберите или смените политику.')
         else:
+            route_path.append('интернет через провайдера')
+            route_country = 'Россия (RU)'
             step('Выход', 'ok', 'напрямую в интернет через провайдера; страна Россия (RU)')
     elif policy in ('VPN', 'VPN-noP2P', 'AI'):
         info = group_state(policy)
         if info and info['now']:
+            route_path.append('туннель %s' % policy)
+            route_path.append('узел «%s»' % info['now'])
+            route_country = (info['country'] + (' (%s)' % info['cc'] if info.get('cc') else '')
+                             if info['country'] else '')
             step('Выход', 'ok', 'через туннель %s на узел «%s»%s' % (
                 policy, info['now'],
                 ('; страна ' + info['country'] + ' (' + info['cc'] + ')') if info['country'] else ''))
@@ -1469,6 +1486,10 @@ def trace_domain(domain, live=False):
                      if now.upper() == 'DIRECT'
                      else 'через узел «%s»%s' % (now, ('; страна ' + info['country'])
                                                 if info.get('country') else ''))
+            route_path.append('группа GLOBAL')
+            route_path.append(where.replace('; страна Россия (RU)', '').strip())
+            route_country = 'Россия (RU)' if now.upper() == 'DIRECT' else (
+                info.get('country') or '')
             step('Выход', 'warn',
                  'группа GLOBAL отправляет %s — домен не попал ни в одно правило' % where,
                  'Домен не попал ни в одно правило, поэтому работает группа GLOBAL, а её '
@@ -1503,10 +1524,12 @@ def trace_domain(domain, live=False):
              'Уберите домен (или его родителя) из /opt/zapret/ipset/zapret-hosts-user-exclude.txt '
              'и перезапустите zapret: /etc/init.d/zapret restart')
     elif zap['listed']:
+        route_path.insert(0, 'zapret (запрос маскируется)')
         step('Запрет (DPI)', 'ok',
              'включён: домен в списке zapret (строка «%s») — запрос к сайту маскируется от '
              'провайдера (nfqws работает, режим %s)' % (zap['listed'], zap['mode'] or '?'))
     elif zap['auto']:
+        route_path.insert(0, 'zapret (запрос маскируется)')
         step('Запрет (DPI)', 'ok',
              'включён: zapret добавил домен сам после нескольких неудачных попыток — '
              'запрос к сайту маскируется от провайдера')
@@ -1608,8 +1631,13 @@ def trace_domain(domain, live=False):
                      'не найдено — страница не ссылается на другие домены')
 
     lines.append('')
-    exit_step = next((item for item in steps if item['stage'] == 'Выход'), None)
-    summary = exit_step['detail'] if exit_step else (steps[2]['detail'] if len(steps) > 2 else '')
+    if route_path:
+        summary = ' → '.join(route_path)
+        if route_country:
+            summary += '; страна %s' % route_country
+    else:
+        exit_step = next((item for item in steps if item['stage'] == 'Выход'), None)
+        summary = exit_step['detail'] if exit_step else ''
     lines.append('Итог: %s' % summary)
     fix = ''
     for wanted in ('fail', 'warn'):

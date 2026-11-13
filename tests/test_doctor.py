@@ -321,6 +321,39 @@ class DoctorRegistryTests(unittest.TestCase):
         self.assertIn('Правило mihomo', text)
         self.assertIn('AI', text)
 
+    def test_domain_trace_summarises_the_whole_path(self):
+        # the owner asked for the path, not just the exit: zapret -> MagiTrickle -> internet
+        self._route_fixture()
+        original = doctor.run
+        self.addCleanup(lambda: setattr(doctor, 'run', original))
+        doctor.run = lambda cmd, timeout=8, stdin=None: (1, '')
+        result = doctor.trace_domain('thepiratebay.org')
+        summary = [line for line in result['lines'] if line.startswith('Итог:')][0]
+        self.assertIn('MagiTrickle: группа', summary)
+        self.assertIn(' → ', summary)
+
+    def test_domain_trace_puts_zapret_first_when_it_processes_the_domain(self):
+        self._route_fixture()
+        original = {name: getattr(doctor, name)
+                    for name in ('run', 'ZAPRET_CONF', 'ZAPRET_HOSTLIST',
+                                 'ZAPRET_EXCLUDE', 'ZAPRET_AUTO')}
+        self.addCleanup(lambda: [setattr(doctor, name, value)
+                                 for name, value in original.items()])
+        base = Path(tempfile.mkdtemp())
+        (base / 'conf').write_text('MODE_FILTER=autohostlist\n', encoding='utf-8')
+        (base / 'hosts').write_text('thepiratebay.org\n', encoding='utf-8')
+        (base / 'excl').write_text('', encoding='utf-8')
+        (base / 'auto').write_text('', encoding='utf-8')
+        doctor.ZAPRET_CONF = str(base / 'conf')
+        doctor.ZAPRET_HOSTLIST = str(base / 'hosts')
+        doctor.ZAPRET_EXCLUDE = str(base / 'excl')
+        doctor.ZAPRET_AUTO = str(base / 'auto')
+        doctor.run = lambda cmd, timeout=8, stdin=None: (
+            (0, '571 572') if cmd[0] == 'pidof' else (1, ''))
+        result = doctor.trace_domain('thepiratebay.org')
+        summary = [line for line in result['lines'] if line.startswith('Итог:')][0]
+        self.assertTrue(summary.startswith('Итог: zapret'), summary)
+
     def test_domain_trace_treats_a_quic_reject_as_normal(self):
         self._route_fixture()
         result = doctor.trace_domain('rr1---sn-abc.googlevideo.com')

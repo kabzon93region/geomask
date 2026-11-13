@@ -1,39 +1,60 @@
 # Документация geomask
 
-Техническая документация установщика и стека обхода блокировок.
+Справки по установщику, стеку маршрутизации и панели. Всё, что описывает **текущее
+поведение**, сверено с релизом **v1.30.7**; исторические документы помечены отдельно.
 
-**Статус на 08.11.2026, MSK:** база v1.25.3 с незакоммиченными изменениями, а не принятый v2. Единственная текущая очередь — [утверждённый основной план](PLAN-2026-11-06-geomask-v2-rework.md). [Этап 0](STAGE-0-2026-11-07.md) — подтверждённая общая контрольная точка; [carryover 1A](SPEC-STAGE-1A-CARRYOVER-2026-11-07.md) — отдельная исторически проверенная подзадача, не весь этап 1. [Сводка проекта](../../docs/summary.md) отделяет код, целевую политику и непроверенное live-состояние.
-
-Незавершённые документы: [SPEC 1](SPEC-STAGE-1-SAFE-WRITES-2026-11-07.md), [SPEC 2](SPEC-STAGE-2-DIAGNOSTICS-2026-11-07.md), [SPEC 3](SPEC-STAGE-3-POLICIES-2026-11-07.md) — DRAFT, не допущены к внедрению, содержат перечни исправляемых противоречий. Наличие файлов helper/model/manifest не закрывает этапы.
-
-Технические справки ниже писались в разные версии. Старые примеры `sub/de5`, фиксированных pref, двух туннелей и rule-based torrent-listener — исторические, не подтверждённая текущая инвентаризация и не разрешение живого применения.
+## Актуальное
 
 | Документ | Содержание |
 |---|---|
-| [NODE-AUDIT.md](NODE-AUDIT.md) | Независимые желаемые фильтры стран и изолированные проверки VPN/VPN-noP2P/AI; применение отложено |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Общая архитектура, компоненты, карта установленных файлов |
-| [ROUTING.md](ROUTING.md) | Модель маршрутизации: таблицы, `ip rule`, приоритеты, magitrickle |
-| [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md) | Подписки `sub`/`de5`, переключение, `x-hwid` |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Компоненты и карта установленных файлов |
+| [ROUTING.md](ROUTING.md) | Маршрутизация: таблицы, `ip rule`, приоритеты, MagiTrickle |
+| [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md) | Подписки VPN/AI, обновление, переключение |
 | [AI-DEVICES.md](AI-DEVICES.md) | AI-туннель, hev-инстанс, слушатель `7891`, STUN/WebRTC |
 | [AIDNS.md](AIDNS.md) | AI-DNS без утечки: DNAT → второй dnsmasq/DoH → метка → `dev AI` |
-| [SYNC.md](SYNC.md) | Синхронизация magitrickle → mihomo (`rule-providers`) |
-| [LISTS.md](LISTS.md) | Шаблоны списков MagiTrickle: снимок групп, сид/восстановление (v1.13.0) |
-| [YOUTUBE.md](YOUTUBE.md) | YouTube: страница/картинки через запрет, сбойные рёбра googlevideo — в VPN (v1.14.0) |
-| [TORRENTS.md](TORRENTS.md) | История торрент-ingress; старое описание v1.15.1 не соответствует позднему fixed-VPN listener и не доказывает защиту AI/P2P |
+| [SYNC.md](SYNC.md) | Синхронизация MagiTrickle → mihomo (`rule-providers`) |
+| [LISTS.md](LISTS.md) | Списки MagiTrickle: шаблон, сид, точечная правка домена (`geomask-lists-edit.py`) |
+| [YOUTUBE.md](YOUTUBE.md) | YouTube: страница и картинки напрямую, сбойные рёбра — в VPN |
+| [TORRENTS.md](TORRENTS.md) | Торрент-ingress и прямой путь |
+| [NODE-AUDIT.md](NODE-AUDIT.md) | Аудит узлов подписки и проверки стран |
+| [MODULES.md](MODULES.md) | Модули: выбор при установке, версии, гейты cron/сервисов, отдельное обновление |
+| [DIAGNOSTICS.md](DIAGNOSTICS.md) | Диагностика: проверки, маршрут домена, связанные хосты, логи 7 дней |
+| [RELEASING.md](RELEASING.md) | Релизы: `tools/release.py`, контракт тега и ассета, инвариант байтов |
 | [OPERATIONS.md](OPERATIONS.md) | Режимы запуска, шаги, бэкапы, безопасность |
-| [MODULES.md](MODULES.md) | Модули: выбор при установке, гейты cron/сервисов, отдельное обновление (v1.29.0) |
-| [DIAGNOSTICS.md](DIAGNOSTICS.md) | Диагностика: вкладка, проверки по модулям/роутеру/сети/путям, маршрут домена, логи 7 дней (v1.29.1) |
-| [RELEASING.md](RELEASING.md) | Релизы: tools/release.py, контракт тега и ассета, инвариант байтов каталога (v1.30.4) |
-| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Диагностика типовых проблем |
+| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Типовые проблемы и что смотреть |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Сборка, песочница, тесты |
 | [releases/](releases/) | Release notes по версиям |
 
+## Историческое (не описывает текущее поведение)
+
+Планы, SPEC, аудиты и отчёты разных этапов. Читать как историю решений: часть требований
+из них реализована, часть отменена, часть так и не принята.
+
+| Документ | Что это |
+|---|---|
+| [PLAN-2026-11-06-geomask-v2-rework.md](PLAN-2026-11-06-geomask-v2-rework.md) | План переработки v2 (не принят целиком) |
+| [STAGE-0-2026-11-07.md](STAGE-0-2026-11-07.md) | Контрольная точка этапа 0 |
+| [SPEC-STAGE-1-SAFE-WRITES-2026-11-07.md](SPEC-STAGE-1-SAFE-WRITES-2026-11-07.md) | SPEC безопасных записей (частично реализовано) |
+| [SPEC-STAGE-1A-CARRYOVER-2026-11-07.md](SPEC-STAGE-1A-CARRYOVER-2026-11-07.md) | Узкая подзадача переноса |
+| [SPEC-STAGE-2-DIAGNOSTICS-2026-11-07.md](SPEC-STAGE-2-DIAGNOSTICS-2026-11-07.md) | SPEC диагностики (реализовано иначе, см. DIAGNOSTICS.md) |
+| [SPEC-STAGE-3-POLICIES-2026-11-07.md](SPEC-STAGE-3-POLICIES-2026-11-07.md) | SPEC политик (не внедрён) |
+| [SPEC-MIGRATION-NODE-AUDIT-v2-2026-11-08.md](SPEC-MIGRATION-NODE-AUDIT-v2-2026-11-08.md) | Миграция аудита узлов |
+| [SPEC-PATH-EGRESS-AUDIT-2026-11-08.md](SPEC-PATH-EGRESS-AUDIT-2026-11-08.md) | Аудит выхода путей |
+| [PLAN-NODE-AUDIT-COMPLETE-2026-11-08.md](PLAN-NODE-AUDIT-COMPLETE-2026-11-08.md) | План завершения node-audit |
+| [STATUS-NODE-AUDIT-2026-11-08.md](STATUS-NODE-AUDIT-2026-11-08.md) | Статус node-audit |
+| [SUMMARY-NODE-AUDIT-2026-11-09.md](SUMMARY-NODE-AUDIT-2026-11-09.md) | Итоги node-audit |
+| [COMPLIANCE-NODE-AUDIT-2026-11-09.md](COMPLIANCE-NODE-AUDIT-2026-11-09.md) | Соответствие требованиям аудита |
+| [GATES-EVIDENCE-2026-11-09.md](GATES-EVIDENCE-2026-11-09.md) | Доказательства прохождения гейтов |
+| [AUDIT-2026-11-01.md](AUDIT-2026-11-01.md) | Независимый аудит v1.22.6 |
+| [RESEARCH-GOOGLE-GEO-2026-11-08.md](RESEARCH-GOOGLE-GEO-2026-11-08.md) | Исследование географии Google |
+| [SUPPORT-un1pro-openai-helsinki-2026-11-02.md](SUPPORT-un1pro-openai-helsinki-2026-11-02.md) | Разбор случая с узлом |
+
 ## Терминология
 
-- **Подписка** — источник узлов и его ограничения (включая допустимость P2P); не географический путь.
-- **Путь** — независимая политика/группа/транспорт (`VPN`, `VPN-noP2P`, `AI`); провайдер читается из группы, не из hardcode `sub/de5`.
-- **Модуль** — возможность единого релиза с owned-артефактами и зависимостями; настоящая отключаемость ещё не принята.
-- **AI-устройство / bypass-устройство** — существующие режимы выбора пути. В целевой v2 они не обходят допуск разрешённого WAN-трафика; сегодняшнее enforcement не подтверждено.
-- **mihomo** — прокси-ядро (Clash.Meta), слушатели и правила.
-- **hev-socks5-tunnel** — создаёт TUN-интерфейсы и связывает их с SOCKS listeners; состав инстансов проверяется по факту.
-- **magitrickle** — DNS-based routing (группы доменов → интерфейс).
+- **Подписка** — источник узлов и его ограничения (включая допустимость P2P).
+- **Путь** — независимая политика/группа/транспорт (`VPN`, `VPN-noP2P`, `AI`).
+- **Модуль** — часть релиза со своими файлами, версией и отдельным обновлением.
+- **AI-устройство** — устройство, чей трафик идёт в AI-туннель (слушатель `7891`).
+- **mihomo** — прокси-ядро (Clash.Meta): группы, правила, слушатели.
+- **hev-socks5-tunnel** — создаёт TUN-интерфейсы и связывает их с SOCKS-слушателями.
+- **MagiTrickle** — DNS-based routing: доменные группы → интерфейс, метки в nftables.

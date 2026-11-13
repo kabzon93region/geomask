@@ -55,17 +55,28 @@ geomask ставит на OpenWrt-роутер домашний стек обх�
 | `/etc/init.d/{ai-doh,dnsmasq-ai}` | Второй DoH-воркер и второй dnsmasq для AI-DNS |
 | `/etc/geo-devices.list` | Список устройств: `IP mode name` (`bypass`/`ai`/`realtz`) |
 | `/etc/geomask-aidns.uid` / `-aidns.off` | UID пользователя `dnsai` / флаг отключения AI-DNS |
+| `/usr/lib/geomask/geomask-doctor.py` | Диагностика: проверки, маршрут домена, логи (модуль `doctor`) |
+| `/usr/lib/geomask/geomask-lists-edit.py` | Точечная правка списков MagiTrickle (`groups/add/move/remove`) |
+| `/usr/lib/geomask/geomask-module-update.py` | Обновление модулей по каталогу (sha256, откат) |
+| `/etc/geomask/modules-index.json` | Каталог модулей: файлы, режимы, хеши, версии |
+| `/etc/geomask/modules.json` | Выбранный набор модулей |
+| `/etc/geomask/version` | Релиз этого роутера (панель сравнивает с GitHub) |
+| `/etc/geomask/modules-state.json` | Базовая линия для «изменён локально» и версии частей |
 | `/root/geomask-backups/` | Полные бэкапы (`sysupgrade -b`): ротация — самая свежая одна; SMB-шар `geomask-backups` (guest, read-only), ссылка в панели (v1.9.0); сборка в /tmp + перенос исключает вложение архивов |
 
 ## Инсталлятор: шаги
 
-1. **env** — проверка окружения (OpenWrt, apk/opkg, python3, curl, место, интернет).
-2. **geo** — гео-оверлей (файлы панели + rpcd + ACL + меню).
+1. **env** — окружение: OpenWrt, apk/opkg, `mihomo` и `magitrickle` (обязательны), место,
+   интернет. Здесь же **ставятся** `python3` и `curl`, если их нет (v1.30.6). На голом
+   роутере шаг падает до записи файлов и говорит, что поставить сначала (v1.30.5).
+2. **geo** — файлы: панель, rpcd, ACL, меню, скрипты ядра, каталог модулей, диагностика,
+   правка списков; запись выбранного набора модулей. Файлы снятых модулей не пишутся.
 3. **subs** — конфиг mihomo (провайдеры, группы, правила, listeners, sniffer) + `mihomo -t`.
-4. **aidns** — цепочка AI-DNS без утечки (nft + второй dnsmasq + DoH + ip rule).
-5. **sync** — скрипт синка + cron `*/5` + `rule-provider` + hotplug-роутинг.
+4. **aidns** — цепочка AI-DNS без утечки (nft + второй dnsmasq + DoH + ip rule);
+   `https-dns-proxy` ставится автоматически, если его нет (v1.30.7).
+5. **sync** — скрипт синка + cron `*/5` + `rule-provider` + hotplug-роутинг, node-audit, guard.
 6. **services** — старт только упавших сервисов.
-7. **verify** — E2E-проверки.
+7. **verify** — проверки; шаг только читает.
 
 ## Сборка
 

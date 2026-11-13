@@ -9,6 +9,7 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -34,8 +35,25 @@ jobs:
       - name: Compile every shipped python module
         run: python -m py_compile assets/geomask-node-audit.py assets/geomask-audit-state.py assets/geomask-config-tx.py assets/geomask-config-owner.py assets/geomask-apply.py assets/geomask-lane-torrent.py assets/geomask-sync-youtube.py tools/gen-geo-rpc.py tools/node-audit-save.py
 
+      # One module per process with its own timeout: a hang used to freeze the whole job
+      # for as long as GitHub allowed, and the log never said which test it was.
       - name: Unit tests
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
+        run: |
+          set -u
+          failed=0
+          for file in tests/test_*.py; do
+            module=$(basename "$file" .py)
+            start=$(date +%s)
+            if timeout --kill-after=10 180 python -m unittest discover -s tests -p "$module.py" \
+                 > "/tmp/$module.log" 2>&1; then
+              echo "ok   $module ($(( $(date +%s) - start ))s)"
+            else
+              echo "FAIL $module ($(( $(date +%s) - start ))s)"
+              tail -40 "/tmp/$module.log"
+              failed=1
+            fi
+          done
+          exit $failed
 
       - name: Sandbox tests
-        run: bash tests/run_tests.sh
+        run: timeout --kill-after=10 600 bash tests/run_tests.sh

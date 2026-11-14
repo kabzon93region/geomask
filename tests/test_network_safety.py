@@ -235,7 +235,7 @@ ip() { case "$*" in "link show "*) return 0 ;; esac; return 0; }
         state.mkdir(exist_ok=True)
         if owned is not None:
             (state / 'owned-100').write_text('\n'.join(owned) + ('\n' if owned else ''),
-                                             encoding='utf-8')
+                                             encoding='utf-8', newline='\n')
 
         def q(lines):
             return ' '.join("'" + line.replace("'", "'\\''") + "'" for line in lines) or "''"
@@ -297,7 +297,9 @@ ip() { case "$*" in "link show "*) return 0 ;; esac; return 0; }
     def test_a_stale_route_we_installed_is_removed(self):
         main = ['10.0.0.0/24 dev br-lan scope link']
         table = ['10.0.0.0/24 dev br-lan scope link', '172.16.0.0/24 dev br-lan scope link']
-        result = self.route_sync(main, table, owned=['172.16.0.0/24'])
+        # `owned` keeps the FULL route line: a record that is not installed verbatim any more is
+        # no longer ours, and deleting it by prefix could take a foreign entry with it.
+        result = self.route_sync(main, table, owned=table)
         self.assertIn('DEL route del table 100 172.16.0.0/24', result.stdout)
         self.assertNotIn('DEL route del table 100 10.0.0.0/24', result.stdout)
 

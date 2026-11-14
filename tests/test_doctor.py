@@ -699,6 +699,25 @@ class DoctorExitHonestyTests(unittest.TestCase):
         doctor.run = fake
         self.assertEqual(doctor.wan_iface(), 'pppoe-wan')
 
+    def test_a_default_route_through_the_tunnel_is_not_the_provider(self):
+        """A policy-routed box can have the VPN as default: that is not the WAN device."""
+        def fake(cmd, timeout=8, stdin=None):
+            if cmd[:3] == ['ip', 'route', 'show']:
+                return 0, 'default dev Mihomo scope link'
+            if cmd[:3] == ['ip', 'link', 'show']:
+                return 0, ''
+            if cmd[:2] == ['uci', '-q']:
+                return 0, 'eth1'
+            return 1, ''
+
+        original_run, original_read = doctor.run, doctor.read_text
+        self.addCleanup(lambda: setattr(doctor, 'run', original_run))
+        self.addCleanup(lambda: setattr(doctor, 'read_text', original_read))
+        doctor.run = fake
+        doctor.read_text = lambda path: ('tun:\n  enable: true\n  device: Mihomo\n'
+                                         if path == doctor.MIHOMO_CONF else '')
+        self.assertEqual(doctor.wan_iface(), 'eth1')
+
 
 class DoctorZapretTests(unittest.TestCase):
     """Whether zapret (nfqws) processes a domain - the trace used to stop before this."""

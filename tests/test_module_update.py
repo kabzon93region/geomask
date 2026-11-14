@@ -10,8 +10,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -83,9 +85,11 @@ class ModuleUpdaterSafetyTests(unittest.TestCase):
         self.assertEqual(skipped, [str(conf)])
         self.assertTrue(changed)
         self.assertEqual([item['path'] for item in staged], [str(other)])
+        def forced_fetch(url):
+            return body if url.endswith('.conf') else script
+
         forced = updater.download_module(index, state, 'core', {'repo': 'r', 'ref': 'm'},
-                                         force=True,
-                                         fetcher=lambda url: body if url.endswith('.conf') else script)[1]
+                                         force=True, fetcher=forced_fetch)[1]
         self.assertEqual(sorted(item['path'] for item in forced), sorted([str(conf), str(other)]))
         self.assertEqual(forced[0]['mode'] if forced[0]['path'] == str(conf) else forced[1]['mode'],
                          0o644)
@@ -139,6 +143,14 @@ class ModuleUpdateTests(unittest.TestCase):
         self.config = {'repo': 'owner/repo', 'ref': 'master', 'ttl': 3600}
         self.repo = {}      # asset name -> bytes served by the fetcher
         self.disk = {}      # install path -> (bytes currently on disk, mode)
+        # install_staged writes backups and takes a lock: keep both inside the temp tree
+        self.backup_root = self.root / 'backups'
+        for name, value in (('BACKUP_ROOT', str(self.backup_root)),
+                            ('LOCK_PATH', str(self.root / 'install.lock')),
+                            ('CACHE', str(self.root / 'index-cache.json'))):
+            patcher = mock.patch.object(updater, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     # --- fixtures ---------------------------------------------------------
     def put(self, install_path, content, mode=755, on_disk=None):
@@ -222,6 +234,35 @@ class ModuleUpdateTests(unittest.TestCase):
         self.assertEqual(report[0]['state'], 'incomplete')
         self.assertIn(path, report[0]['missing'])
 
+    # --- verify -----------------------------------------------------------
+    def test_verify_exits_one_when_the_module_is_modified(self):
+        # F20: {"ok": false} used to exit 0, so a caller checking the code saw success
+        self.put(str(self.root / 'bin' / 'tool.sh'), b'body\n', on_disk=b'edited\n')
+        self.state_path.write_text(json.dumps(self.state('1.0.0')), encoding='utf-8')
+        out = io.StringIO()
+        with mock.patch.object(updater, 'load_index',
+                               return_value=(self.index('1.1.0'), 'cache')):
+            with contextlib.redirect_stdout(out):
+                rc = updater.main(['verify', 'core', '--state', str(self.state_path),
+                                   '--selection', str(self.root / 'absent.json')])
+        self.assertEqual(rc, 1)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload['ok'])
+        self.assertEqual(payload['module']['state'], 'modified')
+
+    def test_verify_exits_zero_when_the_module_is_current(self):
+        path = self.put(str(self.root / 'bin' / 'tool.sh'), b'body\n')
+        self.state_path.write_text(
+            json.dumps(self.state('1.0.0', {path: sha(b'body\n')})), encoding='utf-8')
+        out = io.StringIO()
+        with mock.patch.object(updater, 'load_index',
+                               return_value=(self.index('1.0.0'), 'cache')):
+            with contextlib.redirect_stdout(out):
+                rc = updater.main(['verify', 'core', '--state', str(self.state_path),
+                                   '--selection', str(self.root / 'absent.json')])
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(out.getvalue())['ok'])
+
     # --- update -----------------------------------------------------------
     def test_update_refuses_when_file_edited_locally(self):
         self.put(str(self.root / 'bin' / 'tool.sh'), b'body\n', on_disk=b'hand edit\n')
@@ -286,6 +327,134 @@ class ModuleUpdateTests(unittest.TestCase):
             updater.install_staged('core', staged, self.state('1.0.0'), '1.1.0',
                                    str(self.state_path))
         self.assertTrue(Path(path).is_dir())
+
+    def test_failed_second_write_removes_a_newly_created_file(self):
+        """A file that did not exist has no backup: rollback must delete it.
+
+        The previous version only restored files it had copied and still reported that the
+        originals were restored.
+        """
+        first = self.root / 'bin' / 'brand-new'
+        second = self.root / 'bin' / 'second'
+        second.parent.mkdir(parents=True, exist_ok=True)
+        staged = [
+            {'path': str(first), 'mode': 0o644, 'data': b'new\n', 'sha256': sha(b'new\n')},
+            {'path': str(second), 'mode': 0o644, 'data': b'new\n', 'sha256': sha(b'new\n')},
+        ]
+        real_replace = updater.os.replace
+
+        def fail_second(src, dst):
+            if str(dst) == str(second):
+                raise OSError('mocked write failure')
+            return real_replace(src, dst)
+
+        with mock.patch.object(updater.os, 'replace', side_effect=fail_second):
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.install_staged('core', staged, {}, '1.0.0', str(self.state_path))
+        self.assertFalse(first.exists(), 'the new file was left behind after a failed update')
+        self.assertFalse(second.exists())
+        leftovers = [name for name in os.listdir(str(second.parent))
+                     if name.startswith('.geomask-new')]
+        self.assertEqual(leftovers, [], 'a temp file survived the failed write')
+        self.assertIn('originals restored', str(caught.exception))
+
+    def test_state_write_failure_rolls_back_the_files(self):
+        """The state file is part of the transaction: a failed commit must undo the writes."""
+        path = self.put(str(self.root / 'bin' / 'tool.sh'), b'new\n', on_disk=b'old\n')
+        module, staged, changed = updater.download_module(
+            self.index('1.1.0'), self.state('1.0.0', {path: sha(b'old\n')}), 'core',
+            self.config, fetcher=self.fetcher())
+        with mock.patch.object(updater, 'write_json', side_effect=OSError('mocked state failure')):
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.install_staged('core', staged, self.state('1.0.0'), '1.1.0',
+                                       str(self.state_path))
+        self.assertEqual(Path(path).read_bytes(), b'old\n')
+        self.assertFalse(self.state_path.exists(), 'a failed transaction wrote state anyway')
+        self.assertIn('originals restored', str(caught.exception))
+
+    def test_duplicate_destination_paths_are_refused(self):
+        # F21: two index entries aimed at one path wrote the file twice; the last write
+        # silently became the installed content
+        target = self.root / 'bin' / 'tool.sh'
+        first = {'path': str(target), 'mode': 0o644, 'data': b'one\n',
+                 'sha256': sha(b'one\n')}
+        second = {'path': str(self.root / 'bin' / '..' / 'bin' / 'tool.sh'),
+                  'mode': 0o644, 'data': b'two\n', 'sha256': sha(b'two\n')}
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.install_staged('core', [first, second], {}, '1.0.0',
+                                   str(self.state_path))
+        self.assertIn('duplicate destination path', str(caught.exception))
+        self.assertFalse(target.exists())
+        self.assertFalse(self.state_path.exists())
+
+    def test_a_failed_transaction_leaves_the_caller_state_unchanged(self):
+        # F21: the caller's dict was mutated before the state file was written, so a
+        # failed install left memory claiming an update that never happened
+        path = self.put(str(self.root / 'bin' / 'tool.sh'), b'new\n', on_disk=b'old\n')
+        _module, staged, _changed = updater.download_module(
+            self.index('1.1.0'), self.state('1.0.0', {path: sha(b'old\n')}), 'core',
+            self.config, fetcher=self.fetcher())
+        state = self.state('1.0.0', {path: sha(b'old\n')})
+        snapshot = json.loads(json.dumps(state))
+        with mock.patch.object(updater, 'write_json',
+                               side_effect=OSError('mocked state failure')):
+            with self.assertRaises(updater.UpdateError):
+                updater.install_staged('core', staged, state, '1.1.0',
+                                       str(self.state_path))
+        self.assertEqual(state, snapshot)
+        self.assertEqual(Path(path).read_bytes(), b'old\n')
+
+    def test_a_successful_install_updates_the_caller_state(self):
+        path = self.put(str(self.root / 'bin' / 'tool.sh'), b'new\n', on_disk=b'old\n')
+        _module, staged, _changed = updater.download_module(
+            self.index('1.1.0'), self.state('1.0.0', {path: sha(b'old\n')}), 'core',
+            self.config, fetcher=self.fetcher())
+        state = self.state('1.0.0', {path: sha(b'old\n')})
+        updater.install_staged('core', staged, state, '1.1.0', str(self.state_path))
+        self.assertEqual(state['modules']['core']['version'], '1.1.0')
+        self.assertEqual(state['modules']['core']['files'][path], sha(b'new\n'))
+
+    def test_the_install_lock_wraps_the_whole_transaction(self):
+        # F21: the state write must happen while the inter-process lock is held
+        events = []
+
+        class FakeFcntl:
+            LOCK_EX = 'lock'
+            LOCK_UN = 'unlock'
+
+            @staticmethod
+            def flock(_fd, operation):
+                events.append(operation)
+
+        real_write_json = updater.write_json
+
+        def write_while_locked(path, payload):
+            events.append('state-write')
+            real_write_json(path, payload)
+
+        staged = [{'path': str(self.root / 'bin' / 'tool.sh'), 'mode': 0o644,
+                   'data': b'body\n', 'sha256': sha(b'body\n')}]
+        with mock.patch.object(updater, 'fcntl', FakeFcntl):
+            with mock.patch.object(updater, 'write_json', side_effect=write_while_locked):
+                updater.install_staged('core', staged, {}, '1.0.0',
+                                       str(self.state_path))
+        self.assertEqual(events, ['lock', 'state-write', 'unlock'])
+
+    def test_backup_directories_are_unique(self):
+        # a fixed module-stamp name made two installs in one second share a backup
+        path = self.put(str(self.root / 'bin' / 'tool.sh'), b'new\n', on_disk=b'old\n')
+        _module, staged, _changed = updater.download_module(
+            self.index('1.1.0'), self.state('1.0.0', {path: sha(b'old\n')}), 'core',
+            self.config, fetcher=self.fetcher())
+        state = self.state('1.0.0', {path: sha(b'old\n')})
+        first = updater.install_staged('core', staged, state, '1.1.0',
+                                       str(self.state_path))
+        second = updater.install_staged('core', staged, state, '1.1.0',
+                                        str(self.state_path))
+        self.assertNotEqual(first, second)
+        self.assertEqual(os.path.dirname(first), str(self.backup_root))
+        self.assertTrue(os.path.isdir(first))
+        self.assertTrue(os.path.isdir(second))
 
     # --- selection --------------------------------------------------------
     def test_status_marks_a_deselected_module(self):
@@ -362,6 +531,29 @@ class ModuleUpdateTests(unittest.TestCase):
         self.assertTrue(problems)
         self.assertIn('core', problems[0])
 
+    def test_a_dependency_without_a_version_is_not_ready(self):
+        # F20: installed == '' skipped the version comparison, so a module that was never
+        # installed counted as ready and its dependent updated over a missing base
+        index = {'schema': 1, 'modules': {
+            'core': {'version': '2.0.0', 'files': []},
+            'feature': {'version': '1.0.0', 'dependencies': ['core'], 'files': []}}}
+        problems = updater.dependencies_ready(index, self.state(''), 'feature')
+        self.assertIn('core is not installed', problems)
+
+    def test_a_dependency_with_missing_files_is_not_ready(self):
+        base = self.root / 'lib' / 'base.sh'
+        index = {'schema': 1, 'modules': {
+            'core': {'version': '1.0.0', 'files': [
+                {'path': str(base), 'source': 'assets/base.sh', 'mode': '0644',
+                 'sha256': sha(b'base\n')}]},
+            'feature': {'version': '1.0.0', 'dependencies': ['core'], 'files': []}}}
+        state = self.state('1.0.0')
+        problems = updater.dependencies_ready(index, state, 'feature')
+        self.assertIn('core is missing 1 file', problems[0])
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_bytes(b'base\n')
+        self.assertEqual(updater.dependencies_ready(index, state, 'feature'), [])
+
     def test_unknown_module_is_refused(self):
         with self.assertRaises(updater.UpdateError):
             updater.download_module(self.index(), self.state('1.0.0'), 'nope',
@@ -370,6 +562,94 @@ class ModuleUpdateTests(unittest.TestCase):
     def test_version_compare_handles_padding(self):
         self.assertGreater(updater.version_tuple('1.10.0'), updater.version_tuple('1.9.9'))
         self.assertEqual(updater.version_tuple('1.27'), (1, 27, 0))
+
+
+class OfflineIndexTests(unittest.TestCase):
+    """Regressions for the audit of 14.11.2026 (F28): status must not use the network."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cache = self.root / 'index-cache.json'
+        self.state_path = self.root / 'state.json'
+        self.config = {'repo': 'owner/repo', 'ref': 'master', 'ttl': 3600}
+        patcher = mock.patch.object(updater, 'CACHE', str(self.cache))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.state_path.write_text(json.dumps({'schema': 1, 'modules': {}}),
+                                   encoding='utf-8')
+
+    @staticmethod
+    def no_network(url):
+        raise AssertionError('a network fetch was attempted: ' + url)
+
+    def write_cache(self, payload=None):
+        payload = payload if payload is not None else {'schema': 1, 'modules': {}}
+        self.cache.write_text(json.dumps(payload), encoding='utf-8')
+
+    def run_main(self, command):
+        out = io.StringIO()
+        with mock.patch.object(updater, 'fetch', self.no_network):
+            with contextlib.redirect_stdout(out):
+                rc = updater.main([command, '--state', str(self.state_path),
+                                   '--selection', str(self.root / 'absent.json'),
+                                   '--config', str(self.root / 'absent.json')])
+        return rc, json.loads(out.getvalue())
+
+    def test_offline_without_a_cache_is_a_refusal_not_a_download(self):
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.load_index(self.config, offline=True, fetcher=self.no_network)
+        self.assertIn('index cache is empty', str(caught.exception))
+        self.assertFalse(self.cache.exists())
+
+    def test_offline_returns_a_fresh_cache(self):
+        self.write_cache()
+        index, source = updater.load_index(self.config, offline=True,
+                                           fetcher=self.no_network)
+        self.assertEqual(source, 'cache')
+        self.assertEqual(index, {'schema': 1, 'modules': {}})
+
+    def test_offline_returns_a_stale_cache(self):
+        self.write_cache()
+        old = time.time() - self.config['ttl'] - 60
+        os.utime(str(self.cache), (old, old))
+        _index, source = updater.load_index(self.config, offline=True,
+                                            fetcher=self.no_network)
+        self.assertEqual(source, 'stale-cache')
+
+    def test_status_reads_the_cache_and_never_downloads(self):
+        self.write_cache()
+        rc, payload = self.run_main('status')
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload['source'], 'cache')
+        self.assertEqual(payload['modules'], [])
+
+    def test_status_without_a_cache_fails_without_a_download(self):
+        rc, payload = self.run_main('status')
+        self.assertEqual(rc, 1)
+        self.assertFalse(payload['ok'])
+        self.assertIn('index cache is empty', payload['error'])
+        self.assertFalse(self.cache.exists())
+
+    def test_check_still_refreshes_the_cache_from_the_network(self):
+        calls = []
+        payload = {'schema': 1, 'modules': {}}
+
+        def fetcher(url):
+            calls.append(url)
+            return json.dumps(payload).encode('utf-8')
+
+        out = io.StringIO()
+        with mock.patch.object(updater, 'fetch', fetcher):
+            with contextlib.redirect_stdout(out):
+                rc = updater.main(['check', '--state', str(self.state_path),
+                                   '--selection', str(self.root / 'absent.json'),
+                                   '--config', str(self.root / 'absent.json')])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(self.cache.exists())
+        self.assertEqual(json.loads(out.getvalue())['source'], 'network')
 
 
 if __name__ == '__main__':

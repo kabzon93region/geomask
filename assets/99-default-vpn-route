@@ -13,13 +13,32 @@ TUN_DEV=$(awk '/^tun:/{f=1;next} f&&/^[^ ]/{exit} f&&/^[[:space:]]*device:/{gsub
           /etc/mihomo/config.yaml 2>/dev/null)
 case "$TUN_DEV" in ''|*[!a-zA-Z0-9._-]*) TUN_DEV=Mihomo ;; esac
 
-apply_routes() {
-  if ! ip route show table 100 | grep -q '^default'; then
-    ip route show table main | grep -v '^default' | while IFS= read -r r; do
-      ip route replace table 100 $r 2>/dev/null
-    done
-    ip route replace table 100 default dev "$TUN_DEV" 2>/dev/null
+sync_table() { # sync_table <table> - mirror LAN connected routes, drop only our own stale ones
+  # The implementation lives in /usr/lib/geomask/geomask-routes.sh so the hotplug path and
+  # the panel (geo-backend.sh) cannot drift apart. Without it nothing is changed at all: a
+  # partial install must not leave the LAN pointing into a table we cannot maintain.
+  _rl=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
+  if [ ! -r "$_rl" ]; then
+    command -v logger >/dev/null 2>&1 && logger -t geomask "route sync skipped: $_rl missing"
+    return 1
   fi
+  . "$_rl"
+  geomask_routes_sync "$1"
+}
+
+apply_routes() {
+  # The policy rule sends ALL LAN traffic into table 100, so that table must carry the LAN
+  # subnets first. If the sync fails, adding the rule would break the LAN and skipping it
+  # would send the LAN out with the real IP: keep the previous state and record the failure
+  # where --check and the panel can see it.
+  if ! sync_table 100; then
+    mkdir -p /tmp/geomask-routes 2>/dev/null
+    date '+%F %T' > /tmp/geomask-routes/error-100 2>/dev/null
+    command -v logger >/dev/null 2>&1 && logger -t geomask "route table 100 not synced - LAN routing left as is"
+    return 1
+  fi
+  rm -f /tmp/geomask-routes/error-100 2>/dev/null
+  ip route replace table 100 default dev "$TUN_DEV" 2>/dev/null
   ip rule show | grep -q '32760:' || ip rule add priority 32760 iif "$LAN_DEV" lookup 100
   # --- WireGuard peers are remote LAN clients (10.10.0.0/24). Without this rule their
   #     traffic falls through to main (real WAN IP), so anything blocked for the ISP -
@@ -58,17 +77,17 @@ apply_routes() {
     # --- ai-mode devices (the whole device goes through the AI tunnel; LAN stays local in table 101) ---
     if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
       if ip link show AI >/dev/null 2>&1; then
-        if ! ip route show table 101 | grep -q '^default'; then
-          ip route show table main | grep -v '^default' | while IFS= read -r r; do
-            ip route replace table 101 $r 2>/dev/null
-          done
-          ip route replace table 101 default dev AI 2>/dev/null
+        # Per-device rules are added only when table 101 really carries the LAN subnets and a
+        # default: otherwise an AI device would be black-holed after a reboot.
+        if sync_table 101 && ip route replace table 101 default dev AI 2>/dev/null; then
+          while read -r dip dmode dname; do
+            case "$dip" in ''|'#'*) continue ;; esac
+            [ "$dmode" = "ai" ] || continue
+             ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
+          done < /etc/geo-devices.list
+        else
+          command -v logger >/dev/null 2>&1 && logger -t geomask "table 101 not ready - AI device rules skipped"
         fi
-        while read -r dip dmode dname; do
-          case "$dip" in ''|'#'*) continue ;; esac
-          [ "$dmode" = "ai" ] || continue
-           ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
-        done < /etc/geo-devices.list
       fi
     fi
   fi

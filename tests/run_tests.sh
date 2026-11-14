@@ -60,10 +60,18 @@ echo x > "$R/usr/libexec/rpcd/zapret-manager"
 echo x > "$R/usr/share/rpcd/acl.d/luci-app-zapret-manager.json"
 echo x > "$R/www/luci-static/resources/zapret-manager/common.js"
 mkdir -p "$R/etc/init.d"
-for s in magitrickle mihomo zapret hev-socks5-tunnel dnsmasq; do
+for s in magitrickle mihomo zapret hev-socks5-tunnel dnsmasq firewall; do
   printf '#!/bin/sh\nexit 0\n' > "$R/etc/init.d/$s"
   chmod +x "$R/etc/init.d/$s"   # a real init script is executable; [ -x ] on Linux needs it
 done
+# the shared route helper is installed by step 2; the hotplug script refuses to change
+# routes without it, so a healthy fixture must carry it
+mkdir -p "$R/usr/lib/geomask"
+cp "$HERE/../assets/geomask-routes.sh" "$R/usr/lib/geomask/geomask-routes.sh" 2>/dev/null || true
+# step 5 installs the hotplug route script; a post-install fixture must carry it
+mkdir -p "$R/etc/hotplug.d/iface"
+cp "$HERE/../assets/99-default-vpn-route" "$R/etc/hotplug.d/iface/99-default-vpn-route" 2>/dev/null || true
+chmod 755 "$R/etc/hotplug.d/iface/99-default-vpn-route" 2>/dev/null || true
 # AI-DNS step deps (v1.5.7): DoH binary + rc.common for the services it installs
 mkdir -p "$R/usr/sbin"
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/hev-socks5-tunnel"; chmod +x "$R/usr/bin/hev-socks5-tunnel"
@@ -104,9 +112,12 @@ mkdir -p "$R/usr/lib/geomask"
 for m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
          geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
          geomask-sync-youtube.py geomask-audit-scheduler.py \
-         geomask-subscription-status.py geomask-slot-patch.py; do
+         geomask-subscription-status.py geomask-slot-patch.py geomask-console.py; do
   printf '#!/usr/bin/env python3\n' > "$R/usr/lib/geomask/$m"
 done
+# strict DNS policy (v1.31.0): a shell helper, so it gets its own shebang and the +x bit
+printf '#!/bin/sh\nexit 0\n' > "$R/usr/lib/geomask/geomask-dnsguard.sh"
+chmod +x "$R/usr/lib/geomask/geomask-dnsguard.sh"
 printf 'group=VPN-noP2P\nlogfile=/root/geomask-vpn-audit.log\n' > "$R/etc/geomask/vpnwatch.conf"
 mkdir -p "$R/etc/geomask/torrent"
 printf 'payload: []\n' > "$R/etc/mihomo/ruleset/ytvpn.yaml"
@@ -264,6 +275,10 @@ else
 fi
 [ -s "$R/usr/bin/geo-backend.sh" ] && { echo "PASS: S7 geo reinstalled"; pass=$((pass+1)); } || { echo "FAIL: S7 geo missing"; failn=$((failn+1)); }
 
+# ---------- scenario 7b: --ipv6 is validated before anything is touched ----------
+echo "=== S7b: --ipv6 argument validation ==="
+t "S7b unknown --ipv6 value is refused" 2 sh "$SCRIPT" --ipv6=yes
+
 # ---------- scenario 8: --check has no duplicate lines, real counters ----------
 echo "=== S8: check-only output sanity ==="
 export GM_PREFIX="$HERE/root_healthy"
@@ -303,7 +318,7 @@ else
   echo "PASS: S11 no pref-based ICMP check in installer"; pass=$((pass+1))
 fi
 echo '20100: from all iif br-lan ipproto icmp lookup main' > "$HERE/state/ip_rules"
-ACTION=ifup sh "$HERE/../assets/99-default-vpn-route" >"$HERE/last_out.txt" 2>&1
+ACTION=ifup GM_ROUTES_LIB="$HERE/../assets/geomask-routes.sh" sh "$HERE/../assets/99-default-vpn-route" >"$HERE/last_out.txt" 2>&1
 _icmp_n=$(grep -c 'ipproto icmp' "$HERE/state/ip_rules")
 if [ "$_icmp_n" = 1 ]; then
   echo "PASS: S11 reseated ICMP rule not duplicated"; pass=$((pass+1))
@@ -379,13 +394,14 @@ if grep -qF 'read_only=yes' "$SCRIPT" && ! grep -qE "read_only='1'" "$SCRIPT"; t
 else
   echo "FAIL: S13 quoted uci values present"; failn=$((failn+1))
 fi
-if grep -qF 'geomask-bk-park' "$SCRIPT" && grep -qF 'for _old in "$_park"/*.tar.gz; do [ -f "$_old" ] && mv -f "$_old" "$_dir/"; done' "$SCRIPT"; then
+if grep -qF 'geomask-bk-park-' "$SCRIPT" && grep -qF 'mktemp -d' "$SCRIPT" \
+   && grep -qF '_backup_park_restore' "$SCRIPT" && grep -qF '_backup_recovery_write' "$SCRIPT"; then
   echo "PASS: S13 old copies parked outside /root and restored on failure"; pass=$((pass+1))
 else
   echo "FAIL: S13 old copies are not preserved on a failed backup"; failn=$((failn+1))
 fi
 # v1.9.3: section enumeration must accept 'ksmbd.@share[N]' (uci show format) + dedupe
-if grep -qF 's/^\(ksmbd\.[^=]*\)=share$/\1/p' "$SCRIPT" && grep -qF 'duplicate sections removed' "$SCRIPT"; then
+if grep -qF 's/^\(ksmbd\.[^=]*\)=share$/\1/p' "$SCRIPT" && grep -qF 'duplicate section' "$SCRIPT"; then
   echo "PASS: S13 section enumeration handles @share[N] + dedupe"; pass=$((pass+1))
 else
   echo "FAIL: S13 section enumeration broken"; failn=$((failn+1))
@@ -432,11 +448,13 @@ for _p in 'geomask-node-scan.sh' 'geomask-nodes.conf' 'geomask-nodescan.state' '
   if grep -qF "$_p" "$SCRIPT"; then echo "PASS: S15 nodescan has: $_p"; pass=$((pass+1))
   else echo "FAIL: S15 nodescan missing: $_p"; failn=$((failn+1)); fi
 done
-# v1.9.6: simple SMB credentials (backup/backup, guest ok) + force_root for /root paths
-if grep -qF 'force_root=1' "$SCRIPT" && grep -qF 'ksmbd.adduser backup -p backup' "$SCRIPT"; then
-  echo "PASS: S13 force_root + backup auth user"; pass=$((pass+1))
+# v1.9.6 -> v1.30.22: the SMB share is opt-in and authenticated; no fixed backup/backup
+if grep -qF 'force_root=1' "$SCRIPT" \
+   && grep -qF 'SMB_SHARE_ENABLE=/etc/geomask/backup-share.enable' "$SCRIPT" \
+   && ! grep -qF 'ksmbd.adduser backup -p backup' "$SCRIPT"; then
+  echo "PASS: S13 force_root + opt-in SMB share (no fixed credentials)"; pass=$((pass+1))
 else
-  echo "FAIL: S13 SMB auth setup missing"; failn=$((failn+1))
+  echo "FAIL: S13 SMB share is not opt-in / still ships fixed credentials"; failn=$((failn+1))
 fi
 # backup must be built in /tmp then moved (never let an older /root copy nest into sysupgrade -b)
 if grep -qF 'geomask-bk-$_ts.tar.gz' "$SCRIPT" && grep -qF 'mv -f "$_tmp" "$_dest"' "$SCRIPT"; then
@@ -1602,9 +1620,12 @@ chmod +x "$B/apk"
 # them and never exercise the install. Link only the tools the installer needs, leave
 # python3 and curl out, and let the apk stub provide them.
 for tool in sh awk sed grep cat mkdir rm date df head tail cut tr sleep ln wc uname chmod \
-            mktemp id basename dirname printf env; do
+            mktemp id basename dirname printf env tar gzip; do
   _p=$(command -v "$tool" 2>/dev/null) && ln -sf "$_p" "$B/$tool"
 done
+# step 1 installs packages, so it needs a verified backup first: the honest stub must be
+# reachable even in this hermetic PATH (it is not a python3/curl provider).
+ln -sf "$STUB/sysupgrade" "$B/sysupgrade"
 # On Linux the runner already has python3 and curl, so the scenario has to hide them:
 # the symlink farm above is a complete PATH. Git Bash cannot run symlinked ELF wrappers
 # from a minimal PATH (DLL search), but it does not have python3/curl anyway.

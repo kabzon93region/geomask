@@ -36,6 +36,9 @@ var callLists                 = rpc.declare({ object: 'geo-sync', method: 'sync_
 var callGoogle                = rpc.declare({ object: 'geo-sync', method: 'google', expect: {} });
 var callGlobal                = rpc.declare({ object: 'geo-sync', method: 'global', params: { mode: null }, expect: {} });
 var callIpv6                  = rpc.declare({ object: 'geo-sync', method: 'ipv6', params: { state: null }, expect: {} });
+var callDnsGuard              = rpc.declare({ object: 'geo-sync', method: 'dns_guard', params: { action: null }, expect: {} });
+var callConsole               = rpc.declare({ object: 'geo-sync', method: 'console', params: { action: null, ip: null, sub: null, countries: null }, expect: {} });
+var callConsoleDiag           = rpc.declare({ object: 'geo-sync', method: 'console_diag', params: { what: null }, expect: {} });
 var callDevAdd                = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
 var callDevDel                = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
 var callAiSubGet              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
@@ -63,6 +66,7 @@ var callNodesPathRevoke       = rpc.declare({ object: 'geo-sync', method: 'nodes
 var callNodesPathApplyStatus  = rpc.declare({ object: 'geo-sync', method: 'nodes_path_apply_status', params: [ 'path_id' ], expect: {} });
 var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtrickle_sync', expect: {} });
 var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
+var callBackup                = rpc.declare({ object: 'geo-sync', method: 'backup', expect: {} });
 var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
 // <<< geo-rpc generated:decl <<<
 var PANEL_VERSION = '@@PANEL_VERSION@@';
@@ -646,6 +650,43 @@ return view.extend({
 		]);
 		panels.obzor.appendChild(v6Card);
 
+		/* ===================== Console lane ===================== */
+		// One switch on, one switch off. Off is the promise the owner asked for: the console
+		// goes back to its old path immediately, while the Mihomo side stays ready so switching
+		// back on costs nothing and does not reload the proxy.
+		var conIp = E('input', { 'class': 'gs-input', 'style': 'width:140px', 'placeholder': '192.168.1.177' });
+		var conCc = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'TR,DE' });
+		var conSubs = ((all[4] || {}).subs || []);
+		var conSel = E('select', { 'class': 'gs-input', 'style': 'min-width:220px' },
+			[ E('option', { 'value': '' }, '— как у VPN (по умолчанию) —') ].concat(
+				conSubs.map(function(s) {
+					return E('option', { 'value': String(s.id) },
+						(s.name || ('подписка ' + s.id)) + ' — ' + maskUrl(s.url || ''));
+				})));
+		function conAct(action) {
+			view.act(callConsole, { action: action,
+				ip: (conIp.value || '').trim(), sub: (conSel.value || ''),
+				countries: (conCc.value || '').trim() });
+		}
+		var conCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Игровая консоль — отдельный выход'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'IP консоли'), conIp,
+				E('span', { 'class': 'gs-label' }, 'Страны выхода'), conCc
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Подписка'), conSel
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() { conAct('on'); } }, 'Включить путь консоли'),
+				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было'),
+				E('button', { 'class': 'gs-btn', 'click': function() { view.act(callConsoleDiag, { what: 'all' }); } }, 'Собрать логи')
+			]),
+			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Настройки остаются, повторное включение мгновенное. «Собрать логи» кладёт архив в /tmp и в папку бэкапов (если шара включена).'),
+			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки. Указывайте коды через запятую: TR, DE, NL.')
+		]);
+		panels.obzor.appendChild(conCard);
+
 		/* ===================== Per-device geo policy ===================== */
 		var MODEINFO = {
 			bypass: { label: 'Мимо VPN', klass: 'gs-warn',
@@ -754,9 +795,15 @@ return view.extend({
 			b = b || {};
 			bkBox.textContent = '';
 			bkBox.appendChild(E('h4', {}, 'Резервные копии (папка на роутере, SMB-шар)'));
+			bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
+				E('button', { 'class': 'gs-btn', 'click': function () {
+					view.act(callBackup, {}, 'Бэкап создан');
+				} }, 'Создать бэкап сейчас'),
+				E('span', { 'class': 'gs-hint' }, 'Полный архив нужен перед любыми изменениями из панели.')
+			]));
 			if (b.share_ok === false)
 				bkBox.appendChild(E('div', { 'class': 'gs-row' }, [ E('span', { 'class': 'gs-badge gs-warn' },
-					'SMB-шар geomask-backups не найден — прогоните шаг geo в geomask') ]));
+					'SMB-шара geomask-backups не публикуется — это режим по умолчанию') ]));
 			var unc = b.unc || '', smbu = b.smb || '';
 			bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
 				E('span', { 'class': 'gs-label' }, 'Папка'),
@@ -782,13 +829,19 @@ return view.extend({
 			bkBox.appendChild(E('div', { 'class': 'gs-hint' },
 				'Хранится самая свежая копия (роутер экономит место); полная история — на ПК: geomask\\fetch_backup.ps1. ' +
 				'Провод Windows: Win+R → вставить скопированный путь. Восстановление: LuCI → System → Backup / Flash Firmware → Restore.'));
-			if (b.user && b.pass) {
-				var nu = 'net use ' + unc + ' /user:' + b.user + ' ' + b.pass + ' /persistent:yes';
-				bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
-					E('span', { 'class': 'gs-label' }, 'Windows: вход backup / backup (или без пароля — гость)'),
-					E('span', { 'class': 'gs-mono gs-upd-meta' }, b.user + ' / ' + b.pass),
-					E('span', {}, E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(nu, this); } }, 'Копировать net use'))
-				]));
+			if (b.optin === false) {
+				bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+					'SMB-шара не включена: публикация — только вручную (touch /etc/geomask/backup-share.enable) ' +
+					'и именованный пользователь ksmbd (ksmbd.adduser). Пароля по умолчанию нет: архив содержит ' +
+					'ключи и токены подписок.'));
+			} else if (b.share_ok) {
+				bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+					'Вход в шару: именованный пользователь ksmbd, которого вы создали (ksmbd.adduser). ' +
+					'Пароля по умолчанию нет. Архив содержит ключи и токены подписок.'));
+			} else {
+				bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+					'Автопубликация включена, но шары нет в ksmbd.conf — проверьте LuCI → ksmbd ' +
+					'(или перезапустите шаг geo). Архив содержит ключи и токены подписок.'));
 			}
 		}
 		renderBk(bks);

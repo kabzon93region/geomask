@@ -4,6 +4,15 @@ case "$*" in
   "rule show") cat "${GM_STATE:-/tmp}/ip_rules" 2>/dev/null; exit 0 ;;
   "rule add "*) printf '%s\n' "$*" >> "${GM_STATE:-/tmp}/ip_rules"; exit 0 ;;
   "rule del "*) exit 0 ;;
+  "route show table main")
+    # one connected LAN route: enough for the shared route helper to have work to do
+    echo "192.168.0.0/24 dev br-lan proto kernel scope link src 192.168.0.1"
+    exit 0 ;;
+  "route show table "*" exact "*) exit 1 ;;
+  "route show table "*) exit 0 ;;
+  "route replace table "*) exit 0 ;;
+  "route del table "*) exit 0 ;;
+  "route show default") echo "default via 192.168.0.254 dev br-lan"; exit 0 ;;
   *"addr show"*)
     # the router's LAN address, plus the AI-DNS alias the aidns step adds
     echo "    inet 192.168.0.1/24 brd 192.168.0.255 scope global br-lan"

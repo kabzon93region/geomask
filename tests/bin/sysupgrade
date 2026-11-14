@@ -1,12 +1,14 @@
 #!/bin/sh
 # stub sysupgrade: `sysupgrade -b <file>` writes a REAL small archive.
 # It used to write a text line, which the installer now (correctly) rejects as not-a-backup
-# - that is exactly the audit case B4, so the stub has to be honest too.
+# - that is exactly the audit case B4, so the stub has to be honest too. The archive must
+# also carry an etc/ entry: a readable tar of one arbitrary file is not a router backup.
 [ "$1" = "-b" ] || exit 0
 [ -n "${2:-}" ] || exit 1
 mkdir -p "$(dirname "$2")" 2>/dev/null
 _t=$(mktemp -d 2>/dev/null) || exit 1
-printf 'x\n' > "$_t/payload"
-tar czf "$2" -C "$_t" payload 2>/dev/null || { rm -rf "$_t"; exit 1; }
+mkdir -p "$_t/etc/config" || exit 1
+printf 'config interface stub\n' > "$_t/etc/config/network"
+tar czf "$2" -C "$_t" etc 2>/dev/null || { rm -rf "$_t"; exit 1; }
 rm -rf "$_t"
 exit 0

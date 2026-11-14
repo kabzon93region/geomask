@@ -5,8 +5,12 @@ indented by four spaces), because the indentation is what a text edit gets wrong
 """
 import importlib.util
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+from unittest import mock
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / 'assets' / 'geomask-lists-edit.py'
@@ -59,7 +63,22 @@ def load_tool():
 
 
 class SeederSafetyTests(unittest.TestCase):
-    """Auto-seed must never read a valid config as empty (audit F11)."""
+    """Auto-seed must never read a valid config as empty, and never duplicate a key.
+
+    The old fallback counted `- id:` lines: a group without an id read as "empty", an inline
+    `groups: [...]` read as "no section" and got a second top-level key appended.
+    """
+
+    TEMPLATE = '''configVersion: 0.8.2
+app:
+  logLevel: error
+groups:
+- id: aaa111
+  name: Template
+  interface: pppoe-wan
+  rules: []
+subscriptions: []
+'''
 
     @classmethod
     def setUpClass(cls):
@@ -68,16 +87,74 @@ class SeederSafetyTests(unittest.TestCase):
         cls.seed = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.seed)
 
-    def test_an_indented_group_is_counted(self):
-        lines = ['groups:', '  - id: custom', '    name: mine', '    rules: []', '']
-        self.assertEqual(self.seed.count_groups(lines), 1)
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.config = self.dir / 'config.yaml'
+        self.template = self.dir / 'template.yaml'
+        self.template.write_text(self.TEMPLATE, encoding='utf-8')
 
-    def test_an_empty_block_is_empty(self):
-        self.assertEqual(self.seed.count_groups(['groups:', '']), 0)
+    def run_seed(self, *args):
+        argv = [str(ROOT / 'assets' / 'geomask-seed-lists.py'),
+                '--config=' + str(self.config),
+                '--template=' + str(self.template)] + list(args)
+        with mock.patch.object(sys, 'argv', argv):
+            return self.seed.main()
 
-    def test_an_unparseable_config_is_not_treated_as_empty(self):
-        lines = ['groups:', '  - id: [broken', '   name: x']
-        self.assertEqual(self.seed.count_groups(lines), -1)
+    def write_config(self, text):
+        self.config.write_text(text, encoding='utf-8')
+        return text
+
+    def test_an_inline_non_empty_list_is_not_empty(self):
+        before = self.write_config(
+            'app:\n  logLevel: error\ngroups: [{id: custom, name: Mine, rules: []}]\n')
+        self.assertEqual(self.run_seed('--check-empty'), 1)
+        self.assertEqual(self.run_seed(), 2)
+        self.assertEqual(self.config.read_text(encoding='utf-8'), before)
+
+    def test_a_group_without_an_id_is_not_empty(self):
+        before = self.write_config('groups:\n  - name: MyGroup\n    rules: []\n')
+        self.assertEqual(self.run_seed('--check-empty'), 1)
+        self.assertEqual(self.run_seed(), 2)
+        self.assertEqual(self.config.read_text(encoding='utf-8'), before)
+
+    def test_an_unparseable_config_is_unverifiable_not_empty(self):
+        self.write_config('groups:\n  - id: [broken\n   name: x\n')
+        self.assertEqual(self.run_seed('--check-empty'), 2)
+        self.assertEqual(self.run_seed(), 2)
+
+    def test_a_non_list_groups_value_is_unverifiable(self):
+        self.write_config('groups: not-a-list\n')
+        self.assertEqual(self.run_seed('--check-empty'), 2)
+
+    def test_duplicate_keys_are_refused(self):
+        before = self.write_config('groups: []\napp: {}\ngroups: []\n')
+        self.assertEqual(self.run_seed('--check-empty'), 2)
+        self.assertEqual(self.run_seed('--force'), 2)
+        self.assertEqual(self.config.read_text(encoding='utf-8'), before)
+
+    def test_force_replaces_groups_once_and_keeps_trailing_keys(self):
+        self.write_config('app:\n  logLevel: error\ngroups: [{id: custom, name: Mine}]\n'
+                          'subscriptions: []\n')
+        self.assertEqual(self.run_seed('--force'), 0)
+        text = self.config.read_text(encoding='utf-8')
+        data = yaml.safe_load(text)
+        self.assertEqual([g['name'] for g in data['groups']], ['Template'])
+        self.assertEqual(data['subscriptions'], [])
+        self.assertEqual(data['app'], {'logLevel': 'error'})
+        self.assertEqual(text.count('\ngroups:') + text.startswith('groups:'), 1)
+        # the template's own trailing key must not be spliced into the live config
+        self.assertEqual(text.count('subscriptions:'), 1)
+        self.assertTrue(list(self.dir.glob('config.yaml.bak_geomask_*')))
+
+    def test_auto_seed_fills_a_truly_empty_config(self):
+        self.write_config('app:\n  logLevel: error\ngroups: []\nsubscriptions: []\n')
+        self.assertEqual(self.run_seed('--check-empty'), 0)
+        self.assertEqual(self.run_seed(), 0)
+        data = yaml.safe_load(self.config.read_text(encoding='utf-8'))
+        self.assertEqual([g['name'] for g in data['groups']], ['Template'])
+        self.assertEqual(data['subscriptions'], [])
 
     def test_the_wan_interface_is_remapped(self):
         lines = ['groups:', '  - id: a', '    interface: pppoe-wan', '  - id: b']

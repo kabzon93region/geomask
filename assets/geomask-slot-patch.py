@@ -103,9 +103,16 @@ def rewrite_vpn_rules(doc):
 
 def main(argv):
     if len(argv) != 4:
-        sys.stderr.write('usage: slot patcher <config> <group> <url>\n')
+        sys.stderr.write('usage: slot patcher <config> <group> <url|->\n')
         return 2
     config_path, group, url = argv[1], argv[2], argv[3]
+    # `-` reads the URL from stdin: a subscription URL carries its access token, and argv is
+    # world-readable in /proc for as long as the process runs (audit 14.11.2026, F23).
+    if url == '-':
+        url = sys.stdin.readline().strip()
+    if not url:
+        sys.stderr.write('empty subscription url\n')
+        return 2
     with open(config_path, encoding='utf-8') as handle:
         doc = yaml.load(handle, Loader=loader())
     if not isinstance(doc, dict):

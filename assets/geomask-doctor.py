@@ -945,20 +945,68 @@ def parse_listeners(text):
 _DIRECT_CACHE = {}
 
 
+def mihomo_tun_device():
+    """The TUN device mihomo creates, from its config (empty when unknown).
+
+    A quoted `device: "Mihomo"` is valid YAML and was ignored by the old unquoted regex, so a
+    default route through the tunnel looked like the provider exit. A config without a `tun:`
+    block is normal when an external hev creates the device - then nothing is known here.
+    """
+    inside = False
+    for line in read_text(MIHOMO_CONF).splitlines():
+        if re.match(r'^tun:\s*$', line):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if line and not line[0].isspace():
+            break
+        match = re.match(r'^[ \t]+device:\s*["\']?([A-Za-z0-9._-]+)["\']?\s*(?:#.*)?$', line)
+        if match:
+            return match.group(1)
+    return ''
+
+
+def _physical_wan(device, tun):
+    """True when `device` can be the provider exit (not a tunnel/TUN)."""
+    if not device:
+        return False
+    if tun and device == tun:
+        return False
+    return not device.startswith(('wg', 'tun', 'tap'))
+
+
 def wan_iface():
-    """The device that carries the default route: the provider exit.
+    """The device that carries the provider exit: the physical default route.
 
     The uci name is not the device: on PPPoE `network.wan.device` is `wan` while the
-    traffic leaves through `pppoe-wan`, and `curl --interface wan` simply fails.
+    traffic leaves through `pppoe-wan`, and `curl --interface wan` simply fails. netifd is
+    asked first; the routing table is a fallback that skips tunnels, and an unverifiable
+    answer is returned as empty instead of guessing (audit 14.11.2026, F17).
     """
+    tun = mihomo_tun_device()
+    rc, out = run(['ubus', 'call', 'network.interface.wan', 'status'], timeout=5)
+    if rc == 0 and out:
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            payload = {}
+        device = str(payload.get('l3_device') or '') if isinstance(payload, dict) else ''
+        if _physical_wan(device, tun):
+            return device
     rc, out = run(['ip', 'route', 'show', 'default'], timeout=5)
-    match = re.search(r'dev\s+([A-Za-z0-9._-]+)', out or '')
-    if match:
-        return match.group(1)
+    for match in re.finditer(r'\bdev\s+([A-Za-z0-9._-]+)', out or ''):
+        device = match.group(1)
+        if _physical_wan(device, tun):
+            return device
     for key in ('network.wan.device', 'network.wan.ifname', 'network.wan6.device'):
         rc, out = run(['uci', '-q', 'get', key], timeout=5)
-        if rc == 0 and (out or '').strip():
-            return out.strip()
+        candidate = (out or '').strip()
+        if rc == 0 and candidate and _physical_wan(candidate, tun):
+            # `wan` is the interface name, not a device: only accept one that exists
+            rc2, _ = run(['ip', 'link', 'show', candidate], timeout=5)
+            if rc2 == 0:
+                return candidate
     return ''
 
 

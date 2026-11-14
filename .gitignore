@@ -13,3 +13,6 @@ tests/state/
 tests/root_*/
 tests/freshbin/
 tests/root_fresh/
+
+# local review/reproduction scratch (never published, never committed)
+audit-temp/

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "core_version": "1.30.21",
+  "core_version": "1.31.0",
   "modules": {
     "admission_service": {
       "version": "1.30.20",
@@ -80,7 +80,7 @@
           "path": "/etc/hotplug.d/iface/99-default-vpn-route",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "b363d670c599bcd2067053419298d6f111b0d225ede9057b167769a17a9bc4f0"
+          "sha256": "64377ccd9845ec3c2e243f3c6bf4107b62158da2b6f14596d75ae3ba2a800e63"
         },
         {
           "path": "/etc/init.d/geomask-syncd",
@@ -110,7 +110,7 @@
           "path": "/usr/bin/geomask-seed-lists.py",
           "source": "assets/geomask-seed-lists.py",
           "mode": "0755",
-          "sha256": "9cbf473f3b3a7ff68bdf2cec0c821d79827dd7785987a003b2eca02997b51ed1"
+          "sha256": "937c58f23e42f8f321abb15b6a73e6aa03221f38b21f7e8f0c713b5fe506def6"
         },
         {
           "path": "/usr/bin/geomask-syncd.sh",
@@ -122,7 +122,7 @@
           "path": "/usr/lib/geomask/99-default-vpn-route.dist",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "b363d670c599bcd2067053419298d6f111b0d225ede9057b167769a17a9bc4f0"
+          "sha256": "64377ccd9845ec3c2e243f3c6bf4107b62158da2b6f14596d75ae3ba2a800e63"
         },
         {
           "path": "/usr/lib/geomask/geomask-apply.py",
@@ -155,6 +155,18 @@
           "sha256": "c9bd2e8cee49dc9989d24d3f9998063b420120033f2987076412fd490b3d09dd"
         },
         {
+          "path": "/usr/lib/geomask/geomask-console.py",
+          "source": "assets/geomask-console.py",
+          "mode": "0755",
+          "sha256": "66f42ecaf35feb1da130e567cf058691accc11799efcf69b342ae8a6f127d8e0"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-dnsguard.sh",
+          "source": "assets/geomask-dnsguard.sh",
+          "mode": "0755",
+          "sha256": "fc8da5f197de56651b87edc4b50e5409878145dca9cd51d0617a60e490b9fa30"
+        },
+        {
           "path": "/usr/lib/geomask/geomask-lane-torrent.py",
           "source": "assets/geomask-lane-torrent.py",
           "mode": "0755",
@@ -173,10 +185,16 @@
           "sha256": "c650ba7ba920339833290619846a738148bc7bee31c4780dcf5a85acdc4b5acb"
         },
         {
+          "path": "/usr/lib/geomask/geomask-routes.sh",
+          "source": "assets/geomask-routes.sh",
+          "mode": "0644",
+          "sha256": "f6e9715e2db9b5cd7376988136373d2a699c8b2435a757f4dcf561d8b7d12b45"
+        },
+        {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
           "source": "assets/geomask-slot-patch.py",
           "mode": "0755",
-          "sha256": "7ba5225b0b7973699379842d5012b61528618bb1e22f5fa9bda68e7719e31e6d"
+          "sha256": "261f0a2af10086988c17f7f49711b3813ab739116f31af4b5cd5dd40574e8e98"
         },
         {
           "path": "/usr/lib/geomask/geomask-subscription-status.py",
@@ -248,7 +266,7 @@
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": "0755",
-          "sha256": "38f3aed34bf47352c6e657d09e44d867d9f58f2386962ca5e41574fa985a459f"
+          "sha256": "f3a54ecb139b7e9cc22ed189c6458b6045fe4ac835872f408e949e3eb6098ae3"
         }
       ]
     },
@@ -270,7 +288,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "c4fac34d484d3c41d5ba8ae0118cb70eafaa846efbdb80116b9010fc8429f4bc"
+          "sha256": "0ab61b1df925e134e76cf0d4e2a29f65d0f123f7619562afe610e2f3aad54256"
         }
       ]
     },
@@ -286,13 +304,13 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "5f451fd1b28119ead37cd5b5b3d593ebcf34b9872d1cb8624e45bba58482a7b1"
+          "sha256": "6e9dbe7a27c5cb28cb31739c4a768c91618f9afd31a56f3071d32b0bc55658f6"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
           "mode": "0755",
-          "sha256": "4ae46bc291b39815ccd5054a6dc65e3d9a379debec9e363d232b3d691353f395"
+          "sha256": "34692b3a240052260bd23d94e13ec09752bc1af1a349b97e216034727f27ef4e"
         },
         {
           "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
@@ -304,13 +322,13 @@
           "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
           "source": "assets/acl-geo-sync.json",
           "mode": "0644",
-          "sha256": "091ca0d7251664ae2a972aa86ecd2608b4efb85e27f17f7deebd6a70381020b3"
+          "sha256": "485fb1664ffb8b3b691f071cc7c159358d3b1b881428e5a1f1a8d17c7db9a085"
         },
         {
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "e2bb1939a88ac78510783440082ceae3dd1c724a05c6fb5343e07bfa8bd352a9"
+          "sha256": "b095ea497adaa924ebc05000e2ef02a0d5aa4a7302dc98eb22f6fdc96744ddf7"
         }
       ]
     },

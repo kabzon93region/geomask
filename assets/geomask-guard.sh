@@ -181,6 +181,40 @@ if ! ip route show table 101 2>/dev/null | grep -q '^default'; then
   fi
 fi
 
+# ---------- (E) console lane watchdog ----------
+# A flushed ip rule silently puts the console back on the normal path: the owner sees "it
+# stopped working" and has nothing to look at. Only our own rule and our own table are
+# touched, and only while the lane is switched on in the panel.
+CS=/etc/geomask/console.state
+if [ -f "$CS" ] && [ "$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)" = 1 ]; then
+  CIP=$(sed -n 's/^ip=//p' "$CS" 2>/dev/null | head -1)
+  if [ -n "$CIP" ]; then
+    if ! ip rule show 2>/dev/null | grep -q "from $CIP lookup 102"; then
+      while ip rule del from "$CIP" lookup 102 2>/dev/null; do :; done
+      if ip rule add pref 19903 from "$CIP" lookup 102 2>/dev/null; then
+        log "console rule re-seated for $CIP"
+        conntrack -D -s "$CIP" >/dev/null 2>&1
+        conntrack -D -d "$CIP" >/dev/null 2>&1
+      else
+        log "FAIL console rule add $CIP"
+      fi
+    fi
+    if ! ip route show table 102 2>/dev/null | grep -q '^default'; then
+      if ip route replace table 102 default dev Console 2>/dev/null; then
+        log "console table 102 default restored (dev Console)"
+      else
+        log "WARN console table 102 has no default (tunnel down?)"
+      fi
+    fi
+  fi
+fi
+
+# ---------- (D) AI-DNS self-heal ----------
+# A transient failure (alias not up yet, ip unavailable) must not leave the AI clients with a
+# permanent reject rule until the owner re-runs the panel step. The sync is cheap when nothing
+# changed (it compares the generated include and reloads the firewall only on a difference).
+[ -x /usr/bin/geo-backend.sh ] && ( /usr/bin/geo-backend.sh aidns >/dev/null 2>&1 & )
+
 # ---------- conntrack flush when something changed ----------
 if [ -n "$NEED_FLUSH" ]; then
   for ip in $IPS; do

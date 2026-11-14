@@ -11,10 +11,12 @@ Safety rules, in order:
   * a file edited locally is never overwritten without --force;
   * every download is verified against the index before anything is written;
   * all files are staged first, so a failed download leaves the box untouched;
-  * originals are copied to a backup directory, and a write failure restores them.
+  * originals are copied to a backup directory, and a write failure restores them;
+  * one install runs at a time: a lock serialises updaters, and the caller's state is
+    updated only after the state file has been written.
 
 Commands:
-  status                 what is installed, and what differs from the index
+  status                 what is installed, and what differs from the index (cache only)
   check [--force]        refresh the cached index and report available updates
   update <id> [--force]  install the module's files from the index
   verify <id>            re-hash installed files against the recorded state
@@ -24,14 +26,22 @@ reported as `not-selected` and never updated here: changing which modules a rout
 carries is the installer's job, not the updater's.
 """
 import argparse
+import contextlib
+import copy
 import hashlib
 import json
 import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import urllib.request
+
+try:
+    import fcntl
+except ImportError:  # not on Windows: the router runs Linux, the test host may not
+    fcntl = None
 
 DEFAULT_REPO = 'kabzon93region/geomask'
 DEFAULT_REF = 'master'
@@ -103,6 +113,7 @@ def capability_ready(dependency):
     # that still names de5 in a manifest is satisfied by any working provider.
     return name == 'de5' and 'sub' in providers
 BACKUP_ROOT = '/tmp/geomask-module-backup'
+LOCK_PATH = '/tmp/geomask-module-update.lock'
 RAW = 'https://raw.githubusercontent.com/{repo}/{ref}/{path}'
 INDEX_PATH = 'modules/index.json'
 TTL = 3600
@@ -190,22 +201,30 @@ def index_url(config):
     return '%s?t=%d' % (base, int(time.time()))
 
 
-def load_index(config, force=False, fetcher=None):
-    """Return (index, source). Cached for ttl seconds unless force."""
+def load_index(config, force=False, fetcher=None, offline=False):
+    """Return (index, source). Cached for ttl seconds unless force.
+
+    offline=True never touches the network: the cached catalogue is all that is read, and
+    an empty cache is a refusal. The panel polls status continuously, and a dead uplink
+    used to turn every poll into a fresh download attempt.
+    """
     fetcher = fetcher or fetch
+    cached = read_json(CACHE)
+    usable = isinstance(cached, dict) and cached.get('schema') == 1
     age = None
     if os.path.exists(CACHE):
         age = time.time() - os.path.getmtime(CACHE)
-    if not force and age is not None and age < config['ttl']:
-        cached = read_json(CACHE)
-        if isinstance(cached, dict) and cached.get('schema') == 1:
-            return cached, 'cache'
+    if usable and not force and age is not None and age < config['ttl']:
+        return cached, 'cache'
+    if offline:
+        if usable:
+            return cached, 'stale-cache'
+        raise UpdateError('index cache is empty')
     try:
         raw = fetcher(index_url(config))
         index = json.loads(raw.decode('utf-8'))
     except Exception as exc:
-        cached = read_json(CACHE)
-        if isinstance(cached, dict) and cached.get('schema') == 1:
+        if usable:
             return cached, 'stale-cache'
         raise UpdateError('index unavailable (%s)' % type(exc).__name__) from None
     if not isinstance(index, dict) or index.get('schema') != 1:
@@ -325,7 +344,18 @@ def dependencies_ready(index, state, module_id):
             problems.append('%s is not in the index' % dependency)
             continue
         installed = module_state(state, dependency)['version']
-        if installed and version_tuple(installed) < version_tuple(other.get('version', '0')):
+        if not installed:
+            # an entry without a version is not an install. Comparing '' with the index
+            # skipped the version check, so a dependent module updated over a missing base.
+            problems.append('%s is not installed' % dependency)
+            continue
+        missing = [entry['path'] for entry in other.get('files') or []
+                   if digest_file(entry['path']) is None]
+        if missing:
+            problems.append('%s is missing %d file(s), including %s'
+                            % (dependency, len(missing), missing[0]))
+            continue
+        if version_tuple(installed) < version_tuple(other.get('version', '0')):
             problems.append('%s %s is older than %s'
                             % (dependency, installed, other.get('version')))
     return problems
@@ -382,43 +412,134 @@ def backup_name(path):
     return path.replace('\\', '/').lstrip('/').replace('/', '_').replace(':', '')
 
 
-def install_staged(module_id, staged, state, version, state_path=DEFAULT_STATE):
-    """Write staged files atomically, restoring originals if any write fails."""
-    stamp = time.strftime('%Y%m%d-%H%M%S')
-    backup = os.path.join(BACKUP_ROOT, '%s-%s' % (module_id, stamp))
-    os.makedirs(backup, exist_ok=True)
-    written = []
-    try:
-        for item in staged:
-            path = item['path']
-            if os.path.exists(path):
-                keep = os.path.join(backup, backup_name(path))
-                shutil.copy2(path, keep)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + '.geomask-new'
-            with open(tmp, 'wb') as handle:
-                handle.write(item['data'])
-            os.chmod(tmp, item['mode'])
-            os.replace(tmp, path)
-            written.append(path)
-    except OSError as exc:
-        for path in written:
+def rollback_files(written, backup):
+    """Put the tree back the way it was; returns a list of problems, empty on success.
+
+    `written` holds (path, existed_before). A file that did not exist has no backup copy,
+    so restoring "originals" means removing it - the previous version kept it and still
+    claimed that the originals were restored.
+    """
+    problems = []
+    for path, existed in reversed(written):
+        if existed:
             keep = os.path.join(backup, backup_name(path))
-            if os.path.exists(keep):
+            try:
+                shutil.copy2(keep, path)
+            except OSError:
+                problems.append('could not restore %s (copy kept in %s)' % (path, keep))
+        else:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                problems.append('could not remove new file %s' % path)
+    return problems
+
+
+@contextlib.contextmanager
+def install_lock(path=None):
+    """Serialise installs for the whole transaction; a no-op without fcntl.
+
+    Two updaters launching together used to share one backup directory and one temp file
+    name, so the slower process could replace the other's bytes mid-write. The router is
+    Linux, where flock is cheap; only the Windows test host takes the fallback.
+    """
+    path = path or LOCK_PATH
+    if fcntl is None:
+        yield
+        return
+    try:
+        handle = open(path, 'a+')
+    except OSError as exc:
+        raise UpdateError('could not open lock %s (%s)'
+                          % (path, type(exc).__name__)) from None
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError as exc:
+        handle.close()
+        raise UpdateError('could not lock %s (%s)'
+                          % (path, type(exc).__name__)) from None
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass    # closing the descriptor releases the lock anyway
+        finally:
+            handle.close()
+
+
+def install_staged(module_id, staged, state, version, state_path=DEFAULT_STATE):
+    """Write staged files atomically, restoring originals if any write fails.
+
+    The state file is part of the same transaction: writing it outside the rollback block
+    left new files on disk with the old state, which then reported them as locally modified
+    and blocked every later update. The caller's dict is a copy until the state file has
+    been written, so a failed install leaves memory and disk agreeing.
+    """
+    seen = set()
+    for item in staged:
+        key = os.path.normcase(os.path.abspath(item['path']))
+        if key in seen:
+            raise UpdateError('duplicate destination path in the index: %s' % item['path'])
+        seen.add(key)
+
+    # Mutate a copy: the caller must not learn about an install that never committed.
+    updated = copy.deepcopy(state)
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    with install_lock():
+        backup = ''
+        written = []
+        temps = []
+        try:
+            os.makedirs(BACKUP_ROOT, exist_ok=True)
+            # mkdtemp keeps the backup name unpredictable: a fixed module-stamp directory
+            # let two installs of one module in the same second overwrite each other.
+            backup = tempfile.mkdtemp(prefix='%s-%s-%d-' % (module_id, stamp, os.getpid()),
+                                      dir=BACKUP_ROOT)
+            for item in staged:
+                path = item['path']
+                existed = os.path.exists(path)
+                if existed:
+                    keep = os.path.join(backup, backup_name(path))
+                    shutil.copy2(path, keep)
+                directory = os.path.dirname(path) or '.'
+                os.makedirs(directory, exist_ok=True)
+                # mkstemp writes the bytes under an unguessable name next to the target;
+                # path + '.geomask-new' was predictable and shared between processes.
+                fd, tmp = tempfile.mkstemp(prefix='.geomask-new-', dir=directory)
+                temps.append(tmp)
+                with os.fdopen(fd, 'wb') as handle:
+                    handle.write(item['data'])
+                os.chmod(tmp, item['mode'])
+                os.replace(tmp, path)
+                written.append((path, existed))
+
+            modules = updated.setdefault('modules', {})
+            entry = modules.setdefault(module_id, {})
+            entry['version'] = version or entry.get('version', '')
+            entry['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            # merge, never replace: a skipped config keeps the baseline that makes a later
+            # local edit detectable
+            entry.setdefault('files', {}).update({item['path']: item['sha256']
+                                                  for item in staged})
+            write_json(state_path, updated)
+        except (OSError, ValueError) as exc:
+            for tmp in temps:
                 try:
-                    shutil.copy2(keep, path)
+                    os.remove(tmp)
                 except OSError:
                     pass
-        raise UpdateError('write failed (%s); originals restored' % type(exc).__name__) from None
-
-    modules = state.setdefault('modules', {})
-    entry = modules.setdefault(module_id, {})
-    entry['version'] = version or entry.get('version', '')
-    entry['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    # merge, never replace: a skipped config keeps the baseline that makes a later local
-    # edit detectable
-    entry.setdefault('files', {}).update({item['path']: item['sha256'] for item in staged})
-    write_json(state_path, state)
+            problems = rollback_files(written, backup)
+            if problems:
+                detail = 'rollback incomplete: ' + '; '.join(problems)
+            else:
+                detail = 'originals restored'
+            raise UpdateError('write failed (%s); %s' % (type(exc).__name__, detail)) from None
+        if isinstance(state, dict):
+            state.clear()
+            state.update(updated)
     return backup
 
 
@@ -492,7 +613,9 @@ def main(argv=None):
                              ensure_ascii=False))
             return 0
         if args.command == 'status':
-            index, source = load_index(config)
+            # status is the panel's poll: it reports the cached catalogue and never waits
+            # for the uplink. `check` is the command that refreshes the cache.
+            index, source = load_index(config, offline=True)
             print(json.dumps({'ok': True, 'source': source,
                               'modules': status(index, state, selected=selected)},
                              ensure_ascii=False))
@@ -510,10 +633,11 @@ def main(argv=None):
             report = status(index, state, args.module, selected=selected)
             if not report:
                 raise UpdateError('unknown module %s' % args.module)
-            print(json.dumps({'ok': report[0]['state'] in ('current', 'update-available',
-                                                           'not-selected'),
-                              'module': report[0]}, ensure_ascii=False))
-            return 0
+            ok = report[0]['state'] in ('current', 'update-available', 'not-selected')
+            print(json.dumps({'ok': ok, 'module': report[0]}, ensure_ascii=False))
+            # a JSON {"ok": false} used to exit 0, so callers that check the code saw a
+            # clean verification of a module whose files are missing or edited
+            return 0 if ok else 1
         if args.command == 'update':
             if not args.module:
                 raise UpdateError('update needs a module id')
@@ -540,7 +664,8 @@ def main(argv=None):
                                   'version': module.get('version'), 'source': source,
                                   'skipped': skipped}, ensure_ascii=False))
                 return 0
-            backup = install_staged(args.module, staged, state, module.get('version', ''), args.state)
+            backup = install_staged(args.module, staged, state, module.get('version', ''),
+                                    args.state)
             print(json.dumps({'ok': True, 'module': args.module, 'changed': True,
                               'version': module.get('version'), 'files': len(staged),
                               'backup': backup, 'source': source,

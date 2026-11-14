@@ -40,6 +40,9 @@ list_methods() {
 	json_add_object "google";                   json_close_object
 	json_add_object "global";                   json_add_string "mode" "string"; json_close_object
 	json_add_object "ipv6";                     json_add_string "state" "string"; json_close_object
+	json_add_object "dns_guard";                json_add_string "action" "string"; json_close_object
+	json_add_object "console";                  json_add_string "action" "string"; json_add_string "ip" "string"; json_add_string "sub" "string"; json_add_string "countries" "string"; json_close_object
+	json_add_object "console_diag";             json_add_string "what" "string"; json_close_object
 	json_add_object "dev_add";                  json_add_string "ip" "string"; json_add_string "mode" "string"; json_add_string "mac" "string"; json_add_string "name" "string"; json_close_object
 	json_add_object "dev_del";                  json_add_string "ip" "string"; json_close_object
 	json_add_object "ai_sub_get";               json_close_object
@@ -67,6 +70,7 @@ list_methods() {
 	json_add_object "nodes_path_apply_status";  json_add_string "path_id" "string"; json_close_object
 	json_add_object "mtrickle_sync";            json_close_object
 	json_add_object "nodes_audit_schedule_get"; json_add_string "path_id" "string"; json_close_object
+	json_add_object "backup";                   json_close_object
 	json_add_object "nodes_audit_schedule_set"; json_add_string "path_id" "string"; json_add_string "enabled" "string"; json_add_string "time" "string"; json_add_string "mode" "string"; json_close_object
 	# <<< geo-rpc generated:list <<<
 	json_dump
@@ -117,6 +121,9 @@ call_method() {
 		google)                   "$BACKEND" google ;;
 		global)                   json_get_var mode mode; "$BACKEND" global "$mode" ;;
 		ipv6)                     json_get_var state state; "$BACKEND" ipv6 "$state" ;;
+		dns_guard)                json_get_var action action; "$BACKEND" dns_guard "$action" ;;
+		console)                  json_get_var action action; json_get_var ip ip; json_get_var sub sub; json_get_var countries countries; "$BACKEND" console "$action" "$ip" "$sub" "$countries" ;;
+		console_diag)             json_get_var what what; "$BACKEND" console_diag "$what" ;;
 		dev_add)                  json_get_var ip ip; json_get_var mode mode; json_get_var mac mac; json_get_var name name; "$BACKEND" dev_add "$ip" "$mode" "$mac" "$name" ;;
 		dev_del)                  json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;
 		ai_sub_get)               "$BACKEND" ai_sub_get ;;
@@ -144,6 +151,7 @@ call_method() {
 		nodes_path_apply_status)  json_get_var path_id path_id; "$BACKEND" nodes_path_apply_status "$path_id" ;;
 		mtrickle_sync)            "$BACKEND" mtrickle_sync ;;
 		nodes_audit_schedule_get) json_get_var path_id path_id; "$BACKEND" nodes_audit_schedule_get "$path_id" ;;
+		backup)                   "$BACKEND" backup ;;
 		nodes_audit_schedule_set) json_get_var path_id path_id; json_get_var enabled enabled; json_get_var time time; json_get_var mode mode; "$BACKEND" nodes_audit_schedule_set "$path_id" "$enabled" "$time" "$mode" ;;
 		# <<< geo-rpc generated:call <<<
 		*) echo '{"error":"unknown method"}'; return 1 ;;

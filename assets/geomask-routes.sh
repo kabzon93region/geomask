@@ -95,7 +95,7 @@ _gm_route_in_prefix() { # _gm_route_in_prefix <ip> <prefix/cidr> -> 0 when insid
   }'
 }
 
-_gm_route_cleanup() { rm -f "$1" "$2" "$3" 2>/dev/null; }
+_gm_route_cleanup() { rm -f "$@" 2>/dev/null; }
 
 geomask_routes_sync() { # geomask_routes_sync <table> -> 0 only when the table is consistent
   _rt=$1
@@ -105,6 +105,8 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> 0 only when the table i
   _main="$GM_ROUTE_STATE_DIR/main-$_rt.$$"
   _want="$GM_ROUTE_STATE_DIR/want-$_rt.$$"
   _new="$GM_ROUTE_STATE_DIR/new-$_rt.$$"
+  _cur="$GM_ROUTE_STATE_DIR/cur-$_rt.$$"
+  _occ="$GM_ROUTE_STATE_DIR/occ-$_rt.$$"
 
   _devs=$(_gm_route_devices)
   _local_lines=$(_gm_route_local_lines)
@@ -137,19 +139,40 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> 0 only when the table i
     # would send the LAN into the tunnel.
     printf '%s\n' "$_local_lines" >> "$_want"
   else
-    _gm_route_cleanup "$_main" "$_want" "$_new"
+    _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
     return 1
   fi
-  [ -s "$_want" ] || { _gm_route_cleanup "$_main" "$_want" "$_new"; return 1; }
+  [ -s "$_want" ] || { _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"; return 1; }
+
+  # What is installed now. Ownership is decided against this snapshot, and a failed read
+  # means nothing is touched at all: a blind `replace` could take a route somebody else owns.
+  if ! ip route show table "$_rt" > "$_cur" 2>/dev/null; then
+    _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
+    return 1
+  fi
 
   _fail=0
   : > "$_new"
   while IFS= read -r _r; do
     [ -n "$_r" ] || continue
     _pfx=${_r%% *}
-    # Only a route we recorded may be replaced; a foreign entry on the same prefix stays.
-    if ip route show table "$_rt" exact "$_pfx" 2>/dev/null | grep -q .; then
-      grep -qxF "$_r" "$_owned" 2>/dev/null || continue
+    # Only a route we recorded may be replaced, and the occupants of the prefix - not the
+    # desired line - decide ownership. Comparing `desired` with `owned` skipped every
+    # replacement (on A->B, B is not in `owned` yet, so B was dropped and A removed), and the
+    # removal then went by prefix, which cannot tell two entries of one prefix apart. N01.
+    # The prefix may sit at any field (`10.0.0.0/24 dev ...`, `blackhole 10.0.0.0/24`), so the
+    # match is by whole word, not by the first column; a typed route is foreign by definition.
+    awk -v p="$_pfx" '{ for (i = 1; i <= NF; i++) if ($i == p) { print; break } }' "$_cur" > "$_occ"
+    if [ -s "$_occ" ]; then
+      _foreign=0
+      while IFS= read -r _c; do
+        grep -qxF "$_c" "$_owned" 2>/dev/null || _foreign=1
+      done < "$_occ"
+      if [ "$_foreign" = 1 ]; then
+        # A foreign entry on this prefix stays. rc=1: the table is not what `desired` wants.
+        _fail=1
+        continue
+      fi
     fi
     if ip route replace table "$_rt" $_r 2>/dev/null; then
       printf '%s\n' "$_r" >> "$_new"
@@ -158,18 +181,21 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> 0 only when the table i
     fi
   done < "$_want"
 
-  # Remove only recorded routes that are no longer wanted.
+  # Remove only recorded routes that are no longer wanted, and only by their full line: an
+  # entry of ours may have been replaced by somebody else since, and `ip route del <prefix>`
+  # cannot distinguish the two. A record that is no longer installed is not a failure.
   if [ -f "$_owned" ]; then
     while IFS= read -r _o; do
       [ -n "$_o" ] || continue
       grep -qxF "$_o" "$_want" && continue
-      ip route del table "$_rt" "${_o%% *}" 2>/dev/null || _fail=1
+      grep -qxF "$_o" "$_cur" || continue
+      ip route del table "$_rt" $_o 2>/dev/null || _fail=1
     done < "$_owned"
   fi
 
   # Record what is really installed, even after a partial failure: an entry left in the table
   # without an owner could never be cleaned up later.
   cp -f "$_new" "$_owned" 2>/dev/null || _fail=1
-  _gm_route_cleanup "$_main" "$_want" "$_new"
+  _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
   return "$_fail"
 }

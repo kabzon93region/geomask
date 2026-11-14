@@ -2156,6 +2156,17 @@ _console_rule_off() { # remove only OUR rules: `from <ipv4> lookup 102`, never a
   return 0
 }
 
+# Undo the console patch: put the pre-patch config back and make mihomo re-read it, so a
+# failed switch leaves the router exactly as it was found. Without this the live file stayed
+# patched after a failed reload and the next mihomo restart would pick up a half-applied lane.
+_console_cfg_restore() {
+  [ -f "$MIHOMO_CONF.bak_console" ] || return 1
+  cp -f "$MIHOMO_CONF.bak_console" "$MIHOMO_CONF" 2>/dev/null || return 1
+  controller_curl -s -o /dev/null -m10 -X PUT "$MIHOMO_API/configs?force=true" \
+    -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" >/dev/null 2>&1 || true
+  return 0
+}
+
 cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   _act="$1"
   case "$_act" in
@@ -2240,7 +2251,10 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
       printf '{"ok":false,"error":"mihomo -t rejected the patched config - live config untouched"}\n'; return 1
     }
   fi
-  cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_console" 2>/dev/null
+  cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_console" 2>/dev/null || {
+    rm -f "$_cand"
+    printf '{"ok":false,"error":"cannot back up the mihomo config - live config untouched"}\n'; return 1
+  }
   mv -f "$_cand" "$MIHOMO_CONF" 2>/dev/null || {
     rm -f "$_cand"
     printf '{"ok":false,"error":"cannot install the patched config"}\n'; return 1
@@ -2251,7 +2265,8 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" 2>/dev/null)
   case "$_code" in
     200|204) ;;
-    *) printf '{"ok":false,"error":"mihomo reload failed (HTTP %s) - config written, switch not applied"}\n' "${_code:-none}"; return 1 ;;
+    *) _console_cfg_restore
+       printf '{"ok":false,"error":"mihomo reload failed (HTTP %s) - previous config restored"}\n' "${_code:-none}"; return 1 ;;
   esac
   _i=0; _lst=0
   while [ "$_i" -lt 5 ]; do
@@ -2259,11 +2274,12 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     sleep 1; _i=$((_i+1))
   done
   [ "$_lst" = 1 ] || {
-    printf '{"ok":false,"error":"console listener did not appear on :%s - switch not applied"}\n' "$CONSOLE_SOCKS_PORT"; return 1
+    _console_cfg_restore
+    printf '{"ok":false,"error":"console listener did not appear on :%s - previous config restored"}\n' "$CONSOLE_SOCKS_PORT"; return 1
   }
-  _console_tun_ensure || { printf '{"ok":false,"error":"console tunnel did not come up"}\n'; return 1; }
-  _console_fw_ensure || { printf '{"ok":false,"error":"console firewall zone not created"}\n'; return 1; }
-  _console_rule_on "$_ip" || { printf '{"ok":false,"error":"console route rule not installed"}\n'; return 1; }
+  _console_tun_ensure || { _console_cfg_restore; printf '{"ok":false,"error":"console tunnel did not come up - previous config restored"}\n'; return 1; }
+  _console_fw_ensure || { _console_cfg_restore; printf '{"ok":false,"error":"console firewall zone not created - previous config restored"}\n'; return 1; }
+  _console_rule_on "$_ip" || { _console_cfg_restore; printf '{"ok":false,"error":"console route rule not installed - previous config restored"}\n'; return 1; }
   # enabled is the COMMIT MARKER: written last, so a crash never leaves "on" without an address
   # for the watchdog and the kill switch to work with.
   [ -n "$_countries" ] && _console_set countries "$_countries"
@@ -2281,7 +2297,7 @@ _console_mask_stream() { # stdin -> stdout
   sed -E \
     -e 's#(https?://)[^"[:space:]]+#\1…#g' \
     -e "s#^([[:space:]]*option[[:space:]]+(private_key|preshared_key|password|key|secret|psk|token|username|identity)[[:space:]]+').*'#\\1…'#" \
-    -e "s#^([[:space:]]*(private_key|preshared_key|password|secret|psk|token|key):[[:space:]]*).*#\\1…#"
+    -e "s#^([[:space:]]*(private_key|preshared_key|password|secret|psk|token|key|username|username-secret|auth|uuid|obfs-password|x-hwid):[[:space:]]*).*#\\1…#"
 }
 
 # One archive with everything needed to diagnose the console path from a distance. Secrets are

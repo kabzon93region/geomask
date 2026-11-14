@@ -431,8 +431,8 @@ uci() {
                        '    username: alice\n'
                        '    password: hunter2\n', encoding='utf-8')
         out = self.case / 'masked.yaml'
-        self.run_backend('_console_mask_config "%s" "%s"' % (posix(src), posix(out)),
-                         functions=['_console_mask_config'], extra='')
+        self.run_backend('_console_mask_stream < "%s" > "%s"' % (posix(src), posix(out)),
+                         functions=['_console_mask_stream'], extra='')
         text = out.read_text(encoding='utf-8')
         self.assertNotIn('a9BmJwWGvh61Zg2', text)
         self.assertNotIn('s3cr3t-token', text)
@@ -440,6 +440,25 @@ uci() {
         self.assertNotIn('alice', text)
         self.assertIn('mixed-port: 7890', text)      # structure is kept for diagnosis
         self.assertIn('https://…', text)
+
+    def test_uci_secrets_are_masked_too(self):
+        # `uci show network/firewall` goes into the same bundle and carries the real keys.
+        sample = ("config interface 'wan'\n"
+                  "\toption password 'pppoe-secret'\n"
+                  "config wireguard 'wg0'\n"
+                  "\toption private_key 'PRIVKEY-abc'\n"
+                  "\toption preshared_key 'PSK-xyz'\n"
+                  "\tlist addresses '10.0.0.2/32'\n")
+        src = self.case / 'network.uci'
+        src.write_text(sample, encoding='utf-8', newline='\n')
+        out = self.case / 'network.masked'
+        self.run_backend('_console_mask_stream < "%s" > "%s"' % (posix(src), posix(out)),
+                         functions=['_console_mask_stream'], extra='')
+        text = out.read_text(encoding='utf-8')
+        self.assertNotIn('pppoe-secret', text)
+        self.assertNotIn('PRIVKEY-abc', text)
+        self.assertNotIn('PSK-xyz', text)
+        self.assertIn("list addresses '10.0.0.2/32'", text)
 
     # ---------------------------------------------------------------- credentials (F23)
     def test_a_subscription_url_never_shows_its_credentials(self):

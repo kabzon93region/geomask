@@ -7,6 +7,7 @@ import os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 TPL = os.path.join(HERE, "geomask.sh.in")
 OUT = os.path.join(HERE, "geomask.sh")
+TARGET = OUT
 ASSETS = os.path.join(HERE, "assets")
 
 MAP = {
@@ -80,6 +81,16 @@ def load(name):
     return data
 
 def main():
+    # --out lets a verification step build into a scratch file instead of overwriting the
+    # committed artifact: a checker that repairs what it checks proves nothing.
+    global TARGET
+    TARGET = OUT
+    argv = sys.argv[1:]
+    if argv:
+        if len(argv) == 2 and argv[0] == "--out":
+            TARGET = os.path.abspath(argv[1])
+        else:
+            raise SystemExit("usage: build.py [--out PATH]")
     tpl = open(TPL, encoding="utf-8").read()
 
     def repl(m):
@@ -125,10 +136,10 @@ def main():
     if left:
         raise SystemExit("unreplaced markers: %s" % left)
 
-    with open(OUT, "w", encoding="utf-8", newline="\n") as f:
+    with open(TARGET, "w", encoding="utf-8", newline="\n") as f:
         f.write(out)
-    os.chmod(OUT, 0o755)
-    print("built %s (%d bytes), %d assets injected" % (OUT, len(out.encode()), n))
+    os.chmod(TARGET, 0o755)
+    print("built %s (%d bytes), %d assets injected" % (TARGET, len(out.encode()), n))
 
 if __name__ == "__main__":
     main()

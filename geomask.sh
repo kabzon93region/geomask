@@ -35965,7 +35965,12 @@ step7_check() {
   elif [ "$_v6_assign" = 0 ] && [ "$_v6_ra" = disabled ]; then
     info "IPv6: выключен (ядро + LAN + firewall)"
   else
-    warn "IPv6: глобальных адресов нет, но LAN по-прежнему раздаёт IPv6 (ip6assign=${_v6_assign:-не задан}, ra=${_v6_ra:-не задан}) - префикс может появиться при подъёме WAN"
+    # A warning here used to be skipped by run_step ("check: ALL GOOD"), so the default
+    # "IPv6 off everywhere" was never applied on a router that had no global address yet but
+    # still handed out IPv6 on the LAN. Latent leak is still a leak: fail the check so the
+    # step actually runs.
+    bad "IPv6: глобальных адресов нет, но LAN по-прежнему раздаёт IPv6 (ip6assign=${_v6_assign:-не задан}, ra=${_v6_ra:-не задан}) - префикс появится при подъёме WAN"
+    _need=1
   fi
   # Console lane: while it is switched on, the rule is the only thing that keeps the console
   # off the normal path. A missing rule looks like "the game broke", so it is a failure here.
@@ -36018,8 +36023,10 @@ apply_ipv6_default() {
   fi
   _be="$(P /usr/bin/geo-backend.sh)"
   if [ ! -x "$_be" ]; then
-    warn "IPv6: backend не установлен - состояние IPv6 не менялось"
-    return 0
+    # With --modules core,path_vpn the backend is not installed. Reporting success here made
+    # the installer believe IPv6 was handled while nothing was changed.
+    bad "IPv6: backend не установлен - выключение IPv6 не выполнено (нужен модуль luci/core с geo-backend.sh)"
+    return 1
   fi
   # No uci means this is not a router we can manage network settings on (a test sandbox or a
   # broken image). Saying "not applicable" is honest; failing the whole run is not.

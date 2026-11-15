@@ -450,6 +450,7 @@ module_owns_path() { # echoes the module id that owns an install path, if any
     "/usr/lib/geomask/geomask-config-tx.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-console.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-diag-redact.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-diag-spool.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-dnsguard.sh") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-lane-torrent.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-lists-edit.py") GM_PATH_MODULE="core" ;;
@@ -7979,6 +7980,11 @@ cmd_console_status() { cmd_console status; }
 # carried the owner's keys. The redactor is a shipped asset with the real `uci show` grammar
 # (plus mihomo YAML, controller JSON and log text), so the masking is testable off-router.
 DIAG_PY=${GM_DIAG_PY:-/usr/lib/geomask/geomask-diag-redact.py}
+# R07: the bundle and its sidecar live in one private spool (0700, owned by us) instead of
+# world-writable /tmp, and every read goes through the shipped helper - never through
+# `wc`/`base64`, which follow symlinks.
+DIAG_SPOOL=${GM_DIAG_SPOOL:-/tmp/geomask-diag}
+DIAG_SPOOL_PY=${GM_DIAG_SPOOL_PY:-/usr/lib/geomask/geomask-diag-spool.py}
 
 _console_diag_fail() { # $1 = stage that failed
   rm -rf "$_dir" 2>/dev/null
@@ -7986,7 +7992,7 @@ _console_diag_fail() { # $1 = stage that failed
   return 1
 }
 
-_console_diag_redact() { # $1 = uci|yaml|json|text, $2 = stage, $3 = output file, stdin
+_console_diag_redact() { # $1 = uci|yaml|json|text|nft, $2 = stage, $3 = output file, stdin
   "$PYTHON_BIN" -B "$DIAG_PY" redact "$1" > "$3" 2>/dev/null
   _cdr=$?
   [ "$_cdr" = 0 ] || { _console_diag_fail "$2"; return 1; }
@@ -7997,6 +8003,20 @@ _console_diag_redact() { # $1 = uci|yaml|json|text, $2 = stage, $3 = output file
 # masking is done by the shipped redactor, and `verify` is the last gate: an unmasked bundle
 # is never handed out (review 15.11, R02).
 cmd_console_diag() {
+  # R07: the archive lives in a private spool, never in world-writable /tmp. `init` fails
+  # closed (must be a real directory, ours, 0700) and its JSON refusal is the answer.
+  [ -f "$DIAG_SPOOL_PY" ] || {
+    printf '{"ok":false,"error":"spool is not private: helper missing"}\n'; return 1
+  }
+  _diag_init=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" init "$DIAG_SPOOL" 2>/dev/null)
+  _diag_init_rc=$?
+  if [ "$_diag_init_rc" != 0 ]; then
+    case "$_diag_init" in
+      '{"ok":false'*) printf '%s\n' "$_diag_init" ;;
+      *) printf '{"ok":false,"error":"spool is not private: init failed"}\n' ;;
+    esac
+    return 1
+  fi
   # One private directory per request: the fixed path plus `rm -rf` let two panel clicks delete
   # each other's half-built bundle (review 15.11, points 1 and 33).
   _tmpd=${TMPDIR:-/tmp}
@@ -8004,8 +8024,11 @@ cmd_console_diag() {
   [ -n "$_dir" ] || { printf '{"ok":false,"error":"cannot create a private bundle directory"}\n'; return 1; }
   chmod 700 "$_dir" 2>/dev/null
   # Nothing older than the retention window stays on the router: these archives carry the
-  # masked-but-still-descriptive state of the console lane.
-  find "$_tmpd" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz' \
+  # masked-but-still-descriptive state of the console lane. The sidecar goes with the archive
+  # or a missing archive would still look registered.
+  find "$DIAG_SPOOL" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz' \
+    -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
+  find "$DIAG_SPOOL" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz.json' \
     -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
   # Without the redactor the bundle cannot be masked; an unmasked archive is worse than no
   # archive at all, so the request fails closed.
@@ -8025,7 +8048,7 @@ cmd_console_diag() {
   ip -4 addr show "$CONSOLE_TUN_DEV" > "$_dir/tun.txt" 2>&1
   uci -q show firewall 2>&1 | _console_diag_redact uci uci:firewall "$_dir/firewall.uci" || return 1
   uci -q show network 2>&1 | _console_diag_redact uci uci:network "$_dir/network.uci" || return 1
-  nft list ruleset 2>&1 | _console_diag_redact text text:nft "$_dir/nft.txt" || return 1
+  nft list ruleset 2>&1 | _console_diag_redact nft nft:ruleset "$_dir/nft.txt" || return 1
   [ -n "$_ip" ] && conntrack -L -s "$_ip" > "$_dir/conntrack-console.txt" 2>&1
   logread 2>/dev/null | grep -iE 'mihomo|hev|geomask|console' | tail -400 \
     | _console_diag_redact text text:logread "$_dir/logread.txt" || return 1
@@ -8051,13 +8074,31 @@ cmd_console_diag() {
       "$(json_esc "${_diag_detail:-verification failed}")"
     return 1
   fi
-  _tgz="$_tmpd/geomask-console-diag-$(date +%Y%m%d-%H%M%S).$$.tar.gz"
+  _tgz="$DIAG_SPOOL/geomask-console-diag-$(date +%Y%m%d-%H%M%S).$$.tar.gz"
   ( umask 077; tar -czf "$_tgz" -C "$_tmpd" "$(basename "$_dir")" >/dev/null 2>&1 ) || {
     rm -rf "$_dir" 2>/dev/null
+    rm -f "$_tgz" 2>/dev/null
     printf '{"ok":false,"error":"cannot pack the bundle"}\n'; return 1
   }
   chmod 600 "$_tgz" 2>/dev/null
   rm -rf "$_dir" 2>/dev/null
+  # Registration records (dev, ino, link count, size, sha256) in <archive>.json; a failure
+  # removes the archive so an unregistered bundle cannot linger in the spool.
+  # Fixed creation/registration cap: 2 MiB, checked before SMB copy. Larger archives
+  # are deleted, not left for SMB/SSH. GM_CONSOLE_DIAG_MAX only controls transport.
+  _diag_reg=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" register "$DIAG_SPOOL" "$_tgz" 2>/dev/null)
+  _diag_reg_rc=$?
+  if [ "$_diag_reg_rc" != 0 ]; then
+    rm -f "$_tgz" 2>/dev/null
+    case "$_diag_reg" in
+      '{"ok":false'*) printf '%s\n' "$_diag_reg" ;;
+      *) printf '{"ok":false,"error":"cannot register the bundle"}\n' ;;
+    esac
+    return 1
+  fi
+  # The helper measured the archive from its descriptor; the shell must not read it again.
+  _diag_bytes=$(printf '%s\n' "$_diag_reg" | sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p')
+  case "$_diag_bytes" in ''|*[!0-9]*) _diag_bytes=0 ;; esac
   # Into the share only when the owner opted in with the marker: before this the archive was
   # copied into a folder that may be published over SMB, without asking (review 15.11, #14).
   _shared=false
@@ -8066,54 +8107,24 @@ cmd_console_diag() {
       && chmod 600 "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null && _shared=true
   fi
   printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s}\n' \
-    "$_tgz" "$(wc -c < "$_tgz" 2>/dev/null)" "$_shared"
+    "$_tgz" "$_diag_bytes" "$_shared"
 }
 
 # The panel used to get only a path on the router, so the owner had to find the archive by hand
 # over SMB or SSH - and the file sat in /tmp with no way back (review 15.11, #15). The bytes now
 # travel through the same authenticated ubus call as the rest of the panel: no world-readable
-# URL, no published path. Only our own archives, by plain name, and only up to a size rpcd can
-# carry; anything bigger stays for the SMB share or ssh.
+# URL, no published path. R07: the download path does not reopen the archive in shell - the
+# helper refuses a symlink, a hard link, a swapped inode and a modified body, then base64s the
+# bytes it hashed from one descriptor. GM_CONSOLE_DIAG_MAX is the configurable transport cap;
+# it does not raise the fixed 2 MiB creation cap. Only successfully registered archives can
+# remain in the spool or receive an opted-in SMB copy.
 cmd_console_diag_get() {
-  _dg_name=${1:-}
-  _dg_dir=${TMPDIR:-/tmp}
-  case "$_dg_name" in
-    '')
-      # Without a name the newest bundle is meant: the panel offers "download the last one"
-      # without rebuilding it.
-      _dg_path=$(ls -1t "$_dg_dir"/geomask-console-diag-*.tar.gz 2>/dev/null | head -1)
-      ;;
-    geomask-console-diag-*.tar.gz)
-      # A path is not a name: `../../etc/shadow` must not pass the glob above either.
-      case "$_dg_name" in
-        */*) printf '{"ok":false,"error":"имя архива не должно содержать путь"}\n'; return 1 ;;
-      esac
-      _dg_path="$_dg_dir/$_dg_name"
-      ;;
-    *)
-      printf '{"ok":false,"error":"это не архив диагностики"}\n'
-      return 1
-      ;;
-  esac
-  if [ -z "$_dg_path" ] || [ ! -f "$_dg_path" ]; then
-    printf '{"ok":false,"error":"архива нет - нажмите «Собрать и скачать логи»"}\n'
-    return 1
-  fi
-  _dg_bytes=$(wc -c < "$_dg_path" 2>/dev/null | tr -d ' ')
-  case "$_dg_bytes" in ''|*[!0-9]*) _dg_bytes=0 ;; esac
-  _dg_max=${GM_CONSOLE_DIAG_MAX:-2097152}
-  if [ "$_dg_bytes" -gt "$_dg_max" ]; then
-    printf '{"ok":false,"error":"архив %s байт - больше предела выдачи %s; заберите его по SMB или через ssh"}\n' \
-      "$_dg_bytes" "$_dg_max"
-    return 1
-  fi
-  _dg_b64=$(base64 "$_dg_path" 2>/dev/null | tr -d '\r\n')
-  case "$_dg_b64" in
-    '') printf '{"ok":false,"error":"base64 недоступен - архив остался на роутере"}\n'; return 1 ;;
-  esac
-  _dg_sha=$(sha256sum "$_dg_path" 2>/dev/null | cut -d' ' -f1)
-  printf '{"ok":true,"name":"%s","bytes":%s,"sha256":"%s","data":"%s"}\n' \
-    "$(basename "$_dg_path")" "$_dg_bytes" "$_dg_sha" "$_dg_b64"
+  [ -f "$DIAG_SPOOL_PY" ] || {
+    printf '{"ok":false,"error":"spool helper missing"}\n'; return 1
+  }
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" get "$DIAG_SPOOL" "${1:-}" \
+    --max "${GM_CONSOLE_DIAG_MAX:-2097152}" --ttl "${CONSOLE_DIAG_KEEP_H:-24}"
+  return $?
 }
 
 case "$1" in
@@ -12572,7 +12583,8 @@ output - not on the config-file form the backend used to know:
     redact uci    `uci show firewall|network` (pkg.sec=type, pkg.sec.opt='value', lists)
     redact yaml   /etc/mihomo/config.yaml (mihomo's own YAML)
     redact json   console-config.json, group-CONSOLE.json, connections.json
-    redact text   logread / nft output (log lines and API payloads)
+    redact text   logread (log lines and API payloads)
+    redact nft    plain nft ruleset tokens, with strict string/comment payload handling
 
 Every mode reads stdin and writes stdout.  `verify <dir>` is the last gate before tar:
 it walks every regular file and fails on anything that still looks like a real secret.
@@ -12683,39 +12695,83 @@ def _uci_allowed(section_type, option):
     return allowed is not None and option in allowed
 
 
-def redact_uci(text):
-    """Structural pass over `uci show`: types first, then every option line."""
-    sections = {}
+def _uci_records(text):
+    """Parse uci_print_value grammar, not shell syntax. Never eval/source input.
+
+    Values are single-quoted chunks, joined by literal \\' escapes, with spaces
+    between list elements. Newlines inside quotes belong to the same assignment.
+    Unknown lines, unquoted values and incomplete quotes are ambiguous: refuse all.
+    """
+    text = text.replace('\r\n', '\n')
     records = []
-    for line in text.split('\n'):
-        section = _UCI_SECTION.match(line)
+    pos = 0
+    while pos < len(text):
+        if text[pos] == '\n':
+            pos += 1
+            continue
+        end = text.find('\n', pos)
+        end = len(text) if end < 0 else end
+        line = text[pos:end]
+        section = _UCI_SECTION.fullmatch(line)
         if section:
-            sections[(section.group(1), section.group(2))] = section.group(3)
-            records.append(('section', line, None))
+            records.append(('section', section.groups(), line, []))
+            pos = end + 1
             continue
-        option = _UCI_OPTION.match(line)
-        if option:
-            records.append(('option', line, option))
-            continue
-        records.append(('other', line, None))
+        option = re.match(r'([A-Za-z0-9_-]+)\.([^.=\n]+)\.([A-Za-z0-9_-]+)=', text[pos:])
+        if not option:
+            raise RedactionError('uci parse failed')
+        prefix = option.group(0)
+        pos += option.end()
+        values = []
+        while True:
+            if pos >= len(text) or text[pos] != "'":
+                raise RedactionError('uci parse failed')
+            value = ''
+            while True:
+                pos += 1
+                close = text.find("'", pos)
+                if close < 0:
+                    raise RedactionError('uci parse failed')
+                value += text[pos:close]
+                pos = close + 1
+                # uci_print_value emits closing quote + backslash quote + opening quote.
+                if text.startswith("\\''", pos):
+                    value += "'"
+                    pos += 2
+                    continue
+                break
+            values.append(value)
+            if pos == len(text) or text[pos] == '\n':
+                pos += 1
+                break
+            if text[pos] != ' ':
+                raise RedactionError('uci parse failed')
+            while pos < len(text) and text[pos] == ' ':
+                pos += 1
+        records.append(('option', option.groups(), prefix, values))
+    return records
+
+
+def _uci_quote(value):
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def redact_uci(text):
+    records = _uci_records(text)
+    sections = {(parts[0], parts[1]): parts[2]
+                for kind, parts, _, _ in records if kind == 'section'}
     out = []
-    for kind, line, match in records:
+    for kind, parts, prefix, values in records:
         if kind == 'section':
-            out.append(line)
+            out.append(prefix)
             continue
-        if kind == 'other':
-            # uci's own error message or a stray line: keep it, but never a credential
-            # that happens to sit on it.
-            out.append(redact_text_line(line))
-            continue
-        pkg, sec, option, value = match.groups()
-        prefix = line[:match.start(4)]
+        pkg, sec, option = parts
         if _uci_allowed(sections.get((pkg, sec)), option):
-            out.append(prefix + (value if value else "''"))
+            clean = [redact_text(value) for value in values]
         else:
-            # Unknown section/option: the name is kept, the value is not.
-            out.append(prefix + "'" + PLACEHOLDER + "'")
-    return '\n'.join(out)
+            clean = [PLACEHOLDER]
+        out.append(prefix + ' '.join(_uci_quote(value) for value in clean))
+    return '\n'.join(out) + ('\n' if text.endswith('\n') and out else '')
 
 
 # ---------------------------------------------------------------- yaml / json
@@ -12726,7 +12782,7 @@ _SECRET_KEYS = {
     'password', 'passwd', 'secret', 'private-key', 'preshared-key', 'psk',
     'token', 'uuid', 'auth', 'authentication', 'authorization', 'header',
     'headers', 'username', 'user', 'x-hwid', 'url', 'subscribe-url',
-    'obfs-password', 'key',
+    'obfs-password', 'key', 'auth-str', 'auth-string', 'proxy-authorization',
 }
 
 
@@ -12768,19 +12824,30 @@ def _string_is_secret(value):
     return False
 
 
-def _redact_tree(node):
+def _redact_tree(node, depth=0):
+    if depth > _MAX_NESTING:
+        raise RedactionError('document nesting limit')
     if isinstance(node, dict):
         clean = {}
         for key, value in node.items():
             if _key_is_secret(key):
                 clean[key] = PLACEHOLDER
             else:
-                clean[key] = _redact_tree(value)
+                clean[key] = _redact_tree(value, depth + 1)
         return clean
     if isinstance(node, list):
-        return [_redact_tree(item) for item in node]
-    if isinstance(node, str) and _string_is_secret(node):
-        return PLACEHOLDER
+        return [_redact_tree(item, depth + 1) for item in node]
+    if isinstance(node, str):
+        clean = redact_text(node, depth + 1)
+        # Retain the prior scalar shape policy (non-HTTP userinfo and secret query
+        # strings too), without discarding useful nested JSON for ordinary key/value logs.
+        if _USERINFO_ANY.search(clean):
+            return PLACEHOLDER
+        for match in _SECRET_QUERY.finditer(clean):
+            value = re.match(_VALUE, clean[match.end():])
+            if value and not _is_placeholder(value.group(0)):
+                return PLACEHOLDER
+        return clean
     return node
 
 
@@ -12802,7 +12869,7 @@ def redact_json(text):
     if not text.strip():
         return ''
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=_unique_json_object)
     except ValueError:
         raise RedactionError('json parse failed')
     clean = _redact_tree(data)
@@ -12811,15 +12878,53 @@ def redact_json(text):
 
 # ---------------------------------------------------------------- text
 
-_BEARER = re.compile(r'(?i)(\bbearer\s+)\S+')
-_URL = re.compile(r'(?i)\bhttps?://[^\s"\'<>]+')
+# One lexical key grammar; policy is _key_is_secret, not a second list of aliases.
+# Quoted values include whitespace. Composite auth values consume scheme AND credential.
+_QUOTED = r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\''
+# An unquoted value keeps going across spaces AND across an indented obs-fold
+# (like _HEADER) until a real `name=value` field begins, so `password=hello
+# world` and a folded `password=raw1\n raw2tail` mask the whole tail while
+# `user=admin` after a secret stays its own field. A col-0 (unindented) next
+# line is a new logical record, not a value tail: masking it would swallow the
+# next log entry, and real multi-line secrets are quoted (handled structurally).
+# A field boundary needs a lowercase `name` (case-sensitive, even though the
+# key grammar is case-insensitive) and a NON-EMPTY value: a trailing base64
+# padding token like `Y2U6cHc=` (uppercase / empty after `=`) is secret tail,
+# never a field, so it is masked rather than left to leak.
+_FIELD_START = r'(?-i:[a-z][a-z0-9_.-]*)\s*[:=]\s*[^\s,;&}\]"\']'
+_UNQUOTED = (r'[^\s,;&}\]"\']+(?:(?:[ \t]+|\r?\n[ \t]+)(?!'
+             + _FIELD_START + r')[^\s,;&}\]"\']+)*')
+_VALUE = r'(?:' + _QUOTED + r'|' + _UNQUOTED + r')'
+# A Basic/Bearer credential is opaque (base64 may contain spaces and `=`, and
+# may fold across indented lines); mask through the fold rather than leaving a
+# folded tail to leak.
+_AUTH_VALUE = r'(?:' + _QUOTED + r'|[^\r\n,;&}]+(?:\r?\n[ \t]+[^\r\n]*)*)'
 _KEYVAL = re.compile(
-    r'(?i)(?<![A-Za-z0-9_-])'
-    r'(password|passwd|secret|private[_-]?key|preshared[_-]?key|psk|token|uuid|'
-    r'x-hwid|authorization|authentication|auth|header|headers|username|user|'
-    r'obfs-password|key)'
-    r'(\s*[:=]\s*)'
-    r'("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|[^\s,;&}\]]+)')
+    r'(?i)(?=(?<![A-Za-z0-9_.-])(["\']?)([A-Za-z0-9_.-]+)\1'
+    r'(\s*[:=]\s*)(' + _VALUE + r'))')
+_AUTH = re.compile(r'(?i)\b(basic|bearer)\s+(' + _AUTH_VALUE + r')')
+_HEADER = re.compile(
+    r'(?i)(?<![A-Za-z0-9_.-])(["\']?)(?:proxy-)?authorization\1'
+    r'[ \t]*[:=][ \t]*(?:\r?\n[ \t]+)*('
+    + _QUOTED + r'|[^\r\n}\]]+(?:\r?\n[ \t]+[^\r\n]*)*)')
+_UNFRAMED_HEADER = re.compile(
+    r'(?i)(?<![A-Za-z0-9_.-])(["\']?)(?:proxy-)?authorization\1'
+    r'[ \t]*[:=][ \t]*\r?\n(?=[^ \t\r\n])')
+_STRINGS = re.compile(_QUOTED, re.DOTALL)
+_URL = re.compile(r'(?i)\bhttps?://[^\s"\'<>]+')
+_MAX_NESTING = 32
+
+
+def _decoded_quote(token):
+    if token.startswith('"'):
+        try:
+            return json.loads(token)
+        except ValueError:
+            pass
+    # Log/YAML single quotes: support doubled quotes without evaluating escape code.
+    return token[1:-1].replace("''", "'")
+
+
 _PLACEHOLDERS = {'', '…', "'…'", '"…"', '[redacted]', '***', 'null', 'none', '~'}
 
 
@@ -12827,7 +12932,13 @@ def _is_placeholder(value):
     token = value.strip()
     if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
         token = token[1:-1].strip()
-    return token.lower() in _PLACEHOLDERS
+    if token.lower() in _PLACEHOLDERS:
+        return True
+    # A real redaction run is only the ellipsis marker (possibly repeated when a
+    # folded credential is masked in pieces). Real placeholder *words* like
+    # `null`/`none` in a multi-word value are a live secret tail, not redaction.
+    pieces = token.split()
+    return bool(pieces) and all(piece == '…' for piece in pieces)
 
 
 def _mask_token(token):
@@ -12847,27 +12958,230 @@ def _url_without_credentials(match):
     return parsed.group(1) + '://' + host
 
 
+def _unique_json_object(pairs):
+    # Duplicate decoded keys are ambiguous (including escape-equivalent spellings).
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RedactionError('duplicate json key')
+        result[key] = value
+    return result
+
+
+_JSON_DECODER = json.JSONDecoder(object_pairs_hook=_unique_json_object)
+_JSON_OBJECT_START = re.compile(r'\s*(?:"(?:[^"\\]|\\.)*"\s*:|})')
+_JSON_ARRAY_START = re.compile(r'\s*(?:[\[\]{"0-9-]|true\b|false\b|null\b)')
+
+
+def _embedded_json(text):
+    """Yield whole object/array spans. Never decode a key apart from its value.
+
+    Quoted scalars are visited by the caller after decoding their complete string.
+    Malformed object-shaped candidates and duplicate keys fail closed. Ordinary
+    nft string sets and non-JSON bracket notation are not interpreted as JSON.
+    """
+    pos = 0
+    while pos < len(text):
+        quoted = _STRINGS.match(text, pos)
+        if quoted:
+            pos = quoted.end()
+            continue
+        char = text[pos]
+        looks_json = ((char == '{' and _JSON_OBJECT_START.match(text, pos + 1))
+                      or (char == '[' and _JSON_ARRAY_START.match(text, pos + 1)))
+        if looks_json:
+            try:
+                node, end = _JSON_DECODER.raw_decode(text, pos)
+            except ValueError:
+                if char == '[':
+                    # Bracketed timestamps/addresses are not necessarily arrays.
+                    # Keep scanning so any inner JSON object is still classified.
+                    pos += 1
+                    continue
+                raise RedactionError('embedded json parse failed')
+            except RecursionError:
+                raise RedactionError('embedded json nesting limit')
+            yield pos, end, node
+            pos = end
+        else:
+            pos += 1
+
+
+def _ambiguous_auth_folding(text):
+    spans = [match.span() for match in _STRINGS.finditer(text)]
+    for match in _UNFRAMED_HEADER.finditer(text):
+        if not any(start < match.start() < end for start, end in spans):
+            return True
+    for match in _HEADER.finditer(text):
+        if any(start < match.start() < end for start, end in spans):
+            continue
+        # Obs-fold must start with SP/HTAB. A bare scheme followed by a physical
+        # line without that framing cannot safely be separated from a credential.
+        if (match.group(2).strip().lower() in ('basic', 'bearer')
+                and (match.end() < len(text) and text[match.end()] in '\r\n')):
+            return True
+    return False
+
+
 def redact_text_line(line):
-    line = _BEARER.sub(lambda m: m.group(1) + PLACEHOLDER, line)
-    line = _URL.sub(_url_without_credentials, line)
-    line = _KEYVAL.sub(lambda m: m.group(1) + m.group(2) + _mask_token(m.group(3)), line)
-    line = _JWT.sub(PLACEHOLDER, line)
-    line = _LONG_TOKEN.sub(PLACEHOLDER, line)
-    return line
+    return redact_text(line)
 
 
-def redact_text(text):
-    return '\n'.join(redact_text_line(line) for line in text.split('\n'))
+def redact_text(text, depth=0, *, embedded=True):
+    if depth > _MAX_NESTING:
+        raise RedactionError('text nesting limit')
+    # Parse whole embedded JSON before any lexical substitution can destroy its
+    # key/value association or quoting. Arrays and decoded keys share tree policy.
+    if embedded:
+        pieces, previous = [], 0
+        for start, end, node in _embedded_json(text):
+            pieces.append(text[previous:start])
+            pieces.append(json.dumps(_redact_tree(node, depth + 1), ensure_ascii=False))
+            previous = end
+        pieces.append(text[previous:])
+        text = ''.join(pieces)
+    # Work inside encoded log strings next, then serialize them back. This handles
+    # escaped JSON embedded in JSON scalar messages without corrupting outer JSON.
+    def quoted(match):
+        token = match.group(0)
+        decoded = _decoded_quote(token)
+        clean = redact_text(decoded, depth + 1)
+        if clean == decoded:
+            return token
+        if token[0] == '"':
+            return json.dumps(clean, ensure_ascii=False)
+        return "'" + clean.replace("'", "''") + "'"
+    text = _STRINGS.sub(quoted, text)
+    if _ambiguous_auth_folding(text):
+        raise RedactionError('ambiguous authorization folding')
+    # A header is a composite value (also Digest/custom schemes). Mask its whole
+    # credential, including any tail after a placeholder from an older redactor.
+    spans = [match.span() for match in _STRINGS.finditer(text)]
+    def header(match):
+        # Quoted contents were handled recursively; never eat their closing quote.
+        if any(start < match.start() < end for start, end in spans):
+            return match.group(0)
+        return match.group(0)[:match.start(2) - match.start()] + _mask_token(match.group(2))
+    text = _HEADER.sub(header, text)
+    text = _AUTH.sub(lambda m: m.group(1) + ' ' + _mask_token(m.group(2)), text)
+    text = _URL.sub(_url_without_credentials, text)
+    replacements = []
+    for match in _KEYVAL.finditer(text):
+        _, key, _, value = match.groups()
+        if not _key_is_secret(key):
+            continue
+        # A complete auth credential was masked above; leave its scheme useful.
+        if (_normalise_key(key) in ('authorization', 'authentication', 'auth')
+                and value.lower() in ('basic', 'bearer')):
+            continue
+        if _normalise_key(key) in ('url', 'subscribe-url') and _plain_host_url(value):
+            continue
+        start, end = match.span(4)
+        # A parent secret value owns any nested credential spans.
+        if replacements and start < replacements[-1][1]:
+            continue
+        replacements.append((start, end, _mask_token(value)))
+    for start, end, value in reversed(replacements):
+        text = text[:start] + value + text[end:]
+    text = _JWT.sub(PLACEHOLDER, text)
+    return _LONG_TOKEN.sub(PLACEHOLDER, text)
+
+
+# ---------------------------------------------------------------- nft producer
+
+def _nft_parts(text):
+    """Lex strings and # comments, never evaluate nft syntax or require nft -j.
+
+    Bare nft tokens/maps are not JSON. Quoted payloads must have an unambiguous
+    supported string encoding; anything unsupported/unclosed fails without raw output.
+    """
+    parts = []
+    pos = 0
+    while pos < len(text):
+        if text[pos] == '#':
+            end = text.find('\n', pos)
+            end = len(text) if end < 0 else end
+            parts.append(('comment', pos, end, text[pos:end]))
+            pos = end
+        elif text[pos] in ('"', "'"):
+            match = _STRINGS.match(text, pos)
+            if not match:
+                raise RedactionError('nft string parse failed')
+            token = match.group(0)
+            if token[0] == '"':
+                try:
+                    decoded = json.loads(token)
+                except ValueError:
+                    raise RedactionError('nft string escape unsupported')
+            else:
+                if '\\' in token:
+                    raise RedactionError('nft string escape unsupported')
+                decoded = token[1:-1]
+            parts.append(('string', pos, match.end(), decoded))
+            pos = match.end()
+        else:
+            pos += 1
+    return parts
+
+
+def _nft_key_values(text, parts):
+    # Also bind credential-shaped quoted map keys to scalar values. Escaped/spaced
+    # names must not turn nft.txt into a bypass for the existing normalized policy.
+    for kind, _, end, key in parts:
+        if kind != 'string' or not _key_is_secret(key):
+            continue
+        colon = re.match(r'\s*:\s*', text[end:])
+        if not colon:
+            continue
+        start = end + colon.end()
+        value = re.match(_VALUE, text[start:])
+        if not value or text[start:start + 1] in ('{', '['):
+            raise RedactionError('ambiguous nft credential value')
+        finish = start + value.end()
+        if not re.match(r'[ \t]*(?:[,;}\]\r\n#]|$)', text[finish:]):
+            raise RedactionError('ambiguous nft credential value')
+        token = value.group(0)
+        decoded = _decoded_quote(token) if token[0] in ('"', "'") else token
+        yield start, finish, decoded
+
+
+def _nft_segments(text, parts):
+    previous = 0
+    for kind, start, end, _ in parts:
+        if kind == 'comment':
+            yield False, text[previous:start]
+            yield True, text[start:end]
+            previous = end
+    yield False, text[previous:]
+
+
+def redact_nft(text):
+    parts = _nft_parts(text)
+    replacements = list(_nft_key_values(text, parts))
+    for start, end, value in reversed(replacements):
+        if not _is_placeholder(value):
+            text = text[:start] + json.dumps(PLACEHOLDER, ensure_ascii=False) + text[end:]
+    # Only bare nft syntax opts out of JSON-object recognition. Every quoted scalar
+    # still recurses through strict redact_text; comments use strict text directly.
+    return ''.join(redact_text(segment, embedded=is_comment)
+                   for is_comment, segment in _nft_segments(text, _nft_parts(text)))
+
+
+def _verify_nft(filename, text):
+    # Independent checks, not a comparison to redact_nft output.
+    try:
+        parts = _nft_parts(text)
+        findings = ['%s:0: nft credential' % filename
+                    for _, _, value in _nft_key_values(text, parts)
+                    if not _is_placeholder(value)]
+        for is_comment, segment in _nft_segments(text, parts):
+            findings.extend(_verify_text(filename, segment, embedded=is_comment))
+        return findings
+    except RedactionError:
+        return ['%s:0: nft parse failed' % filename]
 
 
 # ---------------------------------------------------------------- verify
-
-_VERIFY_KV = re.compile(
-    r'(?i)(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+)\s*[:=]\s*'
-    r'("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|[^\s,;&}\]]+)')
-_VERIFY_BEARER = re.compile(r'(?i)\bbearer\s+(\S+)')
-_VERIFY_URL_USERINFO = re.compile(r'(?i)[a-z][a-z0-9+.-]*://[^/\s@:]+:[^/\s@]+@')
-
 
 def _plain_host_url(value):
     token = value.strip()
@@ -12876,28 +13190,98 @@ def _plain_host_url(value):
     return bool(re.match(r'(?i)^https?://[^/\s?#@]+$', token))
 
 
-def _verify_text(filename, text):
+def _verify_text(filename, text, depth=0, *, embedded=True):
+    """Independent classifier: never call redaction or compare against its output."""
+    if depth > _MAX_NESTING:
+        return ['%s:0: text nesting limit' % filename]
     findings = []
+    if embedded:
+        try:
+            for _, _, node in _embedded_json(text):
+                findings.extend(_verify_tree(filename, node, depth + 1))
+        except RedactionError:
+            findings.append('%s:0: embedded json parse failed' % filename)
+    if _ambiguous_auth_folding(text):
+        findings.append('%s:0: ambiguous authorization folding' % filename)
+    # Verify full logical headers, including every SP/HTAB continuation, rather
+    # than trusting a placeholder on the first physical line.
+    spans = [match.span() for match in _STRINGS.finditer(text)]
+    for match in _HEADER.finditer(text):
+        if any(start < match.start() < end for start, end in spans):
+            continue
+        if not _is_placeholder(match.group(2)):
+            findings.append('%s:0: authorization-header' % filename)
     for number, line in enumerate(text.split('\n'), 1):
-        for match in _VERIFY_KV.finditer(line):
-            key, value = match.group(1), match.group(2)
-            if not _key_is_secret(key):
-                continue
-            if _normalise_key(key) in ('url', 'subscribe-url') and _plain_host_url(value):
-                # `redact text` keeps scheme://host only, so a bare host is the safe form.
-                continue
-            if not _is_placeholder(value):
-                findings.append('%s:%d: %s' % (filename, number, _normalise_key(key)))
-        for match in _VERIFY_BEARER.finditer(line):
-            if not _is_placeholder(match.group(1)):
-                findings.append('%s:%d: bearer' % (filename, number))
-        if _VERIFY_URL_USERINFO.search(line):
+        if _USERINFO_ANY.search(line):
             findings.append('%s:%d: url-userinfo' % (filename, number))
-        for match in _LONG_TOKEN.finditer(line):
-            if not _is_placeholder(match.group(0)):
-                findings.append('%s:%d: long-token' % (filename, number))
-        if _JWT.search(line):
+        for match in _SECRET_QUERY.finditer(line):
+            value = re.match(_VALUE, line[match.end():])
+            if value and not _is_placeholder(value.group(0)):
+                findings.append('%s:%d: secret-query' % (filename, number))
+        if _LONG_TOKEN.search(line) or _JWT.search(line):
             findings.append('%s:%d: long-token' % (filename, number))
+    # Key/value and auth-credential spans run over the whole buffer exactly like
+    # redaction, so a value or credential that continues on the next physical
+    # line is judged as one span and the raw form is still refused (per-line
+    # scanning would miss that fold).
+    for match in _AUTH.finditer(text):
+        if not _is_placeholder(match.group(2)):
+            number = text.count('\n', 0, match.start()) + 1
+            findings.append('%s:%d: authorization' % (filename, number))
+    for match in _KEYVAL.finditer(text):
+        _, key, _, value = match.groups()
+        if not _key_is_secret(key):
+            continue
+        if _normalise_key(key) in ('url', 'subscribe-url') and _plain_host_url(value):
+            continue
+        if value.lower() in ('basic', 'bearer'):
+            # Only a complete recognized scheme+credential is handled below.
+            tail = text[match.start(4):]
+            auth = _AUTH.match(tail)
+            if auth and _is_placeholder(auth.group(2)):
+                continue
+        if not _is_placeholder(value):
+            number = text.count('\n', 0, match.start()) + 1
+            findings.append('%s:%d: %s' % (filename, number, _normalise_key(key)))
+    for match in _STRINGS.finditer(text):
+        findings.extend(_verify_text(filename, _decoded_quote(match.group(0)), depth + 1))
+    return findings
+
+
+def _verify_tree(filename, node, depth=0):
+    if depth > _MAX_NESTING:
+        return ['%s:0: document nesting limit' % filename]
+    findings = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if _key_is_secret(key) and not (isinstance(value, str) and _is_placeholder(value)) and value is not None:
+                findings.append('%s:0: %s' % (filename, _normalise_key(key)))
+            findings.extend(_verify_tree(filename, value, depth + 1))
+    elif isinstance(node, list):
+        for value in node:
+            findings.extend(_verify_tree(filename, value, depth + 1))
+    elif isinstance(node, str):
+        findings.extend(_verify_text(filename, node, depth + 1))
+    return findings
+
+
+def _verify_uci(filename, text):
+    try:
+        records = _uci_records(text)
+    except RedactionError:
+        return ['%s:0: uci parse failed' % filename]
+    sections = {(parts[0], parts[1]): parts[2]
+                for kind, parts, _, _ in records if kind == 'section'}
+    findings = []
+    for kind, parts, prefix, values in records:
+        if kind != 'option':
+            continue
+        pkg, sec, option = parts
+        for value in values:
+            if not _uci_allowed(sections.get((pkg, sec)), option) and not _is_placeholder(value):
+                number = text[:text.find(prefix)].count('\n') + 1
+                findings.append('%s:%d: %s' % (filename, number, _normalise_key(option)))
+            findings.extend(_verify_text(filename, value))
     return findings
 
 
@@ -12916,7 +13300,19 @@ def verify_directory(directory):
             except OSError as exc:
                 findings.append('%s:0: unreadable (%s)' % (relative, exc.strerror or exc))
                 continue
-            findings.extend(_verify_text(relative, data.decode('utf-8', 'replace')))
+            text = data.decode('utf-8', 'replace')
+            if name == 'nft.txt':
+                findings.extend(_verify_nft(relative, text))
+            elif name.endswith('.uci'):
+                findings.extend(_verify_uci(relative, text))
+            elif name.endswith(('.json', '.yaml', '.yml')) and text.strip():
+                try:
+                    node = json.loads(text, object_pairs_hook=_unique_json_object) if name.endswith('.json') else yaml.safe_load(text)
+                    findings.extend(_verify_tree(relative, node))
+                except (ValueError, yaml.YAMLError, RecursionError, RedactionError):
+                    findings.append('%s:0: document parse failed' % relative)
+            else:
+                findings.extend(_verify_text(relative, text))
     return findings
 
 
@@ -12927,16 +13323,17 @@ _REDACTORS = {
     'yaml': redact_yaml,
     'json': redact_json,
     'text': redact_text,
+    'nft': redact_nft,
 }
 
 
 def main(argv):
     if len(argv) < 2:
-        return fail('usage: geomask-diag-redact.py redact <uci|yaml|json|text> | verify <dir>')
+        return fail('usage: geomask-diag-redact.py redact <uci|yaml|json|text|nft> | verify <dir>')
     command = argv[1]
     if command == 'redact':
         if len(argv) != 3 or argv[2] not in _REDACTORS:
-            return fail('usage: geomask-diag-redact.py redact <uci|yaml|json|text>')
+            return fail('usage: geomask-diag-redact.py redact <uci|yaml|json|text|nft>')
         mode = argv[2]
         text = read_stdin()
         try:
@@ -12961,6 +13358,380 @@ def main(argv):
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-diag-spool.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Registered diagnostic downloads. Linux uses pinned, no-follow directory descriptors.
+
+Windows tests exercise content/identity rejection, not Linux kernel/0700 guarantees.
+No fallback exporter may reopen a verified archive by pathname.
+"""
+import base64
+import hashlib
+import json
+import math
+import os
+import secrets
+import stat
+import sys
+import time
+
+EUID = os.geteuid() if hasattr(os, 'geteuid') else 0
+PREFIX = 'geomask-console-diag-'
+SUFFIX = '.tar.gz'
+SIDECAR_LIMIT = 65536
+# Fixed creation/registration bound, independent of configurable get --max transport cap.
+# Larger archives are refused and removed by the collector before any SMB copy.
+CREATION_MAXIMUM = 2097152
+MAXIMUM = CREATION_MAXIMUM  # Default transport limit; get --max may be lower or higher.
+SCHEMA = 1
+POSIX = os.name == 'posix'
+
+
+class Refused(Exception):
+    """Fail closed with a JSON error."""
+
+
+def refuse(message):
+    raise Refused(message)
+
+
+def identity(st):
+    return st.st_dev, st.st_ino
+
+
+def signature(st):
+    return (st.st_dev, st.st_ino, st.st_size, st.st_uid, st.st_nlink,
+            st.st_mtime_ns, st.st_ctime_ns)
+
+
+def valid_name(name):
+    return (isinstance(name, str) and name.startswith(PREFIX) and name.endswith(SUFFIX)
+            and len(name) > len(PREFIX) + len(SUFFIX) and '..' not in name
+            and all(c in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-'
+                    for c in name))
+
+
+def private(st):
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != EUID:
+        refuse('spool is not private: not our directory')
+    if POSIX and stat.S_IMODE(st.st_mode) & 0o077:
+        refuse('spool is not private: group/other permissions')
+
+
+def walk_directory(path):
+    """Never follow any ancestor symlink. Return a pinned Linux directory fd."""
+    path = os.path.abspath(path)
+    if POSIX:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open('/', flags)
+        try:
+            for part in path.split('/')[1:]:
+                if not part:
+                    continue
+                other = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = other
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    # Windows has no openat/O_NOFOLLOW; this is not a POSIX privacy proof.
+    current = os.path.splitdrive(path)[0] + os.sep
+    for part in path[len(current):].split(os.sep):
+        if not part:
+            continue
+        current = os.path.join(current, part)
+        st = os.lstat(current)
+        if stat.S_ISLNK(st.st_mode) or getattr(st, 'st_reparse_tag', 0):
+            refuse('spool ancestor is a symlink/reparse point')
+        if not stat.S_ISDIR(st.st_mode):
+            refuse('spool ancestor is not a directory')
+    return None
+
+
+class Spool:
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self.fd = walk_directory(self.path)
+        try:
+            self.st = os.fstat(self.fd) if POSIX else os.lstat(self.path)
+            private(self.st)
+        except BaseException:
+            if self.fd is not None:
+                os.close(self.fd)
+            raise
+
+    def __enter__(self):
+        return self
+
+    def check(self):
+        fd = walk_directory(self.path)
+        try:
+            st = os.fstat(fd) if POSIX else os.lstat(self.path)
+            private(st)
+            if identity(st) != identity(self.st):
+                refuse('spool identity changed')
+            if POSIX:
+                private(os.fstat(self.fd))
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def __exit__(self, *unused):
+        if self.fd is not None:
+            os.close(self.fd)
+
+    def open(self, name, flags=os.O_RDONLY, mode=0o600):
+        self.check()
+        flags |= getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0)
+        if POSIX:
+            return os.open(name, flags | os.O_NOFOLLOW, mode, dir_fd=self.fd)
+        path = os.path.join(self.path, name)
+        before = None
+        if not flags & os.O_CREAT:
+            before = os.lstat(path)
+            if stat.S_ISLNK(before.st_mode) or getattr(before, 'st_reparse_tag', 0):
+                refuse('file is a symlink/reparse point')
+        fd = os.open(path, flags, mode)
+        try:
+            if before and identity(before) != identity(os.fstat(fd)):
+                refuse('file identity changed at open')
+            self.check()
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def names(self):
+        self.check()
+        return os.listdir(self.fd if POSIX else self.path)
+
+    def replace(self, source, target):
+        self.check()
+        if POSIX:
+            os.replace(source, target, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        else:
+            os.replace(os.path.join(self.path, source), os.path.join(self.path, target))
+
+    def unlink(self, name):
+        if POSIX:
+            os.unlink(name, dir_fd=self.fd)
+        else:
+            os.unlink(os.path.join(self.path, name))
+
+
+def check_file(st, what):
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != EUID or st.st_nlink != 1:
+        refuse('%s must be our regular single-link file' % what)
+    if st.st_size <= 0:
+        refuse('%s is empty' % what)
+
+
+def read_all(fd, maximum):
+    """Read at most maximum+1 bytes even if a same-inode writer grows the file."""
+    chunks = []
+    total = 0
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(fd, min(262144, maximum - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > maximum:
+            refuse('file exceeds bounded read limit')
+        digest.update(chunk)
+        chunks.append(chunk)
+    return digest.hexdigest(), total, b''.join(chunks)
+
+
+def read_sidecar(spool, name):
+    try:
+        fd = spool.open(name + '.json')
+    except FileNotFoundError:
+        refuse('архива нет: not a registered bundle')
+    try:
+        before = os.fstat(fd)
+        check_file(before, 'sidecar')
+        if before.st_size > SIDECAR_LIMIT:
+            refuse('sidecar is oversized')
+        _, total, payload = read_all(fd, before.st_size)
+        if total != before.st_size or signature(before) != signature(os.fstat(fd)):
+            refuse('sidecar changed while read')
+    finally:
+        os.close(fd)
+    try:
+        record = json.loads(payload)
+    except (ValueError, UnicodeDecodeError):
+        refuse('malformed sidecar')
+    if (not isinstance(record, dict) or type(record.get('schema')) is not int
+            or record['schema'] != SCHEMA or record.get('name') != name):
+        refuse('invalid sidecar schema/name')
+    for key in ('dev', 'ino', 'bytes', 'uid', 'created', 'created_ns'):
+        if type(record.get(key)) is not int or not 0 <= record[key] < 2 ** 64:
+            refuse('invalid sidecar ' + key)
+    digest = record.get('sha256')
+    if (record['bytes'] <= 0 or not isinstance(digest, str) or len(digest) != 64
+            or any(c not in '0123456789abcdef' for c in digest)):
+        refuse('invalid sidecar size/hash')
+    return record
+
+
+def write_sidecar(spool, name, record):
+    temporary = '.sidecar-' + secrets.token_hex(16)
+    fd = spool.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    try:
+        if POSIX:
+            os.fchmod(fd, 0o600)
+        payload = (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0:
+                refuse('short sidecar write')
+            payload = payload[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        spool.replace(temporary, name + '.json')
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            spool.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def cmd_init(path):
+    # Pin and validate the parent before creation; do not chmod an existing directory.
+    absolute = os.path.abspath(path)
+    parent, name = os.path.split(absolute)
+    fd = walk_directory(parent)
+    try:
+        try:
+            if POSIX:
+                os.mkdir(name, 0o700, dir_fd=fd)
+            else:
+                os.mkdir(absolute, 0o700)
+        except FileExistsError:
+            pass
+        with Spool(absolute) as spool:
+            spool.check()
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return {'ok': True, 'spool': path}
+
+
+def cmd_register(path, archive):
+    absolute = os.path.abspath(archive)
+    if os.path.normcase(os.path.dirname(absolute)) != os.path.normcase(os.path.abspath(path)):
+        refuse('archive is not directly inside spool')
+    name = os.path.basename(absolute)
+    if not valid_name(name):
+        refuse('not a diagnostic bundle name')
+    with Spool(path) as spool:
+        fd = spool.open(name)
+        try:
+            before = os.fstat(fd)
+            check_file(before, 'bundle')
+            # Registration is bounded too; never hash arbitrary-size input into memory.
+            if before.st_size > CREATION_MAXIMUM:
+                refuse('bundle exceeds %s-byte creation/registration cap' % CREATION_MAXIMUM)
+            digest, total, _ = read_all(fd, before.st_size)
+            if total != before.st_size or signature(before) != signature(os.fstat(fd)):
+                refuse('bundle changed during registration')
+            record = dict(schema=SCHEMA, name=name, dev=before.st_dev, ino=before.st_ino,
+                          bytes=total, uid=before.st_uid, sha256=digest, created=int(time.time()),
+                          created_ns=time.time_ns())
+            write_sidecar(spool, name, record)
+            spool.check()
+        finally:
+            os.close(fd)
+    return {'ok': True, 'name': name, 'bytes': total, 'sha256': digest}
+
+
+def cmd_get(path, name, maximum, ttl):
+    maximum = MAXIMUM if maximum is None else maximum
+    if type(maximum) is not int or maximum < 0:
+        refuse('invalid maximum')
+    if ttl is not None and (not math.isfinite(ttl) or ttl < 0):
+        refuse('invalid ttl')
+    with Spool(path) as spool:
+        if not name:
+            candidates = []
+            for entry in spool.names():
+                if entry.endswith('.json') and valid_name(entry[:-5]):
+                    try:
+                        record = read_sidecar(spool, entry[:-5])
+                        candidates.append((record['created_ns'], entry[:-5]))
+                    except (Refused, OSError):
+                        continue
+            if not candidates:
+                refuse('архива нет: no registered bundle')
+            name = max(candidates)[1]
+        if not valid_name(name):
+            refuse('not a diagnostic bundle name')
+        record = read_sidecar(spool, name)
+        if ttl is not None and record['created'] + ttl * 3600 < time.time():
+            refuse('bundle expired')
+        fd = spool.open(name)
+        try:
+            before = os.fstat(fd)
+            check_file(before, 'bundle')
+            if identity(before) != (record['dev'], record['ino']) or before.st_uid != record['uid']:
+                refuse('bundle identity changed')
+            if before.st_size != record['bytes']:
+                refuse('bundle size changed')
+            if before.st_size > maximum:
+                refuse('bundle is %s bytes, over the %s-byte download cap' % (before.st_size, maximum))
+            digest, total, payload = read_all(fd, before.st_size)
+            after = os.fstat(fd)
+            check_file(after, 'bundle')
+            if total != before.st_size or signature(before) != signature(after):
+                refuse('bundle changed while read')
+            if digest != record['sha256']:
+                refuse('bundle sha256 mismatch')
+            spool.check()
+            return dict(ok=True, name=name, bytes=total, sha256=digest,
+                        data=base64.b64encode(payload).decode('ascii'))
+        finally:
+            os.close(fd)
+
+
+def cli(args):
+    if len(args) == 2 and args[0] == 'init':
+        return cmd_init(args[1])
+    if len(args) == 3 and args[0] == 'register':
+        return cmd_register(args[1], args[2])
+    if len(args) >= 3 and args[0] == 'get':
+        maximum, ttl = MAXIMUM, 24.0
+        options = args[3:]
+        if len(options) % 2:
+            refuse('invalid options')
+        for key, value in zip(options[::2], options[1::2]):
+            if key == '--max':
+                maximum = int(value)
+            elif key == '--ttl':
+                ttl = float(value)
+            else:
+                refuse('unknown option')
+        return cmd_get(args[1], args[2], maximum, ttl)
+    refuse('usage: init spool | register spool path | get spool name [--max N] [--ttl H]')
+
+
+def main():
+    try:
+        answer = cli(sys.argv[1:])
+        rc = 0
+    except (Refused, OSError, ValueError) as exc:
+        answer, rc = {'ok': False, 'error': str(exc)}, 1
+    sys.stdout.buffer.write((json.dumps(answer, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8'))
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main())
 ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 {
@@ -13129,7 +13900,13 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-diag-redact.py",
           "source": "assets/geomask-diag-redact.py",
           "mode": "0755",
-          "sha256": "80eddbbc26b7bfa4e534d35c89f23b0509f9cd286b03f0b9d16a2907168bb011"
+          "sha256": "686399b833619f513ab9d3bf9ec13e67d927720fba4b07439e636e7c4b9b16ed"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-diag-spool.py",
+          "source": "assets/geomask-diag-spool.py",
+          "mode": "0755",
+          "sha256": "03dc6a10c3ce82e2cca18f596c9a7bbf84cfd818d6f919760092cc56f29d6d71"
         },
         {
           "path": "/usr/lib/geomask/geomask-dnsguard.sh",
@@ -13275,7 +14052,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "2aa3d220c5df29a0db84e0353cf30d0214c894c1c5bc23c5a80a55e2ce717b7d"
+          "sha256": "4c35df37d2f3558e87fcb83872802ae63a842d1434fa0b2f38febe56adad7610"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -37902,7 +38679,8 @@ geomask_uninstall() {
   for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
             geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
             geomask-sync-youtube.py geomask-audit-scheduler.py geomask-subscription-status.py \
-            geomask-slot-patch.py geomask-console.py geomask-dnsguard.sh; do
+            geomask-slot-patch.py geomask-console.py geomask-dnsguard.sh \
+            geomask-diag-spool.py; do
     rm -f "$(P /usr/lib/geomask/$_m)"
   done
   if crontab -l 2>/dev/null | grep -q 'geomask-audit-schedule'; then

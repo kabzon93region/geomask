@@ -2469,6 +2469,11 @@ cmd_console_status() { cmd_console status; }
 # carried the owner's keys. The redactor is a shipped asset with the real `uci show` grammar
 # (plus mihomo YAML, controller JSON and log text), so the masking is testable off-router.
 DIAG_PY=${GM_DIAG_PY:-/usr/lib/geomask/geomask-diag-redact.py}
+# R07: the bundle and its sidecar live in one private spool (0700, owned by us) instead of
+# world-writable /tmp, and every read goes through the shipped helper - never through
+# `wc`/`base64`, which follow symlinks.
+DIAG_SPOOL=${GM_DIAG_SPOOL:-/tmp/geomask-diag}
+DIAG_SPOOL_PY=${GM_DIAG_SPOOL_PY:-/usr/lib/geomask/geomask-diag-spool.py}
 
 _console_diag_fail() { # $1 = stage that failed
   rm -rf "$_dir" 2>/dev/null
@@ -2476,7 +2481,7 @@ _console_diag_fail() { # $1 = stage that failed
   return 1
 }
 
-_console_diag_redact() { # $1 = uci|yaml|json|text, $2 = stage, $3 = output file, stdin
+_console_diag_redact() { # $1 = uci|yaml|json|text|nft, $2 = stage, $3 = output file, stdin
   "$PYTHON_BIN" -B "$DIAG_PY" redact "$1" > "$3" 2>/dev/null
   _cdr=$?
   [ "$_cdr" = 0 ] || { _console_diag_fail "$2"; return 1; }
@@ -2487,6 +2492,20 @@ _console_diag_redact() { # $1 = uci|yaml|json|text, $2 = stage, $3 = output file
 # masking is done by the shipped redactor, and `verify` is the last gate: an unmasked bundle
 # is never handed out (review 15.11, R02).
 cmd_console_diag() {
+  # R07: the archive lives in a private spool, never in world-writable /tmp. `init` fails
+  # closed (must be a real directory, ours, 0700) and its JSON refusal is the answer.
+  [ -f "$DIAG_SPOOL_PY" ] || {
+    printf '{"ok":false,"error":"spool is not private: helper missing"}\n'; return 1
+  }
+  _diag_init=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" init "$DIAG_SPOOL" 2>/dev/null)
+  _diag_init_rc=$?
+  if [ "$_diag_init_rc" != 0 ]; then
+    case "$_diag_init" in
+      '{"ok":false'*) printf '%s\n' "$_diag_init" ;;
+      *) printf '{"ok":false,"error":"spool is not private: init failed"}\n' ;;
+    esac
+    return 1
+  fi
   # One private directory per request: the fixed path plus `rm -rf` let two panel clicks delete
   # each other's half-built bundle (review 15.11, points 1 and 33).
   _tmpd=${TMPDIR:-/tmp}
@@ -2494,8 +2513,11 @@ cmd_console_diag() {
   [ -n "$_dir" ] || { printf '{"ok":false,"error":"cannot create a private bundle directory"}\n'; return 1; }
   chmod 700 "$_dir" 2>/dev/null
   # Nothing older than the retention window stays on the router: these archives carry the
-  # masked-but-still-descriptive state of the console lane.
-  find "$_tmpd" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz' \
+  # masked-but-still-descriptive state of the console lane. The sidecar goes with the archive
+  # or a missing archive would still look registered.
+  find "$DIAG_SPOOL" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz' \
+    -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
+  find "$DIAG_SPOOL" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz.json' \
     -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
   # Without the redactor the bundle cannot be masked; an unmasked archive is worse than no
   # archive at all, so the request fails closed.
@@ -2515,7 +2537,7 @@ cmd_console_diag() {
   ip -4 addr show "$CONSOLE_TUN_DEV" > "$_dir/tun.txt" 2>&1
   uci -q show firewall 2>&1 | _console_diag_redact uci uci:firewall "$_dir/firewall.uci" || return 1
   uci -q show network 2>&1 | _console_diag_redact uci uci:network "$_dir/network.uci" || return 1
-  nft list ruleset 2>&1 | _console_diag_redact text text:nft "$_dir/nft.txt" || return 1
+  nft list ruleset 2>&1 | _console_diag_redact nft nft:ruleset "$_dir/nft.txt" || return 1
   [ -n "$_ip" ] && conntrack -L -s "$_ip" > "$_dir/conntrack-console.txt" 2>&1
   logread 2>/dev/null | grep -iE 'mihomo|hev|geomask|console' | tail -400 \
     | _console_diag_redact text text:logread "$_dir/logread.txt" || return 1
@@ -2541,13 +2563,31 @@ cmd_console_diag() {
       "$(json_esc "${_diag_detail:-verification failed}")"
     return 1
   fi
-  _tgz="$_tmpd/geomask-console-diag-$(date +%Y%m%d-%H%M%S).$$.tar.gz"
+  _tgz="$DIAG_SPOOL/geomask-console-diag-$(date +%Y%m%d-%H%M%S).$$.tar.gz"
   ( umask 077; tar -czf "$_tgz" -C "$_tmpd" "$(basename "$_dir")" >/dev/null 2>&1 ) || {
     rm -rf "$_dir" 2>/dev/null
+    rm -f "$_tgz" 2>/dev/null
     printf '{"ok":false,"error":"cannot pack the bundle"}\n'; return 1
   }
   chmod 600 "$_tgz" 2>/dev/null
   rm -rf "$_dir" 2>/dev/null
+  # Registration records (dev, ino, link count, size, sha256) in <archive>.json; a failure
+  # removes the archive so an unregistered bundle cannot linger in the spool.
+  # Fixed creation/registration cap: 2 MiB, checked before SMB copy. Larger archives
+  # are deleted, not left for SMB/SSH. GM_CONSOLE_DIAG_MAX only controls transport.
+  _diag_reg=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" register "$DIAG_SPOOL" "$_tgz" 2>/dev/null)
+  _diag_reg_rc=$?
+  if [ "$_diag_reg_rc" != 0 ]; then
+    rm -f "$_tgz" 2>/dev/null
+    case "$_diag_reg" in
+      '{"ok":false'*) printf '%s\n' "$_diag_reg" ;;
+      *) printf '{"ok":false,"error":"cannot register the bundle"}\n' ;;
+    esac
+    return 1
+  fi
+  # The helper measured the archive from its descriptor; the shell must not read it again.
+  _diag_bytes=$(printf '%s\n' "$_diag_reg" | sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p')
+  case "$_diag_bytes" in ''|*[!0-9]*) _diag_bytes=0 ;; esac
   # Into the share only when the owner opted in with the marker: before this the archive was
   # copied into a folder that may be published over SMB, without asking (review 15.11, #14).
   _shared=false
@@ -2556,54 +2596,24 @@ cmd_console_diag() {
       && chmod 600 "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null && _shared=true
   fi
   printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s}\n' \
-    "$_tgz" "$(wc -c < "$_tgz" 2>/dev/null)" "$_shared"
+    "$_tgz" "$_diag_bytes" "$_shared"
 }
 
 # The panel used to get only a path on the router, so the owner had to find the archive by hand
 # over SMB or SSH - and the file sat in /tmp with no way back (review 15.11, #15). The bytes now
 # travel through the same authenticated ubus call as the rest of the panel: no world-readable
-# URL, no published path. Only our own archives, by plain name, and only up to a size rpcd can
-# carry; anything bigger stays for the SMB share or ssh.
+# URL, no published path. R07: the download path does not reopen the archive in shell - the
+# helper refuses a symlink, a hard link, a swapped inode and a modified body, then base64s the
+# bytes it hashed from one descriptor. GM_CONSOLE_DIAG_MAX is the configurable transport cap;
+# it does not raise the fixed 2 MiB creation cap. Only successfully registered archives can
+# remain in the spool or receive an opted-in SMB copy.
 cmd_console_diag_get() {
-  _dg_name=${1:-}
-  _dg_dir=${TMPDIR:-/tmp}
-  case "$_dg_name" in
-    '')
-      # Without a name the newest bundle is meant: the panel offers "download the last one"
-      # without rebuilding it.
-      _dg_path=$(ls -1t "$_dg_dir"/geomask-console-diag-*.tar.gz 2>/dev/null | head -1)
-      ;;
-    geomask-console-diag-*.tar.gz)
-      # A path is not a name: `../../etc/shadow` must not pass the glob above either.
-      case "$_dg_name" in
-        */*) printf '{"ok":false,"error":"имя архива не должно содержать путь"}\n'; return 1 ;;
-      esac
-      _dg_path="$_dg_dir/$_dg_name"
-      ;;
-    *)
-      printf '{"ok":false,"error":"это не архив диагностики"}\n'
-      return 1
-      ;;
-  esac
-  if [ -z "$_dg_path" ] || [ ! -f "$_dg_path" ]; then
-    printf '{"ok":false,"error":"архива нет - нажмите «Собрать и скачать логи»"}\n'
-    return 1
-  fi
-  _dg_bytes=$(wc -c < "$_dg_path" 2>/dev/null | tr -d ' ')
-  case "$_dg_bytes" in ''|*[!0-9]*) _dg_bytes=0 ;; esac
-  _dg_max=${GM_CONSOLE_DIAG_MAX:-2097152}
-  if [ "$_dg_bytes" -gt "$_dg_max" ]; then
-    printf '{"ok":false,"error":"архив %s байт - больше предела выдачи %s; заберите его по SMB или через ssh"}\n' \
-      "$_dg_bytes" "$_dg_max"
-    return 1
-  fi
-  _dg_b64=$(base64 "$_dg_path" 2>/dev/null | tr -d '\r\n')
-  case "$_dg_b64" in
-    '') printf '{"ok":false,"error":"base64 недоступен - архив остался на роутере"}\n'; return 1 ;;
-  esac
-  _dg_sha=$(sha256sum "$_dg_path" 2>/dev/null | cut -d' ' -f1)
-  printf '{"ok":true,"name":"%s","bytes":%s,"sha256":"%s","data":"%s"}\n' \
-    "$(basename "$_dg_path")" "$_dg_bytes" "$_dg_sha" "$_dg_b64"
+  [ -f "$DIAG_SPOOL_PY" ] || {
+    printf '{"ok":false,"error":"spool helper missing"}\n'; return 1
+  }
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" get "$DIAG_SPOOL" "${1:-}" \
+    --max "${GM_CONSOLE_DIAG_MAX:-2097152}" --ttl "${CONSOLE_DIAG_KEEP_H:-24}"
+  return $?
 }
 
 case "$1" in

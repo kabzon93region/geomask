@@ -851,6 +851,9 @@ ASSET_EOF
   save_stream /usr/lib/geomask/geomask-diag-redact.py 755 <<'ASSET_EOF'
 @@ASSET:geomask-diag-redact.py@@
 ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-diag-spool.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-diag-spool.py@@
+ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 @@ASSET:module-index.json@@
 ASSET_EOF
@@ -2943,7 +2946,8 @@ geomask_uninstall() {
   for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
             geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
             geomask-sync-youtube.py geomask-audit-scheduler.py geomask-subscription-status.py \
-            geomask-slot-patch.py geomask-console.py geomask-dnsguard.sh; do
+            geomask-slot-patch.py geomask-console.py geomask-dnsguard.sh \
+            geomask-diag-spool.py; do
     rm -f "$(P /usr/lib/geomask/$_m)"
   done
   if crontab -l 2>/dev/null | grep -q 'geomask-audit-schedule'; then

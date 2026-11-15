@@ -56,6 +56,7 @@ MAP = {
     "geomask-doctor.py":     "geomask-doctor.py",
     "geomask-console.py":    "geomask-console.py",
     "geomask-diag-redact.py": "geomask-diag-redact.py",
+    "geomask-diag-spool.py": "geomask-diag-spool.py",
     "geomask-dnsguard.sh":   "geomask-dnsguard.sh",
     "ai-doh.init":           "ai-doh.init",
     "dnsmasq-ai.init":       "dnsmasq-ai.init",

@@ -158,7 +158,7 @@
           "path": "/usr/lib/geomask/geomask-console.py",
           "source": "assets/geomask-console.py",
           "mode": "0755",
-          "sha256": "66f42ecaf35feb1da130e567cf058691accc11799efcf69b342ae8a6f127d8e0"
+          "sha256": "713b254b90fd844bf42526da72ce680e7222e424486832a048ea71366a5be020"
         },
         {
           "path": "/usr/lib/geomask/geomask-dnsguard.sh",
@@ -188,7 +188,7 @@
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "f6e9715e2db9b5cd7376988136373d2a699c8b2435a757f4dcf561d8b7d12b45"
+          "sha256": "7ac9f3113b85b61d2fafa59484359c69b0f80a4c9454ee7da710cf8da633cac1"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
@@ -304,13 +304,13 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "8a0d13236c18eb6005ac7818e634b62982bf462284c6d608aecf8e4bd45a4afe"
+          "sha256": "18b4f739459bd25b05ea422c26c1b33c911d3c21a9c424b4a74e57c2b6a225b6"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
           "mode": "0755",
-          "sha256": "34692b3a240052260bd23d94e13ec09752bc1af1a349b97e216034727f27ef4e"
+          "sha256": "726c6cdf14421bb8edde09a8ff19195af4ba6877b985da31922d6b44f4d56d15"
         },
         {
           "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
@@ -322,13 +322,13 @@
           "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
           "source": "assets/acl-geo-sync.json",
           "mode": "0644",
-          "sha256": "485fb1664ffb8b3b691f071cc7c159358d3b1b881428e5a1f1a8d17c7db9a085"
+          "sha256": "a740aa838f5ced053a085222c89119459bc93b90ea2aeca30fed13c8ae860e72"
         },
         {
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "b095ea497adaa924ebc05000e2ef02a0d5aa4a7302dc98eb22f6fdc96744ddf7"
+          "sha256": "7abc19f64e64a7a306d0ad301c52de1d4625c08223f6b4af29f1172f541e227a"
         }
       ]
     },

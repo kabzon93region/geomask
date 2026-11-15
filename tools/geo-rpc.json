@@ -266,6 +266,12 @@
       "js": "callConsole"
     },
     {
+      "name": "console_status",
+      "acl": "read",
+      "args": [],
+      "js": "callConsoleStatus"
+    },
+    {
       "name": "console_diag",
       "acl": "write",
       "args": [

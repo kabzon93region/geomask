@@ -42,6 +42,7 @@ list_methods() {
 	json_add_object "ipv6";                     json_add_string "state" "string"; json_close_object
 	json_add_object "dns_guard";                json_add_string "action" "string"; json_close_object
 	json_add_object "console";                  json_add_string "action" "string"; json_add_string "ip" "string"; json_add_string "sub" "string"; json_add_string "countries" "string"; json_close_object
+	json_add_object "console_status";           json_close_object
 	json_add_object "console_diag";             json_add_string "what" "string"; json_close_object
 	json_add_object "dev_add";                  json_add_string "ip" "string"; json_add_string "mode" "string"; json_add_string "mac" "string"; json_add_string "name" "string"; json_close_object
 	json_add_object "dev_del";                  json_add_string "ip" "string"; json_close_object
@@ -123,6 +124,7 @@ call_method() {
 		ipv6)                     json_get_var state state; "$BACKEND" ipv6 "$state" ;;
 		dns_guard)                json_get_var action action; "$BACKEND" dns_guard "$action" ;;
 		console)                  json_get_var action action; json_get_var ip ip; json_get_var sub sub; json_get_var countries countries; "$BACKEND" console "$action" "$ip" "$sub" "$countries" ;;
+		console_status)           "$BACKEND" console_status ;;
 		console_diag)             json_get_var what what; "$BACKEND" console_diag "$what" ;;
 		dev_add)                  json_get_var ip ip; json_get_var mode mode; json_get_var mac mac; json_get_var name name; "$BACKEND" dev_add "$ip" "$mode" "$mac" "$name" ;;
 		dev_del)                  json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;

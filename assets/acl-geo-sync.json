@@ -3,7 +3,7 @@
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "ai_sub_get", "subs_list", "mod_list", "diag_list", "diag_log", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "console_status", "ai_sub_get", "subs_list", "mod_list", "diag_list", "diag_log", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
 				"system": [ "info" ]
 			}
 		},

@@ -7648,8 +7648,15 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     *) printf '{"error":"bad arg"}'; return 1 ;;
   esac
   _ip="${2:-$(_console_get ip)}"
-  _countries="${4:-$(_console_get countries)}"
+  # The caller's fields are authoritative, EMPTY INCLUDED: that is how the panel asks for "no
+  # country filter" and "subscription like the VPN again". The old `${4:-saved}` fallback read
+  # an empty field as "keep the previous value", so neither reset was possible.
+  _countries="${4-}"
+  _sub="${3-}"
   if [ "$_act" = status ]; then
+    # `status` reports what is stored instead of what the caller sent.
+    _countries=$(_console_get countries)
+    _sub=$(_console_get sub)
     _rule=0
     [ -n "$_ip" ] && ip rule show 2>/dev/null | grep -q "from $_ip lookup $CONSOLE_TABLE" && _rule=1
     _tun=0
@@ -7658,9 +7665,10 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     [ -x "$CONSOLE_PY" ] && [ -f "$MIHOMO_CONF" ] && \
       _cfg=$("$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" 2>/dev/null)
     [ -n "$_cfg" ] || _cfg='{}'
-    printf '{"ok":true,"enabled":%s,"ip":"%s","countries":"%s","rule":%s,"tun":%s,"config":%s}\n' \
+    # `sub` is the registry id the panel restores into its field; empty means "as the VPN".
+    printf '{"ok":true,"enabled":%s,"ip":"%s","sub":"%s","countries":"%s","rule":%s,"tun":%s,"config":%s}\n' \
       "$([ "$(_console_get enabled)" = 1 ] && echo true || echo false)" \
-      "$_ip" "$_countries" "$_rule" "$_tun" "$_cfg"
+      "$_ip" "$_sub" "$_countries" "$_rule" "$_tun" "$_cfg"
     return 0
   fi
   if [ "$_act" = off ]; then
@@ -7712,7 +7720,9 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   if [ -n "$_url" ]; then
     _res=$(printf '%s\n' "$_url" | "$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --url - --countries "$_countries" 2>&1)
   else
-    _res=$("$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --countries "$_countries" 2>&1)
+    # No subscription chosen = "as the VPN": the patcher re-derives the URL from the VPN group
+    # instead of keeping whatever the provider was pinned to earlier.
+    _res=$("$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --url default --countries "$_countries" 2>&1)
   fi
   case "$_res" in
     *'"ok": true'*|*'"ok":true'*) ;;
@@ -7755,14 +7765,20 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   _console_fw_ensure || { _console_cfg_restore; printf '{"ok":false,"error":"console firewall zone not created - previous config restored"}\n'; return 1; }
   _console_rule_on "$_ip" || { _console_cfg_restore; printf '{"ok":false,"error":"console route rule not installed - previous config restored"}\n'; return 1; }
   # enabled is the COMMIT MARKER: written last, so a crash never leaves "on" without an address
-  # for the watchdog and the kill switch to work with.
-  [ -n "$_countries" ] && _console_set countries "$_countries"
-  [ -n "${3:-}" ] && _console_set sub "$3"
+  # for the watchdog and the kill switch to work with. `countries` and `sub` are written ALWAYS,
+  # empty string included: an empty field is the reset the panel offers.
+  _console_set countries "$_countries"
+  _console_set sub "$_sub"
   _console_set ip "$_ip"
   _console_set enabled 1
-  echo "$(date +%FT%T) CONSOLE on ip=$_ip countries=${_countries:-any}" >> "$LOG"
-  printf '{"ok":true,"enabled":true,"ip":"%s","countries":"%s"}\n' "$_ip" "$_countries"
+  echo "$(date +%FT%T) CONSOLE on ip=$_ip countries=${_countries:-any} sub=${_sub:-vpn}" >> "$LOG"
+  printf '{"ok":true,"enabled":true,"ip":"%s","sub":"%s","countries":"%s"}\n' "$_ip" "$_sub" "$_countries"
 }
+
+# Read-only twin of `cmd_console status`, registered in tools/geo-rpc.json as `console_status`
+# with acl "read": the panel needs the state on every render, and a write-granted method there
+# would let any panel reader change the lane.
+cmd_console_status() { cmd_console status; }
 
 # uci keeps the real credentials: WireGuard private_key, PPPoE password, provider tokens.
 # `uci show network` and `uci show firewall` went into the bundle untouched, so the archive
@@ -7851,6 +7867,7 @@ case "$1" in
   ipv6)                     cmd_ipv6 "$2" ;;
   dns_guard)                cmd_dns_guard "$2" ;;
   console)                  cmd_console "$2" "$3" "$4" "$5" ;;
+  console_status)           cmd_console_status ;;
   console_diag)             cmd_console_diag "$2" ;;
   dev_add)                  cmd_dev_add "$2" "$3" "$4" "$5" ;;
   dev_del)                  cmd_dev_del "$2" ;;
@@ -11239,7 +11256,7 @@ same problem with a dedicated hev tunnel + a listener pinned to one group; this 
 same for a console, so the egress is chosen by the listener and no rule can steal it.
 
 Commands:
-  apply  <config> [--url URL|-] [--countries TR,DE] [--port N]   create or update
+  apply  <config> [--url URL|default|-] [--countries TR,DE] [--port N]   create or update
   remove <config>                                                remove what we own
   status <config>                                                JSON state, read-only
 
@@ -11259,6 +11276,8 @@ PROVIDER = 'console'
 GROUP = 'CONSOLE'
 LISTENER = 'console'
 DEFAULT_PORT = 7893
+# `--url default` is not a URL: it means "as the VPN" and discards the pinned subscription.
+RESET_URL = 'default'
 
 # Node names in this subscription carry the country in Russian and/or English. The filter is a
 # regex over names, so a country is the union of the spellings actually seen in the wild.
@@ -11402,6 +11421,42 @@ def find_listener(doc):
     return None
 
 
+def default_provider(doc):
+    """The provider the VPN really rides on, else the legacy sub/slot/sub2 order.
+
+    Point 10 of the 15.11 review: the console borrowed the first provider named `sub`, so on a
+    split registry it silently left through the restricted (VPN-noP2P) subscription while the
+    console needs the one the VPN group uses. `VPN` wins over `VPN-noP2P`; the first provider
+    of that group's `use` list that actually has a URL is the answer.
+    """
+    providers = doc.get('proxy-providers')
+    if not isinstance(providers, dict):
+        return None
+    groups = doc.get('proxy-groups')
+    if isinstance(groups, list):
+        for name in ('VPN', 'VPN-noP2P'):
+            group = next((g for g in groups
+                          if isinstance(g, dict) and g.get('name') == name), None)
+            if group is None:
+                continue
+            for provider_name in group.get('use') or []:
+                candidate = providers.get(provider_name)
+                if isinstance(candidate, dict) and candidate.get('url'):
+                    return candidate
+    # No VPN lane on this config (or it has no usable provider): keep the old behaviour, or the
+    # very first switch-on fails on a router that is already working.
+    for name in ('sub', 'slot', 'sub2'):
+        candidate = providers.get(name)
+        if isinstance(candidate, dict) and candidate.get('url'):
+            return candidate
+    return None
+
+
+def default_provider_url(doc):
+    provider = default_provider(doc)
+    return provider.get('url') if provider else None
+
+
 def ensure_provider(doc, url):
     providers = doc.get('proxy-providers')
     if not isinstance(providers, dict):
@@ -11412,19 +11467,20 @@ def ensure_provider(doc, url):
     if isinstance(current, dict):
         # keep whatever the owner's provider block already had (header, proxy, interval)
         spec = dict(current)
+    if url == RESET_URL:
+        # "As the VPN again": drop the pinned URL and the header that was copied with it, then
+        # re-derive both below. Without the reset an explicit `--url` could never be undone.
+        url = ''
+        spec.pop('url', None)
+        spec.pop('header', None)
     if url:
         spec['url'] = url
     if not spec.get('url'):
-        # Out of the box the console rides the same subscription as everything else; the panel
-        # can re-point it at any other registry entry later. Refusing here would make the first
-        # switch-on fail on a router that is already working.
-        for name in ('sub', 'slot', 'sub2'):
-            candidate = providers.get(name)
-            if isinstance(candidate, dict) and candidate.get('url'):
-                spec['url'] = candidate['url']
-                if isinstance(candidate.get('header'), dict) and candidate['header']:
-                    spec['header'] = copy.deepcopy(candidate['header'])
-                break
+        source = default_provider(doc)
+        if source is not None:
+            spec['url'] = source['url']
+            if isinstance(source.get('header'), dict) and source['header']:
+                spec['header'] = copy.deepcopy(source['header'])
     if not spec.get('url'):
         raise ConsoleError('no subscription URL: the console provider has none and none was given')
     # A provider-level health check makes mihomo drop nodes from the group; the console lane
@@ -11744,7 +11800,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-console.py",
           "source": "assets/geomask-console.py",
           "mode": "0755",
-          "sha256": "66f42ecaf35feb1da130e567cf058691accc11799efcf69b342ae8a6f127d8e0"
+          "sha256": "713b254b90fd844bf42526da72ce680e7222e424486832a048ea71366a5be020"
         },
         {
           "path": "/usr/lib/geomask/geomask-dnsguard.sh",
@@ -11774,7 +11830,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "f6e9715e2db9b5cd7376988136373d2a699c8b2435a757f4dcf561d8b7d12b45"
+          "sha256": "7ac9f3113b85b61d2fafa59484359c69b0f80a4c9454ee7da710cf8da633cac1"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
@@ -11890,13 +11946,13 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "8a0d13236c18eb6005ac7818e634b62982bf462284c6d608aecf8e4bd45a4afe"
+          "sha256": "18b4f739459bd25b05ea422c26c1b33c911d3c21a9c424b4a74e57c2b6a225b6"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
           "mode": "0755",
-          "sha256": "34692b3a240052260bd23d94e13ec09752bc1af1a349b97e216034727f27ef4e"
+          "sha256": "726c6cdf14421bb8edde09a8ff19195af4ba6877b985da31922d6b44f4d56d15"
         },
         {
           "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
@@ -11908,13 +11964,13 @@ ASSET_EOF
           "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
           "source": "assets/acl-geo-sync.json",
           "mode": "0644",
-          "sha256": "485fb1664ffb8b3b691f071cc7c159358d3b1b881428e5a1f1a8d17c7db9a085"
+          "sha256": "a740aa838f5ced053a085222c89119459bc93b90ea2aeca30fed13c8ae860e72"
         },
         {
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "b095ea497adaa924ebc05000e2ef02a0d5aa4a7302dc98eb22f6fdc96744ddf7"
+          "sha256": "7abc19f64e64a7a306d0ad301c52de1d4625c08223f6b4af29f1172f541e227a"
         }
       ]
     },
@@ -12069,6 +12125,7 @@ list_methods() {
 	json_add_object "ipv6";                     json_add_string "state" "string"; json_close_object
 	json_add_object "dns_guard";                json_add_string "action" "string"; json_close_object
 	json_add_object "console";                  json_add_string "action" "string"; json_add_string "ip" "string"; json_add_string "sub" "string"; json_add_string "countries" "string"; json_close_object
+	json_add_object "console_status";           json_close_object
 	json_add_object "console_diag";             json_add_string "what" "string"; json_close_object
 	json_add_object "dev_add";                  json_add_string "ip" "string"; json_add_string "mode" "string"; json_add_string "mac" "string"; json_add_string "name" "string"; json_close_object
 	json_add_object "dev_del";                  json_add_string "ip" "string"; json_close_object
@@ -12150,6 +12207,7 @@ call_method() {
 		ipv6)                     json_get_var state state; "$BACKEND" ipv6 "$state" ;;
 		dns_guard)                json_get_var action action; "$BACKEND" dns_guard "$action" ;;
 		console)                  json_get_var action action; json_get_var ip ip; json_get_var sub sub; json_get_var countries countries; "$BACKEND" console "$action" "$ip" "$sub" "$countries" ;;
+		console_status)           "$BACKEND" console_status ;;
 		console_diag)             json_get_var what what; "$BACKEND" console_diag "$what" ;;
 		dev_add)                  json_get_var ip ip; json_get_var mode mode; json_get_var mac mac; json_get_var name name; "$BACKEND" dev_add "$ip" "$mode" "$mac" "$name" ;;
 		dev_del)                  json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;
@@ -12207,7 +12265,7 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "ai_sub_get", "subs_list", "mod_list", "diag_list", "diag_log", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "console_status", "ai_sub_get", "subs_list", "mod_list", "diag_list", "diag_log", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
 				"system": [ "info" ]
 			}
 		},
@@ -12287,6 +12345,7 @@ var callGlobal                = rpc.declare({ object: 'geo-sync', method: 'globa
 var callIpv6                  = rpc.declare({ object: 'geo-sync', method: 'ipv6', params: { state: null }, expect: {} });
 var callDnsGuard              = rpc.declare({ object: 'geo-sync', method: 'dns_guard', params: { action: null }, expect: {} });
 var callConsole               = rpc.declare({ object: 'geo-sync', method: 'console', params: { action: null, ip: null, sub: null, countries: null }, expect: {} });
+var callConsoleStatus         = rpc.declare({ object: 'geo-sync', method: 'console_status', expect: {} });
 var callConsoleDiag           = rpc.declare({ object: 'geo-sync', method: 'console_diag', params: { what: null }, expect: {} });
 var callDevAdd                = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
 var callDevDel                = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
@@ -12901,8 +12960,9 @@ return view.extend({
 
 		/* ===================== Console lane ===================== */
 		// One switch on, one switch off. Off is the promise the owner asked for: the console
-		// goes back to its old path immediately, while the Mihomo side stays ready so switching
-		// back on costs nothing and does not reload the proxy.
+		// goes back to its old path immediately. Switching back on re-applies the config and
+		// reloads mihomo (`PUT /configs?force=true`), so it costs a few seconds - the hint says
+		// so instead of promising an instant switch.
 		var conIp = E('input', { 'class': 'gs-input', 'style': 'width:140px', 'placeholder': '192.168.1.177' });
 		var conCc = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'TR,DE' });
 		var conSubs = ((all[4] || {}).subs || []);
@@ -12912,11 +12972,30 @@ return view.extend({
 					return E('option', { 'value': String(s.id) },
 						(s.name || ('подписка ' + s.id)) + ' — ' + maskUrl(s.url || ''));
 				})));
+		var conState = E('div', { 'class': 'gs-hint' }, 'состояние консоли: —');
 		function conAct(action) {
 			view.act(callConsole, { action: action,
 				ip: (conIp.value || '').trim(), sub: (conSel.value || ''),
 				countries: (conCc.value || '').trim() });
 		}
+		// The card used to be empty after every reload: nothing ever asked the router what the
+		// lane is. `console_status` is read-only, so it is safe to call on each render; after a
+		// switch the reload re-renders and reads it again.
+		callConsoleStatus().then(function(cs) {
+			cs = cs || {};
+			conIp.value = cs.ip || '';
+			conCc.value = cs.countries || '';
+			conSel.value = cs.sub ? String(cs.sub) : '';
+			var cc = cs.config || {};
+			conState.textContent = 'состояние консоли: ' + (cs.enabled ? 'включена' : 'выключена')
+				+ ' · правило: ' + (cs.rule ? 'есть' : 'нет')
+				+ ' · туннель Console: ' + (cs.tun ? 'поднят' : 'нет')
+				+ ' · группа CONSOLE: ' + (cc.group ? 'есть' : 'нет')
+				+ ' · провайдер console: ' + (cc.provider ? 'есть' : 'нет');
+		}).catch(function() {
+			// A router whose backend has no such method must still render the card.
+			conState.textContent = 'состояние консоли: нет данных';
+		});
 		var conCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Игровая консоль — отдельный выход'),
 			E('div', { 'class': 'gs-row' }, [
@@ -12926,13 +13005,15 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [
 				E('span', { 'class': 'gs-label' }, 'Подписка'), conSel
 			]),
+			conState,
 			E('div', { 'class': 'gs-row' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() { conAct('on'); } }, 'Включить путь консоли'),
 				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было'),
 				E('button', { 'class': 'gs-btn', 'click': function() { view.act(callConsoleDiag, { what: 'all' }); } }, 'Собрать логи')
 			]),
-			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Настройки остаются, повторное включение мгновенное. «Собрать логи» кладёт архив в /tmp и в папку бэкапов (если шара включена).'),
-			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки. Указывайте коды через запятую: TR, DE, NL.')
+			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. «Собрать логи» кладёт архив в /tmp и в папку бэкапов (если шара включена).'),
+			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки (это и есть сброс фильтра). Указывайте коды через запятую: TR, DE, NL.'),
+			E('div', { 'class': 'gs-hint' }, 'Пустая подписка — «как у VPN»: провайдер консоли смотрит на подписку, которой пользуется группа VPN.')
 		]);
 		panels.obzor.appendChild(conCard);
 

@@ -2174,8 +2174,15 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     *) printf '{"error":"bad arg"}'; return 1 ;;
   esac
   _ip="${2:-$(_console_get ip)}"
-  _countries="${4:-$(_console_get countries)}"
+  # The caller's fields are authoritative, EMPTY INCLUDED: that is how the panel asks for "no
+  # country filter" and "subscription like the VPN again". The old `${4:-saved}` fallback read
+  # an empty field as "keep the previous value", so neither reset was possible.
+  _countries="${4-}"
+  _sub="${3-}"
   if [ "$_act" = status ]; then
+    # `status` reports what is stored instead of what the caller sent.
+    _countries=$(_console_get countries)
+    _sub=$(_console_get sub)
     _rule=0
     [ -n "$_ip" ] && ip rule show 2>/dev/null | grep -q "from $_ip lookup $CONSOLE_TABLE" && _rule=1
     _tun=0
@@ -2184,9 +2191,10 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     [ -x "$CONSOLE_PY" ] && [ -f "$MIHOMO_CONF" ] && \
       _cfg=$("$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" 2>/dev/null)
     [ -n "$_cfg" ] || _cfg='{}'
-    printf '{"ok":true,"enabled":%s,"ip":"%s","countries":"%s","rule":%s,"tun":%s,"config":%s}\n' \
+    # `sub` is the registry id the panel restores into its field; empty means "as the VPN".
+    printf '{"ok":true,"enabled":%s,"ip":"%s","sub":"%s","countries":"%s","rule":%s,"tun":%s,"config":%s}\n' \
       "$([ "$(_console_get enabled)" = 1 ] && echo true || echo false)" \
-      "$_ip" "$_countries" "$_rule" "$_tun" "$_cfg"
+      "$_ip" "$_sub" "$_countries" "$_rule" "$_tun" "$_cfg"
     return 0
   fi
   if [ "$_act" = off ]; then
@@ -2238,7 +2246,9 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   if [ -n "$_url" ]; then
     _res=$(printf '%s\n' "$_url" | "$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --url - --countries "$_countries" 2>&1)
   else
-    _res=$("$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --countries "$_countries" 2>&1)
+    # No subscription chosen = "as the VPN": the patcher re-derives the URL from the VPN group
+    # instead of keeping whatever the provider was pinned to earlier.
+    _res=$("$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --url default --countries "$_countries" 2>&1)
   fi
   case "$_res" in
     *'"ok": true'*|*'"ok":true'*) ;;
@@ -2281,14 +2291,20 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   _console_fw_ensure || { _console_cfg_restore; printf '{"ok":false,"error":"console firewall zone not created - previous config restored"}\n'; return 1; }
   _console_rule_on "$_ip" || { _console_cfg_restore; printf '{"ok":false,"error":"console route rule not installed - previous config restored"}\n'; return 1; }
   # enabled is the COMMIT MARKER: written last, so a crash never leaves "on" without an address
-  # for the watchdog and the kill switch to work with.
-  [ -n "$_countries" ] && _console_set countries "$_countries"
-  [ -n "${3:-}" ] && _console_set sub "$3"
+  # for the watchdog and the kill switch to work with. `countries` and `sub` are written ALWAYS,
+  # empty string included: an empty field is the reset the panel offers.
+  _console_set countries "$_countries"
+  _console_set sub "$_sub"
   _console_set ip "$_ip"
   _console_set enabled 1
-  echo "$(date +%FT%T) CONSOLE on ip=$_ip countries=${_countries:-any}" >> "$LOG"
-  printf '{"ok":true,"enabled":true,"ip":"%s","countries":"%s"}\n' "$_ip" "$_countries"
+  echo "$(date +%FT%T) CONSOLE on ip=$_ip countries=${_countries:-any} sub=${_sub:-vpn}" >> "$LOG"
+  printf '{"ok":true,"enabled":true,"ip":"%s","sub":"%s","countries":"%s"}\n' "$_ip" "$_sub" "$_countries"
 }
+
+# Read-only twin of `cmd_console status`, registered in tools/geo-rpc.json as `console_status`
+# with acl "read": the panel needs the state on every render, and a write-granted method there
+# would let any panel reader change the lane.
+cmd_console_status() { cmd_console status; }
 
 # uci keeps the real credentials: WireGuard private_key, PPPoE password, provider tokens.
 # `uci show network` and `uci show firewall` went into the bundle untouched, so the archive
@@ -2377,6 +2393,7 @@ case "$1" in
   ipv6)                     cmd_ipv6 "$2" ;;
   dns_guard)                cmd_dns_guard "$2" ;;
   console)                  cmd_console "$2" "$3" "$4" "$5" ;;
+  console_status)           cmd_console_status ;;
   console_diag)             cmd_console_diag "$2" ;;
   dev_add)                  cmd_dev_add "$2" "$3" "$4" "$5" ;;
   dev_del)                  cmd_dev_del "$2" ;;

@@ -38,6 +38,7 @@ var callGlobal                = rpc.declare({ object: 'geo-sync', method: 'globa
 var callIpv6                  = rpc.declare({ object: 'geo-sync', method: 'ipv6', params: { state: null }, expect: {} });
 var callDnsGuard              = rpc.declare({ object: 'geo-sync', method: 'dns_guard', params: { action: null }, expect: {} });
 var callConsole               = rpc.declare({ object: 'geo-sync', method: 'console', params: { action: null, ip: null, sub: null, countries: null }, expect: {} });
+var callConsoleStatus         = rpc.declare({ object: 'geo-sync', method: 'console_status', expect: {} });
 var callConsoleDiag           = rpc.declare({ object: 'geo-sync', method: 'console_diag', params: { what: null }, expect: {} });
 var callDevAdd                = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
 var callDevDel                = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
@@ -652,8 +653,9 @@ return view.extend({
 
 		/* ===================== Console lane ===================== */
 		// One switch on, one switch off. Off is the promise the owner asked for: the console
-		// goes back to its old path immediately, while the Mihomo side stays ready so switching
-		// back on costs nothing and does not reload the proxy.
+		// goes back to its old path immediately. Switching back on re-applies the config and
+		// reloads mihomo (`PUT /configs?force=true`), so it costs a few seconds - the hint says
+		// so instead of promising an instant switch.
 		var conIp = E('input', { 'class': 'gs-input', 'style': 'width:140px', 'placeholder': '192.168.1.177' });
 		var conCc = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'TR,DE' });
 		var conSubs = ((all[4] || {}).subs || []);
@@ -663,11 +665,30 @@ return view.extend({
 					return E('option', { 'value': String(s.id) },
 						(s.name || ('подписка ' + s.id)) + ' — ' + maskUrl(s.url || ''));
 				})));
+		var conState = E('div', { 'class': 'gs-hint' }, 'состояние консоли: —');
 		function conAct(action) {
 			view.act(callConsole, { action: action,
 				ip: (conIp.value || '').trim(), sub: (conSel.value || ''),
 				countries: (conCc.value || '').trim() });
 		}
+		// The card used to be empty after every reload: nothing ever asked the router what the
+		// lane is. `console_status` is read-only, so it is safe to call on each render; after a
+		// switch the reload re-renders and reads it again.
+		callConsoleStatus().then(function(cs) {
+			cs = cs || {};
+			conIp.value = cs.ip || '';
+			conCc.value = cs.countries || '';
+			conSel.value = cs.sub ? String(cs.sub) : '';
+			var cc = cs.config || {};
+			conState.textContent = 'состояние консоли: ' + (cs.enabled ? 'включена' : 'выключена')
+				+ ' · правило: ' + (cs.rule ? 'есть' : 'нет')
+				+ ' · туннель Console: ' + (cs.tun ? 'поднят' : 'нет')
+				+ ' · группа CONSOLE: ' + (cc.group ? 'есть' : 'нет')
+				+ ' · провайдер console: ' + (cc.provider ? 'есть' : 'нет');
+		}).catch(function() {
+			// A router whose backend has no such method must still render the card.
+			conState.textContent = 'состояние консоли: нет данных';
+		});
 		var conCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Игровая консоль — отдельный выход'),
 			E('div', { 'class': 'gs-row' }, [
@@ -677,13 +698,15 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [
 				E('span', { 'class': 'gs-label' }, 'Подписка'), conSel
 			]),
+			conState,
 			E('div', { 'class': 'gs-row' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() { conAct('on'); } }, 'Включить путь консоли'),
 				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было'),
 				E('button', { 'class': 'gs-btn', 'click': function() { view.act(callConsoleDiag, { what: 'all' }); } }, 'Собрать логи')
 			]),
-			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Настройки остаются, повторное включение мгновенное. «Собрать логи» кладёт архив в /tmp и в папку бэкапов (если шара включена).'),
-			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки. Указывайте коды через запятую: TR, DE, NL.')
+			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. «Собрать логи» кладёт архив в /tmp и в папку бэкапов (если шара включена).'),
+			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки (это и есть сброс фильтра). Указывайте коды через запятую: TR, DE, NL.'),
+			E('div', { 'class': 'gs-hint' }, 'Пустая подписка — «как у VPN»: провайдер консоли смотрит на подписку, которой пользуется группа VPN.')
 		]);
 		panels.obzor.appendChild(conCard);
 

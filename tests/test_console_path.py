@@ -44,6 +44,23 @@ rules:
 """
 
 
+# BASE plus a VPN group that rides its own provider. The console must borrow THAT subscription,
+# not the first provider named `sub` (review point 10: on a split registry `sub` is the
+# restricted VPN-noP2P subscription).
+VPN_BASE = BASE.replace(
+    'proxy-providers:\n',
+    'proxy-providers:\n  vpn:\n    type: http\n    url: "https://example.invalid/vpn"\n'
+    '    interval: 3600\n').replace(
+    '  - name: VPN-noP2P\n',
+    '  - name: VPN\n    type: url-test\n    use:\n      - vpn\n'
+    '  - name: VPN-noP2P\n')
+
+# The same config with no VPN lane at all: the legacy sub/slot/sub2 order still has to work,
+# otherwise the very first switch-on fails on a router that is already running.
+NO_VPN_GROUP = BASE.replace(
+    '  - name: VPN-noP2P\n    type: url-test\n    use:\n      - sub\n', '')
+
+
 def load_module():
     spec = importlib.util.spec_from_file_location('geomask_console', SOURCE)
     module = importlib.util.module_from_spec(spec)
@@ -147,7 +164,18 @@ class ConsolePatcherTests(unittest.TestCase):
 
     def test_first_switch_on_borrows_the_main_subscription(self):
         # Out of the box the console has no URL of its own; refusing would make the very first
-        # switch-on fail on a working router.
+        # switch-on fail on a working router. "Main" means the subscription the VPN group
+        # rides, not the first provider named `sub` (review point 10).
+        self.config.write_text(VPN_BASE, encoding='utf-8')
+        code = self.run_main('apply', str(self.config), '--countries', 'TR')
+        self.assertEqual(code, 0)
+        provider = self.doc()['proxy-providers']['console']
+        self.assertEqual(provider['url'], 'https://example.invalid/vpn')
+
+    def test_first_switch_on_still_finds_a_url_without_a_vpn_group(self):
+        # No VPN/VPN-noP2P group at all: the legacy order (sub, slot, sub2) is the last resort,
+        # and a clean config must still get a working console provider.
+        self.config.write_text(NO_VPN_GROUP, encoding='utf-8')
         code = self.run_main('apply', str(self.config), '--countries', 'TR')
         self.assertEqual(code, 0)
         provider = self.doc()['proxy-providers']['console']

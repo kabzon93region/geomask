@@ -8,7 +8,7 @@ same problem with a dedicated hev tunnel + a listener pinned to one group; this 
 same for a console, so the egress is chosen by the listener and no rule can steal it.
 
 Commands:
-  apply  <config> [--url URL|-] [--countries TR,DE] [--port N]   create or update
+  apply  <config> [--url URL|default|-] [--countries TR,DE] [--port N]   create or update
   remove <config>                                                remove what we own
   status <config>                                                JSON state, read-only
 
@@ -28,6 +28,8 @@ PROVIDER = 'console'
 GROUP = 'CONSOLE'
 LISTENER = 'console'
 DEFAULT_PORT = 7893
+# `--url default` is not a URL: it means "as the VPN" and discards the pinned subscription.
+RESET_URL = 'default'
 
 # Node names in this subscription carry the country in Russian and/or English. The filter is a
 # regex over names, so a country is the union of the spellings actually seen in the wild.
@@ -171,6 +173,42 @@ def find_listener(doc):
     return None
 
 
+def default_provider(doc):
+    """The provider the VPN really rides on, else the legacy sub/slot/sub2 order.
+
+    Point 10 of the 15.11 review: the console borrowed the first provider named `sub`, so on a
+    split registry it silently left through the restricted (VPN-noP2P) subscription while the
+    console needs the one the VPN group uses. `VPN` wins over `VPN-noP2P`; the first provider
+    of that group's `use` list that actually has a URL is the answer.
+    """
+    providers = doc.get('proxy-providers')
+    if not isinstance(providers, dict):
+        return None
+    groups = doc.get('proxy-groups')
+    if isinstance(groups, list):
+        for name in ('VPN', 'VPN-noP2P'):
+            group = next((g for g in groups
+                          if isinstance(g, dict) and g.get('name') == name), None)
+            if group is None:
+                continue
+            for provider_name in group.get('use') or []:
+                candidate = providers.get(provider_name)
+                if isinstance(candidate, dict) and candidate.get('url'):
+                    return candidate
+    # No VPN lane on this config (or it has no usable provider): keep the old behaviour, or the
+    # very first switch-on fails on a router that is already working.
+    for name in ('sub', 'slot', 'sub2'):
+        candidate = providers.get(name)
+        if isinstance(candidate, dict) and candidate.get('url'):
+            return candidate
+    return None
+
+
+def default_provider_url(doc):
+    provider = default_provider(doc)
+    return provider.get('url') if provider else None
+
+
 def ensure_provider(doc, url):
     providers = doc.get('proxy-providers')
     if not isinstance(providers, dict):
@@ -181,19 +219,20 @@ def ensure_provider(doc, url):
     if isinstance(current, dict):
         # keep whatever the owner's provider block already had (header, proxy, interval)
         spec = dict(current)
+    if url == RESET_URL:
+        # "As the VPN again": drop the pinned URL and the header that was copied with it, then
+        # re-derive both below. Without the reset an explicit `--url` could never be undone.
+        url = ''
+        spec.pop('url', None)
+        spec.pop('header', None)
     if url:
         spec['url'] = url
     if not spec.get('url'):
-        # Out of the box the console rides the same subscription as everything else; the panel
-        # can re-point it at any other registry entry later. Refusing here would make the first
-        # switch-on fail on a router that is already working.
-        for name in ('sub', 'slot', 'sub2'):
-            candidate = providers.get(name)
-            if isinstance(candidate, dict) and candidate.get('url'):
-                spec['url'] = candidate['url']
-                if isinstance(candidate.get('header'), dict) and candidate['header']:
-                    spec['header'] = copy.deepcopy(candidate['header'])
-                break
+        source = default_provider(doc)
+        if source is not None:
+            spec['url'] = source['url']
+            if isinstance(source.get('header'), dict) and source['header']:
+                spec['header'] = copy.deepcopy(source['header'])
     if not spec.get('url'):
         raise ConsoleError('no subscription URL: the console provider has none and none was given')
     # A provider-level health check makes mihomo drop nodes from the group; the console lane

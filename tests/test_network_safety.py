@@ -454,6 +454,46 @@ uci() {
         self.assertNotIn('photos', result.stdout)
         self.assertIn('RC=0', result.stdout)
 
+    def test_the_share_restarts_the_file_server_inside_the_prefix(self):
+        """A bare /etc/init.d/<svc> restart reaches the host, not the tree under test.
+
+        Review 15.11, point 1: the template started the real init script of whatever machine ran
+        the tests. The recording init script under `P /etc/init.d` proves which path was used.
+        """
+        calls = self.case / 'initd-calls'
+        initd = self.case / 'etc/init.d/ksmbd'
+        initd.parent.mkdir(parents=True, exist_ok=True)
+        initd.write_text('#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' % calls.as_posix(),
+                         encoding='utf-8', newline='\n')
+        initd.chmod(0o755)
+        conf = self.case / 'etc/ksmbd/ksmbd.conf'
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text('[geomask-backups]\n', encoding='utf-8')
+        marker = self.case / 'etc/geomask/backup-share.enable'
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('', encoding='utf-8')
+        # force_root is empty in the found section, so the helper has to change it - and a change
+        # is what makes it restart the file server.
+        extra = r'''
+uci() {
+  case "$*" in
+    "-q show ksmbd") printf 'ksmbd.cfg1=share\n' ;;
+    "-q get ksmbd.cfg1.name") printf 'geomask-backups' ;;
+    "-q get ksmbd.cfg1.path") printf '/root/geomask-backups' ;;
+    "-q get ksmbd.cfg1.read_only") printf 'yes' ;;
+    "-q get ksmbd.cfg1.guest_ok") printf 'no' ;;
+    "-q get ksmbd.cfg1.force_root") printf '' ;;
+    "set "*) printf 'SET %s\n' "$2" ;;
+    *) return 0 ;;
+  esac
+}
+'''
+        result = self.run_script('ensure_smb_share; printf "\\nRC=%s\\n" "$?"',
+                                 functions=self.SMB_FUNCS, extra=extra)
+        self.assertIn('SET ksmbd.cfg1.force_root=1', result.stdout)
+        self.assertTrue(calls.exists(), 'the file server was never restarted from the prefix')
+        self.assertIn('restart', calls.read_text(encoding='utf-8'))
+
 
 if __name__ == '__main__':
     unittest.main()

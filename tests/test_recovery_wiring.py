@@ -23,33 +23,51 @@ ctx = _load('config_tx_recovery', 'geomask-config-tx.py')
 
 
 class RecoveryIsWiredTests(unittest.TestCase):
+    def setUp(self):
+        # On the router the journal, the lock and the work dir live under /etc/geomask. Leaving
+        # them there made these tests open a real transaction on the host running them (review
+        # 15.11, point 1): everything now points inside the temporary directory.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / 'state').mkdir()
+        (self.root / 'preimages').mkdir()
+        self.target = self.root / 'config.yaml'
+        for patcher in (
+            mock.patch.object(ctx, 'TX_JOURNAL', self.root / 'state' / 'journal.jsonl'),
+            mock.patch.object(ctx, 'TX_PREIMAGES_DIR', self.root / 'preimages'),
+            mock.patch.object(ctx, 'TX_STATE_DIR', self.root / 'state' / 'tx-work'),
+            mock.patch.object(ctx, 'TX_LOCK', self.root / 'state' / '.config-tx.lock'),
+            mock.patch.object(ctx, 'DEFAULT_CONFIG', self.target),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_start_transaction_recovers_before_writing(self):
-        target = Path('/etc/geomask/does-not-matter.yaml')
         calls = []
 
         with mock.patch.object(ctx, 'recover_interrupted_transactions',
                                side_effect=lambda: calls.append('recovered')):
             try:
-                ctx.start_transaction({target: b'x'})
+                ctx.start_transaction({self.target: b'x'})
             except ctx.TxError:
                 pass   # later stages fail off-router; the order is what is under test
 
         self.assertEqual(calls, ['recovered'])
 
     def test_a_failed_recovery_blocks_the_new_transaction(self):
-        target = Path('/etc/geomask/does-not-matter.yaml')
-
         with mock.patch.object(ctx, 'recover_interrupted_transactions',
                                side_effect=RuntimeError('disk gone')):
             with self.assertRaises(ctx.TxError) as caught:
-                ctx.start_transaction({target: b'x'})
+                ctx.start_transaction({self.target: b'x'})
 
         self.assertIn('could not be recovered', str(caught.exception))
 
     def test_multi_file_is_refused_before_any_recovery_side_effect(self):
+        second = self.root / 'other.yaml'
         with mock.patch.object(ctx, 'recover_interrupted_transactions') as recovery:
             with self.assertRaises(ctx.TxError):
-                ctx.start_transaction({'/etc/a.yaml': b'x', '/etc/b.yaml': b'y'})
+                ctx.start_transaction({self.target: b'x', second: b'y'})
         recovery.assert_not_called()
 
 

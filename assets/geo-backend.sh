@@ -23,6 +23,11 @@ DEVICES=/etc/geo-devices.list
 EXCL_OLD=/etc/geo-exclude.list   # legacy (ip name) -> migrated to DEVICES as bypass
 SUBS_FILE=/etc/geomask-subs.list # registry: id|name|url (one per line)
 BACKUP_DIR=${GM_BACKUP_DIR:-/root/geomask-backups}
+# The backup folder is published over SMB only after the owner opts in with this marker; the
+# diagnostic bundle must not land there without it (review 15.11, #14).
+SMB_SHARE_ENABLE=${GM_SMB_SHARE_ENABLE:-/etc/geomask/backup-share.enable}
+# How long a bundle may sit in the temporary directory before it is removed (hours).
+CONSOLE_DIAG_KEEP_H=${GM_CONSOLE_DIAG_KEEP:-24}
 DHCP_OWNED=/etc/geomask/dhcp-hosts   # id|ip|mac of host sections geomask created
 AI_TUN_DEV=AI
 AI_TUN_IP=198.19.0.1
@@ -618,7 +623,7 @@ cmd_aidns_apply() {
   _before=$(sha256sum "$AIDNS_NFT_DEST" 2>/dev/null | awk '{print $1}')
   _aidns_sync
   _after=$(sha256sum "$AIDNS_NFT_DEST" 2>/dev/null | awk '{print $1}')
-  if [ "$(cat /tmp/geomask-aidns.state 2>/dev/null)" = error ]; then
+  if [ "$(cat "$AIDNS_STATE" 2>/dev/null)" = error ]; then
     printf '{"ok":false,"error":"AI-DNS listen address is unknown: client DNS is rejected (fail closed)"}'
     return 1
   fi
@@ -843,6 +848,9 @@ AIDNS_DNS_PORT=5353
 AIDNS_NFT_DEST=${GM_AIDNS_NFT:-/usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft}
 AIDNS_UID_FILE=${GM_AIDNS_UID:-/etc/geomask-aidns.uid}
 AIDNS_OFF_FILE=${GM_AIDNS_OFF:-/etc/geomask-aidns.off}
+# Outcome of the last sync, read by status. A parameterless hard path here was one of the ways
+# the tests wrote into the host's /tmp (review 15.11, point 1).
+AIDNS_STATE=${GM_AIDNS_STATE:-/tmp/geomask-aidns.state}
 
 _aidns_sync() {
   [ -f "$AIDNS_UID_FILE" ] || return 0
@@ -891,7 +899,7 @@ _aidns_sync() {
   # the list stayed the same must still be applied (audit 14.11.2026, F08).
   if cmp -s "$_tmp" "$AIDNS_NFT_DEST"; then
     rm -f "$_tmp"
-    [ -n "$_list" ] && [ -z "$_aidns" ] && printf 'error' > /tmp/geomask-aidns.state
+    [ -n "$_list" ] && [ -z "$_aidns" ] && printf 'error' > "$AIDNS_STATE"
     return 0
   fi
   if ! cp "$_tmp" "$AIDNS_NFT_DEST" 2>/dev/null; then
@@ -901,10 +909,10 @@ _aidns_sync() {
   fi
   rm -f "$_tmp"
   if [ -n "$_list" ] && [ -z "$_aidns" ]; then
-    printf 'error' > /tmp/geomask-aidns.state
+    printf 'error' > "$AIDNS_STATE"
     echo "$(date +%FT%T) AI-DNS: listen address unknown - client DNS REJECTED (fail closed)" >> "$LOG"
   else
-    printf 'ok' > /tmp/geomask-aidns.state
+    printf 'ok' > "$AIDNS_STATE"
   fi
   if ! /etc/init.d/firewall reload >/dev/null 2>&1; then
     sleep 1
@@ -2469,9 +2477,16 @@ _console_mask_stream() { # stdin -> stdout
 # One archive with everything needed to diagnose the console path from a distance. Secrets are
 # masked here, not by the reader: the owner hands this file over as-is.
 cmd_console_diag() {
-  _dir=/tmp/geomask-console-diag
-  rm -rf "$_dir" 2>/dev/null
-  mkdir -p "$_dir" 2>/dev/null || { printf '{"ok":false,"error":"cannot create %s"}\n' "$_dir"; return 1; }
+  # One private directory per request: the fixed path plus `rm -rf` let two panel clicks delete
+  # each other's half-built bundle (review 15.11, points 1 and 33).
+  _tmpd=${TMPDIR:-/tmp}
+  _dir=$(mktemp -d "$_tmpd/geomask-console-diag.XXXXXX" 2>/dev/null)
+  [ -n "$_dir" ] || { printf '{"ok":false,"error":"cannot create a private bundle directory"}\n'; return 1; }
+  chmod 700 "$_dir" 2>/dev/null
+  # Nothing older than the retention window stays on the router: these archives carry the
+  # masked-but-still-descriptive state of the console lane.
+  find "$_tmpd" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz' \
+    -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
   _ip=$(_console_get ip)
   {
     printf 'geomask console diag %s\n' "$(date '+%F %T %z')"
@@ -2493,17 +2508,22 @@ cmd_console_diag() {
   controller_curl -s -m5 "$MIHOMO_API/connections" > "$_dir/connections.json" 2>&1
   # The mihomo config carries subscription URLs and the controller secret.
   [ -f "$MIHOMO_CONF" ] && _console_mask_stream < "$MIHOMO_CONF" > "$_dir/config.masked.yaml"
-  _tgz="/tmp/geomask-console-diag-$(date +%Y%m%d-%H%M%S).tar.gz"
-  ( umask 077; tar -czf "$_tgz" -C /tmp "$(basename "$_dir")" >/dev/null 2>&1 ) || {
+  _tgz="$_tmpd/geomask-console-diag-$(date +%Y%m%d-%H%M%S).$$.tar.gz"
+  ( umask 077; tar -czf "$_tgz" -C "$_tmpd" "$(basename "$_dir")" >/dev/null 2>&1 ) || {
+    rm -rf "$_dir" 2>/dev/null
     printf '{"ok":false,"error":"cannot pack the bundle"}\n'; return 1
   }
   chmod 600 "$_tgz" 2>/dev/null
   rm -rf "$_dir" 2>/dev/null
-  # If the backup share exists the owner can copy the archive from his PC without SSH.
-  if [ -d "$BACKUP_DIR" ] && [ -w "$BACKUP_DIR" ]; then
-    cp -f "$_tgz" "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null && chmod 600 "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null
+  # Into the share only when the owner opted in with the marker: before this the archive was
+  # copied into a folder that may be published over SMB, without asking (review 15.11, #14).
+  _shared=false
+  if [ -f "$SMB_SHARE_ENABLE" ] && [ -d "$BACKUP_DIR" ] && [ -w "$BACKUP_DIR" ]; then
+    cp -f "$_tgz" "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null \
+      && chmod 600 "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null && _shared=true
   fi
-  printf '{"ok":true,"file":"%s","bytes":%s}\n' "$_tgz" "$(wc -c < "$_tgz" 2>/dev/null)"
+  printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s}\n' \
+    "$_tgz" "$(wc -c < "$_tgz" 2>/dev/null)" "$_shared"
 }
 
 case "$1" in

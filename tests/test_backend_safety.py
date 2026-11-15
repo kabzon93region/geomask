@@ -96,13 +96,15 @@ class BackendSafetyTests(unittest.TestCase):
             'DEVICES="%s"\nLOG="%s"\nSUBS_FILE="%s"\nDHCP_OWNED="%s"\n'
             'BACKUP_DIR="%s"\nNODESCONF="%s"\nNODESCAN_TAG="# geomask-nodescan"\n'
             'MIHOMO_CONF="%s"\nGM_ROUTES_LIB=/nonexistent\n'
-            'AIDNS_UID_FILE="%s"\nAIDNS_OFF_FILE="%s"\nNODES_LOCK="%s"\n'
+            'AIDNS_UID_FILE="%s"\nAIDNS_OFF_FILE="%s"\nAIDNS_STATE="%s"\nNODES_LOCK="%s"\n'
             'BACKUP_OK="%s"\n'
             'warn() { printf "WARN %%s\\n" "$*" >&2; }\n'
             % (posix(self.devices), posix(self.log), posix(self.case / 'subs.list'),
                posix(self.owned), posix(self.backups), posix(self.nodes),
                posix(self.case / 'config.yaml'), posix(self.case / 'geomask-aidns.uid'),
-               posix(self.case / 'geomask-aidns.off'), posix(self.case / 'nodes.lock'),
+               posix(self.case / 'geomask-aidns.off'),
+               posix(self.case / 'geomask-aidns.state'),
+               posix(self.case / 'nodes.lock'),
                posix(self.case / 'backup-ok')))
         script = (header + extra + '\n'
                   + '\n'.join(extract(name) for name in functions) + '\n' + body)

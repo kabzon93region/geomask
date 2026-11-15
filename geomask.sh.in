@@ -1651,8 +1651,10 @@ ensure_smb_share() {
     info "SMB share: создайте пользователя вручную: ksmbd.adduser <имя>"
   fi
   if [ "$_changed" = 1 ]; then
-    # restart ONLY the file server (not the network stack); verify right away
-    "/etc/init.d/$_init" restart >/dev/null 2>&1 || true
+    # restart ONLY the file server (not the network stack); verify right away.
+    # `P` keeps this on the root the run was pointed at: a bare /etc/init.d/... restart reaches
+    # the host that executes the script, not the router tree under test (review 15.11, point 1).
+    "$(P /etc/init.d/$_init)" restart >/dev/null 2>&1 || true
     sleep 2
   fi
   # a leftover share section without a name is reported, never deleted: it is not ours

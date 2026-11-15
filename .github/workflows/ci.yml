@@ -21,7 +21,7 @@ jobs:
         run: python -m pip install --upgrade pyyaml
 
       - name: Build consistency (geomask.sh == build of geomask.sh.in + assets)
-        run: python tools/check_build.py
+        run: python tools/check_build.py --verify-only
 
       - name: RPC manifest parity (four generated integration points)
         run: python tools/gen-geo-rpc.py --check
@@ -37,8 +37,9 @@ jobs:
 
       # One module per process with its own timeout: a hang used to freeze the whole job
       # for as long as GitHub allowed, and the log never said which test it was.
-      # Several modules exercise the real /etc/geomask and /root paths (that is what the
-      # router has), so they run as root here - without it they fail with PermissionError.
+      # No sudo: a test that needs root is a test that writes into the host's /etc, /root or
+      # /tmp. Every module runs under its own HOME and TMPDIR (review 15.11, point 1); if one
+      # of them starts writing outside its sandbox, tests/test_sandbox_guard.py says which.
       - name: Unit tests
         run: |
           set -u
@@ -46,7 +47,7 @@ jobs:
           for file in tests/test_*.py; do
             module=$(basename "$file" .py)
             start=$(date +%s)
-            if timeout --kill-after=10 180 sudo -E env "PATH=$PATH" "HOME=$HOME" \
+            if timeout --kill-after=10 180 env "PATH=$PATH" "HOME=$HOME" \
                  python -m unittest discover -s tests -p "$module.py" \
                  > "/tmp/$module.log" 2>&1; then
               echo "ok   $module ($(( $(date +%s) - start ))s)"

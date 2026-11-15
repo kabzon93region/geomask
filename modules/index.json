@@ -152,7 +152,7 @@
           "path": "/usr/lib/geomask/geomask-config-tx.py",
           "source": "assets/geomask-config-tx.py",
           "mode": "0755",
-          "sha256": "c9bd2e8cee49dc9989d24d3f9998063b420120033f2987076412fd490b3d09dd"
+          "sha256": "53e77fe83b65a9c824a66d239ddc4bb4213aef1427a384d650ea2ea820be6fcb"
         },
         {
           "path": "/usr/lib/geomask/geomask-console.py",
@@ -288,7 +288,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "0ab61b1df925e134e76cf0d4e2a29f65d0f123f7619562afe610e2f3aad54256"
+          "sha256": "cb19b7265ea114c7a12e89ca536ef48501cf2b29a6c7aae6d9a602f642dd4741"
         }
       ]
     },
@@ -304,7 +304,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "d76abe519955c0c9b022580a85c16b94fe5671924725052cefdd38b47eceb22f"
+          "sha256": "288b7512805f2da664deeabb16bbd30325e818785201643020e371a026d71b66"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",

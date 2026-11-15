@@ -3270,11 +3270,46 @@ def _restore_preimages(tx_id, journal):
             ok = False
     return ok
 
+def main(argv=None):
+    """Command line for the shell: `--commit <path>` / `--recover`, self-test without args.
+
+    The console switch used to copy the live config by hand before touching it, so a failed
+    reload left the patched file in place. It now hands the candidate bytes to this CLI, which
+    runs the same transaction the rest of the backend uses: preimage, mihomo -t, isolated
+    trial, atomic write, reload, rollback. The answer is one JSON line and rc 0/1 - a caller
+    must never have to parse a traceback to learn that the switch did not happen.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        # No arguments keeps the historical self-test.
+        print('Config transaction module loaded OK')
+        print(f'DEFAULT_CONFIG={DEFAULT_CONFIG}')
+        print(f'TX_JOURNAL={TX_JOURNAL}')
+        return 0
+    try:
+        if args[0] == '--commit':
+            if len(args) != 2:
+                raise TxError('--commit takes exactly one target path')
+            data = sys.stdin.buffer.read()
+            if not data:
+                # Replacing the live config with nothing is never a switch: refuse it.
+                raise TxError('refusing to commit an empty payload')
+            result = start_transaction({args[1]: data})
+            answer = {'ok': True, 'tx_id': result.get('tx_id')}
+        elif args[0] == '--recover':
+            recover_interrupted_transactions()
+            answer = {'ok': True, 'recovered': True}
+        else:
+            raise TxError('unknown argument: %s' % args[0])
+    except Exception as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)[:400]}, ensure_ascii=False))
+        return 1
+    print(json.dumps(answer, ensure_ascii=False))
+    return 0
+
+
 if __name__ == '__main__':
-    # Quick self-test
-    print('Config transaction module loaded OK')
-    print(f'DEFAULT_CONFIG={DEFAULT_CONFIG}')
-    print(f'TX_JOURNAL={TX_JOURNAL}')
+    sys.exit(main())
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-config-owner.py 755 <<'ASSET_EOF'
 #!/usr/bin/env python3
@@ -7553,8 +7588,52 @@ CONSOLE_YML=${GM_CONSOLE_YML:-/etc/hev-socks5-tunnel/console.yml}
 CONSOLE_INITD=${GM_CONSOLE_INITD:-/etc/init.d/hev-console}
 CONSOLE_NFT=${GM_CONSOLE_NFT:-/usr/share/nftables.d/ruleset-post/99-console-accept.nft}
 CONSOLE_PY=/usr/lib/geomask/geomask-console.py
+# The switch writes the live config through a transaction (preimage, mihomo -t, isolated
+# trial, atomic write, reload, rollback), never through a hand-written `cp`/`mv` pair.
+TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}
+# One lock for `on`, `off` and the guard's console block: a rule must not come back after the
+# kill switch removed it. `status` never takes it - the panel calls it on every render.
+CONSOLE_LOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
 
 _console_get() { sed -n "s/^$1=//p" "$CONSOLE_STATE" 2>/dev/null | head -1; }
+
+# BusyBox on OpenWrt does not ship flock everywhere, so the lane lock is a directory with the
+# owner pid inside. A lock whose owner is gone (a killed switch) is broken once and retried; if
+# the lane is still busy after the wait, the caller fails instead of working unserialised.
+_console_lock() {
+  _lt=0
+  while [ "$_lt" -lt "${CONSOLE_LOCK_TRIES:-10}" ]; do
+    if mkdir "$CONSOLE_LOCK" 2>/dev/null; then
+      if printf '%s\n' "$$" > "$CONSOLE_LOCK/pid" 2>/dev/null; then
+        return 0
+      fi
+      rm -rf "$CONSOLE_LOCK" 2>/dev/null     # cannot name the owner: do not keep a half lock
+      return 1
+    fi
+    _lt=$((_lt+1))
+    _owner=''
+    [ -f "$CONSOLE_LOCK/pid" ] && _owner=$(cat "$CONSOLE_LOCK/pid" 2>/dev/null)
+    if [ -z "$_owner" ] && [ "$_lt" -eq 1 ]; then
+      # The owner may be between `mkdir` and writing its pid: look again before breaking it.
+      sleep 1
+    elif [ -n "$_owner" ] && kill -0 "$_owner" 2>/dev/null; then
+      sleep 1
+    else
+      rm -rf "$CONSOLE_LOCK" 2>/dev/null     # ownerless or dead owner: a killed switch
+    fi
+  done
+  return 1
+}
+
+# Never release a lock this process does not own: a slow switch whose lock was taken over
+# must not delete the new owner's lock on the way out.
+_console_unlock() {
+  [ -n "${CONSOLE_LOCK:-}" ] || return 0
+  _uo=$(cat "$CONSOLE_LOCK/pid" 2>/dev/null)
+  [ -z "$_uo" ] || [ "$_uo" = "$$" ] || return 0
+  rm -rf "$CONSOLE_LOCK" 2>/dev/null
+  return 0
+}
 
 _console_set() { # _console_set <key> <value>
   mkdir -p "$(dirname "$CONSOLE_STATE")" 2>/dev/null || return 1
@@ -7677,15 +7756,45 @@ _console_rule_off() { # remove only OUR rules: `from <ipv4> lookup 102`, never a
   return 0
 }
 
-# Undo the console patch: put the pre-patch config back and make mihomo re-read it, so a
-# failed switch leaves the router exactly as it was found. Without this the live file stayed
-# patched after a failed reload and the next mihomo restart would pick up a half-applied lane.
+# Undo the console patch: put the pre-switch bytes back through the SAME transaction the switch
+# used, then prove the live file is usable again. A restore that leaves mihomo unable to load
+# the file, or the controller not answering, is not a restore.
+#   _console_cfg_restore [preimage] -> rc 0 only when the live config is byte-identical to the
+#   preimage, `mihomo -t` accepts it and the controller answers /version.
 _console_cfg_restore() {
-  [ -f "$MIHOMO_CONF.bak_console" ] || return 1
-  cp -f "$MIHOMO_CONF.bak_console" "$MIHOMO_CONF" 2>/dev/null || return 1
-  controller_curl -s -o /dev/null -m10 -X PUT "$MIHOMO_API/configs?force=true" \
-    -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" >/dev/null 2>&1 || true
-  return 0
+  _pre="${1:-${_orig:-}}"
+  [ -n "$_pre" ] && [ -f "$_pre" ] || return 1
+  # The CLI can refuse (lane busy, disk full, trial failed): its own rollback may already have
+  # put the bytes back, so the byte comparison below decides, not its exit code.
+  "$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" < "$_pre" >/dev/null 2>&1 || :
+  cmp -s "$MIHOMO_CONF" "$_pre" || return 1
+  if command -v mihomo >/dev/null 2>&1; then
+    mihomo -d /etc/mihomo -f "$MIHOMO_CONF" -t >/dev/null 2>&1 || return 1
+  fi
+  _ver=$(controller_curl -s -o /dev/null -w '%{http_code}' -m10 "$MIHOMO_API/version" 2>/dev/null)
+  case "$_ver" in 200|204) return 0 ;; *) return 1 ;; esac
+}
+
+# A failed switch: name the step, put the pre-switch config back and say honestly whether the
+# live file really is the old one again. The preimage is kept only when the restore failed -
+# then it is the only working copy left, and the answer has to say where it is.
+_console_on_fail() { # _console_on_fail <step> <message>
+  _restored=false
+  if _console_cfg_restore "$_orig"; then
+    _restored=true
+    rm -f "$_orig" 2>/dev/null
+  fi
+  rm -f "$_cand" 2>/dev/null
+  if [ "$_restored" = true ]; then
+    printf '{"ok":false,"step":"%s","restored":true,"error":"%s - previous config restored"}\n' "$1" "$2"
+  else
+    # Not verified is not the same as "left patched": the transaction rolls back on its own, so
+    # the bytes may already be the old ones while mihomo or the controller still refuses to
+    # confirm it. Say what is certain and where the working copy is.
+    printf '{"ok":false,"step":"%s","restored":false,"error":"%s - RESTORE NOT VERIFIED (mihomo -t or the controller did not confirm it); the live config may still be the patched one, the pre-switch copy is kept at %s"}\n' "$1" "$2" "$_orig"
+  fi
+  _console_unlock
+  return 1
 }
 
 cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
@@ -7718,11 +7827,19 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
       "$_ip" "$_sub" "$_countries" "$_rule" "$_tun" "$_cfg"
     return 0
   fi
+  # Serialise the lane before anything is changed: `off` must not interleave with a switch,
+  # and the guard takes the same lock before it re-reads the state. The emergency path waits
+  # for the lock (bounded), but never for a fresh backup.
+  _console_lock || {
+    printf '{"ok":false,"error":"console is busy: another switch holds the lane lock (%s)"}\n' "$CONSOLE_LOCK"
+    return 1
+  }
   if [ "$_act" = off ]; then
     # The kill switch must work when the router is already half-broken: no backup gate and no
     # silent success. State goes first (the watchdog reads it), then the service and the rules,
     # and every step is checked.
     _console_set enabled 0 || {
+      _console_unlock
       printf '{"ok":false,"error":"cannot update the console state file"}\n'; return 1; }
     _rc=0
     if [ -x "$CONSOLE_INITD" ]; then
@@ -7731,6 +7848,7 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     fi
     _console_rule_off "$_ip" || _rc=1
     _console_rule_off "" || _rc=1
+    _console_unlock
     if [ "$_rc" != 0 ]; then
       printf '{"ok":false,"enabled":false,"error":"console is marked off, but a rule or the tunnel did not stop - check ip rule and hev-console"}\n'
       return 1
@@ -7739,29 +7857,34 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     printf '{"ok":true,"enabled":false}\n'
     return 0
   fi
-  _require_backup || return 1
+  _require_backup || { _console_unlock; return 1; }
   # --- on ---
-  _ipv4_ok "$_ip" || { printf '{"ok":false,"error":"bad or missing console IP"}\n'; return 1; }
+  _ipv4_ok "$_ip" || { _console_unlock; printf '{"ok":false,"error":"bad or missing console IP"}\n'; return 1; }
   # A device already managed as ai/bypass gets its own rule at pref 19900, which outranks the
   # console rule (19903): the panel would say "on" while the traffic goes somewhere else.
   if [ -f "$DEVICES" ] && awk -v i="$_ip" '$1==i {found=1} END{exit found?0:1}' "$DEVICES" 2>/dev/null; then
+    _console_unlock
     printf '{"ok":false,"error":"this IP is already a managed device (ai/bypass) - its rule would win; remove it from the device list first"}\n'
     return 1
   fi
   if [ ! -x "$CONSOLE_PY" ]; then
+    _console_unlock
     printf '{"ok":false,"error":"console patcher not installed (/usr/lib/geomask/geomask-console.py)"}\n'; return 1
   fi
   _url=''
   if [ -n "${3:-}" ]; then
     _url=$(_find_sub_url "$3") || {
+      _console_unlock
       printf '{"ok":false,"error":"subscription %s is not in the registry"}\n' "$3"; return 1
     }
   fi
   # Patch a CANDIDATE, validate it, and only then replace the live file: the first version
   # wrote the live config first and checked afterwards, so a rejected config was already on
   # disk and the next mihomo restart would fail.
-  _cand="/tmp/geomask-console-candidate.$$.yaml"
+  _cand="${TMPDIR:-/tmp}/geomask-console-candidate.$$.yaml"
+  _orig="${TMPDIR:-/tmp}/geomask-console-orig.$$"
   cp -p "$MIHOMO_CONF" "$_cand" 2>/dev/null || {
+    _console_unlock
     printf '{"ok":false,"error":"cannot read the mihomo config"}\n'; return 1
   }
   if [ -n "$_url" ]; then
@@ -7774,30 +7897,44 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   case "$_res" in
     *'"ok": true'*|*'"ok":true'*) ;;
     *) rm -f "$_cand"
+       _console_unlock
        printf '{"ok":false,"error":"mihomo config not patched: %s"}\n' "$(printf '%s' "$_res" | tail -1)"; return 1 ;;
   esac
+  # A pre-check only: the transaction repeats the validation shaped for the trial, so this is
+  # not duplicated work, it is the cheap "do not even start" gate.
   if command -v mihomo >/dev/null 2>&1; then
     mihomo -d /etc/mihomo -f "$_cand" -t >/dev/null 2>&1 || {
       rm -f "$_cand"
+      _console_unlock
       printf '{"ok":false,"error":"mihomo -t rejected the patched config - live config untouched"}\n'; return 1
     }
   fi
-  cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_console" 2>/dev/null || {
+  # Private copy of the live bytes. The transaction keeps its own preimage, but the rollback
+  # below runs in this shell and must not depend on the tx work dir surviving. The old backup
+  # copy is gone: it lived forever and no transaction owned it.
+  ( umask 077; cp -p "$MIHOMO_CONF" "$_orig" ) 2>/dev/null || {
     rm -f "$_cand"
-    printf '{"ok":false,"error":"cannot back up the mihomo config - live config untouched"}\n'; return 1
+    _console_unlock
+    printf '{"ok":false,"error":"cannot keep a private copy of the mihomo config - live config untouched"}\n'
+    return 1
   }
-  mv -f "$_cand" "$MIHOMO_CONF" 2>/dev/null || {
-    rm -f "$_cand"
-    printf '{"ok":false,"error":"cannot install the patched config"}\n'; return 1
-  }
+  chmod 600 "$_orig" 2>/dev/null
+  # The switch itself: preimage, mihomo -t, isolated trial, atomic write, reload and a rollback
+  # if any of it fails. Nothing here changes the live file by hand.
+  _txout=$("$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" < "$_cand" 2>&1)
+  _txrc=$?
+  if [ "$_txrc" != 0 ]; then
+    _detail=$(printf '%s' "$_txout" | tail -1 | sed 's/["\\]//g' | cut -c1-300)
+    _console_on_fail transaction "mihomo config transaction failed: ${_detail:-no output}"
+    return 1
+  fi
   # A new listener exists only after mihomo re-reads the file: force a reload and prove the
   # listener is really listening before any traffic is pointed at it.
   _code=$(controller_curl -s -o /dev/null -w '%{http_code}' -m15 -X PUT "$MIHOMO_API/configs?force=true" \
     -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" 2>/dev/null)
   case "$_code" in
     200|204) ;;
-    *) _console_cfg_restore
-       printf '{"ok":false,"error":"mihomo reload failed (HTTP %s) - previous config restored"}\n' "${_code:-none}"; return 1 ;;
+    *) _console_on_fail reload "mihomo reload failed (HTTP ${_code:-none})"; return 1 ;;
   esac
   _i=0; _lst=0
   while [ "$_i" -lt 5 ]; do
@@ -7805,12 +7942,12 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     sleep 1; _i=$((_i+1))
   done
   [ "$_lst" = 1 ] || {
-    _console_cfg_restore
-    printf '{"ok":false,"error":"console listener did not appear on :%s - previous config restored"}\n' "$CONSOLE_SOCKS_PORT"; return 1
+    _console_on_fail listener "console listener did not appear on :$CONSOLE_SOCKS_PORT"; return 1
   }
-  _console_tun_ensure || { _console_cfg_restore; printf '{"ok":false,"error":"console tunnel did not come up - previous config restored"}\n'; return 1; }
-  _console_fw_ensure || { _console_cfg_restore; printf '{"ok":false,"error":"console firewall zone not created - previous config restored"}\n'; return 1; }
-  _console_rule_on "$_ip" || { _console_cfg_restore; printf '{"ok":false,"error":"console route rule not installed - previous config restored"}\n'; return 1; }
+  _console_tun_ensure || { _console_on_fail tun "console tunnel did not come up"; return 1; }
+  _console_fw_ensure || { _console_on_fail firewall "console firewall zone not created"; return 1; }
+  _console_rule_on "$_ip" || { _console_on_fail rule "console route rule not installed"; return 1; }
+  rm -f "$_orig" "$_cand" 2>/dev/null
   # enabled is the COMMIT MARKER: written last, so a crash never leaves "on" without an address
   # for the watchdog and the kill switch to work with. `countries` and `sub` are written ALWAYS,
   # empty string included: an empty field is the reset the panel offers.
@@ -7818,6 +7955,7 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   _console_set sub "$_sub"
   _console_set ip "$_ip"
   _console_set enabled 1
+  _console_unlock
   echo "$(date +%FT%T) CONSOLE on ip=$_ip countries=${_countries:-any} sub=${_sub:-vpn}" >> "$LOG"
   printf '{"ok":true,"enabled":true,"ip":"%s","sub":"%s","countries":"%s"}\n' "$_ip" "$_sub" "$_countries"
 }
@@ -11841,7 +11979,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-config-tx.py",
           "source": "assets/geomask-config-tx.py",
           "mode": "0755",
-          "sha256": "c9bd2e8cee49dc9989d24d3f9998063b420120033f2987076412fd490b3d09dd"
+          "sha256": "53e77fe83b65a9c824a66d239ddc4bb4213aef1427a384d650ea2ea820be6fcb"
         },
         {
           "path": "/usr/lib/geomask/geomask-console.py",
@@ -11977,7 +12115,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "0ab61b1df925e134e76cf0d4e2a29f65d0f123f7619562afe610e2f3aad54256"
+          "sha256": "cb19b7265ea114c7a12e89ca536ef48501cf2b29a6c7aae6d9a602f642dd4741"
         }
       ]
     },
@@ -11993,7 +12131,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "d76abe519955c0c9b022580a85c16b94fe5671924725052cefdd38b47eceb22f"
+          "sha256": "288b7512805f2da664deeabb16bbd30325e818785201643020e371a026d71b66"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -34694,28 +34832,68 @@ fi
 # A flushed ip rule silently puts the console back on the normal path: the owner sees "it
 # stopped working" and has nothing to look at. Only our own rule and our own table are
 # touched, and only while the lane is switched on in the panel.
-CS=/etc/geomask/console.state
-if [ -f "$CS" ] && [ "$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)" = 1 ]; then
-  CIP=$(sed -n 's/^ip=//p' "$CS" 2>/dev/null | head -1)
-  if [ -n "$CIP" ]; then
-    if ! ip rule show 2>/dev/null | grep -q "from $CIP lookup 102"; then
-      while ip rule del from "$CIP" lookup 102 2>/dev/null; do :; done
-      if ip rule add pref 19903 from "$CIP" lookup 102 2>/dev/null; then
-        log "console rule re-seated for $CIP"
-        conntrack -D -s "$CIP" >/dev/null 2>&1
-        conntrack -D -d "$CIP" >/dev/null 2>&1
-      else
-        log "FAIL console rule add $CIP"
+#
+# The kill switch and this block must not interleave: `off` writes enabled=0 and removes the
+# rule, so a watchdog that had read the state BEFORE that would put the rule straight back
+# after the owner switched the lane off. The state is therefore re-read INSIDE the same lock
+# that `on`/`off` hold for their whole operation. BusyBox has no flock everywhere, so the lock
+# is a directory with the owner pid inside; a stale lock (owner gone) is broken once, and a
+# lock that stays busy means "skip this run", never "work without it".
+CS=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
+CLOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
+console_lock() {
+  _ct=0
+  while [ "$_ct" -lt 10 ]; do
+    if mkdir "$CLOCK" 2>/dev/null; then
+      if printf '%s\n' "$$" > "$CLOCK/pid" 2>/dev/null; then
+        return 0
       fi
+      rm -rf "$CLOCK" 2>/dev/null
+      return 1
     fi
-    if ! ip route show table 102 2>/dev/null | grep -q '^default'; then
-      if ip route replace table 102 default dev Console 2>/dev/null; then
-        log "console table 102 default restored (dev Console)"
-      else
-        log "WARN console table 102 has no default (tunnel down?)"
+    _ct=$((_ct+1))
+    _cop=''
+    [ -f "$CLOCK/pid" ] && _cop=$(cat "$CLOCK/pid" 2>/dev/null)
+    if [ -z "$_cop" ] && [ "$_ct" -eq 1 ]; then
+      # The owner may be between `mkdir` and writing its pid: look again before breaking it.
+      sleep 1
+    elif [ -n "$_cop" ] && kill -0 "$_cop" 2>/dev/null; then
+      sleep 1
+    else
+      rm -rf "$CLOCK" 2>/dev/null
+    fi
+  done
+  return 1
+}
+if console_lock; then
+  if [ -f "$CS" ] && [ "$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)" = 1 ]; then
+    CIP=$(sed -n 's/^ip=//p' "$CS" 2>/dev/null | head -1)
+    if [ -n "$CIP" ]; then
+      if ! ip rule show 2>/dev/null | grep -q "from $CIP lookup 102"; then
+        while ip rule del from "$CIP" lookup 102 2>/dev/null; do :; done
+        if ip rule add pref 19903 from "$CIP" lookup 102 2>/dev/null; then
+          log "console rule re-seated for $CIP"
+          conntrack -D -s "$CIP" >/dev/null 2>&1
+          conntrack -D -d "$CIP" >/dev/null 2>&1
+        else
+          log "FAIL console rule add $CIP"
+        fi
+      fi
+      if ! ip route show table 102 2>/dev/null | grep -q '^default'; then
+        if ip route replace table 102 default dev Console 2>/dev/null; then
+          log "console table 102 default restored (dev Console)"
+        else
+          log "WARN console table 102 has no default (tunnel down?)"
+        fi
       fi
     fi
   fi
+  _cup=$(cat "$CLOCK/pid" 2>/dev/null)
+  if [ -z "$_cup" ] || [ "$_cup" = "$$" ]; then
+    rm -rf "$CLOCK" 2>/dev/null
+  fi
+else
+  log "SKIP console watchdog: lane lock is busy"
 fi
 
 # ---------- (D) AI-DNS self-heal ----------

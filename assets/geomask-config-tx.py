@@ -861,8 +861,43 @@ def _restore_preimages(tx_id, journal):
             ok = False
     return ok
 
+def main(argv=None):
+    """Command line for the shell: `--commit <path>` / `--recover`, self-test without args.
+
+    The console switch used to copy the live config by hand before touching it, so a failed
+    reload left the patched file in place. It now hands the candidate bytes to this CLI, which
+    runs the same transaction the rest of the backend uses: preimage, mihomo -t, isolated
+    trial, atomic write, reload, rollback. The answer is one JSON line and rc 0/1 - a caller
+    must never have to parse a traceback to learn that the switch did not happen.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        # No arguments keeps the historical self-test.
+        print('Config transaction module loaded OK')
+        print(f'DEFAULT_CONFIG={DEFAULT_CONFIG}')
+        print(f'TX_JOURNAL={TX_JOURNAL}')
+        return 0
+    try:
+        if args[0] == '--commit':
+            if len(args) != 2:
+                raise TxError('--commit takes exactly one target path')
+            data = sys.stdin.buffer.read()
+            if not data:
+                # Replacing the live config with nothing is never a switch: refuse it.
+                raise TxError('refusing to commit an empty payload')
+            result = start_transaction({args[1]: data})
+            answer = {'ok': True, 'tx_id': result.get('tx_id')}
+        elif args[0] == '--recover':
+            recover_interrupted_transactions()
+            answer = {'ok': True, 'recovered': True}
+        else:
+            raise TxError('unknown argument: %s' % args[0])
+    except Exception as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)[:400]}, ensure_ascii=False))
+        return 1
+    print(json.dumps(answer, ensure_ascii=False))
+    return 0
+
+
 if __name__ == '__main__':
-    # Quick self-test
-    print('Config transaction module loaded OK')
-    print(f'DEFAULT_CONFIG={DEFAULT_CONFIG}')
-    print(f'TX_JOURNAL={TX_JOURNAL}')
+    sys.exit(main())

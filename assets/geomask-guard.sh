@@ -185,28 +185,68 @@ fi
 # A flushed ip rule silently puts the console back on the normal path: the owner sees "it
 # stopped working" and has nothing to look at. Only our own rule and our own table are
 # touched, and only while the lane is switched on in the panel.
-CS=/etc/geomask/console.state
-if [ -f "$CS" ] && [ "$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)" = 1 ]; then
-  CIP=$(sed -n 's/^ip=//p' "$CS" 2>/dev/null | head -1)
-  if [ -n "$CIP" ]; then
-    if ! ip rule show 2>/dev/null | grep -q "from $CIP lookup 102"; then
-      while ip rule del from "$CIP" lookup 102 2>/dev/null; do :; done
-      if ip rule add pref 19903 from "$CIP" lookup 102 2>/dev/null; then
-        log "console rule re-seated for $CIP"
-        conntrack -D -s "$CIP" >/dev/null 2>&1
-        conntrack -D -d "$CIP" >/dev/null 2>&1
-      else
-        log "FAIL console rule add $CIP"
+#
+# The kill switch and this block must not interleave: `off` writes enabled=0 and removes the
+# rule, so a watchdog that had read the state BEFORE that would put the rule straight back
+# after the owner switched the lane off. The state is therefore re-read INSIDE the same lock
+# that `on`/`off` hold for their whole operation. BusyBox has no flock everywhere, so the lock
+# is a directory with the owner pid inside; a stale lock (owner gone) is broken once, and a
+# lock that stays busy means "skip this run", never "work without it".
+CS=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
+CLOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
+console_lock() {
+  _ct=0
+  while [ "$_ct" -lt 10 ]; do
+    if mkdir "$CLOCK" 2>/dev/null; then
+      if printf '%s\n' "$$" > "$CLOCK/pid" 2>/dev/null; then
+        return 0
       fi
+      rm -rf "$CLOCK" 2>/dev/null
+      return 1
     fi
-    if ! ip route show table 102 2>/dev/null | grep -q '^default'; then
-      if ip route replace table 102 default dev Console 2>/dev/null; then
-        log "console table 102 default restored (dev Console)"
-      else
-        log "WARN console table 102 has no default (tunnel down?)"
+    _ct=$((_ct+1))
+    _cop=''
+    [ -f "$CLOCK/pid" ] && _cop=$(cat "$CLOCK/pid" 2>/dev/null)
+    if [ -z "$_cop" ] && [ "$_ct" -eq 1 ]; then
+      # The owner may be between `mkdir` and writing its pid: look again before breaking it.
+      sleep 1
+    elif [ -n "$_cop" ] && kill -0 "$_cop" 2>/dev/null; then
+      sleep 1
+    else
+      rm -rf "$CLOCK" 2>/dev/null
+    fi
+  done
+  return 1
+}
+if console_lock; then
+  if [ -f "$CS" ] && [ "$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)" = 1 ]; then
+    CIP=$(sed -n 's/^ip=//p' "$CS" 2>/dev/null | head -1)
+    if [ -n "$CIP" ]; then
+      if ! ip rule show 2>/dev/null | grep -q "from $CIP lookup 102"; then
+        while ip rule del from "$CIP" lookup 102 2>/dev/null; do :; done
+        if ip rule add pref 19903 from "$CIP" lookup 102 2>/dev/null; then
+          log "console rule re-seated for $CIP"
+          conntrack -D -s "$CIP" >/dev/null 2>&1
+          conntrack -D -d "$CIP" >/dev/null 2>&1
+        else
+          log "FAIL console rule add $CIP"
+        fi
+      fi
+      if ! ip route show table 102 2>/dev/null | grep -q '^default'; then
+        if ip route replace table 102 default dev Console 2>/dev/null; then
+          log "console table 102 default restored (dev Console)"
+        else
+          log "WARN console table 102 has no default (tunnel down?)"
+        fi
       fi
     fi
   fi
+  _cup=$(cat "$CLOCK/pid" 2>/dev/null)
+  if [ -z "$_cup" ] || [ "$_cup" = "$$" ]; then
+    rm -rf "$CLOCK" 2>/dev/null
+  fi
+else
+  log "SKIP console watchdog: lane lock is busy"
 fi
 
 # ---------- (D) AI-DNS self-heal ----------

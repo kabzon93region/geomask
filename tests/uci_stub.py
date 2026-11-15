@@ -54,10 +54,14 @@ Deliberate deviations, all documented in the tests
   interpreter); the atomic rename still gives all-or-nothing visibility.
 * Failure injection (test-only, never used by the asset):
   ``UCI_FAIL_COMMIT=pkg[:n]`` fails the n-th commit of that package,
-  ``UCI_FAIL_ADDLIST=value`` fails an ``add_list`` of that exact value,
-  ``UCI_FAIL_SET=key`` fails a ``set`` whose key (before ``=``) matches.
-  Counters are kept in ``UCI_STUB_STATE`` when set (shared across candidate and
-  live delta dirs, so ``pkg:2`` can mean "the live commit"), otherwise in
+  ``UCI_FAIL_ADDLIST=value[:n]`` fails the n-th ``add_list`` of that value,
+  ``UCI_FAIL_SET=key[:n]`` fails the n-th ``set`` of that key,
+  ``UCI_FAIL_DELETE=key[:n]`` fails the n-th ``delete`` of that key, and
+  ``UCI_LIE_COMMIT=pkg[:n]`` returns success from the n-th commit of that
+  package without writing or removing the delta.
+  A bare value/key (no ``:n``) fails the first matching call. Counters are kept
+  in ``UCI_STUB_STATE`` when set (shared across candidate and live delta dirs,
+  so ``pkg:2`` can mean "the live call"), otherwise in
   ``<delta dir>/.uci-stub-counters``.
 """
 
@@ -374,6 +378,28 @@ def parse_commit_spec(spec):
     return spec, 1
 
 
+def parse_indexed_spec(spec):
+    """``value`` / ``key`` fails the first matching call; ``value:2`` the second.
+
+    The suffix is only treated as a counter when it is a bare number, so an IPv6 address
+    without a numeric tail stays one value."""
+    base, separator, tail = spec.rpartition(':')
+    if separator and base and tail.isdigit():
+        return base, int(tail)
+    return spec, 1
+
+
+def check_indexed(kind, value, counter_key, confdir, savedir):
+    spec = os.environ.get(kind)
+    if not spec:
+        return False
+    target, number = parse_indexed_spec(spec)
+    if target != value:
+        return False
+    count = bump_counter(counter_path(confdir, savedir), counter_key)
+    return count == number
+
+
 def counter_path(sconfdir, savedir):
     explicit = os.environ.get('UCI_STUB_STATE')
     if explicit:
@@ -410,16 +436,31 @@ def check_commit_failure(package, confdir, savedir):
         raise UciError('commit %s failed (injected)' % package)
 
 
-def check_addlist_failure(value):
-    spec = os.environ.get('UCI_FAIL_ADDLIST')
-    if spec and value == spec:
+def check_addlist_failure(value, confdir, savedir):
+    if check_indexed('UCI_FAIL_ADDLIST', value, 'addlist:' + value, confdir, savedir):
         raise UciError('add_list %s failed (injected)' % value)
 
 
-def check_set_failure(key):
-    spec = os.environ.get('UCI_FAIL_SET')
-    if spec and key == spec:
+def check_set_failure(key, confdir, savedir):
+    if check_indexed('UCI_FAIL_SET', key, 'set:' + key, confdir, savedir):
         raise UciError('set %s failed (injected)' % key)
+
+
+def check_delete_failure(key, confdir, savedir):
+    if check_indexed('UCI_FAIL_DELETE', key, 'delete:' + key, confdir, savedir):
+        raise UciError('delete %s failed (injected)' % key)
+
+
+def check_lie_commit(package, confdir, savedir):
+    """UCI_LIE_COMMIT=pkg[:n] returns success without writing anything."""
+    spec = os.environ.get('UCI_LIE_COMMIT')
+    if not spec:
+        return False
+    target, number = parse_commit_spec(spec)
+    if target != package:
+        return False
+    count = bump_counter(counter_path(confdir, savedir), 'liecommit:' + package)
+    return count == number
 
 
 # --------------------------------------------------------------------------- commands
@@ -437,6 +478,8 @@ def cmd_get(opts, args):
     savedir = delta_dir(opts)
     package_name, rest = split_key(args[0])
     if rest is None:
+        raise UciError('Entry not found')
+    if not package_exists(confdir, savedir, package_name):
         raise UciError('Entry not found')
     package = load_package(confdir, savedir, package_name)
     section, option = lookup(package, rest[0], rest[1])
@@ -457,9 +500,9 @@ def cmd_set(opts, args):
     if len(args) != 1 or '=' not in args[0]:
         raise UciError('uci set: invalid argument')
     key, value = args[0].split('=', 1)
-    check_set_failure(key)
     confdir = config_dir(opts)
     savedir = delta_dir(opts, required=True)
+    check_set_failure(key, confdir, savedir)
     package_name, rest = split_key(key)
     if rest is None:
         raise UciError('uci set: invalid argument')
@@ -487,9 +530,9 @@ def cmd_add_list(opts, args):
     if len(args) != 1 or '=' not in args[0]:
         raise UciError('uci add_list: invalid argument')
     key, value = args[0].split('=', 1)
-    check_addlist_failure(value)
     confdir = config_dir(opts)
     savedir = delta_dir(opts, required=True)
+    check_addlist_failure(value, confdir, savedir)
     package_name, rest = split_key(key)
     if rest is None or rest[1] is None:
         raise UciError('uci add_list: invalid argument')
@@ -512,6 +555,7 @@ def cmd_delete(opts, args):
         raise UciError('uci delete: invalid argument')
     confdir = config_dir(opts)
     savedir = delta_dir(opts, required=True)
+    check_delete_failure(args[0], confdir, savedir)
     package_name, rest = split_key(args[0])
     if rest is None:
         raise UciError('uci delete: invalid argument')
@@ -581,6 +625,8 @@ def cmd_show(opts, args):
         wanted = target
     names = [package_name] if package_name else _package_names(confdir, savedir)
     for name in names:
+        if package_name and not package_exists(confdir, savedir, name):
+            raise UciError('Entry not found')
         package = load_package(confdir, savedir, name)
         for line in _show_lines(package):
             if wanted is None or line == wanted or line.startswith(wanted + '.') \
@@ -595,6 +641,8 @@ def cmd_export(opts, args):
     savedir = delta_dir(opts)
     names = [args[0]] if args else _package_names(confdir, savedir)
     for index, name in enumerate(names):
+        if args and not package_exists(confdir, savedir, name):
+            raise UciError('Entry not found')
         if index:
             sys.stdout.write('\n')
         sys.stdout.write(render_export(load_package(confdir, savedir, name)))
@@ -619,6 +667,8 @@ def cmd_commit(opts, args):
     names = args or _pending_packages(savedir)
     for name in names:
         check_commit_failure(name, confdir, savedir)
+        if check_lie_commit(name, confdir, savedir):
+            continue
         if not savedir:
             continue
         pending = delta_path(savedir, name)

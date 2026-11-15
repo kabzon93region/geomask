@@ -8035,6 +8035,53 @@ cmd_console_diag() {
     "$_tgz" "$(wc -c < "$_tgz" 2>/dev/null)" "$_shared"
 }
 
+# The panel used to get only a path on the router, so the owner had to find the archive by hand
+# over SMB or SSH - and the file sat in /tmp with no way back (review 15.11, #15). The bytes now
+# travel through the same authenticated ubus call as the rest of the panel: no world-readable
+# URL, no published path. Only our own archives, by plain name, and only up to a size rpcd can
+# carry; anything bigger stays for the SMB share or ssh.
+cmd_console_diag_get() {
+  _dg_name=${1:-}
+  _dg_dir=${TMPDIR:-/tmp}
+  case "$_dg_name" in
+    '')
+      # Without a name the newest bundle is meant: the panel offers "download the last one"
+      # without rebuilding it.
+      _dg_path=$(ls -1t "$_dg_dir"/geomask-console-diag-*.tar.gz 2>/dev/null | head -1)
+      ;;
+    geomask-console-diag-*.tar.gz)
+      # A path is not a name: `../../etc/shadow` must not pass the glob above either.
+      case "$_dg_name" in
+        */*) printf '{"ok":false,"error":"имя архива не должно содержать путь"}\n'; return 1 ;;
+      esac
+      _dg_path="$_dg_dir/$_dg_name"
+      ;;
+    *)
+      printf '{"ok":false,"error":"это не архив диагностики"}\n'
+      return 1
+      ;;
+  esac
+  if [ -z "$_dg_path" ] || [ ! -f "$_dg_path" ]; then
+    printf '{"ok":false,"error":"архива нет - нажмите «Собрать и скачать логи»"}\n'
+    return 1
+  fi
+  _dg_bytes=$(wc -c < "$_dg_path" 2>/dev/null | tr -d ' ')
+  case "$_dg_bytes" in ''|*[!0-9]*) _dg_bytes=0 ;; esac
+  _dg_max=${GM_CONSOLE_DIAG_MAX:-2097152}
+  if [ "$_dg_bytes" -gt "$_dg_max" ]; then
+    printf '{"ok":false,"error":"архив %s байт - больше предела выдачи %s; заберите его по SMB или через ssh"}\n' \
+      "$_dg_bytes" "$_dg_max"
+    return 1
+  fi
+  _dg_b64=$(base64 "$_dg_path" 2>/dev/null | tr -d '\r\n')
+  case "$_dg_b64" in
+    '') printf '{"ok":false,"error":"base64 недоступен - архив остался на роутере"}\n'; return 1 ;;
+  esac
+  _dg_sha=$(sha256sum "$_dg_path" 2>/dev/null | cut -d' ' -f1)
+  printf '{"ok":true,"name":"%s","bytes":%s,"sha256":"%s","data":"%s"}\n' \
+    "$(basename "$_dg_path")" "$_dg_bytes" "$_dg_sha" "$_dg_b64"
+}
+
 case "$1" in
   # >>> geo-rpc generated:dispatch (tools/geo-rpc.json) >>>
   status)                   cmd_status ;;
@@ -8074,6 +8121,7 @@ case "$1" in
   console)                  cmd_console "$2" "$3" "$4" "$5" ;;
   console_status)           cmd_console_status ;;
   console_diag)             cmd_console_diag "$2" ;;
+  console_diag_get)         cmd_console_diag_get "$2" ;;
   dev_add)                  cmd_dev_add "$2" "$3" "$4" "$5" ;;
   dev_del)                  cmd_dev_del "$2" ;;
   ai_sub_get)               cmd_ai_sub_get ;;
@@ -12232,13 +12280,13 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "1a5f776fffab318599a94d116082b0ecbb600efd1a1530660f3af97acfc04ff4"
+          "sha256": "e94b7e3a85677976e6dad807585973c7d107f2cbcd5b9796e0f193b283f42f5a"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
           "mode": "0755",
-          "sha256": "726c6cdf14421bb8edde09a8ff19195af4ba6877b985da31922d6b44f4d56d15"
+          "sha256": "e6d19c4bec14606125443cb577306fb9a330ac97c7e23bd481ce450d28316dfb"
         },
         {
           "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
@@ -12250,13 +12298,13 @@ ASSET_EOF
           "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
           "source": "assets/acl-geo-sync.json",
           "mode": "0644",
-          "sha256": "a740aa838f5ced053a085222c89119459bc93b90ea2aeca30fed13c8ae860e72"
+          "sha256": "6fa63af85272b1a0f330999cc00a8048175082c239ff77820d2241aa899ff5e7"
         },
         {
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "7abc19f64e64a7a306d0ad301c52de1d4625c08223f6b4af29f1172f541e227a"
+          "sha256": "97ac20b460b6df06bea7af2baefe38c9dcde7d65018bac2d775cf4a3bba93127"
         }
       ]
     },
@@ -12413,6 +12461,7 @@ list_methods() {
 	json_add_object "console";                  json_add_string "action" "string"; json_add_string "ip" "string"; json_add_string "sub" "string"; json_add_string "countries" "string"; json_close_object
 	json_add_object "console_status";           json_close_object
 	json_add_object "console_diag";             json_add_string "what" "string"; json_close_object
+	json_add_object "console_diag_get";         json_add_string "name" "string"; json_close_object
 	json_add_object "dev_add";                  json_add_string "ip" "string"; json_add_string "mode" "string"; json_add_string "mac" "string"; json_add_string "name" "string"; json_close_object
 	json_add_object "dev_del";                  json_add_string "ip" "string"; json_close_object
 	json_add_object "ai_sub_get";               json_close_object
@@ -12495,6 +12544,7 @@ call_method() {
 		console)                  json_get_var action action; json_get_var ip ip; json_get_var sub sub; json_get_var countries countries; "$BACKEND" console "$action" "$ip" "$sub" "$countries" ;;
 		console_status)           "$BACKEND" console_status ;;
 		console_diag)             json_get_var what what; "$BACKEND" console_diag "$what" ;;
+		console_diag_get)         json_get_var name name; "$BACKEND" console_diag_get "$name" ;;
 		dev_add)                  json_get_var ip ip; json_get_var mode mode; json_get_var mac mac; json_get_var name name; "$BACKEND" dev_add "$ip" "$mode" "$mac" "$name" ;;
 		dev_del)                  json_get_var ip ip; "$BACKEND" dev_del "$ip" ;;
 		ai_sub_get)               "$BACKEND" ai_sub_get ;;
@@ -12551,7 +12601,7 @@ ASSET_EOF
 		"description": "Grant access to geo masking + AI routing panel",
 		"read": {
 			"ubus": {
-				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "console_status", "ai_sub_get", "subs_list", "mod_list", "diag_list", "diag_log", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
+				"geo-sync": [ "status", "leases", "log", "backups", "stack", "nodes_get", "nodes_paths_get", "nodes_audit_events_get", "nodes_audit_job_get", "lists_get", "yt_get", "torrent_get", "console_status", "console_diag_get", "ai_sub_get", "subs_list", "mod_list", "diag_list", "diag_log", "upd_check", "upd_status", "nodes_path_apply_status", "nodes_audit_schedule_get" ],
 				"system": [ "info" ]
 			}
 		},
@@ -12633,6 +12683,7 @@ var callDnsGuard              = rpc.declare({ object: 'geo-sync', method: 'dns_g
 var callConsole               = rpc.declare({ object: 'geo-sync', method: 'console', params: { action: null, ip: null, sub: null, countries: null }, expect: {} });
 var callConsoleStatus         = rpc.declare({ object: 'geo-sync', method: 'console_status', expect: {} });
 var callConsoleDiag           = rpc.declare({ object: 'geo-sync', method: 'console_diag', params: { what: null }, expect: {} });
+var callConsoleDiagGet        = rpc.declare({ object: 'geo-sync', method: 'console_diag_get', params: { name: null }, expect: {} });
 var callDevAdd                = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
 var callDevDel                = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
 var callAiSubGet              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
@@ -13282,6 +13333,47 @@ return view.extend({
 			// A router whose backend has no such method must still render the card.
 			conState.textContent = 'состояние консоли: нет данных';
 		});
+		// The bundle is built on the router and handed back through the same authenticated ubus
+		// call as the rest of the panel: the owner gets a file, not a path in /tmp to hunt for
+		// (review 15.11, #15).
+		function conSave(res) {
+			if (!res || !res.data) {
+				conState.textContent = 'архив не получен: ' + ((res && res.error) || 'нет данных');
+				return;
+			}
+			var bin = atob(res.data);
+			var bytes = new Uint8Array(bin.length);
+			for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+			var blob = new Blob([bytes], { type: 'application/gzip' });
+			var url = URL.createObjectURL(blob);
+			var a = E('a', { 'href': url, 'download': res.name || 'geomask-console-diag.tar.gz' });
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+			conState.textContent = 'архив сохранён: ' + (res.name || '')
+				+ ' (' + (res.bytes || 0) + ' байт)';
+		}
+		function conDiagBuild() {
+			conState.textContent = 'собираю архив…';
+			return callConsoleDiag({ what: 'all' }).then(function(res) {
+				res = res || {};
+				if (!res.ok) {
+					conState.textContent = 'архив не собран: ' + (res.error || 'нет ответа');
+					return;
+				}
+				return callConsoleDiagGet({ name: String(res.file || '').replace(/^.*\//, '') })
+					.then(conSave);
+			}).catch(function(e) {
+				conState.textContent = 'архив не собран: ' + e;
+			});
+		}
+		function conDiagSaveLast() {
+			conState.textContent = 'читаю последний архив…';
+			return callConsoleDiagGet({ name: '' }).then(conSave).catch(function(e) {
+				conState.textContent = 'архив не прочитан: ' + e;
+			});
+		}
 		var conCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Игровая консоль — отдельный выход'),
 			E('div', { 'class': 'gs-row' }, [
@@ -13295,9 +13387,10 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() { conAct('on'); } }, 'Включить путь консоли'),
 				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было'),
-				E('button', { 'class': 'gs-btn', 'click': function() { view.act(callConsoleDiag, { what: 'all' }); } }, 'Собрать логи')
+				E('button', { 'class': 'gs-btn', 'click': function() { conDiagBuild(); } }, 'Собрать и скачать логи'),
+				E('button', { 'class': 'gs-btn', 'click': function() { conDiagSaveLast(); } }, 'Скачать прошлый архив')
 			]),
-			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. «Собрать логи» кладёт архив в /tmp и в папку бэкапов (если шара включена).'),
+			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. «Собрать и скачать логи» собирает архив на роутере и сохраняет его на этом компьютере; копия в папке бэкапов появляется только если шара включена.'),
 			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки (это и есть сброс фильтра). Указывайте коды через запятую: TR, DE, NL.'),
 			E('div', { 'class': 'gs-hint' }, 'Пустая подписка — «как у VPN»: провайдер консоли смотрит на подписку, которой пользуется группа VPN.')
 		]);

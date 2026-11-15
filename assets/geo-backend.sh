@@ -2526,6 +2526,53 @@ cmd_console_diag() {
     "$_tgz" "$(wc -c < "$_tgz" 2>/dev/null)" "$_shared"
 }
 
+# The panel used to get only a path on the router, so the owner had to find the archive by hand
+# over SMB or SSH - and the file sat in /tmp with no way back (review 15.11, #15). The bytes now
+# travel through the same authenticated ubus call as the rest of the panel: no world-readable
+# URL, no published path. Only our own archives, by plain name, and only up to a size rpcd can
+# carry; anything bigger stays for the SMB share or ssh.
+cmd_console_diag_get() {
+  _dg_name=${1:-}
+  _dg_dir=${TMPDIR:-/tmp}
+  case "$_dg_name" in
+    '')
+      # Without a name the newest bundle is meant: the panel offers "download the last one"
+      # without rebuilding it.
+      _dg_path=$(ls -1t "$_dg_dir"/geomask-console-diag-*.tar.gz 2>/dev/null | head -1)
+      ;;
+    geomask-console-diag-*.tar.gz)
+      # A path is not a name: `../../etc/shadow` must not pass the glob above either.
+      case "$_dg_name" in
+        */*) printf '{"ok":false,"error":"имя архива не должно содержать путь"}\n'; return 1 ;;
+      esac
+      _dg_path="$_dg_dir/$_dg_name"
+      ;;
+    *)
+      printf '{"ok":false,"error":"это не архив диагностики"}\n'
+      return 1
+      ;;
+  esac
+  if [ -z "$_dg_path" ] || [ ! -f "$_dg_path" ]; then
+    printf '{"ok":false,"error":"архива нет - нажмите «Собрать и скачать логи»"}\n'
+    return 1
+  fi
+  _dg_bytes=$(wc -c < "$_dg_path" 2>/dev/null | tr -d ' ')
+  case "$_dg_bytes" in ''|*[!0-9]*) _dg_bytes=0 ;; esac
+  _dg_max=${GM_CONSOLE_DIAG_MAX:-2097152}
+  if [ "$_dg_bytes" -gt "$_dg_max" ]; then
+    printf '{"ok":false,"error":"архив %s байт - больше предела выдачи %s; заберите его по SMB или через ssh"}\n' \
+      "$_dg_bytes" "$_dg_max"
+    return 1
+  fi
+  _dg_b64=$(base64 "$_dg_path" 2>/dev/null | tr -d '\r\n')
+  case "$_dg_b64" in
+    '') printf '{"ok":false,"error":"base64 недоступен - архив остался на роутере"}\n'; return 1 ;;
+  esac
+  _dg_sha=$(sha256sum "$_dg_path" 2>/dev/null | cut -d' ' -f1)
+  printf '{"ok":true,"name":"%s","bytes":%s,"sha256":"%s","data":"%s"}\n' \
+    "$(basename "$_dg_path")" "$_dg_bytes" "$_dg_sha" "$_dg_b64"
+}
+
 case "$1" in
   # >>> geo-rpc generated:dispatch (tools/geo-rpc.json) >>>
   status)                   cmd_status ;;
@@ -2565,6 +2612,7 @@ case "$1" in
   console)                  cmd_console "$2" "$3" "$4" "$5" ;;
   console_status)           cmd_console_status ;;
   console_diag)             cmd_console_diag "$2" ;;
+  console_diag_get)         cmd_console_diag_get "$2" ;;
   dev_add)                  cmd_dev_add "$2" "$3" "$4" "$5" ;;
   dev_del)                  cmd_dev_del "$2" ;;
   ai_sub_get)               cmd_ai_sub_get ;;

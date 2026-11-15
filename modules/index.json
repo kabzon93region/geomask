@@ -304,13 +304,13 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "1a5f776fffab318599a94d116082b0ecbb600efd1a1530660f3af97acfc04ff4"
+          "sha256": "e94b7e3a85677976e6dad807585973c7d107f2cbcd5b9796e0f193b283f42f5a"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
           "mode": "0755",
-          "sha256": "726c6cdf14421bb8edde09a8ff19195af4ba6877b985da31922d6b44f4d56d15"
+          "sha256": "e6d19c4bec14606125443cb577306fb9a330ac97c7e23bd481ce450d28316dfb"
         },
         {
           "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
@@ -322,13 +322,13 @@
           "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
           "source": "assets/acl-geo-sync.json",
           "mode": "0644",
-          "sha256": "a740aa838f5ced053a085222c89119459bc93b90ea2aeca30fed13c8ae860e72"
+          "sha256": "6fa63af85272b1a0f330999cc00a8048175082c239ff77820d2241aa899ff5e7"
         },
         {
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "7abc19f64e64a7a306d0ad301c52de1d4625c08223f6b4af29f1172f541e227a"
+          "sha256": "97ac20b460b6df06bea7af2baefe38c9dcde7d65018bac2d775cf4a3bba93127"
         }
       ]
     },

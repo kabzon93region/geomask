@@ -40,6 +40,7 @@ var callDnsGuard              = rpc.declare({ object: 'geo-sync', method: 'dns_g
 var callConsole               = rpc.declare({ object: 'geo-sync', method: 'console', params: { action: null, ip: null, sub: null, countries: null }, expect: {} });
 var callConsoleStatus         = rpc.declare({ object: 'geo-sync', method: 'console_status', expect: {} });
 var callConsoleDiag           = rpc.declare({ object: 'geo-sync', method: 'console_diag', params: { what: null }, expect: {} });
+var callConsoleDiagGet        = rpc.declare({ object: 'geo-sync', method: 'console_diag_get', params: { name: null }, expect: {} });
 var callDevAdd                = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
 var callDevDel                = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
 var callAiSubGet              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
@@ -689,6 +690,47 @@ return view.extend({
 			// A router whose backend has no such method must still render the card.
 			conState.textContent = 'состояние консоли: нет данных';
 		});
+		// The bundle is built on the router and handed back through the same authenticated ubus
+		// call as the rest of the panel: the owner gets a file, not a path in /tmp to hunt for
+		// (review 15.11, #15).
+		function conSave(res) {
+			if (!res || !res.data) {
+				conState.textContent = 'архив не получен: ' + ((res && res.error) || 'нет данных');
+				return;
+			}
+			var bin = atob(res.data);
+			var bytes = new Uint8Array(bin.length);
+			for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+			var blob = new Blob([bytes], { type: 'application/gzip' });
+			var url = URL.createObjectURL(blob);
+			var a = E('a', { 'href': url, 'download': res.name || 'geomask-console-diag.tar.gz' });
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+			conState.textContent = 'архив сохранён: ' + (res.name || '')
+				+ ' (' + (res.bytes || 0) + ' байт)';
+		}
+		function conDiagBuild() {
+			conState.textContent = 'собираю архив…';
+			return callConsoleDiag({ what: 'all' }).then(function(res) {
+				res = res || {};
+				if (!res.ok) {
+					conState.textContent = 'архив не собран: ' + (res.error || 'нет ответа');
+					return;
+				}
+				return callConsoleDiagGet({ name: String(res.file || '').replace(/^.*\//, '') })
+					.then(conSave);
+			}).catch(function(e) {
+				conState.textContent = 'архив не собран: ' + e;
+			});
+		}
+		function conDiagSaveLast() {
+			conState.textContent = 'читаю последний архив…';
+			return callConsoleDiagGet({ name: '' }).then(conSave).catch(function(e) {
+				conState.textContent = 'архив не прочитан: ' + e;
+			});
+		}
 		var conCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Игровая консоль — отдельный выход'),
 			E('div', { 'class': 'gs-row' }, [
@@ -702,9 +744,10 @@ return view.extend({
 			E('div', { 'class': 'gs-row' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() { conAct('on'); } }, 'Включить путь консоли'),
 				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было'),
-				E('button', { 'class': 'gs-btn', 'click': function() { view.act(callConsoleDiag, { what: 'all' }); } }, 'Собрать логи')
+				E('button', { 'class': 'gs-btn', 'click': function() { conDiagBuild(); } }, 'Собрать и скачать логи'),
+				E('button', { 'class': 'gs-btn', 'click': function() { conDiagSaveLast(); } }, 'Скачать прошлый архив')
 			]),
-			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. «Собрать логи» кладёт архив в /tmp и в папку бэкапов (если шара включена).'),
+			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. «Собрать и скачать логи» собирает архив на роутере и сохраняет его на этом компьютере; копия в папке бэкапов появляется только если шара включена.'),
 			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки (это и есть сброс фильтра). Указывайте коды через запятую: TR, DE, NL.'),
 			E('div', { 'class': 'gs-hint' }, 'Пустая подписка — «как у VPN»: провайдер консоли смотрит на подписку, которой пользуется группа VPN.')
 		]);

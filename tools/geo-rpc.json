@@ -280,6 +280,14 @@
       "js": "callConsoleDiag"
     },
     {
+      "name": "console_diag_get",
+      "acl": "read",
+      "args": [
+        "name"
+      ],
+      "js": "callConsoleDiagGet"
+    },
+    {
       "name": "dev_add",
       "acl": "write",
       "args": [

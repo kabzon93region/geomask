@@ -96,6 +96,30 @@ _safe_write_verify_rollback() {
     return 0
 }
 
+# The trial step per resource. It used to be a command string that the shell executed at run
+# time, and the mihomo entry interpolated the candidate path into that string: a candidate whose
+# name contained `;` would have run the rest of the name, and this is the code that rewrites
+# configs on the router (review 15.11, #28). The commands are spelled out instead, so a path can
+# only ever be an argument.
+_safe_write_trial() { # _safe_write_trial <resource> <candidate> -> 0 when the layer accepts it
+    case "$1" in
+        mihomo_config) mihomo -f "$2" -d /etc/mihomo -t ;;
+        nodes_conf) return 0 ;;                    # config only, nothing to try
+        ruleset_*) mihomo -f /etc/mihomo/config.yaml -d /etc/mihomo -t ;;
+        zapret_exclude)
+            if [ -f /etc/nftables.d/zapret-exclude.nft ]; then
+                nft -c -f /etc/nftables.d/zapret-exclude.nft
+            else
+                printf 'table inet zapret { set nozapret { type ipv4_addr; }}\n' | nft -c -f -
+            fi
+            ;;
+        cron_root) crontab -l >/dev/null 2>&1 ;;
+        device_rules) nft -c -f /etc/nftables.d/device-rules.nft 2>/dev/null || true ;;
+        mtr_groups) magitrickled --dry-run 2>/dev/null || true ;;
+        *) return 1 ;;
+    esac
+}
+
 safe_write() {
     _resource="$1"
     _make_cand_fn="$2"
@@ -108,14 +132,12 @@ safe_write() {
             _live="/etc/mihomo/config.yaml"
             _lock="/tmp/mihomo_config.lock"
             _rev="/etc/mihomo/config.yaml.rev"
-            _trial_cmd="mihomo -f \$_cand -d /etc/mihomo -t"
             _reload_fn="mihomo_reload"
             ;;
         nodes_conf)
             _live="/etc/geomask-nodes.conf"
             _lock="/tmp/nodes_conf.lock"
             _rev="/etc/geomask-nodes.conf.rev"
-            _trial_cmd="true"  # config only, no trial
             _reload_fn="nodes_conf_reload"
             ;;
         ruleset_*)
@@ -123,35 +145,30 @@ safe_write() {
             _live="/etc/mihomo/ruleset/${_name}.yaml"
             _lock="/tmp/ruleset_${_name}.lock"
             _rev="/etc/mihomo/ruleset/${_name}.yaml.rev"
-            _trial_cmd="mihomo -f /etc/mihomo/config.yaml -d /etc/mihomo -t"
             _reload_fn="ruleset_reload"
             ;;
         zapret_exclude)
             _live="/opt/zapret/ipset/zapret-hosts-user-exclude.txt"
             _lock="/tmp/zapret_exclude.lock"
             _rev="/opt/zapret/ipset/zapret-hosts-user-exclude.txt.rev"
-            _trial_cmd="nft -c -f - <<EOF\n$(cat /etc/nftables.d/zapret-exclude.nft 2>/dev/null || echo 'table inet zapret { set nozapret { type ipv4_addr; }}')\nEOF"
             _reload_fn="zapret_reload"
             ;;
         cron_root)
             _live="/etc/crontabs/root"
             _lock="/tmp/cron_root.lock"
             _rev="/etc/crontabs/root.rev"
-            _trial_cmd="crontab -l >/dev/null 2>&1"
             _reload_fn="cron_reload"
             ;;
         device_rules)
             _live="/etc/geo-devices.list"
             _lock="/tmp/device_rules.lock"
             _rev="/etc/geo-devices.list.rev"
-            _trial_cmd="nft -c -f /etc/nftables.d/device-rules.nft 2>/dev/null || true"
             _reload_fn="device_rules_reload"
             ;;
         mtr_groups)
             _live="/etc/magitrickle/state/config.yaml"
             _lock="/tmp/mtr_groups.lock"
             _rev="/etc/magitrickle/state/config.yaml.rev"
-            _trial_cmd="magitrickled --dry-run 2>/dev/null || true"
             _reload_fn="mtr_reload"
             ;;
         *)
@@ -186,7 +203,7 @@ safe_write() {
     $_validate_fn "$_cand" || { rm -f "$_pre_snap" "$_cand"; return 1; }
 
     # 7. TRIAL
-    eval "$_trial_cmd" >/dev/null 2>&1 || { rm -f "$_pre_snap" "$_cand"; return 3; }
+    _safe_write_trial "$_resource" "$_cand" >/dev/null 2>&1 || { rm -f "$_pre_snap" "$_cand"; return 3; }
 
     # 8. ATOMIC INSTALL
     _safe_write_atomic_install "$_live" "$_cand" "$_pre_mode" "$_pre_owner" || { rm -f "$_pre_snap" "$_cand"; return 4; }

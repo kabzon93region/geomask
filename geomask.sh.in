@@ -2960,6 +2960,11 @@ geomask_uninstall() {
 # in it, including "this file did not exist" and the autostart links. A component that is
 # missing from the snapshot cannot be restored, and the previous version still reported a
 # successful rollback (audit 14.11.2026, F05).
+#
+# A reinstall rewrites more than the panel files: write_mihomo_config patches the subscription
+# URLs, AI-DNS and the sync step write uci and the generated rulesets, and the install stamps
+# the version and the module selection. Leaving those out let a failed reinstall report a clean
+# rollback while the router kept the new configuration (review 15.11, #23).
 REINSTALL_TRACKED="/usr/libexec/rpcd/geo-sync
 /usr/share/rpcd/acl.d/luci-app-geo-sync.json
 /usr/share/luci/menu.d/luci-app-geo-sync.json
@@ -2972,7 +2977,18 @@ REINSTALL_TRACKED="/usr/libexec/rpcd/geo-sync
 /etc/geomask/backup-share.enable
 /etc/geomask-aidns.uid
 /etc/geomask-aidns.ip
-/etc/geomask-aidns.off"
+/etc/geomask-aidns.off
+/etc/mihomo/config.yaml
+/etc/config/network
+/etc/config/dhcp
+/etc/config/ksmbd
+/etc/geomask/version
+/etc/geomask/modules.json
+/etc/geomask/modules-state.json"
+# Directories whose whole content is part of the snapshot. The installer's own files in
+# /usr/bin are matched by name, because that directory holds everything else on the router.
+REINSTALL_TRACKED_DIRS="/usr/lib/geomask /etc/mihomo/ruleset"
+REINSTALL_TRACKED_BIN="/usr/bin"
 
 _reinstall_save() { # _reinstall_save <snapshot-dir> <install-path>
   [ -f "$(P "$2")" ] || return 0
@@ -2997,13 +3013,15 @@ _reinstall_snapshot() { # _reinstall_snapshot <dir> -> 0 when the current compon
   done
   # Globbed paths are expanded against the real root, so they are listed through P instead:
   # otherwise the snapshot silently missed every helper script.
-  for _rd in /usr/bin /usr/lib/geomask; do
+  for _rd in ${REINSTALL_TRACKED_DIRS:-/usr/lib/geomask /etc/mihomo/ruleset}; do
     for _rf in "$(P "$_rd")"/*; do
       [ -f "$_rf" ] || continue
-      case "${_rf##*/}" in
-        geomask*) ;;
-        *) [ "$_rd" = /usr/lib/geomask ] || continue ;;
-      esac
+      _reinstall_save "$1" "${_rf#"$GM_PREFIX"}" || return 1
+    done
+  done
+  for _rd in ${REINSTALL_TRACKED_BIN:-/usr/bin}; do
+    for _rf in "$(P "$_rd")"/geomask*; do
+      [ -f "$_rf" ] || continue
       _reinstall_save "$1" "${_rf#"$GM_PREFIX"}" || return 1
     done
   done
@@ -3026,14 +3044,29 @@ _reinstall_restore() { # _reinstall_restore <dir> -> 0 only when every saved com
     mkdir -p "$(dirname "$_dst")" 2>/dev/null || { _rr=1; continue; }
     cp -p "$1/files/$_rel" "$_dst" 2>/dev/null || _rr=1
   done < "$_list"
+  # Byte check: the loop above only reproduces what `find` listed. A snapshot that lost a
+  # component (interrupted copy, a full disk, a killed run) looked like a clean rollback, so
+  # every path recorded as present must exist in the copy tree AND end up as the same bytes.
+  if [ -f "$1/present" ]; then
+    while IFS= read -r _rp; do
+      [ -n "$_rp" ] || continue
+      if [ ! -f "$1/files$_rp" ]; then
+        bad "откат: в снимке нет копии $_rp"; _rr=1; continue
+      fi
+      cmp -s "$1/files$_rp" "$(P "$_rp")" || { bad "откат: $_rp не восстановлен"; _rr=1; }
+    done < "$1/present"
+  fi
   # Files this failed install created are not in the snapshot: remove them, or the next
   # start would mix the restored components with a half-written new version.
-  for _rd in /usr/bin /usr/lib/geomask; do
+  for _rd in ${REINSTALL_TRACKED_BIN:-/usr/bin}; do
+    for _rf in "$(P "$_rd")"/geomask*; do
+      [ -f "$_rf" ] || continue
+      grep -qxF ".${_rf#"$GM_PREFIX"}" "$_list" || rm -f "$_rf" 2>/dev/null || _rr=1
+    done
+  done
+  for _rd in ${REINSTALL_TRACKED_DIRS:-/usr/lib/geomask /etc/mihomo/ruleset}; do
     for _rf in "$(P "$_rd")"/*; do
       [ -f "$_rf" ] || continue
-      if [ "$_rd" = /usr/bin ]; then
-        case "${_rf##*/}" in geomask*) ;; *) continue ;; esac
-      fi
       grep -qxF ".${_rf#"$GM_PREFIX"}" "$_list" || rm -f "$_rf" 2>/dev/null || _rr=1
     done
   done

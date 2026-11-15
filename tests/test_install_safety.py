@@ -474,6 +474,93 @@ initd() { printf '%s\n' "$*" >> "$INITD_LOG"; }
                          'a file created by the failed install survived the rollback')
         self.assertFalse((self.case / 'snap').exists(), 'the snapshot was not cleaned up')
 
+    def reinstall_tracked(self):
+        """The shipped snapshot list, straight from the template.
+
+        Taking the test's own list would prove nothing: what the rollback covers is exactly
+        the question, so the assertion has to run against the real variable.
+        """
+        match = re.search(r'(?m)^REINSTALL_TRACKED="(?:[^"]*)"$', SOURCE)
+        self.assertIsNotNone(match, 'REINSTALL_TRACKED not found in the template')
+        return match.group(0) + '\n'
+
+    def reinstall_case(self):
+        """The files the reinstall flow rewrites: they must survive a rollback."""
+        files = {
+            'etc/mihomo/config.yaml': 'mixed-port: 7890\n# old config\n',
+            'etc/mihomo/ruleset/ai.yaml': 'payload:\n  - OLD-RULESET\n',
+            'etc/config/network': "config interface 'lan'\n\toption ipaddr '192.168.1.1'\n",
+            'etc/config/dhcp': "config dnsmasq\n\toption domain 'lan'\n",
+            'etc/config/ksmbd': "config globals\n\toption workgroup 'OLD'\n",
+            'etc/geomask/modules.json': '{"selected": ["core"]}\n',
+            'etc/geomask/modules-state.json': '{"modules": {}}\n',
+            'etc/geomask/version': 'v1.30.0\n',
+        }
+        for relative, body in files.items():
+            path = self.case / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding='utf-8', newline='\n')
+        return files
+
+    def reinstall_stubs(self):
+        """crontab/initd stand-ins; the real ones would read the host's crontab."""
+        cron = posix(self.case / 'cron.txt')
+        return ('crontab() { if [ "$1" = "-l" ]; then cat "%s" 2>/dev/null; '
+                'else cp "$1" "%s"; fi; }\ninitd() { :; }\n' % (cron, cron))
+
+    def test_the_snapshot_covers_the_config_the_flow_rewrites(self):
+        """#23: restoring the panel while leaving the new config is not a rollback.
+
+        `_reinstall_steps` rewrites the mihomo config and AI-DNS writes uci, so a snapshot of
+        the panel files only could return "success" with the device on the new settings.
+        """
+        files = self.reinstall_case()
+        extra = self.reinstall_tracked() + self.reinstall_stubs()
+        rewrites = '\n'.join('printf "NEW\\n" > "%s"' % posix(self.case / relative)
+                             for relative in files)
+        # The failed run also deletes what it did not have before: restore must recreate it.
+        rewrites += '\nrm -f "%s"' % posix(self.case / 'etc/mihomo/ruleset/ai.yaml')
+        body = ('snap="%s/snap"; rm -rf "$snap"\n'
+                '_reinstall_snapshot "$snap" || { printf "SNAP_FAIL\\n"; exit 1; }\n'
+                '%s\n'
+                '_reinstall_restore "$snap"; printf "RC=%%s\\n" "$?"\n'
+                % (posix(self.case), rewrites))
+        result = self.run_script(body,
+                                 functions=['_reinstall_save', '_reinstall_snapshot',
+                                            '_reinstall_restore'],
+                                 extra=extra)
+        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
+        for relative, expected in files.items():
+            actual = (self.case / relative).read_text(encoding='utf-8')
+            self.assertEqual(actual, expected,
+                             '%s was not rolled back (the failed reinstall left its own bytes)'
+                             % relative)
+
+    def test_an_incomplete_snapshot_fails_the_restore(self):
+        """A component recorded as present but missing from the copy tree must fail the rollback.
+
+        The old restore copied whatever it found with `find` and returned 0, so a truncated
+        snapshot looked like a successful rollback while the files stayed new.
+        """
+        self.reinstall_case()
+        extra = self.reinstall_tracked() + self.reinstall_stubs()
+        body = ('snap="%s/snap"; rm -rf "$snap"\n'
+                '_reinstall_snapshot "$snap" || { printf "SNAP_FAIL\\n"; exit 1; }\n'
+                'rm -rf "$snap/files/etc/geomask"\n'
+                'printf "NEW\\n" > "%s"\n'
+                '_reinstall_restore "$snap"; printf "RC=%%s\\n" "$?"\n'
+                % (posix(self.case), posix(self.case / 'etc/geomask/modules.json')))
+        result = self.run_script(body,
+                                 functions=['_reinstall_save', '_reinstall_snapshot',
+                                            '_reinstall_restore'],
+                                 extra=extra)
+        self.assertIn('RC=1', result.stdout, result.stdout + result.stderr)
+        self.assertEqual((self.case / 'etc/geomask/modules.json').read_text(encoding='utf-8'),
+                         'NEW\n')
+        self.assertIn('etc/geomask/modules.json', result.stdout + result.stderr)
+        self.assertTrue((self.case / 'snap').exists(),
+                        'the only copy of the old state was deleted by a failed rollback')
+
     def test_reinstall_refuses_a_foreign_config_before_removing_anything(self):
         """The old order uninstalled the panel/cron and only then refused the config."""
         conf = self.case / 'etc/mihomo/config.yaml'

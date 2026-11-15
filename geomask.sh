@@ -5885,6 +5885,9 @@ IPV6_NFT=/etc/nftables.d/99-geomask-no-v6.nft
 IPV6_SYSCTL=/etc/sysctl.d/99-disable-ipv6.conf
 IPV6_PROC=/proc/sys/net/ipv6/conf
 # ip6assign lives in network.lan, the rest in dhcp.lan (odhcpd). All four are restored.
+# The record also carries the kernel switch (`sysctl_all`/`sysctl_default`) and whether our nft
+# guard file was there: without them `on` assumed "IPv6 was on before geomask" and wrote 0 over
+# a router that had it disabled for another reason (review 15.11, point 19).
 IPV6_KEYS="ip6assign ra dhcpv6 ndp"
 
 _ipv6_state_get() { # recorded value for one key ('' when the record has no such line)
@@ -5899,8 +5902,19 @@ _ipv6_record_ok() { # a complete record is what makes `on` possible; a partial o
   return 0
 }
 
+_ipv6_read_kernel() { # kernel switch and guard presence, one `key=value` per line
+  for _kd in all default; do
+    _kv=$(cat "$IPV6_PROC/$_kd/disable_ipv6" 2>/dev/null | tr -dc '01')
+    [ -n "$_kv" ] || _kv=unset
+    printf '%s=%s\n' "sysctl_$_kd" "$_kv"
+  done
+  if [ -f "$IPV6_NFT" ]; then printf 'nft=present\n'; else printf 'nft=absent\n'; fi
+}
+
 _ipv6_save() { # record the current values once; never overwrite a valid record
-  _ipv6_record_ok && return 0
+  # A record that already carries the original prefix must stay untouched: a second `off`
+  # would otherwise replace the owner's 56 with our own 0 and `on` could never go back (G04).
+  [ -s "$IPV6_STATE" ] && [ -n "$(_ipv6_state_get ip6assign)" ] && return 0
   mkdir -p "$(dirname "$IPV6_STATE")" 2>/dev/null || return 1
   _tmp="$IPV6_STATE.tmp"
   : > "$_tmp" 2>/dev/null || return 1
@@ -5910,6 +5924,7 @@ _ipv6_save() { # record the current values once; never overwrite a valid record
     [ -n "$_v" ] || _v=unset
     printf '%s=%s\n' "$_k" "$_v" >> "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
   done
+  _ipv6_read_kernel >> "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
   chmod 600 "$_tmp" 2>/dev/null
   mv -f "$_tmp" "$IPV6_STATE" 2>/dev/null || { rm -f "$_tmp"; return 1; }
 }
@@ -5970,6 +5985,38 @@ _ipv6_kernel() { # _ipv6_kernel <0|1> - sysctl file plus every interface already
   return 0
 }
 
+_ipv6_kernel_restore() { # put the recorded kernel switch back instead of assuming "0"
+  _ra=$(_ipv6_state_get sysctl_all)
+  _rd=$(_ipv6_state_get sysctl_default)
+  case "$_ra" in 0|1) ;; *) _ra='' ;; esac
+  case "$_rd" in 0|1) ;; *) _rd='' ;; esac
+  if [ -z "$_ra" ] || [ -z "$_rd" ]; then
+    # A record written by an older build kept no kernel state. Leaving the kernel disabled
+    # would report "IPv6 restored" while nothing came back, so the documented default is on.
+    _ra=0; _rd=0
+  fi
+  for _d in "$IPV6_PROC"/*; do
+    [ -e "$_d/disable_ipv6" ] || continue
+    printf '%s\n' "$_rd" > "$_d/disable_ipv6" 2>/dev/null || return 1
+  done
+  if [ "$_ra" = 1 ] || [ "$_rd" = 1 ]; then
+    mkdir -p "$(dirname "$IPV6_SYSCTL")" 2>/dev/null || return 1
+    printf '%s\n%s\n' "net.ipv6.conf.all.disable_ipv6 = $_ra" \
+      "net.ipv6.conf.default.disable_ipv6 = $_rd" > "$IPV6_SYSCTL" 2>/dev/null || return 1
+    sysctl -p "$IPV6_SYSCTL" >/dev/null 2>&1 || return 1
+  else
+    rm -f "$IPV6_SYSCTL" 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+_ipv6_guard_restore() { # our guard file existed before geomask -> put our own copy back
+  case "$(_ipv6_state_get nft)" in
+    present) _ipv6_guard_install ;;
+    *) _ipv6_guard_remove ;;
+  esac
+}
+
 _ipv6_apply_off() { # every write of the disabled state; no commit, no reload
   # Record BEFORE the first change, and stop if it cannot be written: turning IPv6 off with
   # no way back is exactly the trap that G04 described.
@@ -5984,9 +6031,9 @@ _ipv6_apply_off() { # every write of the disabled state; no commit, no reload
 }
 
 _ipv6_apply_on() { # every write of the restored state; no commit, no reload
-  _ipv6_kernel 0 || return 1
+  _ipv6_kernel_restore || return 1
   _ipv6_restore || return 1
-  _ipv6_guard_remove || return 1
+  _ipv6_guard_restore || return 1
   return 0
 }
 
@@ -11946,7 +11993,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "18b4f739459bd25b05ea422c26c1b33c911d3c21a9c424b4a74e57c2b6a225b6"
+          "sha256": "d76abe519955c0c9b022580a85c16b94fe5671924725052cefdd38b47eceb22f"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",

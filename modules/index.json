@@ -304,7 +304,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "18b4f739459bd25b05ea422c26c1b33c911d3c21a9c424b4a74e57c2b6a225b6"
+          "sha256": "d76abe519955c0c9b022580a85c16b94fe5671924725052cefdd38b47eceb22f"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",

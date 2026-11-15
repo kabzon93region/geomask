@@ -237,7 +237,11 @@ uci() {
     def uci_extra(self, db):
         stub = '''IPV6_STATE="@STATE@"
 IPV6_KEYS="@KEYS@"
+IPV6_PROC="@PROC@"
+IPV6_NFT="@NFT@"
+IPV6_SYSCTL="@SYSCTL@"
 UCI_DB="@DB@"
+sysctl() { :; }
 uci() {
   _a="$1"; shift
   [ "$_a" = "-q" ] && { _a="$1"; shift; }
@@ -253,6 +257,9 @@ uci() {
 '''
         return (stub.replace('@STATE@', posix(self.case / 'ipv6.state'))
                     .replace('@KEYS@', IPV6_KEYS)
+                    .replace('@PROC@', posix(self.case / 'proc'))
+                    .replace('@NFT@', posix(self.case / 'nft' / '99-geomask-no-v6.nft'))
+                    .replace('@SYSCTL@', posix(self.case / 'sysctl' / '99-disable-ipv6.conf'))
                     .replace('@DB@', posix(db)))
 
     def test_ipv6_off_then_on_keeps_prefix_size_and_odhcpd_flags(self):
@@ -274,7 +281,8 @@ uci() {
                 'printf "dhcpv6=%s\\n" "$(uci -q get dhcp.lan.dhcpv6)"\n'
                 'printf "ndp=%s\\n" "$(uci -q get dhcp.lan.ndp)"\n')
         result = self.run_backend(body, functions=['_ipv6_state_get', '_ipv6_record_ok',
-                                                   '_ipv6_save', '_ipv6_restore'],
+                                                   '_ipv6_read_kernel', '_ipv6_save',
+                                                   '_ipv6_restore'],
                                   extra=self.uci_extra(db))
         self.assertIn('ip6assign=56', result.stdout)
         self.assertIn('ra=server', result.stdout)
@@ -292,7 +300,8 @@ uci() {
                 'done\n'
                 'printf "DONE\\n"\n')
         result = self.run_backend(body, functions=['_ipv6_state_get', '_ipv6_record_ok',
-                                                   '_ipv6_save', '_ipv6_restore'],
+                                                   '_ipv6_read_kernel', '_ipv6_save',
+                                                   '_ipv6_restore'],
                                   extra=self.uci_extra(db))
         self.assertNotIn('STILL', result.stdout)
         self.assertIn('DONE', result.stdout)
@@ -313,8 +322,9 @@ uci() {
                  + 'IPV6_PROC="%s"\nIPV6_SYSCTL="%s"\nIPV6_NFT="%s"\n'
                    'sysctl() { :; }\n'
                  % (posix(proc), posix(sysctl_conf), posix(guard)))
-        functions = ['_ipv6_state_get', '_ipv6_record_ok', '_ipv6_save', '_ipv6_restore',
-                     '_ipv6_kernel', '_ipv6_guard_install', '_ipv6_guard_remove',
+        functions = ['_ipv6_state_get', '_ipv6_record_ok', '_ipv6_read_kernel', '_ipv6_save',
+                     '_ipv6_restore', '_ipv6_kernel', '_ipv6_kernel_restore',
+                     '_ipv6_guard_install', '_ipv6_guard_remove', '_ipv6_guard_restore',
                      '_ipv6_apply_off', '_ipv6_apply_on']
         off = self.run_backend('_ipv6_apply_off; printf "RC=%s\\n" "$?"',
                                functions=functions, extra=extra)

@@ -31,7 +31,7 @@ BACKEND_TEXT = BACKEND.read_text(encoding='utf-8')
 # Only the console lane: the slot path has its own (unrelated) backup copy and must not be
 # mistaken for a console one.
 CONSOLE_SECTION = BACKEND_TEXT[BACKEND_TEXT.index('CONSOLE_PY='):
-                               BACKEND_TEXT.index('_console_mask_stream()')]
+                               BACKEND_TEXT.index('\nDIAG_PY=')]
 
 CONFIG = """\
 mixed-port: 7890

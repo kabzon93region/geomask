@@ -2466,16 +2466,26 @@ cmd_console_status() { cmd_console status; }
 
 # uci keeps the real credentials: WireGuard private_key, PPPoE password, provider tokens.
 # `uci show network` and `uci show firewall` went into the bundle untouched, so the archive
-# carried the owner's keys. This filter is applied to every uci/nft text file in the bundle.
-_console_mask_stream() { # stdin -> stdout
-  sed -E \
-    -e 's#(https?://)[^"[:space:]]+#\1…#g' \
-    -e "s#^([[:space:]]*option[[:space:]]+(private_key|preshared_key|password|key|secret|psk|token|username|identity)[[:space:]]+').*'#\\1…'#" \
-    -e "s#^([[:space:]]*(private_key|preshared_key|password|secret|psk|token|key|username|username-secret|auth|uuid|obfs-password|x-hwid):[[:space:]]*).*#\\1…#"
+# carried the owner's keys. The redactor is a shipped asset with the real `uci show` grammar
+# (plus mihomo YAML, controller JSON and log text), so the masking is testable off-router.
+DIAG_PY=${GM_DIAG_PY:-/usr/lib/geomask/geomask-diag-redact.py}
+
+_console_diag_fail() { # $1 = stage that failed
+  rm -rf "$_dir" 2>/dev/null
+  printf '{"ok":false,"error":"redaction failed: %s"}\n' "$1"
+  return 1
 }
 
-# One archive with everything needed to diagnose the console path from a distance. Secrets are
-# masked here, not by the reader: the owner hands this file over as-is.
+_console_diag_redact() { # $1 = uci|yaml|json|text, $2 = stage, $3 = output file, stdin
+  "$PYTHON_BIN" -B "$DIAG_PY" redact "$1" > "$3" 2>/dev/null
+  _cdr=$?
+  [ "$_cdr" = 0 ] || { _console_diag_fail "$2"; return 1; }
+  return 0
+}
+
+# One archive with everything needed to diagnose the console path from a distance. The
+# masking is done by the shipped redactor, and `verify` is the last gate: an unmasked bundle
+# is never handed out (review 15.11, R02).
 cmd_console_diag() {
   # One private directory per request: the fixed path plus `rm -rf` let two panel clicks delete
   # each other's half-built bundle (review 15.11, points 1 and 33).
@@ -2487,6 +2497,13 @@ cmd_console_diag() {
   # masked-but-still-descriptive state of the console lane.
   find "$_tmpd" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz' \
     -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
+  # Without the redactor the bundle cannot be masked; an unmasked archive is worse than no
+  # archive at all, so the request fails closed.
+  [ -f "$DIAG_PY" ] || {
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"redaction failed: redactor missing"}\n'
+    return 1
+  }
   _ip=$(_console_get ip)
   {
     printf 'geomask console diag %s\n' "$(date '+%F %T %z')"
@@ -2496,18 +2513,34 @@ cmd_console_diag() {
   ip -4 rule show > "$_dir/ip-rule.txt" 2>&1
   ip -4 route show table "$CONSOLE_TABLE" > "$_dir/route-table-$CONSOLE_TABLE.txt" 2>&1
   ip -4 addr show "$CONSOLE_TUN_DEV" > "$_dir/tun.txt" 2>&1
-  uci -q show firewall 2>&1 | _console_mask_stream > "$_dir/firewall.uci"
-  uci -q show network 2>&1 | _console_mask_stream > "$_dir/network.uci"
-  nft list ruleset > "$_dir/nft.txt" 2>&1
+  uci -q show firewall 2>&1 | _console_diag_redact uci uci:firewall "$_dir/firewall.uci" || return 1
+  uci -q show network 2>&1 | _console_diag_redact uci uci:network "$_dir/network.uci" || return 1
+  nft list ruleset 2>&1 | _console_diag_redact text text:nft "$_dir/nft.txt" || return 1
   [ -n "$_ip" ] && conntrack -L -s "$_ip" > "$_dir/conntrack-console.txt" 2>&1
   logread 2>/dev/null | grep -iE 'mihomo|hev|geomask|console' | tail -400 \
-    | _console_mask_stream > "$_dir/logread.txt" 2>&1
-  [ -x "$CONSOLE_PY" ] && [ -f "$MIHOMO_CONF" ] && \
-    "$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" > "$_dir/console-config.json" 2>&1
-  controller_curl -s -m5 "$MIHOMO_API/proxies/CONSOLE" > "$_dir/group-CONSOLE.json" 2>&1
-  controller_curl -s -m5 "$MIHOMO_API/connections" > "$_dir/connections.json" 2>&1
+    | _console_diag_redact text text:logread "$_dir/logread.txt" || return 1
+  if [ -x "$CONSOLE_PY" ] && [ -f "$MIHOMO_CONF" ]; then
+    "$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" 2>/dev/null \
+      | _console_diag_redact json json:console-config "$_dir/console-config.json" || return 1
+  fi
+  controller_curl -s -m5 "$MIHOMO_API/proxies/CONSOLE" 2>/dev/null \
+    | _console_diag_redact json json:group-CONSOLE "$_dir/group-CONSOLE.json" || return 1
+  controller_curl -s -m5 "$MIHOMO_API/connections" 2>/dev/null \
+    | _console_diag_redact json json:connections "$_dir/connections.json" || return 1
   # The mihomo config carries subscription URLs and the controller secret.
-  [ -f "$MIHOMO_CONF" ] && _console_mask_stream < "$MIHOMO_CONF" > "$_dir/config.masked.yaml"
+  if [ -f "$MIHOMO_CONF" ]; then
+    _console_diag_redact yaml yaml:mihomo "$_dir/config.masked.yaml" < "$MIHOMO_CONF" || return 1
+  fi
+  # Last gate: unknown content must not be packed. `verify` prints file:line: kind.
+  _diag_secret=$("$PYTHON_BIN" -B "$DIAG_PY" verify "$_dir" 2>&1)
+  _diag_rc=$?
+  if [ "$_diag_rc" != 0 ]; then
+    _diag_detail=$(printf '%s\n' "$_diag_secret" | head -1)
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"bundle contains a secret (%s) - nothing was packed"}\n' \
+      "$(json_esc "${_diag_detail:-verification failed}")"
+    return 1
+  fi
   _tgz="$_tmpd/geomask-console-diag-$(date +%Y%m%d-%H%M%S).$$.tar.gz"
   ( umask 077; tar -czf "$_tgz" -C "$_tmpd" "$(basename "$_dir")" >/dev/null 2>&1 ) || {
     rm -rf "$_dir" 2>/dev/null

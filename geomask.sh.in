@@ -846,6 +846,11 @@ ASSET_EOF
   save_stream /usr/lib/geomask/geomask-console.py 755 <<'ASSET_EOF'
 @@ASSET:geomask-console.py@@
 ASSET_EOF
+  # v1.31.0: the diagnostic bundle redactor (`uci show`, mihomo YAML, controller JSON,
+  # log text) and the verify gate the backend runs before it packs anything.
+  save_stream /usr/lib/geomask/geomask-diag-redact.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-diag-redact.py@@
+ASSET_EOF
   save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
 @@ASSET:module-index.json@@
 ASSET_EOF

@@ -161,6 +161,12 @@
           "sha256": "713b254b90fd844bf42526da72ce680e7222e424486832a048ea71366a5be020"
         },
         {
+          "path": "/usr/lib/geomask/geomask-diag-redact.py",
+          "source": "assets/geomask-diag-redact.py",
+          "mode": "0755",
+          "sha256": "80eddbbc26b7bfa4e534d35c89f23b0509f9cd286b03f0b9d16a2907168bb011"
+        },
+        {
           "path": "/usr/lib/geomask/geomask-dnsguard.sh",
           "source": "assets/geomask-dnsguard.sh",
           "mode": "0755",
@@ -304,7 +310,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "e94b7e3a85677976e6dad807585973c7d107f2cbcd5b9796e0f193b283f42f5a"
+          "sha256": "2aa3d220c5df29a0db84e0353cf30d0214c894c1c5bc23c5a80a55e2ce717b7d"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",

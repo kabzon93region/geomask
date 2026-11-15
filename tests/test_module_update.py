@@ -35,6 +35,21 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def keep_writes_in(test, root):
+    """Point every host path the updater uses at the test's own tree.
+
+    LOCK_PATH defaults to /tmp/geomask-module-update.lock and is opened by every
+    state-changing command, so a test that only patches the state file would still write to
+    the host's /tmp on a POSIX run (review 15.11, points 1 and 25).
+    """
+    for name, value in (('LOCK_PATH', str(root / 'install.lock')),
+                        ('BACKUP_ROOT', str(root / 'backups')),
+                        ('CACHE', str(root / 'index-cache.json'))):
+        patcher = mock.patch.object(updater, name, value)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
+
 class ModuleUpdaterSafetyTests(unittest.TestCase):
     """Regressions for the audit of 13.11.2026 (F09, F10, F14)."""
 
@@ -564,6 +579,94 @@ class ModuleUpdateTests(unittest.TestCase):
         self.assertEqual(updater.version_tuple('1.27'), (1, 27, 0))
 
 
+class UpdateLockScopeTests(unittest.TestCase):
+    """#25: the lock covers the read of the state, not only the final write.
+
+    `install_staged` took flock around its own writes, but `load_state` and `download_module`
+    ran before it. Two updaters therefore read the same baseline, and the slower one wrote its
+    state over the faster one's install: the faster files stayed on disk while the state
+    claimed the old versions, which the panel then reported as "locally modified".
+
+    The ordering is asserted with a recording fcntl, because the Windows test host has none and
+    a real two-process race would be both flaky and invisible there.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        keep_writes_in(self, self.root)
+        self.state_path = self.root / 'state.json'
+        self.state_path.write_text(json.dumps({'schema': 1, 'modules': {}}), encoding='utf-8')
+        self.index_path = self.root / 'index.json'
+        self.index_path.write_text(json.dumps({'schema': 1, 'modules': {}}), encoding='utf-8')
+
+    def fake_fcntl(self, events):
+        class FakeFcntl:
+            LOCK_EX = 'lock'
+            LOCK_UN = 'unlock'
+
+            @staticmethod
+            def flock(_fd, operation):
+                events.append(operation)
+        return FakeFcntl
+
+    def common_argv(self, command):
+        return [command, '--state', str(self.state_path),
+                '--config', str(self.root / 'absent.json'),
+                '--selection', str(self.root / 'absent.json')]
+
+    def run_main(self, argv, events, **patches):
+        out = io.StringIO()
+        readers = patches.pop('readers', {})
+        with mock.patch.object(updater, 'fcntl', self.fake_fcntl(events)):
+            with contextlib.ExitStack() as stack:
+                for name, action in readers.items():
+                    stack.enter_context(mock.patch.object(updater, name, action))
+                for name, value in patches.items():
+                    stack.enter_context(mock.patch.object(updater, name, value))
+                with contextlib.redirect_stdout(out):
+                    rc = updater.main(argv)
+        return rc, out.getvalue()
+
+    def recording_read_state(self, events):
+        def load_state(path=None):
+            events.append('state-read')
+            return {'schema': 1, 'modules': {}}
+        return load_state
+
+    def test_the_state_is_read_under_the_lock(self):
+        events = []
+        rc, _out = self.run_main(['seed', '--index-file', str(self.index_path)] +
+                                 self.common_argv('seed')[1:], events,
+                                 readers={'load_state': self.recording_read_state(events),
+                                          'load_selection': lambda path=None: None})
+        self.assertEqual(rc, 0)
+        self.assertEqual(events[0], 'lock',
+                         'the state was read before the lock was taken: %r' % (events,))
+        self.assertIn('state-read', events)
+        self.assertLess(events.index('lock'), events.index('state-read'))
+        self.assertEqual(events[-1], 'unlock')
+
+    def test_a_read_only_command_never_waits_for_the_lock(self):
+        # `status` is the panel's poll: if it queued behind an update, the panel would freeze
+        # for the length of a download.
+        events = []
+        rc, payload = self.run_main(self.common_argv('status'), events,
+                                    load_index=lambda *_a, **_k: ({'modules': {}}, 'cache'))
+        self.assertEqual(rc, 0, payload)
+        self.assertEqual(events, [], 'a read-only command took the update lock')
+
+    def test_nested_locks_take_exactly_one_real_lock(self):
+        events = []
+        with mock.patch.object(updater, 'fcntl', self.fake_fcntl(events)):
+            with updater.install_lock():
+                with updater.install_lock():
+                    events.append('body')
+        self.assertEqual(events, ['lock', 'body', 'unlock'],
+                         'the commit would block on the lock its own command holds')
+
+
 class OfflineIndexTests(unittest.TestCase):
     """Regressions for the audit of 14.11.2026 (F28): status must not use the network."""
 
@@ -574,9 +677,7 @@ class OfflineIndexTests(unittest.TestCase):
         self.cache = self.root / 'index-cache.json'
         self.state_path = self.root / 'state.json'
         self.config = {'repo': 'owner/repo', 'ref': 'master', 'ttl': 3600}
-        patcher = mock.patch.object(updater, 'CACHE', str(self.cache))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        keep_writes_in(self, self.root)
         self.state_path.write_text(json.dumps({'schema': 1, 'modules': {}}),
                                    encoding='utf-8')
 

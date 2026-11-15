@@ -8752,17 +8752,33 @@ def rollback_files(written, backup):
     return problems
 
 
+# One real flock per process: the command takes the lock before it reads the state and
+# install_staged takes it again for the write. A second flock on a fresh descriptor would block
+# on its own lock, so the nested acquisition is counted instead.
+_LOCK_DEPTH = {}
+
+
 @contextlib.contextmanager
 def install_lock(path=None):
-    """Serialise installs for the whole transaction; a no-op without fcntl.
+    """Serialise an update from its first read to its last write; no-op without fcntl.
 
     Two updaters launching together used to share one backup directory and one temp file
     name, so the slower process could replace the other's bytes mid-write. The router is
     Linux, where flock is cheap; only the Windows test host takes the fallback.
+
+    The lock is re-entrant within one process: `run_command` holds it for the whole
+    read-modify-write cycle and `install_staged` re-enters it for the commit.
     """
     path = path or LOCK_PATH
     if fcntl is None:
         yield
+        return
+    if _LOCK_DEPTH.get(path):
+        _LOCK_DEPTH[path] += 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH[path] -= 1
         return
     try:
         handle = open(path, 'a+')
@@ -8775,9 +8791,11 @@ def install_lock(path=None):
         handle.close()
         raise UpdateError('could not lock %s (%s)'
                           % (path, type(exc).__name__)) from None
+    _LOCK_DEPTH[path] = 1
     try:
         yield
     finally:
+        _LOCK_DEPTH.pop(path, None)
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except OSError:
@@ -8901,6 +8919,84 @@ def seed_state(index, state, state_path=DEFAULT_STATE, versions=False):
     return seeded
 
 
+def run_command(args):
+    """One parsed command; the caller holds the update lock for state-changing ones."""
+    config = load_config(args.config)
+    state = load_state(args.state)
+    selected = load_selection(args.selection)
+    if args.command == 'seed':
+        if args.index_file:
+            with open(args.index_file, encoding='utf-8') as handle:
+                index = json.load(handle)
+            source = 'file'
+        else:
+            index, source = load_index(config)
+        seeded = seed_state(index, state, args.state, versions=args.versions)
+        print(json.dumps({'ok': True, 'seeded': seeded, 'source': source},
+                         ensure_ascii=False))
+        return 0
+    if args.command == 'status':
+        # status is the panel's poll: it reports the cached catalogue and never waits
+        # for the uplink. `check` is the command that refreshes the cache.
+        index, source = load_index(config, offline=True)
+        print(json.dumps({'ok': True, 'source': source,
+                          'modules': status(index, state, selected=selected)},
+                         ensure_ascii=False))
+        return 0
+    if args.command == 'check':
+        index, source = load_index(config, force=True)
+        print(json.dumps({'ok': True, 'source': source,
+                          'modules': status(index, state, selected=selected)},
+                         ensure_ascii=False))
+        return 0
+    if args.command == 'verify':
+        index, source = load_index(config)
+        if not args.module:
+            raise UpdateError('verify needs a module id')
+        report = status(index, state, args.module, selected=selected)
+        if not report:
+            raise UpdateError('unknown module %s' % args.module)
+        ok = report[0]['state'] in ('current', 'update-available', 'not-selected')
+        print(json.dumps({'ok': ok, 'module': report[0]}, ensure_ascii=False))
+        # a JSON {"ok": false} used to exit 0, so callers that check the code saw a
+        # clean verification of a module whose files are missing or edited
+        return 0 if ok else 1
+    if args.command == 'update':
+        if not args.module:
+            raise UpdateError('update needs a module id')
+        if not module_selected(selected, args.module):
+            raise UpdateError(
+                '%s is not part of this install (not selected in %s); '
+                'change the selection with the installer: sh geomask.sh --modules=%s'
+                % (args.module, args.selection, args.module))
+        index, source = load_index(config)
+        skipped = []
+        module, staged, changed = download_module(index, state, args.module, config,
+                                                  force=args.force, skipped=skipped)
+        if not changed:
+            # A manifest-only module (files: []) never stages anything, so its version
+            # used to stay at the old value and the panel offered the same update forever.
+            recorded = module_state(state, args.module)['version']
+            if version_tuple(module.get('version')) > version_tuple(recorded):
+                install_staged(args.module, [], state, module.get('version', ''), args.state)
+                print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
+                                  'version': module.get('version'), 'source': source,
+                                  'metadata': True}, ensure_ascii=False))
+                return 0
+            print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
+                              'version': module.get('version'), 'source': source,
+                              'skipped': skipped}, ensure_ascii=False))
+            return 0
+        backup = install_staged(args.module, staged, state, module.get('version', ''),
+                                args.state)
+        print(json.dumps({'ok': True, 'module': args.module, 'changed': True,
+                          'version': module.get('version'), 'files': len(staged),
+                          'backup': backup, 'source': source,
+                          'skipped': skipped}, ensure_ascii=False))
+        return 0
+    return 2
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='geomask-module-update')
     parser.add_argument('command', choices=['status', 'check', 'update', 'verify', 'seed'])
@@ -8914,83 +9010,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        config = load_config(args.config)
-        state = load_state(args.state)
-        selected = load_selection(args.selection)
-        if args.command == 'seed':
-            if args.index_file:
-                with open(args.index_file, encoding='utf-8') as handle:
-                    index = json.load(handle)
-                source = 'file'
-            else:
-                index, source = load_index(config)
-            seeded = seed_state(index, state, args.state, versions=args.versions)
-            print(json.dumps({'ok': True, 'seeded': seeded, 'source': source},
-                             ensure_ascii=False))
-            return 0
-        if args.command == 'status':
-            # status is the panel's poll: it reports the cached catalogue and never waits
-            # for the uplink. `check` is the command that refreshes the cache.
-            index, source = load_index(config, offline=True)
-            print(json.dumps({'ok': True, 'source': source,
-                              'modules': status(index, state, selected=selected)},
-                             ensure_ascii=False))
-            return 0
-        if args.command == 'check':
-            index, source = load_index(config, force=True)
-            print(json.dumps({'ok': True, 'source': source,
-                              'modules': status(index, state, selected=selected)},
-                             ensure_ascii=False))
-            return 0
-        if args.command == 'verify':
-            index, source = load_index(config)
-            if not args.module:
-                raise UpdateError('verify needs a module id')
-            report = status(index, state, args.module, selected=selected)
-            if not report:
-                raise UpdateError('unknown module %s' % args.module)
-            ok = report[0]['state'] in ('current', 'update-available', 'not-selected')
-            print(json.dumps({'ok': ok, 'module': report[0]}, ensure_ascii=False))
-            # a JSON {"ok": false} used to exit 0, so callers that check the code saw a
-            # clean verification of a module whose files are missing or edited
-            return 0 if ok else 1
-        if args.command == 'update':
-            if not args.module:
-                raise UpdateError('update needs a module id')
-            if not module_selected(selected, args.module):
-                raise UpdateError(
-                    '%s is not part of this install (not selected in %s); '
-                    'change the selection with the installer: sh geomask.sh --modules=%s'
-                    % (args.module, args.selection, args.module))
-            index, source = load_index(config)
-            skipped = []
-            module, staged, changed = download_module(index, state, args.module, config,
-                                                      force=args.force, skipped=skipped)
-            if not changed:
-                # A manifest-only module (files: []) never stages anything, so its version
-                # used to stay at the old value and the panel offered the same update forever.
-                recorded = module_state(state, args.module)['version']
-                if version_tuple(module.get('version')) > version_tuple(recorded):
-                    install_staged(args.module, [], state, module.get('version', ''), args.state)
-                    print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
-                                      'version': module.get('version'), 'source': source,
-                                      'metadata': True}, ensure_ascii=False))
-                    return 0
-                print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
-                                  'version': module.get('version'), 'source': source,
-                                  'skipped': skipped}, ensure_ascii=False))
-                return 0
-            backup = install_staged(args.module, staged, state, module.get('version', ''),
-                                    args.state)
-            print(json.dumps({'ok': True, 'module': args.module, 'changed': True,
-                              'version': module.get('version'), 'files': len(staged),
-                              'backup': backup, 'source': source,
-                              'skipped': skipped}, ensure_ascii=False))
-            return 0
+        # The state file is a read-modify-write record. Taking the lock only in install_staged
+        # left the read outside it: two updaters computed from one baseline and the slower one
+        # wrote its state over the faster one's install (review 15.11, #25). Writing commands
+        # take the lock BEFORE their first read; read-only ones never take it, so the panel's
+        # poll cannot queue behind a long download.
+        if args.command in ('seed', 'update'):
+            with install_lock():
+                return run_command(args)
+        return run_command(args)
     except UpdateError as exc:
         print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))
         return 1
-    return 2
 
 
 if __name__ == '__main__':

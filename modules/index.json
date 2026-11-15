@@ -164,7 +164,7 @@
           "path": "/usr/lib/geomask/geomask-dnsguard.sh",
           "source": "assets/geomask-dnsguard.sh",
           "mode": "0755",
-          "sha256": "fc8da5f197de56651b87edc4b50e5409878145dca9cd51d0617a60e490b9fa30"
+          "sha256": "f36e3b14dd3b18d0764796b660df8d3bf81852ec3ce08888623a2ce31b7c055d"
         },
         {
           "path": "/usr/lib/geomask/geomask-lane-torrent.py",

@@ -8210,10 +8210,53 @@ _gm_route_in_prefix() { # _gm_route_in_prefix <ip> <prefix/cidr> -> 0 when insid
 
 _gm_route_cleanup() { rm -f "$@" 2>/dev/null; }
 
+# One writer per table. The hotplug path and the panel can fire together (a reconnect while the
+# owner presses "apply"), and both read the owned file and then rewrite it: the slower one
+# erased the faster one's prefixes, and a prefix left in the table without an owner can never be
+# cleaned up again (review 15.11, #22). BusyBox has no flock everywhere, so the lock is a
+# directory with the owner pid inside. Waiting is bounded: a lock that stays busy means "do not
+# touch this table now", never "work without it".
+GM_ROUTE_LOCK_WAIT=${GM_ROUTE_LOCK_WAIT:-20}
+
+_gm_route_lock() { # _gm_route_lock <table> -> 0 only when this process owns the table
+  _gl="$GM_ROUTE_STATE_DIR/lock-$1"
+  _gt=0
+  while [ "$_gt" -lt "$GM_ROUTE_LOCK_WAIT" ]; do
+    if mkdir "$_gl" 2>/dev/null; then
+      if printf '%s\n' "$$" > "$_gl/pid" 2>/dev/null; then
+        return 0
+      fi
+      rm -rf "$_gl" 2>/dev/null     # cannot name the owner: do not keep a half lock
+      return 1
+    fi
+    _gt=$((_gt+1))
+    _go=''
+    [ -f "$_gl/pid" ] && _go=$(cat "$_gl/pid" 2>/dev/null)
+    if [ -z "$_go" ] && [ "$_gt" -eq 1 ]; then
+      # The owner may be between `mkdir` and writing its pid: look again before breaking it.
+      sleep 1
+    elif [ -n "$_go" ] && kill -0 "$_go" 2>/dev/null; then
+      sleep 1
+    else
+      rm -rf "$_gl" 2>/dev/null     # ownerless or dead owner: a killed sync
+    fi
+  done
+  return 1
+}
+
+_gm_route_unlock() { # never release a lock another process owns
+  _gu="$GM_ROUTE_STATE_DIR/lock-$1"
+  _gp=$(cat "$_gu/pid" 2>/dev/null)
+  [ -z "$_gp" ] || [ "$_gp" = "$$" ] || return 0
+  rm -rf "$_gu" 2>/dev/null
+  return 0
+}
+
 geomask_routes_sync() { # geomask_routes_sync <table> -> 0 only when the table is consistent
   _rt=$1
   case "$_rt" in ''|*[!0-9]*) return 1 ;; esac
   mkdir -p "$GM_ROUTE_STATE_DIR" 2>/dev/null || return 1
+  _gm_route_lock "$_rt" || return 1
   _owned=$(_gm_route_owned "$_rt")
   _main="$GM_ROUTE_STATE_DIR/main-$_rt.$$"
   _want="$GM_ROUTE_STATE_DIR/want-$_rt.$$"
@@ -8253,14 +8296,20 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> 0 only when the table i
     printf '%s\n' "$_local_lines" >> "$_want"
   else
     _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
+    _gm_route_unlock "$_rt"
     return 1
   fi
-  [ -s "$_want" ] || { _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"; return 1; }
+  if [ ! -s "$_want" ]; then
+    _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
+    _gm_route_unlock "$_rt"
+    return 1
+  fi
 
   # What is installed now. Ownership is decided against this snapshot, and a failed read
   # means nothing is touched at all: a blind `replace` could take a route somebody else owns.
   if ! ip route show table "$_rt" > "$_cur" 2>/dev/null; then
     _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
+    _gm_route_unlock "$_rt"
     return 1
   fi
 
@@ -8310,6 +8359,7 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> 0 only when the table i
   # without an owner could never be cleaned up later.
   cp -f "$_new" "$_owned" 2>/dev/null || _fail=1
   _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
+  _gm_route_unlock "$_rt"
   return "$_fail"
 }
 ASSET_EOF
@@ -12066,7 +12116,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "7ac9f3113b85b61d2fafa59484359c69b0f80a4c9454ee7da710cf8da633cac1"
+          "sha256": "0963e09bb0a27476e3c055c8210202aaf0db47f1cb86e55d7b8aba27faf34b2d"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",

@@ -188,7 +188,7 @@
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "7ac9f3113b85b61d2fafa59484359c69b0f80a4c9454ee7da710cf8da633cac1"
+          "sha256": "0963e09bb0a27476e3c055c8210202aaf0db47f1cb86e55d7b8aba27faf34b2d"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",

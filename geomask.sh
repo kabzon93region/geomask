@@ -11958,7 +11958,7 @@ ASSET_EOF
           "path": "/etc/hotplug.d/iface/99-default-vpn-route",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "64377ccd9845ec3c2e243f3c6bf4107b62158da2b6f14596d75ae3ba2a800e63"
+          "sha256": "32bf28c40935e80271a76eb9c0424ee470fdf37e3b9eb40174dacd0b8f5f5f3e"
         },
         {
           "path": "/etc/init.d/geomask-syncd",
@@ -12000,7 +12000,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/99-default-vpn-route.dist",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "64377ccd9845ec3c2e243f3c6bf4107b62158da2b6f14596d75ae3ba2a800e63"
+          "sha256": "32bf28c40935e80271a76eb9c0424ee470fdf37e3b9eb40174dacd0b8f5f5f3e"
         },
         {
           "path": "/usr/lib/geomask/geomask-apply.py",
@@ -12166,7 +12166,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "cb19b7265ea114c7a12e89ca536ef48501cf2b29a6c7aae6d9a602f642dd4741"
+          "sha256": "4532108d7667e323103ba05d5ae00549a1ec50afd8957c4ebdb051c4f2a45df7"
         }
       ]
     },
@@ -34575,6 +34575,25 @@ apply_routes() {
       fi
     fi
   fi
+  # --- console lane (table 102): the policy rule sends the console device into this table, and
+  #     after a reboot the table starts empty. Without the LAN prefixes the console loses the
+  #     local network, and without a default it leaves with the real address. The rule itself
+  #     belongs to the watchdog (it holds the lane lock); the table is filled here, on ifup, so
+  #     the lane works before the next guard run (review 15.11, #9). ---
+  _clane=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
+  _ctbl=${CONSOLE_TABLE:-102}
+  _ctun=${CONSOLE_TUN_DEV:-Console}
+  if [ -f "$_clane" ] && [ "$(sed -n 's/^enabled=//p' "$_clane" 2>/dev/null | head -1)" = 1 ]; then
+    if sync_table "$_ctbl"; then
+      if ! ip route replace table "$_ctbl" default dev "$_ctun" 2>/dev/null; then
+        command -v logger >/dev/null 2>&1 && logger -t geomask "console table $_ctbl: default not set"
+      fi
+    else
+      command -v logger >/dev/null 2>&1 \
+        && logger -t geomask "console table $_ctbl not synced - the LAN may be hidden from the console"
+    fi
+  fi
+  return 0
 }
 
 if ip link show "$TUN_DEV" >/dev/null 2>&1; then
@@ -34684,6 +34703,25 @@ apply_routes() {
       fi
     fi
   fi
+  # --- console lane (table 102): the policy rule sends the console device into this table, and
+  #     after a reboot the table starts empty. Without the LAN prefixes the console loses the
+  #     local network, and without a default it leaves with the real address. The rule itself
+  #     belongs to the watchdog (it holds the lane lock); the table is filled here, on ifup, so
+  #     the lane works before the next guard run (review 15.11, #9). ---
+  _clane=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
+  _ctbl=${CONSOLE_TABLE:-102}
+  _ctun=${CONSOLE_TUN_DEV:-Console}
+  if [ -f "$_clane" ] && [ "$(sed -n 's/^enabled=//p' "$_clane" 2>/dev/null | head -1)" = 1 ]; then
+    if sync_table "$_ctbl"; then
+      if ! ip route replace table "$_ctbl" default dev "$_ctun" 2>/dev/null; then
+        command -v logger >/dev/null 2>&1 && logger -t geomask "console table $_ctbl: default not set"
+      fi
+    else
+      command -v logger >/dev/null 2>&1 \
+        && logger -t geomask "console table $_ctbl not synced - the LAN may be hidden from the console"
+    fi
+  fi
+  return 0
 }
 
 if ip link show "$TUN_DEV" >/dev/null 2>&1; then
@@ -34894,6 +34932,13 @@ fi
 # lock that stays busy means "skip this run", never "work without it".
 CS=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
 CLOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
+# Table 102 is the only path the console device has, so both halves of it are watched: the LAN
+# prefixes (mirrored through the same helper as table 101) and a default that really points at
+# our tunnel. `grep '^default'` accepted the WAN default netifd restores for every table, so a
+# reboot left the console leaving with the real address (review 15.11, #9).
+CTUN=${GM_CONSOLE_TUN:-Console}
+CTBL=${GM_CONSOLE_TABLE:-102}
+CROUTES=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
 console_lock() {
   _ct=0
   while [ "$_ct" -lt 10 ]; do
@@ -34922,9 +34967,18 @@ if console_lock; then
   if [ -f "$CS" ] && [ "$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)" = 1 ]; then
     CIP=$(sed -n 's/^ip=//p' "$CS" 2>/dev/null | head -1)
     if [ -n "$CIP" ]; then
-      if ! ip rule show 2>/dev/null | grep -q "from $CIP lookup 102"; then
-        while ip rule del from "$CIP" lookup 102 2>/dev/null; do :; done
-        if ip rule add pref 19903 from "$CIP" lookup 102 2>/dev/null; then
+      # The table first: the rule below sends the console into it, and a table without the LAN
+      # prefixes hides the local network from the console. Sourced in a subshell so the shared
+      # helper cannot leak its variables into this script.
+      if [ -r "$CROUTES" ]; then
+        ( . "$CROUTES" && geomask_routes_sync "$CTBL" ) >/dev/null 2>&1 \
+          || log "WARN console table $CTBL not synced"
+      else
+        log "WARN console routes helper missing ($CROUTES)"
+      fi
+      if ! ip rule show 2>/dev/null | grep -q "from $CIP lookup $CTBL"; then
+        while ip rule del from "$CIP" lookup "$CTBL" 2>/dev/null; do :; done
+        if ip rule add pref 19903 from "$CIP" lookup "$CTBL" 2>/dev/null; then
           log "console rule re-seated for $CIP"
           conntrack -D -s "$CIP" >/dev/null 2>&1
           conntrack -D -d "$CIP" >/dev/null 2>&1
@@ -34932,11 +34986,13 @@ if console_lock; then
           log "FAIL console rule add $CIP"
         fi
       fi
-      if ! ip route show table 102 2>/dev/null | grep -q '^default'; then
-        if ip route replace table 102 default dev Console 2>/dev/null; then
-          log "console table 102 default restored (dev Console)"
+      # A default through another device is not "a default": after a reboot netifd can leave
+      # one via the WAN in every table, and the console would use the real address.
+      if ! ip route show table "$CTBL" 2>/dev/null | grep -q "^default dev $CTUN"; then
+        if ip route replace table "$CTBL" default dev "$CTUN" 2>/dev/null; then
+          log "console table $CTBL default restored (dev $CTUN)"
         else
-          log "WARN console table 102 has no default (tunnel down?)"
+          log "WARN console table $CTBL has no default (tunnel down?)"
         fi
       fi
     fi

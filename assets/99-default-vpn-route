@@ -91,6 +91,25 @@ apply_routes() {
       fi
     fi
   fi
+  # --- console lane (table 102): the policy rule sends the console device into this table, and
+  #     after a reboot the table starts empty. Without the LAN prefixes the console loses the
+  #     local network, and without a default it leaves with the real address. The rule itself
+  #     belongs to the watchdog (it holds the lane lock); the table is filled here, on ifup, so
+  #     the lane works before the next guard run (review 15.11, #9). ---
+  _clane=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
+  _ctbl=${CONSOLE_TABLE:-102}
+  _ctun=${CONSOLE_TUN_DEV:-Console}
+  if [ -f "$_clane" ] && [ "$(sed -n 's/^enabled=//p' "$_clane" 2>/dev/null | head -1)" = 1 ]; then
+    if sync_table "$_ctbl"; then
+      if ! ip route replace table "$_ctbl" default dev "$_ctun" 2>/dev/null; then
+        command -v logger >/dev/null 2>&1 && logger -t geomask "console table $_ctbl: default not set"
+      fi
+    else
+      command -v logger >/dev/null 2>&1 \
+        && logger -t geomask "console table $_ctbl not synced - the LAN may be hidden from the console"
+    fi
+  fi
+  return 0
 }
 
 if ip link show "$TUN_DEV" >/dev/null 2>&1; then

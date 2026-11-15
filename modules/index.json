@@ -80,7 +80,7 @@
           "path": "/etc/hotplug.d/iface/99-default-vpn-route",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "64377ccd9845ec3c2e243f3c6bf4107b62158da2b6f14596d75ae3ba2a800e63"
+          "sha256": "32bf28c40935e80271a76eb9c0424ee470fdf37e3b9eb40174dacd0b8f5f5f3e"
         },
         {
           "path": "/etc/init.d/geomask-syncd",
@@ -122,7 +122,7 @@
           "path": "/usr/lib/geomask/99-default-vpn-route.dist",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "64377ccd9845ec3c2e243f3c6bf4107b62158da2b6f14596d75ae3ba2a800e63"
+          "sha256": "32bf28c40935e80271a76eb9c0424ee470fdf37e3b9eb40174dacd0b8f5f5f3e"
         },
         {
           "path": "/usr/lib/geomask/geomask-apply.py",
@@ -288,7 +288,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "cb19b7265ea114c7a12e89ca536ef48501cf2b29a6c7aae6d9a602f642dd4741"
+          "sha256": "4532108d7667e323103ba05d5ae00549a1ec50afd8957c4ebdb051c4f2a45df7"
         }
       ]
     },

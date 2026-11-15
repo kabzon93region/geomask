@@ -2711,9 +2711,10 @@ run_step() { # run_step N  (interactive/auto common logic)
   if [ "$GM_AUTO" = 1 ] || [ "$GM_YES" = 1 ] || ask "Apply step $_n ($_name)?"; then
     # every step below writes to the router: one verified full backup per run, before it.
     # Step 1 installs packages (apk/opkg), so it is a writing step too - it used to run
-    # before any backup existed (audit 14.11.2026, F13).
+    # before any backup existed (audit 14.11.2026, F13). Step 6 starts the services, which is
+    # just as much of a change and was the only writing step without the gate (review 15.11).
     case "$_n" in
-     1|2|3|4|5|7) backup_gate || return 1 ;;
+     1|2|3|4|5|6|7) backup_gate || return 1 ;;
     esac
     # v1.29.0: an installing step is the right moment to ask which modules to carry.
     case "$_n" in 2|4|5) modules_maybe_prompt ;; esac

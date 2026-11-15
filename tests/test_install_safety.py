@@ -561,6 +561,41 @@ initd() { printf '%s\n' "$*" >> "$INITD_LOG"; }
         self.assertTrue((self.case / 'snap').exists(),
                         'the only copy of the old state was deleted by a failed rollback')
 
+    # ---------------------------------------------------------------- step 6 gate
+    def test_step_six_takes_the_backup_gate(self):
+        """#24: step 6 starts services, so it writes to the router like steps 1-5 and 7.
+
+        Without the gate the last writing step of a run could start mihomo, the tunnels and the
+        web server with no verified backup behind it - the one rule the project never relaxes.
+        """
+        extra = r'''
+STEP_NAMES="env geo subs aidns sync services verify"
+hdr() { :; }
+backup_gate() { printf 'GATE\n'; return 0; }
+modules_maybe_prompt() { :; }
+step_fn() { case "$2" in check) return 1 ;; *) return 0 ;; esac; }
+'''
+        result = self.run_script('run_step 6; printf "RC=%s\\n" "$?"',
+                                 functions=['run_step'], extra=extra)
+        self.assertIn('GATE', result.stdout,
+                      'step 6 started services without asking the backup gate')
+        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
+
+    def test_a_refused_gate_stops_step_six(self):
+        """The gate must be able to refuse, not just be called."""
+        extra = r'''
+STEP_NAMES="env geo subs aidns sync services verify"
+hdr() { :; }
+backup_gate() { printf 'GATE_REFUSED\n'; return 1; }
+modules_maybe_prompt() { :; }
+step_fn() { case "$2" in check) return 1 ;; apply) printf 'APPLIED\n' ;; esac; return 0; }
+'''
+        result = self.run_script('run_step 6; printf "RC=%s\\n" "$?"',
+                                 functions=['run_step'], extra=extra)
+        self.assertIn('RC=1', result.stdout, result.stdout + result.stderr)
+        self.assertNotIn('APPLIED', result.stdout,
+                         'the services were started although the backup gate refused')
+
     def test_reinstall_refuses_a_foreign_config_before_removing_anything(self):
         """The old order uninstalled the panel/cron and only then refused the config."""
         conf = self.case / 'etc/mihomo/config.yaml'

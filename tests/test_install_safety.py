@@ -18,6 +18,8 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import win_symlink  # noqa: E402  (test-support helper in the same directory)
 TEMPLATE = ROOT / 'geomask.sh.in'
 
 
@@ -31,6 +33,61 @@ def find_bash():
 
 BASH = find_bash()
 SOURCE = TEMPLATE.read_text(encoding='utf-8')
+
+
+REINSTALL_TABLES = ['REINSTALL_PREFLIGHT_OBJECTS', 'REINSTALL_PREFLIGHT_BYTE_FILES',
+                    'REINSTALL_SHARED_APPEND', 'REINSTALL_UCI_OBJECTS',
+                    'REINSTALL_LIST_DIRS', 'REINSTALL_TEMP_SUFFIXES',
+                    'REINSTALL_NR_STATE']
+
+
+def reinstall_tables():
+    """Product-side manifest tables, straight from the template (not a test copy)."""
+    out = ''
+    for name in REINSTALL_TABLES:
+        match = re.search(r'^' + name + r'="[^"]*"', SOURCE, re.MULTILINE | re.DOTALL)
+        if match:
+            out += match.group(0) + '\n'
+    for match in re.finditer(r'^(AIDNS_[A-Z_]+=.*)$', SOURCE, re.MULTILINE):
+        out += match.group(1) + '\n'
+    return out
+
+
+def reinstall_function_names():
+    found = re.findall(r'^(_rs_[A-Za-z0-9_]+|_reinstall_(?:save|snapshot|restore))\(\) \{',
+                       SOURCE, re.MULTILINE)
+    return [name for name in found if extract(name)]
+
+
+def install_safety_stubs():
+    """Injected runtime adapters for the reinstall snapshot/restore tests."""
+    return r'''
+RUNTIME='@RUNTIME@'
+# The fixture root has no shared append files and no uci: phase 2b covers both with the
+# dedicated fixture suite, this file keeps testing the byte/links/services contract.
+REINSTALL_SHARED_APPEND=''
+REINSTALL_UCI_OBJECTS=''
+module_selected() { return 0; }
+have() {
+  case "$1" in
+    pidof|pgrep|netstat|crontab|uci|ip|nft|sysctl) return 0 ;;
+  esac
+  command -v "$1" >/dev/null 2>&1
+}
+ip() { return 0; }
+nft() { return 1; }
+uci() { return 1; }
+sysctl() { return 0; }
+pidof() { [ -f "$RUNTIME/$1" ] && return 0; return 1; }
+pgrep() {
+  case "$*" in
+    *geomask-syncd.sh*) [ -f "$RUNTIME/geomask-syncd" ] && return 0 ;;
+  esac
+  return 1
+}
+netstat() { return 1; }
+'''
+
 
 
 def extract(name):
@@ -93,6 +150,11 @@ class InstallerSafetyTests(unittest.TestCase):
         self.case.mkdir()
         # /tmp always exists on a router; the fake root needs it for the backup park
         (self.case / 'tmp').mkdir()
+        (self.case / 'etc/rc.d').mkdir(parents=True)
+        for key in ('all', 'default'):
+            (self.case / 'proc/sys/net/ipv6/conf' / key).mkdir(parents=True)
+            (self.case / 'proc/sys/net/ipv6/conf' / key / 'disable_ipv6').write_text(
+                '0\n', encoding='utf-8', newline='\n')
 
     def run_script(self, body, functions=(), extra=''):
         script = (SUPPORT.replace('@PREFIX@', posix(self.case))
@@ -100,7 +162,8 @@ class InstallerSafetyTests(unittest.TestCase):
                   + '\n'.join(extract(name) for name in functions) + '\n' + body)
         path = self.case / 'run.sh'
         path.write_text(script, encoding='utf-8', newline='\n')
-        return subprocess.run([BASH, posix(path)], cwd=str(self.case), capture_output=True,
+        return subprocess.run([BASH, posix(path)], cwd=str(self.case),
+                              env=win_symlink.bash_env(), capture_output=True,
                               text=True, encoding='utf-8', timeout=60)
 
     # ---------------------------------------------------------------- B1
@@ -416,6 +479,30 @@ mv() {
         self.assertIn('unknown module: nope', result.stdout + result.stderr)
 
     # ---------------------------------------------------------------- T05
+    #
+    # R03 phase 2b: the snapshot is manifest-driven, every restored object is verified and an
+    # unverified rollback keeps the snapshot. These tests exercise the real functions against
+    # injected adapters; the full fault matrix lives in tests/test_reinstall_phase2b.py.
+    def reinstall_extra(self, runtime, tracked=''):
+        cron = posix(self.case / 'cron.txt')
+        return (reinstall_tables()
+                + install_safety_stubs().replace('@RUNTIME@', posix(runtime))
+                + "crontab() { if [ \"$1\" = \"-l\" ]; then cat \"%s\" 2>/dev/null; "
+                  "else cp \"$1\" \"%s\"; fi; }\n" % (cron, cron)
+                + ("initd() { printf '%%s\\n' \"$*\" >> \"%s\"; "
+                   "case \"$2\" in start|restart|restart_verified) : > \"$RUNTIME/$1\" ;; "
+                   "stop) rm -f \"$RUNTIME/$1\" ;; esac; }\n"
+                   % posix(self.case / 'initd.log'))
+                + tracked)
+
+    def reinstall_runtime(self, running):
+        runtime = self.case / 'runtime'
+        runtime.mkdir(exist_ok=True)
+        for name in running:
+            (runtime / name).write_text('1\n', encoding='utf-8')
+        return runtime
+
+    @unittest.skipUnless(win_symlink.NATIVE_SYMLINKS, win_symlink.SYMLINK_REASON)
     def test_reinstall_snapshot_restores_removed_components(self):
         """The rollback path must put back exactly what uninstall removed."""
         tool = self.case / 'usr/bin/geomask-tool.sh'
@@ -431,33 +518,30 @@ mv() {
         initd.parent.mkdir(parents=True)
         initd.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
         rc = self.case / 'etc/rc.d/S99geomask-syncd'
-        rc.parent.mkdir(parents=True)
-        rc.write_text('', encoding='utf-8')
+        rc.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink('../init.d/geomask-syncd', rc)
         cron = self.case / 'cron.txt'
-        cron.write_text('*/5 * * * * /usr/bin/geomask-tool.sh\n', encoding='utf-8')
-        extra = r'''
-REINSTALL_TRACKED='/etc/init.d/geomask-syncd /usr/bin/geo-backend.sh /root/sync_mtrickle_mihomo.sh'
-CRON_FILE='@CRON@'
-INITD_LOG='@INITD@'
-crontab() {
-  if [ "$1" = "-l" ]; then cat "$CRON_FILE" 2>/dev/null; else cp "$1" "$CRON_FILE"; fi
-}
-initd() { printf '%s\n' "$*" >> "$INITD_LOG"; }
-'''.replace('@CRON@', posix(cron)).replace('@INITD@', posix(self.case / 'initd.log'))
+        cron.write_text('*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard\n', encoding='utf-8')
+        runtime = self.reinstall_runtime(('dnsmasq', 'mihomo', 'magitrickled', 'rpcd',
+                                          'netifd', 'fw4', 'geomask-syncd'))
+        extra = self.reinstall_extra(
+            runtime,
+            "REINSTALL_TRACKED='/etc/init.d/geomask-syncd /usr/bin/geo-backend.sh "
+            "/usr/bin/geomask-tool.sh /root/sync_mtrickle_mihomo.sh'\n")
         body = ('snap="%s/snap"; rm -rf "$snap"\n'
                 '_reinstall_snapshot "$snap" || { printf "SNAP_FAIL\\n"; exit 1; }\n'
-                'rm -rf "%s/usr" "%s/etc/init.d" "%s/etc/rc.d"\n'
+                'rm -rf "%s/usr" "%s/etc/init.d"\n'
+'rm -f "%s/etc/rc.d"/*\n'
                 'rm -f "%s/root/sync_mtrickle_mihomo.sh"\n'
-                'rm -f "$CRON_FILE"\n'
+                "crontab -l 2>/dev/null | grep -v '# geomask-guard' | crontab - 2>/dev/null\n"
+                'rm -f "%s/geomask-syncd"\n'
                 'mkdir -p "%s/usr/bin"; printf "new\\n" > "%s/usr/bin/geomask-leftover"\n'
                 'printf "NEW_BACKEND\\n" > "%s/usr/bin/geo-backend.sh"\n'
                 '_reinstall_restore "$snap"; printf "RC=%%s\\n" "$?"\n'
-                % (posix(self.case), posix(self.case), posix(self.case), posix(self.case),
-                   posix(self.case), posix(self.case), posix(self.case), posix(self.case)))
-        result = self.run_script(body,
-                                 functions=['_reinstall_save', '_reinstall_snapshot',
-                                            '_reinstall_restore'],
-                                 extra=extra)
+                % (posix(self.case), posix(self.case), posix(self.case),
+                   posix(self.case), posix(self.case), posix(runtime),
+                   posix(self.case), posix(self.case), posix(self.case)))
+        result = self.run_script(body, functions=reinstall_function_names(), extra=extra)
         self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
         self.assertTrue(tool.exists(), 'the tool script was not restored')
         self.assertEqual(tool.read_text(encoding='utf-8'), '#!/bin/sh\necho tool\n')
@@ -467,11 +551,13 @@ initd() { printf '%s\n' "$*" >> "$INITD_LOG"; }
                          'the sync script was not restored')
         self.assertTrue(initd.exists())
         self.assertTrue(rc.exists())
-        self.assertIn('geomask-tool.sh', cron.read_text(encoding='utf-8'))
+        self.assertIn('geomask-guard', cron.read_text(encoding='utf-8'))
         self.assertIn('geomask-syncd start',
                       (self.case / 'initd.log').read_text(encoding='utf-8'))
-        self.assertFalse((self.case / 'usr/bin/geomask-leftover').exists(),
-                         'a file created by the failed install survived the rollback')
+        # phase 2b: an unrecorded file (even with our prefix) is NOT deleted - a third party
+        # may have created it. Only the transaction's own recorded objects are rolled back.
+        self.assertTrue((self.case / 'usr/bin/geomask-leftover').exists(),
+                        'the rollback deleted a file it never recorded')
         self.assertFalse((self.case / 'snap').exists(), 'the snapshot was not cleaned up')
 
     def reinstall_tracked(self):
@@ -485,13 +571,14 @@ initd() { printf '%s\n' "$*" >> "$INITD_LOG"; }
         return match.group(0) + '\n'
 
     def reinstall_case(self):
-        """The files the reinstall flow rewrites: they must survive a rollback."""
+        """Byte objects the reinstall flow rewrites: they must survive a rollback.
+
+        /etc/config/network, dhcp and ksmbd are UCI objects in the manifest (restored by key,
+        not by bytes), so they are covered by tests/test_reinstall_phase2b.py instead.
+        """
         files = {
             'etc/mihomo/config.yaml': 'mixed-port: 7890\n# old config\n',
             'etc/mihomo/ruleset/ai.yaml': 'payload:\n  - OLD-RULESET\n',
-            'etc/config/network': "config interface 'lan'\n\toption ipaddr '192.168.1.1'\n",
-            'etc/config/dhcp': "config dnsmasq\n\toption domain 'lan'\n",
-            'etc/config/ksmbd': "config globals\n\toption workgroup 'OLD'\n",
             'etc/geomask/modules.json': '{"selected": ["core"]}\n',
             'etc/geomask/modules-state.json': '{"modules": {}}\n',
             'etc/geomask/version': 'v1.30.0\n',
@@ -502,33 +589,25 @@ initd() { printf '%s\n' "$*" >> "$INITD_LOG"; }
             path.write_text(body, encoding='utf-8', newline='\n')
         return files
 
-    def reinstall_stubs(self):
-        """crontab/initd stand-ins; the real ones would read the host's crontab."""
-        cron = posix(self.case / 'cron.txt')
-        return ('crontab() { if [ "$1" = "-l" ]; then cat "%s" 2>/dev/null; '
-                'else cp "$1" "%s"; fi; }\ninitd() { :; }\n' % (cron, cron))
-
     def test_the_snapshot_covers_the_config_the_flow_rewrites(self):
         """#23: restoring the panel while leaving the new config is not a rollback.
 
-        `_reinstall_steps` rewrites the mihomo config and AI-DNS writes uci, so a snapshot of
-        the panel files only could return "success" with the device on the new settings.
+        `_reinstall_steps` rewrites the mihomo config and the generated assets, so a snapshot
+        of the panel files only could return "success" with the device on the new settings.
         """
         files = self.reinstall_case()
-        extra = self.reinstall_tracked() + self.reinstall_stubs()
+        runtime = self.reinstall_runtime(('dnsmasq', 'mihomo', 'magitrickled', 'rpcd',
+                                          'netifd', 'fw4'))
+        extra = self.reinstall_extra(runtime)
         rewrites = '\n'.join('printf "NEW\\n" > "%s"' % posix(self.case / relative)
                              for relative in files)
-        # The failed run also deletes what it did not have before: restore must recreate it.
         rewrites += '\nrm -f "%s"' % posix(self.case / 'etc/mihomo/ruleset/ai.yaml')
         body = ('snap="%s/snap"; rm -rf "$snap"\n'
                 '_reinstall_snapshot "$snap" || { printf "SNAP_FAIL\\n"; exit 1; }\n'
                 '%s\n'
                 '_reinstall_restore "$snap"; printf "RC=%%s\\n" "$?"\n'
                 % (posix(self.case), rewrites))
-        result = self.run_script(body,
-                                 functions=['_reinstall_save', '_reinstall_snapshot',
-                                            '_reinstall_restore'],
-                                 extra=extra)
+        result = self.run_script(body, functions=reinstall_function_names(), extra=extra)
         self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
         for relative, expected in files.items():
             actual = (self.case / relative).read_text(encoding='utf-8')
@@ -543,17 +622,16 @@ initd() { printf '%s\n' "$*" >> "$INITD_LOG"; }
         snapshot looked like a successful rollback while the files stayed new.
         """
         self.reinstall_case()
-        extra = self.reinstall_tracked() + self.reinstall_stubs()
+        runtime = self.reinstall_runtime(('dnsmasq', 'mihomo', 'magitrickled', 'rpcd',
+                                          'netifd', 'fw4'))
+        extra = self.reinstall_extra(runtime)
         body = ('snap="%s/snap"; rm -rf "$snap"\n'
                 '_reinstall_snapshot "$snap" || { printf "SNAP_FAIL\\n"; exit 1; }\n'
                 'rm -rf "$snap/files/etc/geomask"\n'
                 'printf "NEW\\n" > "%s"\n'
                 '_reinstall_restore "$snap"; printf "RC=%%s\\n" "$?"\n'
                 % (posix(self.case), posix(self.case / 'etc/geomask/modules.json')))
-        result = self.run_script(body,
-                                 functions=['_reinstall_save', '_reinstall_snapshot',
-                                            '_reinstall_restore'],
-                                 extra=extra)
+        result = self.run_script(body, functions=reinstall_function_names(), extra=extra)
         self.assertIn('RC=1', result.stdout, result.stdout + result.stderr)
         self.assertEqual((self.case / 'etc/geomask/modules.json').read_text(encoding='utf-8'),
                          'NEW\n')

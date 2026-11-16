@@ -611,6 +611,19 @@ have() { command -v "$1" >/dev/null 2>&1; }
 svc_alive() { pidof "$1" >/dev/null 2>&1; }
 
 initd() { # initd <svc> <action>  - respects GM_PREFIX for tests
+  # Never execute an init script through a symlinked component: the restore refuses unsafe
+  # paths up front, and this guard keeps every other caller fail-closed as well.
+  if command -v _rs_safe_exec >/dev/null 2>&1; then
+    if ! _rs_safe_exec "/etc/init.d/$1"; then
+      warn "initd: /etc/init.d/$1 is behind an unsafe or unpinned symlink - refusing to execute it"
+      return 1
+    fi
+  else
+    if [ -L "$(P /etc/init.d/$1)" ]; then
+      warn "initd: /etc/init.d/$1 is a symlink - refusing to execute it"
+      return 1
+    fi
+  fi
   "$(P /etc/init.d/$1)" "$2" 2>/dev/null
 }
 
@@ -1895,16 +1908,11 @@ step4_apply() {
   AIDNS_IP="$_aip"
   # v1.30.7: same rule as step 1 - what is installable from the feeds is installed here,
   # not left to the owner. https-dns-proxy is the DoH worker this step configures.
+  # R03: pkg_install refuses during a reinstall - the preflight already proved the worker
+  # present before the first mutation, so a missing one aborts instead of installing.
   if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
-    if have apk; then
-      info "installing: https-dns-proxy (apk)"
-      apk add https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
-        || warn "apk add https-dns-proxy failed"
-    elif have opkg; then
-      info "installing: https-dns-proxy (opkg)"
-      opkg install https-dns-proxy >/dev/null 2>&1 && info "installed: https-dns-proxy" \
-        || warn "opkg install https-dns-proxy failed"
-    fi
+    pkg_install https-dns-proxy && info "installed: https-dns-proxy" \
+      || warn "auto-install of https-dns-proxy failed"
   fi
   # v1.30.15: no worker - no DNS/network rewrite. The step used to warn and continue,
   # sending AI devices to a dnsmasq whose upstream does not exist.
@@ -2438,7 +2446,9 @@ PYEOF
   # v1.29.1: diagnostics logs keep 7 days (each run prunes its own file; this catches idle ones)
   cron_ensure doctor '# geomask-doctor-prune$' '40 4 * * * /usr/lib/geomask/geomask-doctor.py prune >/dev/null 2>&1 # geomask-doctor-prune'
   # v1.10.0: event sync watchdog - magitrickle save -> sync within ~seconds (cron stays as backup)
-  if have apk; then apk add inotifywait >/dev/null 2>&1 || true; fi
+  # R03: during a reinstall package installs are forbidden (GM_REINSTALL_NO_PKG) - the
+  # watchdog falls back to its 10s mtime poll without inotifywait.
+  if have apk && [ "${GM_REINSTALL_NO_PKG:-0}" != 1 ]; then apk add inotifywait >/dev/null 2>&1 || true; fi
   save_stream /usr/bin/geomask-syncd.sh 755 <<'ASSET_EOF'
 @@ASSET:geomask-syncd.sh@@
 ASSET_EOF
@@ -2966,41 +2976,236 @@ geomask_uninstall() {
 # scripts. The old flow called it first and only then asked write_mihomo_config, which can
 # refuse a foreign config - the refusal arrived after the components were already gone.
 #
-# The snapshot is the rollback contract: everything uninstall removes or reconfigures must be
-# in it, including "this file did not exist" and the autostart links. A component that is
-# missing from the snapshot cannot be restored, and the previous version still reported a
-# successful rollback (audit 14.11.2026, F05).
+# R03 phase 2b: the snapshot/rollback is built from the manifest write-set
+# (tests/reinstall_write_set.json), not from a hand-picked list. Byte objects come from the
+# same table the preflight type-checks (REINSTALL_PREFLIGHT_BYTE_FILES, cross-checked 1:1 by
+# tests/reinstall_manifest.py); shared files are restored by their managed subset only; the
+# runtime state (services, rc.d links, uci keys, cron, nft/ip rule, per-interface IPv6
+# sysctl) is recorded as data, not guessed at restore time. Every restored object is
+# verified: bytes, mode, uci values, live nft/ip-rule, enabled AND running services, sysctl.
+# An unverified or failed object keeps the snapshot and returns non-zero ("rollback
+# incomplete / recovery required"); a concurrent write after the snapshot is a conflict.
 #
-# A reinstall rewrites more than the panel files: write_mihomo_config patches the subscription
-# URLs, AI-DNS and the sync step write uci and the generated rulesets, and the install stamps
-# the version and the module selection. Leaving those out let a failed reinstall report a clean
-# rollback while the router kept the new configuration (review 15.11, #23).
-REINSTALL_TRACKED="/usr/libexec/rpcd/geo-sync
-/usr/share/rpcd/acl.d/luci-app-geo-sync.json
-/usr/share/luci/menu.d/luci-app-geo-sync.json
-/www/luci-static/resources/view/geo-sync/main.js
-/etc/init.d/geomask-syncd
-/etc/hotplug.d/iface/99-default-vpn-route
-/usr/lib/geomask/geomask-routes.sh
-/usr/bin/geo-backend.sh
-/root/sync_mtrickle_mihomo.sh
-/etc/geomask/backup-share.enable
-/etc/geomask-aidns.uid
-/etc/geomask-aidns.ip
-/etc/geomask-aidns.off
-/etc/mihomo/config.yaml
-/etc/config/network
-/etc/config/dhcp
-/etc/config/ksmbd
-/etc/geomask/version
-/etc/geomask/modules.json
-/etc/geomask/modules-state.json"
-# Directories whose whole content is part of the snapshot. The installer's own files in
-# /usr/bin are matched by name, because that directory holds everything else on the router.
-REINSTALL_TRACKED_DIRS="/usr/lib/geomask /etc/mihomo/ruleset"
-REINSTALL_TRACKED_BIN="/usr/bin"
+# Deliberately NOT restored (manifest restore=NR, reported honestly as NR):
+#   * mihomo provider cache / the controller API refresh - a network effect, not a file;
+#   * network/firewall reload effects - applied and then verified, not "restored";
+#   * witness logs (/root/geo-sync.log, node-audit events/pools/reports) and /tmp transients;
+#   * MagiTrickle's config.yaml is owned by magitrickled: if it changed during the run the
+#     rollback reports "incomplete" instead of pretending it was restored.
+# The GM_AUTO_LANE branch (geomask-lane.sh install) creates uci/section ids inside a callee
+# that this snapshot cannot journal; the reinstall refuses that branch before any mutation.
+REINSTALL_TRACKED=""
+REINSTALL_SHARED_APPEND="/etc/passwd|dnsai
+/etc/group|dnsai
+/opt/zapret/ipset/zapret-hosts-user-exclude.txt|zapret-block
+/opt/zapret/ipset/zapret-hosts-user.txt|zapret-force"
+REINSTALL_UCI_OBJECTS="network|lanai|section|proto,device,ipaddr,netmask
+network|lan|option|ip6assign
+dhcp|lan|option|ra,dhcpv6,ndp
+ksmbd|geomask-backups|name|name,path,read_only,guest_ok,force_root"
+REINSTALL_LIST_DIRS="/usr/bin /usr/lib/geomask /usr/libexec/rpcd /usr/share/rpcd/acl.d
+/usr/share/luci/menu.d /usr/share/nftables.d/ruleset-post /etc /etc/config /etc/init.d
+/etc/hotplug.d/iface /etc/geomask /etc/geomask/lists /etc/geomask/torrent /etc/mihomo
+/etc/mihomo/ruleset /etc/nftables.d /etc/sysctl.d /etc/magitrickle/state
+/etc/hev-socks5-tunnel /opt/zapret/ipset /root /www/luci-static/resources/view/geo-sync"
+# Temporary names our writers create next to a manifest object (save_stream, the mihomo
+# patcher, the lane). Only names that did NOT exist at snapshot time are removed: a backup
+# or temp file another writer had before the transaction is never deleted.
+REINSTALL_TEMP_SUFFIXES=".zmnew .de5rm .urlnew .tdnew .ecnew .gm.tmp"
+# Objects the manifest marks restore=NR even though a byte preimage exists: the owner
+# (a daemon) rewrites them, so a rollback must NOT write stale bytes over live state.
+# They are recorded by identity+hash and the restore reports "incomplete" when they
+# changed instead of silently restoring them.
+REINSTALL_NR_STATE="/etc/magitrickle/state/config.yaml"
 
-_reinstall_save() { # _reinstall_save <snapshot-dir> <install-path>
+_rs_posix_path() { # <host-path> -> POSIX absolute path (drive form normalized)
+  # Git Bash may return a native Windows path (Y:\..., //?/Y:/...) from readlink -f;
+  # the router only ever has POSIX paths. Normalize before policy/pin comparison so the
+  # decision does not depend on the test host's temp drive.
+  _rs_pv=$1
+  case "$_rs_pv" in
+    //?/[A-Za-z]:/*) _rs_pv=$(printf '%s' "$_rs_pv" | sed 's#^//?/##') ;;
+  esac
+  case "$_rs_pv" in
+    [A-Za-z]:*)
+      _rs_pd=$(printf '%s' "$_rs_pv" | cut -c1 | tr 'A-Z' 'a-z')
+      _rs_pr=${_rs_pv#??}
+      _rs_pr=$(printf '%s' "$_rs_pr" | sed 's#\\#/#g')
+      printf '/%s%s' "$_rs_pd" "$_rs_pr" ;;
+    *) printf '%s' "$_rs_pv" ;;
+  esac
+}
+
+_rs_readlink_posix() { # <abs-path> -> POSIX form of readlink -f
+  _rs_rl=$(readlink -f "$1" 2>/dev/null) || return 1
+  _rs_posix_path "$_rs_rl"
+}
+
+_rs_trusted_link() { # <resolved-target> -> 0 when the target lives under a trusted root
+  _rs_tv=$(_rs_posix_path "$1")
+  # Policy (phase 2e): a storage symlink is legitimate when it points into a stable,
+  # root-owned tree. /tmp-style trees, arbitrary mounts and user-writable roots are not.
+  case "$_rs_tv" in
+    /overlay/*|/mnt/*|/opt/*|/usr/*|/www/*|/etc/*) return 0 ;;
+  esac
+  _rs_troot=$(P / 2>/dev/null) || _rs_troot=""
+  _rs_troot=${_rs_troot%/}
+  if [ -n "${_rs_troot:-}" ] && [ "$_rs_troot" != "/" ]; then
+    # Test/prefix trees: only the same logical roots as above are trusted. A link to an
+    # arbitrary directory inside the fixture (rc-outside, init-outside) stays untrusted.
+    case "$_rs_tv" in
+      "$_rs_troot"/mnt/*|"$_rs_troot"/overlay/*|"$_rs_troot"/opt/*| \
+      "$_rs_troot"/usr/*|"$_rs_troot"/www/*|"$_rs_troot"/etc/*) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+_rs_link_ok() { # <logical> <host-path> <dir|file> - policy + pinned identity
+  _rs_lh=$(readlink -f "$2" 2>/dev/null) || return 1
+  [ -n "${_rs_lh:-}" ] || return 1
+  _rs_lr=$(_rs_posix_path "$_rs_lh")
+  if [ "$3" = dir ]; then
+    [ -d "$_rs_lh" ] || return 1
+  else
+    [ -f "$_rs_lh" ] || return 1
+  fi
+  _rs_lu=$(_rs_uid "$_rs_lh") || return 1
+  _rs_self=$(id -u 2>/dev/null || printf '0')
+  # On the router the installer runs as root, so only uid 0 is accepted. On a non-root
+  # test host the fixture owner is the runner; that keeps the policy testable without
+  # pretending a Windows temp tree is root-owned.
+  if [ "$_rs_lu" != 0 ] && [ "$_rs_lu" != "$_rs_self" ]; then return 1; fi
+  _rs_lm=$(_rs_mode "$_rs_lh") || return 1
+  if [ $((0$_rs_lm & 2)) -ne 0 ]; then return 1; fi
+  _rs_trusted_link "$_rs_lr" || return 1
+  _rs_ld=$(_rs_devino "$_rs_lh") || return 1
+  if [ "${_rs_pin_mode:-0}" = 1 ] && [ -n "${_rs_snap:-}" ]; then
+    _rs_pin=$(awk -F'|' -v l="$1" '$1==l{print $2"|"$3; exit}' \
+              "$_rs_snap/symlinks" 2>/dev/null)
+    if [ -n "${_rs_pin:-}" ]; then
+      [ "$_rs_pin" = "$_rs_lr|$_rs_ld" ] || return 1
+      return 0
+    fi
+    printf '%s|%s|%s\n' "$1" "$_rs_lr" "$_rs_ld" >> "$_rs_snap/symlinks" 2>/dev/null \
+      || return 1
+    return 0
+  fi
+  if [ "${_rs_pin_enforce:-0}" = 1 ] && [ -n "${_rs_snap:-}" ] \
+     && [ -f "$_rs_snap/symlinks" ]; then
+    _rs_pin=$(awk -F'|' -v l="$1" '$1==l{print $2"|"$3; exit}' \
+              "$_rs_snap/symlinks" 2>/dev/null)
+    [ -n "${_rs_pin:-}" ] || return 1
+    [ "$_rs_pin" = "$_rs_lr|$_rs_ld" ] || return 1
+  fi
+  return 0
+}
+
+_rs_safe_walk() { # <install-path> <dir|file|exec>
+  _rs_pp=""
+  _rs_pr=${1#/}
+  while [ -n "$_rs_pr" ]; do
+    _rs_pc=${_rs_pr%%/*}
+    if [ "$_rs_pc" = "$_rs_pr" ]; then _rs_pr=""; else _rs_pr=${_rs_pr#*/}; fi
+    _rs_pp="$_rs_pp/$_rs_pc"
+    _rs_pa="$(P "$_rs_pp")"
+    if [ -L "$_rs_pa" ]; then
+      if [ -z "$_rs_pr" ] && [ "$2" = file ]; then return 1; fi
+      _rs_want=dir
+      if [ -z "$_rs_pr" ] && [ "$2" = exec ]; then _rs_want=file; fi
+      _rs_link_ok "$_rs_pp" "$_rs_pa" "$_rs_want" || return 1
+    fi
+  done
+  return 0
+}
+
+_rs_safe_path() { # directories: a symlink component is allowed only by the policy + pin
+  _rs_safe_walk "$1" dir
+}
+
+_rs_safe_file() { # byte files: the leaf itself must never be a symlink
+  _rs_safe_walk "$1" file
+}
+
+_rs_safe_exec() { # init scripts: a trusted root-owned file symlink is legible
+  _rs_safe_walk "$1" exec
+}
+
+_rs_critical_paths_safe() { # every path the rollback writes, reads or executes through
+  for _rs_cpp in /etc /etc/init.d /etc/rc.d /etc/config /etc/config/network \
+                  /etc/config/dhcp /etc/config/ksmbd /etc/config/firewall \
+                  /etc/sysctl.d /etc/geomask /etc/mihomo /etc/nftables.d \
+                  /etc/hotplug.d/iface /etc/magitrickle/state \
+                  /usr/bin /usr/lib /usr/lib/geomask /usr/libexec/rpcd \
+                  /usr/share/nftables.d/ruleset-post /usr/share/rpcd/acl.d \
+                  /usr/share/luci/menu.d /root /opt/zapret/ipset \
+                  /www/luci-static/resources/view/geo-sync; do
+    if ! _rs_safe_path "$_rs_cpp"; then
+      bad "conflict: $_rs_cpp is behind an unsafe or unpinned symlink - refusing any write/read/exec through it"
+      return 1
+    fi
+  done
+  return 0
+}
+
+_rs_iprule_state() { # -> absent | "<pref>|<table>|<ours|foreign>;..." for EVERY same-mark rule
+  _rs_ir=$(ip rule show 2>/dev/null) || return 1
+  _rs_rows=$(printf '%s\n' "$_rs_ir" | awk -v m="$AIDNS_MARK" -v ours="$AIDNS_RULE_PREF" '
+    { hit = 0
+      for (i = 1; i < NF; i++) if ($i == "fwmark" && $(i + 1) == m) hit = 1
+      if (!hit) next
+      p = $1; sub(/:$/, "", p)
+      t = ""
+      for (i = 1; i < NF; i++) if ($i == "lookup" || $i == "table") t = $(i + 1)
+      print p "|" t "|" (p == ours ? "ours" : "foreign") }')
+  if [ -z "${_rs_rows:-}" ]; then printf 'absent'; return 0; fi
+  printf '%s' "$_rs_rows" | LC_ALL=C sort -n | tr '\n' ';' | sed 's/;$//'
+}
+
+_rs_ksmbd_live_sig() { # semantic signature of OUR ksmbd share sections (ids are unstable)
+  for _rs_ks in $(_rs_ksmbd_ours geomask-backups); do
+    uci -q show ksmbd 2>/dev/null | awk -v p="$_rs_ks." '
+      index($0, p) == 1 { print substr($0, length(p) + 1) }' | sort | tr '\n' ';'
+    printf '\n'
+  done | grep . | sort
+}
+
+_rs_ksmbd_snap_sig() { # the same signature reconstructed from the snapshot rows
+  _rs_kids=$(sed -n 's/^uci|ksmbd|\(@match[0-9]*\)|@type|share$/\1/p' "$_rs_snap/uci" 2>/dev/null | sort -u)
+  for _rs_kid in $_rs_kids; do
+    sed -n "s/^uci|ksmbd|$_rs_kid|\([^|]*\)|\(.*\)$/\1='\2'/p" "$_rs_snap/uci" 2>/dev/null \
+      | grep -v '^@type=' | sort | tr '\n' ';'
+    printf '\n'
+  done | grep . | sort
+}
+
+_rs_check_snapshot() { # _rs_check_snapshot <dir> - a damaged snapshot is refused as a whole
+  for _rs_need in objects meta listing links services uci sysctl net cron shared \
+                  symlinks nft-ai.list nft-v6.list; do
+    if [ ! -f "$_rs_snap/$_rs_need" ]; then
+      bad "rollback incomplete / recovery required: snapshot $_rs_snap is incomplete ($_rs_need missing)"
+      return 1
+    fi
+  done
+  _rs_ckv=0
+  while IFS='|' read -r _rs_ck _rs_cp _rs_ca _rs_cb _rs_cc _rs_cd _rs_ce; do
+    [ -n "${_rs_cp:-}" ] || continue
+    if [ "$_rs_ck" = file ] && [ ! -f "$_rs_snap/files$_rs_cp" ]; then
+      bad "rollback incomplete / recovery required: snapshot lost the copy of $_rs_cp"
+      _rs_ckv=1
+    fi
+  done < "$_rs_snap/objects"
+  while IFS='|' read -r _rs_sc _rs_sp _rs_si _rs_sk _rs_sh _rs_sd _rs_sm; do
+    [ -n "${_rs_sp:-}" ] || continue
+    if [ "$_rs_sk" = regular ] && [ ! -f "$_rs_snap/shared.$_rs_si.pre" ]; then
+      bad "rollback incomplete / recovery required: snapshot lost the managed preimage of shared file $_rs_sp"
+      _rs_ckv=1
+    fi
+  done < "$_rs_snap/shared"
+  return "$_rs_ckv"
+}
+
+_reinstall_save() { # _reinstall_save <snapshot-dir> <install-path> (legacy helper)
   [ -f "$(P "$2")" ] || return 0
   _rs_dir="$1/files$(dirname "$2")"
   mkdir -p "$_rs_dir" 2>/dev/null || return 1
@@ -3008,114 +3213,1869 @@ _reinstall_save() { # _reinstall_save <snapshot-dir> <install-path>
   printf '%s\n' "$2" >> "$1/present"
 }
 
-_reinstall_snapshot() { # _reinstall_snapshot <dir> -> 0 when the current components are saved
-  mkdir -p "$1/files" 2>/dev/null || return 1
-  : > "$1/present"; : > "$1/absent"; : > "$1/rc.d"
-  crontab -l > "$1/crontab" 2>/dev/null || : > "$1/crontab"
-  # An empty crontab is a state too: the file is always written, and restore always applies it.
-  [ -f "$1/crontab" ] || : > "$1/crontab"
-  for _f in ${REINSTALL_TRACKED:-}; do
-    if [ -f "$(P "$_f")" ]; then
-      _reinstall_save "$1" "$_f" || return 1
-    else
-      printf '%s\n' "$_f" >> "$1/absent"
+_rs_type() { # _rs_type <install-path> -> regular|symlink|dir|absent|unknown
+  _rs_tp="$(P "$1")"
+  if [ -L "$_rs_tp" ]; then printf 'symlink'; return 0; fi
+  if [ -f "$_rs_tp" ]; then printf 'regular'; return 0; fi
+  if [ -d "$_rs_tp" ]; then printf 'dir'; return 0; fi
+  if [ -e "$_rs_tp" ]; then printf 'unknown'; return 0; fi
+  if ls -d "$_rs_tp" >/dev/null 2>&1; then printf 'unknown'; return 0; fi
+  printf 'absent'
+}
+
+_rs_mode() { # _rs_mode <abs-path> -> octal mode
+  _rs_mv=$(stat -c '%a' "$1" 2>/dev/null)
+  if [ -z "${_rs_mv:-}" ]; then _rs_mv=$(stat -f '%Lp' "$1" 2>/dev/null); fi
+  [ -n "${_rs_mv:-}" ] || return 1
+  printf '%s' "$_rs_mv"
+}
+
+_rs_uid() { # _rs_uid <abs-path>
+  _rs_uv=$(stat -c '%u' "$1" 2>/dev/null)
+  [ -n "${_rs_uv:-}" ] || return 1
+  printf '%s' "$_rs_uv"
+}
+
+_rs_devino() { # _rs_devino <abs-path>
+  _rs_dv=$(stat -c '%d:%i' "$1" 2>/dev/null)
+  [ -n "${_rs_dv:-}" ] || return 1
+  printf '%s' "$_rs_dv"
+}
+
+_rs_size() { # _rs_size <abs-path>
+  _rs_sv=$(stat -c '%s' "$1" 2>/dev/null)
+  [ -n "${_rs_sv:-}" ] || return 1
+  printf '%s' "$_rs_sv"
+}
+
+_rs_stat4() { # _rs_stat4 <abs-path> -> "mode|uid|dev:ino|size" in one stat call
+  _rs_p4=$(stat -c '%a|%u|%d:%i|%s' "$1" 2>/dev/null)
+  [ -n "${_rs_p4:-}" ] || return 1
+  printf '%s' "$_rs_p4"
+}
+
+_rs_hash() { # _rs_hash <abs-path> -> sha256:<hex> (md5 fallback)
+  if have sha256sum; then
+    _rs_hv=$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)
+    [ -n "${_rs_hv:-}" ] || return 1
+    printf 'sha256:%s' "$_rs_hv"
+    return 0
+  fi
+  if have md5sum; then
+    _rs_hv=$(md5sum "$1" 2>/dev/null | cut -d' ' -f1)
+    [ -n "${_rs_hv:-}" ] || return 1
+    printf 'md5:%s' "$_rs_hv"
+    return 0
+  fi
+  return 1
+}
+
+_rs_hash_stream() { # _rs_hash_stream (stdin) -> sha256:<hex> (md5 fallback)
+  if have sha256sum; then
+    printf 'sha256:%s' "$(sha256sum 2>/dev/null | cut -d' ' -f1)"
+    return 0
+  fi
+  if have md5sum; then
+    printf 'md5:%s' "$(md5sum 2>/dev/null | cut -d' ' -f1)"
+    return 0
+  fi
+  return 1
+}
+
+_rs_is_nr_state() { # _rs_is_nr_state <install-path> -> 0 when the object is restore=NR
+  for _rs_np in ${REINSTALL_NR_STATE:-}; do
+    [ "$_rs_np" = "$1" ] && return 0
+  done
+  return 1
+}
+
+_rs_in_list() { # _rs_in_list <snapshot-dir> <install-path> -> 0 when it existed at snapshot
+  [ -f "$1/listing" ] || return 1
+  grep -qxF -- "$2" "$1/listing" 2>/dev/null
+}
+
+_rs_is_shared() { # _rs_is_shared <install-path> -> 0 for a shared file with a managed subset
+  while IFS='|' read -r _rs_if _rs_ic; do
+    [ -n "${_rs_if:-}" ] || continue
+    [ "$_rs_if" = "$1" ] && return 0
+  done <<EOF
+${REINSTALL_SHARED_APPEND:-}
+EOF
+  return 1
+}
+
+_rs_note() { info "NR (not restorable): $*"; }
+
+_rs_svc_scope() { # _rs_svc_scope <manifest service id> -> 0 when the reinstall touches it
+  case "$1" in
+    svc.ai-doh|svc.dnsmasq-ai)
+      module_selected ai_dns && [ ! -f "$(P /etc/geomask-aidns.off)" ] ;;
+    svc.hev-socks5-tunnel)
+      module_selected path_ai || module_selected ai_dns ;;
+    svc.hev-nop2p)
+      [ -n "${GM_AUTO_LANE:-}" ] ;;
+    svc.ksmbd)
+      module_selected backup_share ;;
+    *)
+      return 0 ;;
+  esac
+}
+
+_rs_svc_enabled() { # _rs_svc_enabled <initd-names-slash-separated> -> 1|0|unknown
+  _rs_re="$(P /etc/rc.d)"
+  if ! _rs_safe_path /etc/rc.d || [ ! -d "$_rs_re" ] || ! ls "$_rs_re" >/dev/null 2>&1; then
+    printf 'unknown'; return 0
+  fi
+  for _rs_sn in $(printf '%s' "$1" | tr '/' ' '); do
+    if ls "$_rs_re" 2>/dev/null | grep -qE "^S[0-9][0-9]${_rs_sn}$"; then
+      printf '1'; return 0
     fi
   done
-  # Globbed paths are expanded against the real root, so they are listed through P instead:
-  # otherwise the snapshot silently missed every helper script.
-  for _rd in ${REINSTALL_TRACKED_DIRS:-/usr/lib/geomask /etc/mihomo/ruleset}; do
-    for _rf in "$(P "$_rd")"/*; do
-      [ -f "$_rf" ] || continue
-      _reinstall_save "$1" "${_rf#"$GM_PREFIX"}" || return 1
-    done
+  printf '0'
+}
+
+_rs_svc_running() { # _rs_svc_running <pid-or-port> <mode> -> 1|0|unknown
+  case "${2:-pidof}" in
+    pgrep)
+      have pgrep || { printf 'unknown'; return 0; }
+      pgrep -f "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      ;;
+    port)
+      if have netstat; then
+        netstat -ltnu 2>/dev/null | grep -q ":$1 " && printf '1' || printf '0'
+      else
+        printf 'unknown'
+      fi
+      ;;
+    *)
+      if have pidof; then
+        pidof "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      elif have pgrep; then
+        pgrep -x "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      else
+        printf 'unknown'
+      fi
+      ;;
+  esac
+}
+
+_rs_settle() { [ "${GM_RESTORE_VERIFY_TRIES:-2}" = 1 ] && return 0; sleep 1; }
+
+_rs_start_service() { # _rs_start_service <initd-names>
+  for _rs_ss in $(printf '%s' "$1" | tr '/' ' '); do
+    if ! _rs_safe_exec "/etc/init.d/$_rs_ss"; then
+      bad "conflict: /etc/init.d/$_rs_ss is behind an unsafe or unpinned symlink - refusing to execute it"
+      _rr=1
+      return 1
+    fi
+    _rs_sp="$(P "/etc/init.d/$_rs_ss")"
+    if [ -f "$_rs_sp" ]; then
+      initd "$_rs_ss" start >/dev/null 2>&1
+      return $?
+    fi
   done
-  for _rd in ${REINSTALL_TRACKED_BIN:-/usr/bin}; do
-    for _rf in "$(P "$_rd")"/geomask*; do
-      [ -f "$_rf" ] || continue
-      _reinstall_save "$1" "${_rf#"$GM_PREFIX"}" || return 1
-    done
+  return 1
+}
+
+_rs_stop_service() { # _rs_stop_service <initd-names>
+  for _rs_ss in $(printf '%s' "$1" | tr '/' ' '); do
+    if ! _rs_safe_exec "/etc/init.d/$_rs_ss"; then
+      bad "conflict: /etc/init.d/$_rs_ss is behind an unsafe or unpinned symlink - refusing to execute it"
+      _rr=1
+      return 1
+    fi
+    _rs_sp="$(P "/etc/init.d/$_rs_ss")"
+    if [ -f "$_rs_sp" ]; then
+      initd "$_rs_ss" stop >/dev/null 2>&1
+      return $?
+    fi
   done
-  # Autostart links: `disable` removes them, and a restore that only copies files back leaves
-  # the service stopped without saying so.
-  for _rl in "$(P /etc/rc.d)"/*geomask*; do
-    [ -e "$_rl" ] || continue
-    printf '%s\n' "${_rl#"$GM_PREFIX"}" >> "$1/rc.d"
+  return 1
+}
+
+_rs_link_owned() { # _rs_link_owned <svc-name> -> 0 when the snapshot tracks that service
+  [ -f "$_rs_snap/services" ] || return 1
+  while IFS='|' read -r _rs_li _rs_lin _rs_lip _rs_lim _rs_lie _rs_lir; do
+    [ -n "${_rs_lin:-}" ] || continue
+    for _rs_ls in $(printf '%s' "$_rs_lin" | tr '/' ' '); do
+      [ "$_rs_ls" = "$1" ] && return 0
+    done
+  done < "$_rs_snap/services"
+  return 1
+}
+
+_rs_ksmbd_ours() { # _rs_ksmbd_ours <share-name> -> uci section paths of OUR share only
+  _rs_ka=$(uci -q show ksmbd 2>/dev/null | sed -n 's/^\(ksmbd\.[^=]*\)=share$/\1/p')
+  for _rs_ks in $_rs_ka; do
+    if [ "$(uci -q get "$_rs_ks.name" 2>/dev/null)" = "$1" ]; then
+      printf '%s\n' "$_rs_ks"
+    fi
+  done
+}
+
+_rs_shared_neutral() { # _rs_shared_neutral <class> <abs-file> -> the part geomask does not own
+  case "$1" in
+    dnsai)
+      awk -v u="$AIDNS_USER" 'index($0, u ":") != 1' "$2" ;;
+    zapret-block)
+      awk -v b='# >>> geomask sync: tunneled domains (generated) >>>' \
+          -v e="# <<< geomask sync: tunneled domains <<<" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip { print }' "$2" ;;
+    zapret-force)
+      awk -v m='# geomask: tunneled, DPI removed' '
+        index($0, m) == 1 { print substr($0, length(m) + 2); next }
+        { print }' "$2" ;;
+    *)
+      cat "$2" ;;
+  esac
+}
+
+_rs_snap_listing() { # _rs_snap_listing <dir> - names that existed before the transaction
+  : > "$_rs_snap/listing" || return 1
+  for _rs_ld in ${REINSTALL_LIST_DIRS:-}; do
+    _rs_lp="$(P "$_rs_ld")"
+    [ -d "$_rs_lp" ] || continue
+    if ! _rs_safe_path "$_rs_ld"; then
+      bad "snapshot: listing directory $_rs_ld is behind a symlink"
+      return 1
+    fi
+    for _rs_lf in "$_rs_lp"/* "$_rs_lp"/.[!.]*; do
+      [ -e "$_rs_lf" ] || [ -L "$_rs_lf" ] || continue
+      printf '%s\n' "${_rs_lf#"$GM_PREFIX"}" >> "$_rs_snap/listing" 2>/dev/null || return 1
+    done
   done
   return 0
 }
 
-_reinstall_restore() { # _reinstall_restore <dir> -> 0 only when every saved component is back
-  _rr=0
-  _list="$1/restore.list"
-  ( cd "$1/files" 2>/dev/null && find . -type f ) > "$_list" 2>/dev/null || return 1
-  while IFS= read -r _rel; do
-    [ -n "$_rel" ] || continue
-    _dst="$(P "${_rel#.}")"
-    mkdir -p "$(dirname "$_dst")" 2>/dev/null || { _rr=1; continue; }
-    cp -p "$1/files/$_rel" "$_dst" 2>/dev/null || _rr=1
-  done < "$_list"
-  # Byte check: the loop above only reproduces what `find` listed. A snapshot that lost a
-  # component (interrupted copy, a full disk, a killed run) looked like a clean rollback, so
-  # every path recorded as present must exist in the copy tree AND end up as the same bytes.
-  if [ -f "$1/present" ]; then
-    while IFS= read -r _rp; do
-      [ -n "$_rp" ] || continue
-      if [ ! -f "$1/files$_rp" ]; then
-        bad "откат: в снимке нет копии $_rp"; _rr=1; continue
+_rs_snap_cron() { # _rs_snap_cron <dir>
+  crontab -l > "$_rs_snap/cron" 2>/dev/null
+  _rs_cr=$?
+  case "$_rs_cr" in
+    0|1) : ;;
+    *) bad "snapshot: crontab state unobservable (crontab -l rc=$_rs_cr)"; return 1 ;;
+  esac
+  [ -f "$_rs_snap/cron" ] || : > "$_rs_snap/cron"
+  return 0
+}
+
+_rs_snap_files() { # _rs_snap_files <dir> - byte objects of the manifest
+  while IFS='|' read -r _rs_fp _rs_fe; do
+    [ -n "${_rs_fp:-}" ] || continue
+    _rs_is_shared "$_rs_fp" && continue
+    if [ "$_rs_fe" = dir-or-absent ]; then
+      if ! _rs_safe_path "$_rs_fp"; then
+        bad "snapshot: $_rs_fp is behind an unsafe or unpinned symlink"
+        return 1
       fi
-      cmp -s "$1/files$_rp" "$(P "$_rp")" || { bad "откат: $_rp не восстановлен"; _rr=1; }
-    done < "$1/present"
+    else
+      if ! _rs_safe_file "$_rs_fp"; then
+        bad "snapshot: $_rs_fp is a symlink (byte object; links are not restored as bytes)"
+        return 1
+      fi
+    fi
+    _rs_ft=$(_rs_type "$_rs_fp")
+    if _rs_is_nr_state "$_rs_fp"; then
+      case "$_rs_ft" in
+        regular)
+          _rs_fa="$(P "$_rs_fp")"
+          _rs_f4=$(_rs_stat4 "$_rs_fa") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
+          _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+          _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+          _rs_fi=${_rs_fr%%|*}; _rs_fs=${_rs_fr#*|}
+          _rs_fh=$(_rs_hash "$_rs_fa") || { bad "snapshot: cannot hash $_rs_fp"; return 1; }
+          printf 'norestore|%s|%s|%s|%s|%s|%s\n' "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_fi" "$_rs_fs" "$_rs_fh" >> "$_rs_snap/objects" ;;
+        absent)
+          printf 'norestore-absent|%s|-\n' "$_rs_fp" >> "$_rs_snap/objects" ;;
+        *)
+          bad "snapshot: NR object $_rs_fp has unrestorable type $_rs_ft"
+          return 1 ;;
+      esac
+      continue
+    fi
+    case "$_rs_ft" in
+      symlink)
+        if [ "$_rs_fe" = dir-or-absent ] && [ -d "$(P "$_rs_fp")" ]; then
+          # A trusted storage link (extroot-style /etc/mihomo, /etc/geomask) is a
+          # directory object: keep the link, pin its target identity, restore metadata.
+          _rs_fa="$(P "$_rs_fp")"
+          _rs_f4=$(_rs_stat4 "$_rs_fa") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
+          _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+          _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+          _rs_fi=${_rs_fr%%|*}
+          _rs_lh=$(readlink -f "$_rs_fa" 2>/dev/null) || _rs_lh=""
+          [ -n "${_rs_lh:-}" ] || { bad "snapshot: cannot resolve $_rs_fp"; return 1; }
+          _rs_lr=$(_rs_posix_path "$_rs_lh")
+          _rs_ld=$(_rs_devino "$_rs_lh") || { bad "snapshot: cannot pin $_rs_fp"; return 1; }
+          printf 'dirlink|%s|%s|%s|%s|%s|-\n' \
+            "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_ld" "$_rs_lr" >> "$_rs_snap/objects"
+          continue
+        fi
+        bad "snapshot: unrestorable object: $_rs_fp is a symlink (the snapshot restores bytes, not links)"
+        return 1 ;;
+      unknown)
+        bad "snapshot: unobservable object: $_rs_fp"
+        return 1 ;;
+      absent)
+        printf 'absent|%s|-\n' "$_rs_fp" >> "$_rs_snap/objects" ;;
+      dir)
+        if [ "$_rs_fe" != dir-or-absent ]; then
+          bad "snapshot: $_rs_fp is a directory, expected $_rs_fe"
+          return 1
+        fi
+        _rs_fa="$(P "$_rs_fp")"
+        _rs_f4=$(_rs_stat4 "$_rs_fa") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
+        _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+        _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+        _rs_fi=${_rs_fr%%|*}
+        printf 'dir|%s|%s|%s|%s\n' "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_fi" >> "$_rs_snap/objects" ;;
+      regular)
+        _rs_fdir="$_rs_snap/files$(dirname "$_rs_fp")"
+        mkdir -p "$_rs_fdir" 2>/dev/null || { bad "snapshot: cannot create $_rs_fdir"; return 1; }
+        _rs_fa="$(P "$_rs_fp")"
+        cp -p "$_rs_fa" "$_rs_fdir/" 2>/dev/null || { bad "snapshot: cannot copy $_rs_fp"; return 1; }
+        _rs_f4=$(_rs_stat4 "$_rs_fa") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
+        _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+        _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+        _rs_fi=${_rs_fr%%|*}; _rs_fs=${_rs_fr#*|}
+        _rs_fh=$(_rs_hash "$_rs_fa") || { bad "snapshot: cannot hash $_rs_fp (sha256sum/md5sum missing)"; return 1; }
+        printf 'file|%s|%s|%s|%s|%s|%s\n' "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_fi" "$_rs_fs" "$_rs_fh" >> "$_rs_snap/objects" ;;
+    esac
+  done <<EOF
+${REINSTALL_PREFLIGHT_BYTE_FILES:-}
+EOF
+  for _rs_fp in ${REINSTALL_TRACKED:-}; do
+    _rs_is_shared "$_rs_fp" && continue
+    if grep -qF "|$_rs_fp|" "$_rs_snap/objects" 2>/dev/null; then continue; fi
+    if ! _rs_safe_file "$_rs_fp"; then
+      bad "snapshot: extra tracked object $_rs_fp is a symlink"
+      return 1
+    fi
+    _rs_ft=$(_rs_type "$_rs_fp")
+    case "$_rs_ft" in
+      regular)
+        _rs_fdir="$_rs_snap/files$(dirname "$_rs_fp")"
+        mkdir -p "$_rs_fdir" 2>/dev/null || { bad "snapshot: cannot create $_rs_fdir"; return 1; }
+        _rs_fa="$(P "$_rs_fp")"
+        cp -p "$_rs_fa" "$_rs_fdir/" 2>/dev/null || { bad "snapshot: cannot copy $_rs_fp"; return 1; }
+        _rs_f4=$(_rs_stat4 "$_rs_fa") || return 1
+        _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+        _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+        _rs_fi=${_rs_fr%%|*}; _rs_fs=${_rs_fr#*|}
+        _rs_fh=$(_rs_hash "$_rs_fa") || return 1
+        printf 'file|%s|%s|%s|%s|%s|%s\n' "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_fi" "$_rs_fs" "$_rs_fh" >> "$_rs_snap/objects" ;;
+      absent)
+        printf 'absent|%s|-\n' "$_rs_fp" >> "$_rs_snap/objects" ;;
+      *)
+        bad "snapshot: extra tracked object $_rs_fp is not a regular file or absent"
+        return 1 ;;
+    esac
+  done
+  return 0
+}
+
+_rs_snap_shared() { # _rs_snap_shared <dir> - managed subset of the shared files
+  _rs_si=0
+  while IFS='|' read -r _rs_sp _rs_sc; do
+    [ -n "${_rs_sp:-}" ] || continue
+    if ! _rs_safe_file "$_rs_sp"; then
+      bad "snapshot: shared object $_rs_sp is a symlink - refusing to snapshot through it"
+      return 1
+    fi
+    _rs_si=$((_rs_si+1))
+    _rs_st=$(_rs_type "$_rs_sp")
+    case "$_rs_st" in
+      symlink)
+        bad "snapshot: unrestorable shared object: $_rs_sp is a symlink"
+        return 1 ;;
+      dir)
+        bad "snapshot: unrestorable shared object: $_rs_sp is a directory"
+        return 1 ;;
+      unknown)
+        bad "snapshot: unobservable shared object: $_rs_sp"
+        return 1 ;;
+      absent)
+        printf 'shared|%s|%s\n' "$_rs_sp" "$_rs_sc" >> "$_rs_snap/objects"
+        printf '%s|%s|%s|absent|-|-|-\n' "$_rs_sc" "$_rs_sp" "$_rs_si" >> "$_rs_snap/shared"
+        continue ;;
+    esac
+    _rs_sa="$(P "$_rs_sp")"
+    _rs_s4=$(_rs_stat4 "$_rs_sa") || { bad "snapshot: cannot stat $_rs_sp"; return 1; }
+    _rs_sm=${_rs_s4%%|*}; _rs_sr=${_rs_s4#*|}
+    _rs_sd=${_rs_sr#*|}; _rs_sd=${_rs_sd%%|*}
+    _rs_sh=$(_rs_shared_neutral "$_rs_sc" "$_rs_sa" | _rs_hash_stream) \
+      || { bad "snapshot: cannot hash the managed part of $_rs_sp"; return 1; }
+    : > "$_rs_snap/shared.$_rs_si.pre" || { bad "snapshot: cannot create shared.$_rs_si.pre"; return 1; }
+    case "$_rs_sc" in
+      dnsai)
+        grep -E "^$AIDNS_USER:" "$_rs_sa" > "$_rs_snap/shared.$_rs_si.pre" 2>/dev/null || true ;;
+      zapret-block)
+        awk -v b='# >>> geomask sync: tunneled domains (generated) >>>' \
+            -v e="# <<< geomask sync: tunneled domains <<<" '
+          $0 == b { inb = 1 }
+          inb { print }
+          $0 == e { inb = 0 }' "$_rs_sa" > "$_rs_snap/shared.$_rs_si.pre" 2>/dev/null || true ;;
+      zapret-force)
+        # per-domain state before the run: A|domain = in the clear, M|domain = managed
+        # (commented out by sync). A managed line returned to the clear must be re-commented,
+        # which an "active domains only" preimage could not know (review 16.11, item 3).
+        awk -v m='# geomask: tunneled, DPI removed' '
+          index($0, m) == 1 { d = substr($0, length(m) + 2)
+                              if (d != "") print "M|" d; next }
+          $0 != "" && $0 !~ /^#/ { print "A|" $0 }' "$_rs_sa" \
+          > "$_rs_snap/shared.$_rs_si.pre" 2>/dev/null || true ;;
+    esac
+    printf 'shared|%s|%s\n' "$_rs_sp" "$_rs_sc" >> "$_rs_snap/objects"
+    printf '%s|%s|%s|regular|%s|%s|%s\n' "$_rs_sc" "$_rs_sp" "$_rs_si" "$_rs_sh" "$_rs_sd" "$_rs_sm" >> "$_rs_snap/shared"
+  done <<EOF
+${REINSTALL_SHARED_APPEND:-}
+EOF
+  return 0
+}
+
+_rs_snap_uci() { # _rs_snap_uci <dir> - preimage of the managed uci keys
+  for _rs_up in network dhcp ksmbd; do
+    if [ -f "$(P "/tmp/.uci/$_rs_up")" ]; then
+      bad "snapshot: pending uci delta for $_rs_up - another writer is mid-edit; reinstall refused"
+      return 1
+    fi
+  done
+  while IFS='|' read -r _rs_pkg _rs_sel _rs_kind _rs_opts; do
+    [ -n "${_rs_pkg:-}" ] || continue
+    if ! _rs_safe_path "/etc/config/$_rs_pkg"; then
+      bad "snapshot: /etc/config/$_rs_pkg is behind a symlink - refusing uci reads through it"
+      return 1
+    fi
+    case "$_rs_kind" in
+      section)
+        if uci -q get "$_rs_pkg.$_rs_sel" >/dev/null 2>&1; then
+          _rs_ty=$(uci -q get "$_rs_pkg.$_rs_sel" 2>/dev/null)
+          printf 'uci|%s|%s|@type|%s\n' "$_rs_pkg" "$_rs_sel" "$_rs_ty" >> "$_rs_snap/uci"
+          for _rs_o in $(printf '%s' "$_rs_opts" | tr ',' ' '); do
+            if _rs_v=$(uci -q get "$_rs_pkg.$_rs_sel.$_rs_o" 2>/dev/null); then
+              printf 'uci|%s|%s|%s|%s\n' "$_rs_pkg" "$_rs_sel" "$_rs_o" "$_rs_v" >> "$_rs_snap/uci"
+            else
+              printf 'uci|%s|%s|%s|<absent>\n' "$_rs_pkg" "$_rs_sel" "$_rs_o" >> "$_rs_snap/uci"
+            fi
+          done
+        else
+          printf 'uci|%s|%s|@type|<absent>\n' "$_rs_pkg" "$_rs_sel" >> "$_rs_snap/uci"
+        fi ;;
+      option)
+        for _rs_o in $(printf '%s' "$_rs_opts" | tr ',' ' '); do
+          if _rs_v=$(uci -q get "$_rs_pkg.$_rs_sel.$_rs_o" 2>/dev/null); then
+            printf 'uci|%s|%s|%s|%s\n' "$_rs_pkg" "$_rs_sel" "$_rs_o" "$_rs_v" >> "$_rs_snap/uci"
+          else
+            printf 'uci|%s|%s|%s|<absent>\n' "$_rs_pkg" "$_rs_sel" "$_rs_o" >> "$_rs_snap/uci"
+          fi
+        done ;;
+      name)
+        _rs_mi=0
+        for _rs_ms in $(_rs_ksmbd_ours "$_rs_sel"); do
+          _rs_mi=$((_rs_mi+1))
+          printf 'uci|%s|@match%d|@type|share\n' "$_rs_pkg" "$_rs_mi" >> "$_rs_snap/uci"
+          # every option of OUR section is recorded: force_root appeared in the manifest
+          # after phase 2b and a fixed allowlist silently dropped it.
+          _rs_kol=$(uci -q show "$_rs_pkg" 2>/dev/null | awk -v p="$_rs_ms." '
+            index($0, p) == 1 { rest = substr($0, length(p) + 1); sub(/=.*/, "", rest)
+                                if (rest != "") print rest }')
+          for _rs_ko in $_rs_kol; do
+            if _rs_v=$(uci -q get "$_rs_ms.$_rs_ko" 2>/dev/null); then
+              printf 'uci|%s|@match%d|%s|%s\n' "$_rs_pkg" "$_rs_mi" "$_rs_ko" "$_rs_v" >> "$_rs_snap/uci"
+            else
+              printf 'uci|%s|@match%d|%s|<absent>\n' "$_rs_pkg" "$_rs_mi" "$_rs_ko" >> "$_rs_snap/uci"
+            fi
+          done
+        done
+        [ "$_rs_mi" -gt 0 ] || printf 'uci|%s|@none|@type|<absent>\n' "$_rs_pkg" >> "$_rs_snap/uci"
+        ;;
+    esac
+  done <<EOF
+${REINSTALL_UCI_OBJECTS:-}
+EOF
+  return 0
+}
+
+_rs_snap_sysctl() { # _rs_snap_sysctl <dir> - per-interface disable_ipv6, never "0 by default"
+  _rs_kd="$(P /proc/sys/net/ipv6/conf)"
+  if ! _rs_safe_path /proc/sys/net/ipv6/conf || [ ! -d "$_rs_kd" ] || ! ls "$_rs_kd" >/dev/null 2>&1; then
+    bad "snapshot: kernel sysctl state unobservable: /proc/sys/net/ipv6/conf"
+    return 1
   fi
-  # Files this failed install created are not in the snapshot: remove them, or the next
-  # start would mix the restored components with a half-written new version.
-  for _rd in ${REINSTALL_TRACKED_BIN:-/usr/bin}; do
-    for _rf in "$(P "$_rd")"/geomask*; do
-      [ -f "$_rf" ] || continue
-      grep -qxF ".${_rf#"$GM_PREFIX"}" "$_list" || rm -f "$_rf" 2>/dev/null || _rr=1
+  for _rs_kf in "$_rs_kd"/*; do
+    [ -d "$_rs_kf" ] || continue
+    _rs_kn=${_rs_kf##*/}
+    _rs_kv=$(cat "$_rs_kf/disable_ipv6" 2>/dev/null | tr -dc '01')
+    case "$_rs_kv" in
+      0|1) : ;;
+      *) bad "snapshot: kernel sysctl unobservable: net.ipv6.conf.$_rs_kn.disable_ipv6"
+         return 1 ;;
+    esac
+    printf 'sysctl|%s|%s\n' "$_rs_kn" "$_rs_kv" >> "$_rs_snap/sysctl"
+  done
+  return 0
+}
+
+_rs_snap_runtime() { # _rs_snap_runtime <dir> - tri-state enabled/running per service
+  while IFS='|' read -r _rs_id _rs_kind _rs_initd _rs_pid _rs_mode _rs_extra; do
+    [ "${_rs_kind:-}" = service ] || continue
+    _rs_svc_scope "$_rs_id" || continue
+    for _rs_is in $(printf '%s' "$_rs_initd" | tr '/' ' '); do
+      if ! _rs_safe_exec "/etc/init.d/$_rs_is"; then
+        bad "snapshot: init script /etc/init.d/$_rs_is is behind an unsafe or unpinned symlink"
+        return 1
+      fi
+    done
+    _rs_en=$(_rs_svc_enabled "$_rs_initd")
+    _rs_run=$(_rs_svc_running "$_rs_pid" "$_rs_mode")
+    if [ "$_rs_en" = unknown ]; then
+      bad "snapshot: runtime state unobservable: $_rs_id (enabled unknown)"
+      return 1
+    fi
+    if [ "$_rs_run" = unknown ]; then
+      bad "snapshot: runtime state unobservable: $_rs_id (running unknown)"
+      return 1
+    fi
+    printf '%s|%s|%s|%s|%s|%s\n' "$_rs_id" "$_rs_initd" "$_rs_pid" "$_rs_mode" "$_rs_en" "$_rs_run" >> "$_rs_snap/services"
+  done <<EOF
+${REINSTALL_PREFLIGHT_OBJECTS:-}
+EOF
+  # network/firewall are reloaded directly by the rollback even when their service row
+  # is out of scope; pin them too so a target swap cannot redirect the reload.
+  for _rs_is in network firewall; do
+    if ! _rs_safe_exec "/etc/init.d/$_rs_is"; then
+      bad "snapshot: /etc/init.d/$_rs_is is behind an unsafe or unpinned symlink"
+      return 1
+    fi
+  done
+  return 0
+}
+
+_rs_snap_links() { # <dir> - exact rc.d link names AND targets of our services
+  _rs_ld="$(P /etc/rc.d)"
+  if ! _rs_safe_path /etc/rc.d; then
+    bad "snapshot: /etc/rc.d is behind a symlink - refusing to read autostart links through it"
+    return 1
+  fi
+  if [ ! -d "$_rs_ld" ] || ! ls "$_rs_ld" >/dev/null 2>&1; then
+    bad "snapshot: rc.d autostart links unobservable"
+    return 1
+  fi
+  : > "$_rs_snap/links" || return 1
+  for _rs_lf in "$_rs_ld"/*; do
+    [ -L "$_rs_lf" ] || continue
+    _rs_ln=${_rs_lf##*/}
+    case "$_rs_ln" in
+      [SK][0-9][0-9]*) : ;;
+      *) continue ;;
+    esac
+    _rs_ls=${_rs_ln#[SK]}
+    _rs_ls=${_rs_ls#??}
+    _rs_link_owned "$_rs_ls" || continue
+    _rs_lt=$(readlink "$_rs_lf" 2>/dev/null) \
+      || { bad "snapshot: cannot read the target of $_rs_ln"; return 1; }
+    printf '%s|%s\n' "$_rs_ln" "$_rs_lt" >> "$_rs_snap/links"
+  done
+  return 0
+}
+
+_rs_snap_net() { # _rs_snap_net <dir> - ip rule, nft table content, alias address
+  ip rule show > "$_rs_snap/iprule.raw" 2>/dev/null \
+    || { bad "snapshot: ip rule state unobservable"; return 1; }
+  _rs_irs=$(_rs_iprule_state) || { bad "snapshot: ip rule state unobservable"; return 1; }
+  printf 'iprule|%s\n' "$_rs_irs" >> "$_rs_snap/net"
+  : > "$_rs_snap/nft-ai.list" || return 1
+  : > "$_rs_snap/nft-v6.list" || return 1
+  nft list table inet geomask_ai_dns > "$_rs_snap/nft-ai.list" 2>/dev/null
+  _rs_nr=$?
+  case "$_rs_nr" in
+    0) printf 'nft-ai|present\n' >> "$_rs_snap/net" ;;
+    1) : > "$_rs_snap/nft-ai.list"; printf 'nft-ai|absent\n' >> "$_rs_snap/net" ;;
+    *) bad "snapshot: nft state unobservable: inet geomask_ai_dns (rc=$_rs_nr)"; return 1 ;;
+  esac
+  nft list chain inet fw4 geomask_no_v6 > "$_rs_snap/nft-v6.list" 2>/dev/null
+  _rs_nr=$?
+  case "$_rs_nr" in
+    0) printf 'nft-v6|present\n' >> "$_rs_snap/net" ;;
+    1) : > "$_rs_snap/nft-v6.list"; printf 'nft-v6|absent\n' >> "$_rs_snap/net" ;;
+    *) bad "snapshot: nft state unobservable: inet fw4 geomask_no_v6 (rc=$_rs_nr)"; return 1 ;;
+  esac
+  _rs_ai=$(uci -q get network.lanai.ipaddr 2>/dev/null)
+  _rs_ad=$(uci -q get network.lanai.device 2>/dev/null)
+  if [ -n "${_rs_ai:-}" ]; then
+    printf 'alias|present|%s|%s\n' "$_rs_ad" "$_rs_ai" >> "$_rs_snap/net"
+  else
+    printf 'alias|absent||\n' >> "$_rs_snap/net"
+  fi
+  return 0
+}
+
+_reinstall_snapshot() { # <dir> -> 0 when captured; pin mode is always reset
+  _rs_pin_mode=1
+  _rs_snapshot_capture "$@"
+  _rs_snapshot_rc=$?
+  _rs_pin_mode=0
+  # A successful snapshot arms pin enforcement for the install actions that follow;
+  # a failed/aborted snapshot must not leave the caller unable to use initd.
+  if [ "$_rs_snapshot_rc" = 0 ]; then _rs_pin_enforce=1; else _rs_pin_enforce=0; fi
+  return $_rs_snapshot_rc
+}
+
+_rs_snapshot_capture() { # <dir> - body of the snapshot, runs with pin mode 1
+  _rs_snap="$1"
+  mkdir -p "$_rs_snap/files" 2>/dev/null || return 1
+  : > "$_rs_snap/symlinks" || return 1
+  if ! _rs_critical_paths_safe; then
+    bad "snapshot: unsafe or unpinned symlink in a tracked path; reinstall refused before mutation"
+    return 1
+  fi
+  : > "$1/present"; : > "$1/absent"; : > "$1/rc.d"
+  : > "$_rs_snap/objects" || return 1
+  : > "$_rs_snap/listing" || return 1
+  : > "$_rs_snap/links" || return 1
+  : > "$_rs_snap/uci" || return 1
+  : > "$_rs_snap/services" || return 1
+  : > "$_rs_snap/sysctl" || return 1
+  : > "$_rs_snap/net" || return 1
+  : > "$_rs_snap/shared" || return 1
+  printf 'schema=2\nprefix=%s\n' "$GM_PREFIX" > "$_rs_snap/meta" || return 1
+  if [ -n "${GM_AUTO_LANE:-}" ]; then
+    bad "snapshot: GM_AUTO_LANE is armed - geomask-lane.sh would create uci/service objects this snapshot cannot journal; reinstall refused before mutation"
+    return 1
+  fi
+  _rs_snap_listing || return 1
+  _rs_snap_cron || return 1
+  _rs_snap_files || return 1
+  _rs_snap_shared || return 1
+  _rs_snap_uci || return 1
+  _rs_snap_sysctl || return 1
+  _rs_snap_runtime || return 1
+  _rs_snap_links || return 1
+  _rs_snap_net || return 1
+  info "snapshot: state recorded in $_rs_snap"
+  return 0
+}
+
+_rs_stop_new_services() { # _rs_stop_new_services <dir> - stop what the run started, BEFORE
+  # file restore deletes the init scripts the failed install created. A refused stop is an
+  # error: leaving a service running that was stopped before is not a rollback.
+  [ -f "$_rs_snap/services" ] || return 0
+  while IFS='|' read -r _rs_id _rs_initd _rs_pid _rs_mode _rs_en _rs_run; do
+    [ -n "${_rs_id:-}" ] || continue
+    [ "$_rs_run" = 0 ] || continue
+    _rs_now=$(_rs_svc_running "$_rs_pid" "$_rs_mode")
+    [ "$_rs_now" = 1 ] || continue
+    _rs_stop_service "$_rs_initd" \
+      || { bad "rollback: cannot stop $_rs_id (it was stopped before the run)"; _rr=1; }
+  done < "$_rs_snap/services"
+  return 0
+}
+
+_rs_restore_files() { # _rs_restore_files <dir> - bytes/absence/mode of the byte objects
+  [ -f "$_rs_snap/objects" ] || { bad "rollback: snapshot objects list missing"; return 1; }
+  while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
+    [ -n "${_rs_op:-}" ] || continue
+    _rs_dst="$(P "$_rs_op")"
+    if [ "$_rs_ok" = absent ]; then
+      if ! _rs_safe_path "$(dirname "$_rs_op")"; then
+        bad "conflict: a path component of $_rs_op is an unsafe or unpinned symlink"
+        _rr=1
+        continue
+      fi
+    elif [ "$_rs_ok" = file ]; then
+      if ! _rs_safe_file "$_rs_op"; then
+        bad "conflict: $_rs_op is a symlink (byte object; refusing to restore through it)"
+        _rr=1
+        continue
+      fi
+    else
+      if ! _rs_safe_path "$_rs_op"; then
+        bad "conflict: $_rs_op (or a parent) is an unsafe or unpinned symlink"
+        _rr=1
+        continue
+      fi
+    fi
+    case "$_rs_ok" in
+      file)
+        if [ ! -f "$_rs_snap/files$_rs_op" ]; then
+          bad "rollback: snapshot has no copy of $_rs_op"
+          _rr=1
+          continue
+        fi
+        if [ -L "$_rs_dst" ] || { [ -e "$_rs_dst" ] && [ ! -f "$_rs_dst" ]; }; then
+          bad "rollback: $_rs_op is not a regular file any more - refusing to overwrite"
+          _rr=1
+          continue
+        fi
+        mkdir -p "$(dirname "$_rs_dst")" 2>/dev/null \
+          || { bad "rollback: cannot create the directory of $_rs_op"; _rr=1; continue; }
+        cp -p "$_rs_snap/files$_rs_op" "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: copy failed for $_rs_op"; _rr=1; continue; }
+        chmod "$_rs_oa" "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: chmod $_rs_oa failed for $_rs_op"; _rr=1; continue; }
+        ;;
+      dirlink)
+        if [ ! -L "$_rs_dst" ] || [ ! -d "$_rs_dst" ]; then
+          bad "conflict: $_rs_op is no longer the pinned symlinked directory"
+          _rr=1
+          continue
+        fi
+        _rs_lh=$(readlink -f "$_rs_dst" 2>/dev/null) || _rs_lh=""
+        _rs_lr=$(_rs_posix_path "$_rs_lh")
+        _rs_ld=$(_rs_devino "$_rs_lh" 2>/dev/null) || _rs_ld=""
+        if [ "$_rs_lr" != "$_rs_od" ] || [ "$_rs_ld" != "$_rs_oc" ]; then
+          bad "conflict: target of $_rs_op changed after the snapshot - refusing to restore through it"
+          _rr=1
+          continue
+        fi
+        chmod "$_rs_oa" "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: chmod $_rs_oa failed for symlinked directory $_rs_op"; _rr=1; }
+        ;;
+      dir)
+        if [ -L "$_rs_dst" ]; then
+          bad "conflict: $_rs_op is a symlink to a directory - refusing to restore through it"
+          _rr=1
+          continue
+        fi
+        if [ -e "$_rs_dst" ] && [ ! -d "$_rs_dst" ]; then
+          bad "rollback: $_rs_op is not a directory any more - refusing to replace"
+          _rr=1
+          continue
+        fi
+        mkdir -p "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: cannot recreate directory $_rs_op"; _rr=1; continue; }
+        chmod "$_rs_oa" "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: chmod $_rs_oa failed for directory $_rs_op"; _rr=1; }
+        ;;
+      absent)
+        if [ -d "$_rs_dst" ] && [ ! -L "$_rs_dst" ]; then
+          if [ "$_rs_op" = "/root/geomask-backups" ]; then
+            _rs_left=$(ls -A "$_rs_dst" 2>/dev/null | grep -v '^router-backup-' || true)
+            if [ -z "$_rs_left" ]; then
+              rmdir "$_rs_dst" 2>/dev/null \
+                || { bad "rollback: cannot remove directory $_rs_op"; _rr=1; }
+            else
+              _rs_note "$_rs_op contains non-evidence files - directory kept"
+            fi
+          else
+            rmdir "$_rs_dst" 2>/dev/null \
+              || { bad "rollback: directory $_rs_op did not exist before the run and is not empty"; _rr=1; }
+          fi
+          continue
+        fi
+        rm -f "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: cannot remove $_rs_op (it did not exist before the run)"; _rr=1; }
+        ;;
+      shared|norestore|norestore-absent)
+        : ;;   # shared files by _rs_restore_shared; NR state is never overwritten
+    esac
+  done < "$_rs_snap/objects"
+  return 0
+}
+
+_rs_prune_temps() { # _rs_prune_temps <dir> - only temp/backup names this transaction created
+  _rs_tl="$_rs_snap/listing"
+  [ -f "$_rs_tl" ] || return 0
+  while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
+    [ -n "${_rs_op:-}" ] || continue
+    case "$_rs_ok" in
+      file|absent|shared|norestore|norestore-absent)
+        if ! _rs_safe_path "$(dirname "$_rs_op")"; then continue; fi
+        for _rs_sfx in ${REINSTALL_TEMP_SUFFIXES:-}; do
+          _rs_cand="$_rs_op$_rs_sfx"
+          [ -e "$(P "$_rs_cand")" ] || continue
+          _rs_in_list "$_rs_snap" "$_rs_cand" && continue
+          rm -f "$(P "$_rs_cand")" 2>/dev/null \
+            || { bad "rollback: cannot remove our temporary $_rs_cand"; _rr=1; }
+        done
+        for _rs_cand in "$(P "$_rs_op")".bak_geomask_* "$(P "$_rs_op")".pre-run-*; do
+          [ -e "$_rs_cand" ] || continue
+          _rs_rel=${_rs_cand#"$GM_PREFIX"}
+          _rs_in_list "$_rs_snap" "$_rs_rel" && continue
+          rm -f "$_rs_cand" 2>/dev/null \
+            || { bad "rollback: cannot remove our backup $_rs_rel"; _rr=1; }
+        done
+        ;;
+    esac
+  done < "$_rs_snap/objects"
+  # UCI config files are not byte objects, so their backups need their own scan:
+  # geo-backend's `network.bak_v6off_*` is created by the IPv6 branch of the run.
+  for _rs_ucp in network dhcp ksmbd firewall; do
+    if ! _rs_safe_path "/etc/config/$_rs_ucp"; then continue; fi
+    for _rs_cand in "$(P "/etc/config/$_rs_ucp")".bak_v6off_*; do
+      [ -e "$_rs_cand" ] || continue
+      _rs_rel=${_rs_cand#"$GM_PREFIX"}
+      _rs_in_list "$_rs_snap" "$_rs_rel" && continue
+      rm -f "$_rs_cand" 2>/dev/null \
+        || { bad "rollback: cannot remove our backup $_rs_rel"; _rr=1; }
     done
   done
-  for _rd in ${REINSTALL_TRACKED_DIRS:-/usr/lib/geomask /etc/mihomo/ruleset}; do
-    for _rf in "$(P "$_rd")"/*; do
-      [ -f "$_rf" ] || continue
-      grep -qxF ".${_rf#"$GM_PREFIX"}" "$_list" || rm -f "$_rf" 2>/dev/null || _rr=1
+  return 0
+}
+
+_rs_restore_shared() { # _rs_restore_shared <dir> - managed subset only, conflicts refuse
+  [ -f "$_rs_snap/shared" ] || return 0
+  while IFS='|' read -r _rs_sc _rs_sp _rs_si _rs_sk _rs_sh _rs_sd _rs_sm; do
+    [ -n "${_rs_sp:-}" ] || continue
+    _rs_sa="$(P "$_rs_sp")"
+    if [ "$_rs_sk" = regular ] && ! _rs_safe_file "$_rs_sp"; then
+      bad "rollback: $_rs_sp is a symlink (byte file; refusing to restore through it)"
+      _rr=1
+      continue
+    fi
+    if [ "$_rs_sk" = absent ]; then
+      # A router without zapret legitimately has no such file: absent -> absent is fine.
+      # Only a file that APPEARED after the snapshot is not restorable (its writer may be us).
+      if [ -e "$_rs_sa" ] || [ -L "$_rs_sa" ]; then
+        bad "rollback: shared object $_rs_sp did not exist before the run and appeared since - not restorable"
+        _rr=1
+      fi
+      continue
+    fi
+    if [ -L "$_rs_sa" ]; then
+      bad "conflict: $_rs_sp is a symlink now - refusing to write through it"
+      _rr=1
+      continue
+    fi
+    if ! _rs_safe_file "$_rs_sp"; then
+      bad "conflict: $_rs_sp is a symlink (byte file) - refusing to write through it"
+      _rr=1
+      continue
+    fi
+    _rs_pre="$_rs_snap/shared.$_rs_si.pre"
+    if [ ! -f "$_rs_sa" ]; then
+      bad "rollback: shared object $_rs_sp disappeared during the run"
+      _rr=1
+      continue
+    fi
+    if [ ! -f "$_rs_pre" ]; then
+      bad "rollback incomplete / recovery required: snapshot lost the managed preimage of $_rs_sp"
+      _rr=1
+      continue
+    fi
+    if [ "$_rs_sc" = dnsai ]; then
+      _rs_nd=$(_rs_devino "$_rs_sa") || _rs_nd=""
+      if [ -n "${_rs_nd:-}" ] && [ "$_rs_nd" != "$_rs_sd" ]; then
+        bad "conflict: $_rs_sp was replaced after the snapshot - not touching it"
+        _rr=1
+        continue
+      fi
+    fi
+    _rs_nh=$(_rs_shared_neutral "$_rs_sc" "$_rs_sa" | _rs_hash_stream) || _rs_nh=""
+    if [ "$_rs_nh" != "$_rs_sh" ]; then
+      bad "conflict: foreign change in $_rs_sp - not overwriting (snapshot kept)"
+      _rr=1
+      continue
+    fi
+    # mktemp, not a predictable name: a planted <file>.rsnew symlink used to redirect the
+    # rebuilt bytes outside the restored file (review 16.11, item 4).
+    _rs_new=$(mktemp "$_rs_sa.rsnew.XXXXXX" 2>/dev/null)
+    if [ -z "${_rs_new:-}" ]; then
+      bad "rollback: cannot create a rebuild temp for $_rs_sp"
+      _rr=1
+      continue
+    fi
+    case "$_rs_sc" in
+      dnsai)
+        awk -v u="$AIDNS_USER" 'index($0, u ":") != 1' "$_rs_sa" > "$_rs_new" 2>/dev/null \
+          || { bad "rollback: cannot rebuild $_rs_sp"; rm -f "$_rs_new"; _rr=1; continue; }
+        cat "$_rs_pre" >> "$_rs_new" 2>/dev/null || true ;;
+      zapret-block)
+        awk -v b='# >>> geomask sync: tunneled domains (generated) >>>' \
+            -v e="# <<< geomask sync: tunneled domains <<<" '
+          $0 == b { skip = 1; next }
+          $0 == e { skip = 0; next }
+          !skip { print }' "$_rs_sa" > "$_rs_new" 2>/dev/null \
+          || { bad "rollback: cannot rebuild $_rs_sp"; rm -f "$_rs_new"; _rr=1; continue; }
+        cat "$_rs_pre" >> "$_rs_new" 2>/dev/null || true ;;
+      zapret-force)
+        awk -v m='# geomask: tunneled, DPI removed' -v pre="$_rs_pre" '
+          BEGIN {
+            while ((getline line < pre) > 0) {
+              st = substr(line, 1, 1); d = substr(line, 3)
+              if (d != "") want[d] = st
+            }
+          }
+          {
+            if (index($0, m) == 1) {
+              d = substr($0, length(m) + 2)
+              if (want[d] == "A") { print d; next }      # managed -> must be active again
+              print; next
+            }
+            if ($0 != "" && $0 !~ /^#/) {
+              if (want[$0] == "M") { print m " " $0; next }  # active -> must be managed again
+            }
+            print
+          }' "$_rs_sa" > "$_rs_new" 2>/dev/null \
+          || { bad "rollback: cannot rebuild $_rs_sp"; rm -f "$_rs_new"; _rr=1; continue; } ;;
+    esac
+    chmod "$_rs_sm" "$_rs_new" 2>/dev/null \
+      || { bad "rollback: chmod $_rs_sm failed for $_rs_sp"; _rr=1; }
+    mv -f "$_rs_new" "$_rs_sa" 2>/dev/null \
+      || { bad "rollback: cannot install the rebuilt $_rs_sp"; rm -f "$_rs_new"; _rr=1; continue; }
+  done < "$_rs_snap/shared"
+  return 0
+}
+
+_rs_restore_uci() { # _rs_restore_uci <dir> - only our keys, only when no foreign delta
+  for _rs_up in network dhcp ksmbd; do
+    if [ -f "$(P "/tmp/.uci/$_rs_up")" ]; then
+      bad "conflict: pending uci delta for $_rs_up appeared after the snapshot - not committing"
+      _rr=1
+      return 1
+    fi
+  done
+  [ -f "$_rs_snap/uci" ] || return 0
+  for _rs_ucf in network dhcp ksmbd; do
+    if ! _rs_safe_path "/etc/config/$_rs_ucf"; then
+      bad "conflict: /etc/config/$_rs_ucf is behind a symlink - refusing uci writes"
+      _rr=1
+      return 1
+    fi
+  done
+  _rs_ty=$(sed -n 's/^uci|network|lanai|@type|//p' "$_rs_snap/uci" 2>/dev/null | head -1)
+  if [ -n "${_rs_ty:-}" ]; then
+    if [ "$_rs_ty" = '<absent>' ]; then
+      if uci -q get network.lanai >/dev/null 2>&1; then
+        _rs_wip=$(uci -q get network.lanai.ipaddr 2>/dev/null)
+        _rs_wdev=$(uci -q get network.lanai.device 2>/dev/null)
+        printf '%s|%s\n' "$_rs_wdev" "$_rs_wip" > "$_rs_snap/alias.was" 2>/dev/null || true
+        uci -q delete network.lanai 2>/dev/null \
+          || { bad "rollback: cannot delete network.lanai"; _rr=1; }
+        if [ -f "$(P "/tmp/.uci/network")" ]; then
+          uci commit network 2>/dev/null \
+            || { bad "rollback: uci commit network failed"; _rr=1; }
+        fi
+      fi
+    else
+      uci set "network.lanai=$_rs_ty" 2>/dev/null \
+        || { bad "rollback: cannot set network.lanai type"; _rr=1; }
+      for _rs_o in proto device ipaddr netmask; do
+        grep -q "^uci|network|lanai|$_rs_o|" "$_rs_snap/uci" 2>/dev/null || continue
+        _rs_v=$(sed -n "s/^uci|network|lanai|$_rs_o|//p" "$_rs_snap/uci" 2>/dev/null | head -1)
+        if [ "$_rs_v" = '<absent>' ]; then
+          uci -q delete "network.lanai.$_rs_o" 2>/dev/null || true
+          continue
+        fi
+        case "$_rs_o" in
+          proto) uci set network.lanai.proto="$_rs_v" 2>/dev/null || _rr=1 ;;
+          device) uci set network.lanai.device="$_rs_v" 2>/dev/null || _rr=1 ;;
+          ipaddr) uci set network.lanai.ipaddr="$_rs_v" 2>/dev/null || _rr=1 ;;
+          netmask) uci set network.lanai.netmask="$_rs_v" 2>/dev/null || _rr=1 ;;
+        esac
+      done
+      if [ -f "$(P "/tmp/.uci/network")" ]; then
+        uci commit network 2>/dev/null \
+          || { bad "rollback: uci commit network failed"; _rr=1; }
+      fi
+    fi
+  fi
+  if grep -q '^uci|network|lan|ip6assign|' "$_rs_snap/uci" 2>/dev/null; then
+    _rs_v=$(sed -n 's/^uci|network|lan|ip6assign|//p' "$_rs_snap/uci" 2>/dev/null | head -1)
+    if [ "$_rs_v" = '<absent>' ]; then
+      uci -q delete network.lan.ip6assign 2>/dev/null || true
+    else
+      uci set network.lan.ip6assign="$_rs_v" 2>/dev/null \
+        || { bad "rollback: cannot restore network.lan.ip6assign"; _rr=1; }
+    fi
+    if [ -f "$(P "/tmp/.uci/network")" ]; then
+      uci commit network 2>/dev/null \
+        || { bad "rollback: uci commit network failed"; _rr=1; }
+    fi
+  fi
+  for _k in ra dhcpv6 ndp; do
+    grep -q "^uci|dhcp|lan|$_k|" "$_rs_snap/uci" 2>/dev/null || continue
+    _rs_v=$(sed -n "s/^uci|dhcp|lan|$_k|//p" "$_rs_snap/uci" 2>/dev/null | head -1)
+    if [ "$_rs_v" = '<absent>' ]; then
+      uci -q delete "dhcp.lan.$_k" 2>/dev/null || true
+    else
+      uci set "dhcp.lan.$_k=$_rs_v" 2>/dev/null \
+        || { bad "rollback: cannot restore dhcp.lan.$_k"; _rr=1; }
+    fi
+  done
+  if [ -f "$(P "/tmp/.uci/dhcp")" ]; then
+    uci commit dhcp 2>/dev/null \
+      || { bad "rollback: uci commit dhcp failed"; _rr=1; }
+  fi
+  # ksmbd: compare the semantic signature first. If nothing changed, leave the sections
+  # (and their anonymous ids) alone; a recreate would reorder/drop owner options.
+  _rs_want_sig=$(_rs_ksmbd_snap_sig)
+  _rs_now_sig=$(_rs_ksmbd_live_sig)
+  if [ "$_rs_want_sig" != "$_rs_now_sig" ]; then
+    _rs_guard=0
+    while [ "$_rs_guard" -lt 50 ]; do
+      _drop=$(_rs_ksmbd_ours geomask-backups | tail -1)
+      [ -n "${_drop:-}" ] || break
+      uci delete "$_drop" 2>/dev/null \
+        || { bad "rollback: cannot delete our ksmbd share section"; _rr=1; break; }
+      _rs_guard=$((_rs_guard+1))
     done
+    _rs_kids=$(sed -n 's/^uci|ksmbd|\(@match[0-9]*\)|@type|share$/\1/p' "$_rs_snap/uci" 2>/dev/null | sort -u)
+    for _rs_kid in $_rs_kids; do
+      _sec=$(uci add ksmbd share 2>/dev/null)
+      if [ -z "${_sec:-}" ]; then
+        bad "rollback: cannot recreate our ksmbd share section"
+        _rr=1
+        continue
+      fi
+      while IFS='|' read -r _rs_uk _rs_ug _rs_um _rs_uo _rs_uv; do
+        [ "$_rs_uk" = uci ] || continue
+        [ "$_rs_ug" = ksmbd ] || continue
+        [ "$_rs_um" = "$_rs_kid" ] || continue
+        [ "$_rs_uo" = "@type" ] && continue
+        uci set "ksmbd.$_sec.$_rs_uo=$_rs_uv" 2>/dev/null \
+          || { bad "rollback: cannot set ksmbd.$_rs_uo"; _rr=1; }
+      done < "$_rs_snap/uci"
+    done
+    if [ -f "$(P "/tmp/.uci/ksmbd")" ]; then
+      uci commit ksmbd 2>/dev/null \
+        || { bad "rollback: uci commit ksmbd failed"; _rr=1; }
+    fi
+  fi
+  return 0
+}
+
+_rs_verify_alias() { # _rs_verify_alias <present|absent> <dev> <ip>
+  [ -n "${1:-}" ] || return 0
+  if [ "$1" = present ]; then
+    [ "$(uci -q get network.lanai.ipaddr 2>/dev/null)" = "$3" ] || return 1
+    [ -n "${2:-}" ] || return 1
+    ip -4 addr show "$2" 2>/dev/null | grep -q " $3/" || return 1
+    return 0
+  fi
+  uci -q get network.lanai >/dev/null 2>&1 && return 1
+  if [ -n "${3:-}" ] && [ -n "${2:-}" ]; then
+    ip -4 addr show "$2" 2>/dev/null | grep -q " $3/" && return 1
+  fi
+  return 0
+}
+
+_rs_restore_network() { # _rs_restore_network <dir> - netifd reload + alias confirmation
+  _rs_aw=""; _rs_adev=""; _rs_aip=""
+  while IFS='|' read -r _rs_nk _rs_nv _rs_nd _rs_ni; do
+    [ "$_rs_nk" = alias ] || continue
+    _rs_aw=$_rs_nv; _rs_adev=$_rs_nd; _rs_aip=$_rs_ni
+  done < "$_rs_snap/net"
+  if [ "$_rs_aw" = absent ] && [ -f "$_rs_snap/alias.was" ]; then
+    IFS='|' read -r _rs_adev _rs_aip < "$_rs_snap/alias.was" || true
+  fi
+  if ! _rs_safe_exec /etc/init.d/network; then
+    bad "conflict: /etc/init.d/network is behind an unsafe or unpinned symlink - refusing to reload network"
+    _rr=1
+    return 1
+  fi
+  initd network reload >/dev/null 2>&1 \
+    || { bad "rollback: network reload failed - interfaces not confirmed"; _rr=1; return 1; }
+  if ! _rs_verify_alias "$_rs_aw" "$_rs_adev" "$_rs_aip"; then
+    _rs_settle
+    initd network reload >/dev/null 2>&1 \
+      || { bad "rollback: network reload failed (second attempt)"; _rr=1; return 1; }
+    _rs_verify_alias "$_rs_aw" "$_rs_adev" "$_rs_aip" \
+      || { bad "rollback: alias/interface state not confirmed"; _rr=1; return 1; }
+  fi
+  return 0
+}
+
+_rs_restore_firewall() { # <dir> - fw4 reload, nft table, our ip rule (pref+table)
+  if ! _rs_safe_exec /etc/init.d/firewall; then
+    bad "conflict: /etc/init.d/firewall is behind an unsafe or unpinned symlink - refusing to reload firewall"
+    _rr=1
+    return 1
+  fi
+  initd firewall reload >/dev/null 2>&1 \
+    || { bad "rollback: firewall reload failed - nft state not applied"; _rr=1; }
+  while IFS='|' read -r _rs_nk _rs_nv; do
+    [ "$_rs_nk" = nft-ai ] || continue
+    [ "$_rs_nv" = absent ] || continue
+    if nft list table inet geomask_ai_dns >/dev/null 2>&1; then
+      nft delete table inet geomask_ai_dns >/dev/null 2>&1 \
+        || { bad "rollback: cannot delete nft table inet geomask_ai_dns"; _rr=1; }
+    fi
+  done < "$_rs_snap/net"
+  while IFS= read -r _rs_nline; do
+    [ -n "$_rs_nline" ] || continue
+    _rs_nk=${_rs_nline%%|*}
+    _rs_nv=${_rs_nline#*|}
+    [ "$_rs_nk" = iprule ] || continue
+    _rs_now=$(_rs_iprule_state) \
+      || { bad "rollback: ip rule state unobservable"; _rr=1; continue; }
+    [ "$_rs_nv" = "$_rs_now" ] && continue
+    # Compare the WHOLE set of rules with our mark. Only the pref AIDNS_RULE_PREF is
+    # ours; every other same-mark rule is foreign and is never modified. A foreign
+    # change is a conflict, not something we silently overwrite.
+    _rs_w_ours=""; _rs_w_for=""
+    _rs_c_ours=""; _rs_c_for=""
+    if [ "$_rs_nv" != absent ]; then
+      for _rs_row in $(printf '%s' "$_rs_nv" | tr ';' ' '); do
+        case "$_rs_row" in
+          *"|ours") _rs_w_ours=$_rs_row ;;
+          *) _rs_w_for="$_rs_w_for$_rs_row;" ;;
+        esac
+      done
+    fi
+    if [ "$_rs_now" != absent ]; then
+      for _rs_row in $(printf '%s' "$_rs_now" | tr ';' ' '); do
+        case "$_rs_row" in
+          *"|ours") _rs_c_ours=$_rs_row ;;
+          *) _rs_c_for="$_rs_c_for$_rs_row;" ;;
+        esac
+      done
+    fi
+    _rs_wp=""; _rs_wt=""
+    if [ -n "$_rs_w_ours" ]; then
+      _rs_wp=${_rs_w_ours%%|*}
+      _rs_wrest=${_rs_w_ours#*|}
+      _rs_wt=${_rs_wrest%%|*}
+    fi
+    _rs_cp=""; _rs_ct=""
+    if [ -n "$_rs_c_ours" ]; then
+      _rs_cp=${_rs_c_ours%%|*}
+      _rs_crest=${_rs_c_ours#*|}
+      _rs_ct=${_rs_crest%%|*}
+    fi
+    if [ -n "$_rs_c_ours" ] && { [ -z "$_rs_w_ours" ] || [ "$_rs_wt" != "$_rs_ct" ]; }; then
+      ip rule del pref "$_rs_cp" fwmark "$AIDNS_MARK" table "$_rs_ct" >/dev/null 2>&1 \
+        || { bad "rollback: cannot remove our ip rule (pref $_rs_cp table $_rs_ct)"; _rr=1; }
+      _rs_c_ours=""
+    fi
+    if [ -n "$_rs_w_ours" ] && [ -z "$_rs_c_ours" ]; then
+      ip rule add pref "$_rs_wp" fwmark "$AIDNS_MARK" table "$_rs_wt" >/dev/null 2>&1 \
+        || { bad "rollback: cannot restore our ip rule (pref $_rs_wp table $_rs_wt)"; _rr=1; }
+    fi
+    if [ "$_rs_w_for" != "$_rs_c_for" ]; then
+      bad "conflict: foreign ip rules with fwmark $AIDNS_MARK changed - not touching them"
+      _rr=1
+    fi
+  done < "$_rs_snap/net"
+  return 0
+}
+
+_rs_restore_sysctl() { # _rs_restore_sysctl <dir> - per-interface values, never a "0" default
+  [ -f "$_rs_snap/sysctl" ] || return 0
+  while IFS='|' read -r _rs_kk _rs_kn _rs_kv; do
+    [ "$_rs_kk" = sysctl ] || continue
+    _rs_kf="$(P "/proc/sys/net/ipv6/conf/$_rs_kn")"
+    if ! _rs_safe_path "/proc/sys/net/ipv6/conf/$_rs_kn"; then
+      bad "conflict: /proc/sys/net/ipv6/conf/$_rs_kn is behind a symlink - not writing sysctl"
+      _rr=1
+      continue
+    fi
+    if [ ! -d "$_rs_kf" ]; then
+      bad "rollback: interface $_rs_kn disappeared - its disable_ipv6 is not restorable"
+      _rr=1
+      continue
+    fi
+    _rs_now=$(cat "$_rs_kf/disable_ipv6" 2>/dev/null | tr -dc '01')
+    [ "$_rs_now" = "$_rs_kv" ] && continue
+    sysctl -w "net.ipv6.conf.$_rs_kn.disable_ipv6=$_rs_kv" >/dev/null 2>&1 \
+      || { bad "rollback: cannot write net.ipv6.conf.$_rs_kn.disable_ipv6"; _rr=1; }
+  done < "$_rs_snap/sysctl"
+  _rs_sf="$(P /etc/sysctl.d/99-disable-ipv6.conf)"
+  if [ -f "$_rs_sf" ]; then
+    if ! _rs_safe_path /etc/sysctl.d/99-disable-ipv6.conf; then
+      bad "conflict: /etc/sysctl.d/99-disable-ipv6.conf is behind a symlink - refusing sysctl -p"
+      _rr=1
+      return 0
+    fi
+    sysctl -p "$_rs_sf" >/dev/null 2>&1 \
+      || { bad "rollback: sysctl -p $_rs_sf failed"; _rr=1; }
+  fi
+  return 0
+}
+
+_rs_restore_links() { # <dir> - exact link names and targets
+  _rs_rd="$(P /etc/rc.d)"
+  if ! _rs_safe_path /etc/rc.d; then
+    bad "conflict: /etc/rc.d is behind a symlink - refusing to write autostart links through it"
+    _rr=1
+    return 1
+  fi
+  if [ ! -d "$_rs_rd" ]; then
+    bad "rollback: rc.d unobservable"
+    _rr=1
+    return 1
+  fi
+  for _rs_l in "$_rs_rd"/[SK][0-9][0-9]*; do
+    [ -L "$_rs_l" ] || continue
+    _rs_n=${_rs_l##*/}
+    _rs_svc=${_rs_n#[SK]}
+    _rs_svc=${_rs_svc#??}
+    _rs_link_owned "$_rs_svc" || continue
+    grep -q "^$_rs_n|" "$_rs_snap/links" 2>/dev/null && continue
+    rm -f "$_rs_l" 2>/dev/null \
+      || { bad "rollback: cannot remove the autostart link $_rs_n created by the run"; _rr=1; }
   done
-  # Tracked paths that did not exist before must not survive the rollback either.
-  if [ -f "$1/absent" ]; then
-    while IFS= read -r _ra; do
-      [ -n "$_ra" ] || continue
-      [ -e "$(P "$_ra")" ] && { rm -f "$(P "$_ra")" 2>/dev/null || _rr=1; }
-    done < "$1/absent"
+  while IFS='|' read -r _rs_n _rs_t; do
+    [ -n "${_rs_n:-}" ] || continue
+    _rs_l="$_rs_rd/$_rs_n"
+    if [ -L "$_rs_l" ] && [ "$(readlink "$_rs_l" 2>/dev/null)" = "$_rs_t" ]; then
+      continue
+    fi
+    rm -f "$_rs_l" 2>/dev/null \
+      || { bad "rollback: cannot replace the autostart link $_rs_n"; _rr=1; continue; }
+    ln -s "$_rs_t" "$_rs_l" 2>/dev/null \
+      || { bad "rollback: cannot recreate the autostart link $_rs_n -> $_rs_t"; _rr=1; }
+  done < "$_rs_snap/links"
+  return 0
+}
+
+_rs_restore_services() { # _rs_restore_services <dir> - back to the recorded running state
+  [ -f "$_rs_snap/services" ] || return 0
+  while IFS='|' read -r _rs_id _rs_initd _rs_pid _rs_mode _rs_en _rs_run; do
+    [ -n "${_rs_id:-}" ] || continue
+    _rs_now=$(_rs_svc_running "$_rs_pid" "$_rs_mode")
+    case "$_rs_run" in
+      1)
+        if [ "$_rs_now" != 1 ]; then
+          _rs_start_service "$_rs_initd" \
+            || { bad "rollback: cannot start $_rs_id (it was running before the run)"; _rr=1; }
+        fi ;;
+      0)
+        if [ "$_rs_now" = 1 ]; then
+          _rs_stop_service "$_rs_initd" \
+            || { bad "rollback: cannot stop $_rs_id (it was stopped before the run)"; _rr=1; }
+        fi ;;
+      *)
+        bad "rollback: snapshot recorded an unknown running state for $_rs_id"
+        _rr=1 ;;
+    esac
+  done < "$_rs_snap/services"
+  return 0
+}
+
+_rs_restore_cron() { # _rs_restore_cron <dir> - exact crontab, foreign lines are a conflict
+  _rs_cur=$(crontab -l 2>/dev/null)
+  _rs_cr=$?
+  case "$_rs_cr" in
+    0|1) : ;;
+    *) bad "rollback: crontab state unobservable (rc=$_rs_cr)"; _rr=1; return 1 ;;
+  esac
+  _rs_want=$(cat "$_rs_snap/cron" 2>/dev/null)
+  _rs_re='# geomask-(guard|ytwatch|ytwatch-reset|doctor-prune|vpnwatch|nodescan|audit-schedule)|sync_mtrickle_mihomo|geomask-node-scan'
+  _rs_p1=$(printf '%s\n' "$_rs_cur" | grep -vE "$_rs_re" 2>/dev/null)
+  _rs_p2=$(printf '%s\n' "$_rs_want" | grep -vE "$_rs_re" 2>/dev/null)
+  if [ "$_rs_p1" != "$_rs_p2" ]; then
+    bad "conflict: crontab changed by another writer after the snapshot - not overwriting"
+    _rr=1
+    return 1
   fi
-  # cron: always restored, including the empty state (the old `-s` test skipped it)
-  if [ -f "$1/crontab" ]; then crontab "$1/crontab" 2>/dev/null || _rr=1; fi
-  # autostart links: recreate exactly what existed, drop what appeared during the failed run
-  for _rl in "$(P /etc/rc.d)"/*geomask*; do
-    [ -e "$_rl" ] || continue
-    grep -qxF "${_rl#"$GM_PREFIX"}" "$1/rc.d" 2>/dev/null || rm -f "$_rl" 2>/dev/null || _rr=1
+  crontab "$_rs_snap/cron" 2>/dev/null \
+    || { bad "rollback: crontab write failed"; _rr=1; return 1; }
+  _rs_after=$(crontab -l 2>/dev/null)
+  if [ "$_rs_after" != "$_rs_want" ]; then
+    bad "rollback: crontab did not verify (silent write failure?)"
+    _rr=1
+    return 1
+  fi
+  return 0
+}
+
+_rs_verify_files() { # _rs_verify_files <dir>
+  [ -f "$_rs_snap/objects" ] || return 1
+  _rs_vr=0
+  while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
+    [ -n "${_rs_op:-}" ] || continue
+    _rs_dst="$(P "$_rs_op")"
+    case "$_rs_ok" in
+      file)
+        if ! _rs_safe_file "$_rs_op"; then
+          bad "verify: $_rs_op is a symlink (byte object)"
+          _rs_vr=1
+          continue
+        fi ;;
+      dir|dirlink)
+        if ! _rs_safe_path "$_rs_op"; then
+          bad "verify: $_rs_op (or a parent) is an unsafe or unpinned symlink"
+          _rs_vr=1
+          continue
+        fi ;;
+      absent)
+        if ! _rs_safe_path "$(dirname "$_rs_op")"; then
+          bad "verify: a path component of $_rs_op is an unsafe or unpinned symlink"
+          _rs_vr=1
+          continue
+        fi ;;
+    esac
+    case "$_rs_ok" in
+      file)
+        if [ ! -f "$_rs_snap/files$_rs_op" ]; then
+          bad "verify: no snapshot copy of $_rs_op"
+          _rs_vr=1
+          continue
+        fi
+        if [ -L "$_rs_dst" ]; then
+          bad "verify: $_rs_op is a symlink, expected the restored regular file"
+          _rs_vr=1
+          continue
+        fi
+        if ! cmp -s "$_rs_snap/files$_rs_op" "$_rs_dst" 2>/dev/null; then
+          bad "verify: $_rs_op does not match the snapshot bytes"
+          _rs_vr=1
+        fi
+        _rs_nowm=$(_rs_mode "$_rs_dst" 2>/dev/null) || _rs_nowm=""
+        if [ "$_rs_nowm" != "$_rs_oa" ]; then
+          bad "verify: mode of $_rs_op is ${_rs_nowm:-unknown}, expected $_rs_oa"
+          _rs_vr=1
+        fi ;;
+      dirlink)
+        if [ ! -L "$_rs_dst" ] || [ ! -d "$_rs_dst" ]; then
+          bad "verify: $_rs_op is not the pinned symlinked directory"
+          _rs_vr=1
+        else
+          _rs_lh=$(readlink -f "$_rs_dst" 2>/dev/null) || _rs_lh=""
+          _rs_lr=$(_rs_posix_path "$_rs_lh")
+          _rs_ld=$(_rs_devino "$_rs_lh" 2>/dev/null) || _rs_ld=""
+          if [ "$_rs_lr" != "$_rs_od" ] || [ "$_rs_ld" != "$_rs_oc" ]; then
+            bad "verify: target of $_rs_op changed after the snapshot"
+            _rs_vr=1
+          fi
+        fi ;;
+      dir)
+        if [ -L "$_rs_dst" ]; then
+          bad "verify: $_rs_op is a symlink, expected the restored directory"
+          _rs_vr=1
+        elif [ ! -d "$_rs_dst" ]; then
+          bad "verify: directory $_rs_op is missing"
+          _rs_vr=1
+        fi ;;
+      absent)
+        if [ -e "$_rs_dst" ] || [ -L "$_rs_dst" ]; then
+          bad "verify: $_rs_op did not exist before the run but is still present"
+          _rs_vr=1
+        fi ;;
+      norestore)
+        if [ ! -f "$_rs_dst" ]; then
+          bad "verify: NR object $_rs_op disappeared during the run - not restorable"
+          _rs_vr=1
+        else
+          _rs_nowh=$(_rs_hash "$_rs_dst" 2>/dev/null) || _rs_nowh=""
+          if [ "$_rs_nowh" != "$_rs_oe" ]; then
+            bad "verify: NR state $_rs_op was rewritten by its owner and cannot be restored (MagiTrickle state changed) - rollback incomplete"
+            _rs_vr=1
+          fi
+        fi ;;
+      norestore-absent)
+        if [ -e "$_rs_dst" ] || [ -L "$_rs_dst" ]; then
+          bad "verify: NR object $_rs_op did not exist before the run; it was created by the seeder and is not restorable"
+          _rs_vr=1
+        fi ;;
+    esac
+  done < "$_rs_snap/objects"
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_shared() { # _rs_verify_shared <dir>
+  [ -f "$_rs_snap/shared" ] || return 0
+  _rs_vr=0
+  while IFS='|' read -r _rs_sc _rs_sp _rs_si _rs_sk _rs_sh _rs_sd _rs_sm; do
+    [ -n "${_rs_sp:-}" ] || continue
+    _rs_sa="$(P "$_rs_sp")"
+    if [ "$_rs_sk" = absent ]; then
+      if ! _rs_safe_path "$(dirname "$_rs_sp")"; then
+        bad "verify: a path component of $_rs_sp is an unsafe or unpinned symlink"
+        _rs_vr=1
+        continue
+      fi
+      if [ -e "$_rs_sa" ] || [ -L "$_rs_sa" ]; then
+        bad "verify: $_rs_sp did not exist before the run but is present now"
+        _rs_vr=1
+      fi
+      continue
+    fi
+    if ! _rs_safe_file "$_rs_sp"; then
+      bad "verify: $_rs_sp is a symlink or an unsafe/unpinned path"
+      _rs_vr=1
+      continue
+    fi
+    if [ -L "$_rs_sa" ]; then
+      bad "verify: $_rs_sp is a symlink"
+      _rs_vr=1
+      continue
+    fi
+    _rs_pre="$_rs_snap/shared.$_rs_si.pre"
+    if [ ! -f "$_rs_pre" ]; then
+      bad "verify: snapshot lost the managed preimage of $_rs_sp"
+      _rs_vr=1
+      continue
+    fi
+    _rs_nh=$(_rs_shared_neutral "$_rs_sc" "$_rs_sa" 2>/dev/null | _rs_hash_stream) || _rs_nh=""
+    if [ "$_rs_nh" != "$_rs_sh" ]; then
+      bad "verify: foreign part of $_rs_sp differs from the snapshot"
+      _rs_vr=1
+    fi
+    _rs_nowm=$(_rs_mode "$_rs_sa" 2>/dev/null) || _rs_nowm=""
+    if [ "$_rs_nowm" != "$_rs_sm" ]; then
+      bad "verify: mode of $_rs_sp is ${_rs_nowm:-unknown}, expected $_rs_sm"
+      _rs_vr=1
+    fi
+    case "$_rs_sc" in
+      dnsai)
+        _rs_got=$(grep -E "^$AIDNS_USER:" "$_rs_sa" 2>/dev/null | sort)
+        _rs_exp=$(sort "$_rs_pre" 2>/dev/null)
+        if [ "$_rs_got" != "$_rs_exp" ]; then
+          bad "verify: $AIDNS_USER lines in $_rs_sp do not match the snapshot"
+          _rs_vr=1
+        fi ;;
+      zapret-block)
+        _rs_got=$(awk -v b='# >>> geomask sync: tunneled domains (generated) >>>' \
+                     -v e="# <<< geomask sync: tunneled domains <<<" '
+          $0 == b { inb = 1 }
+          inb { print }
+          $0 == e { inb = 0 }' "$_rs_sa" 2>/dev/null | sort)
+        _rs_exp=$(sort "$_rs_pre" 2>/dev/null)
+        if [ "$_rs_got" != "$_rs_exp" ]; then
+          bad "verify: managed block of $_rs_sp does not match the snapshot"
+          _rs_vr=1
+        fi ;;
+      zapret-force)
+        if ! awk -v m='# geomask: tunneled, DPI removed' -v pre="$_rs_pre" '
+             BEGIN {
+               while ((getline line < pre) > 0) {
+                 st = substr(line, 1, 1); d = substr(line, 3)
+                 if (d != "") want[d] = st
+               }
+             }
+             {
+               if (index($0, m) == 1) {
+                 d = substr($0, length(m) + 2)
+                 if (want[d] == "A") exit 1
+                 seenM[d] = 1; next
+               }
+               if ($0 != "" && $0 !~ /^#/) {
+                 if (want[$0] == "M") exit 1
+                 seenA[$0] = 1
+               }
+             }
+             END {
+               for (d in want) {
+                 if (want[d] == "A" && !(d in seenA)) exit 1
+                 if (want[d] == "M" && !(d in seenM)) exit 1
+               }
+             }' "$_rs_sa" 2>/dev/null; then
+          bad "verify: per-domain state of $_rs_sp does not match the snapshot"
+          _rs_vr=1
+        fi ;;
+    esac
+  done < "$_rs_snap/shared"
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_uci() { # _rs_verify_uci <dir>
+  [ -f "$_rs_snap/uci" ] || return 0
+  _rs_vr=0
+  for _rs_up in network dhcp ksmbd; do
+    if [ -f "$(P "/tmp/.uci/$_rs_up")" ]; then
+      bad "verify: uci delta for $_rs_up is still pending - commit did not apply"
+      _rs_vr=1
+    fi
   done
-  if [ -s "$1/rc.d" ]; then
-    while IFS= read -r _rl; do
-      [ -n "$_rl" ] || continue
-      mkdir -p "$(dirname "$(P "$_rl")")" 2>/dev/null || { _rr=1; continue; }
-      # the target is the init script behind a [SK]NN prefix, whatever the prefix is
-      _rb=${_rl##*/}
-      _rb=${_rb#S}; _rb=${_rb#K}
-      _rb=$(printf '%s' "$_rb" | sed 's/^[0-9][0-9]//')
-      # A filesystem without symlink support (or a copy fallback) may still produce the entry:
-      # what matters is that the autostart entry exists again.
-      ln -sf "../init.d/$_rb" "$(P "$_rl")" 2>/dev/null \
-        || { [ -e "$(P "$_rl")" ] || _rr=1; }
-    done < "$1/rc.d"
+  for _rs_ucf in network dhcp ksmbd; do
+    if ! _rs_safe_path "/etc/config/$_rs_ucf"; then
+      bad "verify: /etc/config/$_rs_ucf is behind a symlink - uci values not readable safely"
+      return 1
+    fi
+  done
+  while IFS='|' read -r _rs_uk _rs_pkg _rs_sec _rs_opt _rs_val; do
+    [ "$_rs_uk" = uci ] || continue
+    case "$_rs_sec" in
+      @*) continue ;;   # @none / @matchN are journal markers, not live section names
+    esac
+    case "$_rs_opt" in
+      @type)
+        if [ "$_rs_val" = '<absent>' ]; then
+          if uci -q get "$_rs_pkg.$_rs_sec" >/dev/null 2>&1; then
+            bad "verify: $_rs_pkg.$_rs_sec did not exist before the run but is present"
+            _rs_vr=1
+          fi
+        else
+          _rs_got=$(uci -q get "$_rs_pkg.$_rs_sec" 2>/dev/null)
+          if [ "$_rs_got" != "$_rs_val" ]; then
+            bad "verify: type of $_rs_pkg.$_rs_sec is ${_rs_got:-missing}, expected $_rs_val"
+            _rs_vr=1
+          fi
+        fi ;;
+      *)
+        _rs_got=$(uci -q get "$_rs_pkg.$_rs_sec.$_rs_opt" 2>/dev/null)
+        _rs_grc=$?
+        if [ "$_rs_val" = '<absent>' ]; then
+          if [ "$_rs_grc" = 0 ]; then
+            bad "verify: $_rs_pkg.$_rs_sec.$_rs_opt did not exist before the run but is present"
+            _rs_vr=1
+          fi
+        elif [ "$_rs_got" != "$_rs_val" ]; then
+          bad "verify: $_rs_pkg.$_rs_sec.$_rs_opt is ${_rs_got:-missing}, expected $_rs_val"
+          _rs_vr=1
+        fi ;;
+    esac
+  done < "$_rs_snap/uci"
+  # ksmbd: sections are compared by their full option set (ids are not stable and the
+  # preimage now includes force_root and every other option the owner had).
+  _rs_want_sig=$(_rs_ksmbd_snap_sig)
+  _rs_now_sig=$(_rs_ksmbd_live_sig)
+  if [ "$_rs_want_sig" != "$_rs_now_sig" ]; then
+    bad "verify: ksmbd share 'geomask-backups' does not match the snapshot"
+    _rs_vr=1
   fi
-  # a restored init script is not running by itself: bring back what was enabled before
-  if [ -s "$1/rc.d" ] && [ -f "$(P /etc/init.d/geomask-syncd)" ] \
-     && grep -q 'geomask-syncd' "$1/rc.d" 2>/dev/null; then
-    initd geomask-syncd start >/dev/null 2>&1 || _rr=1
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_sysctl() { # _rs_verify_sysctl <dir>
+  [ -f "$_rs_snap/sysctl" ] || return 0
+  _rs_vr=0
+  while IFS='|' read -r _rs_kk _rs_kn _rs_kv; do
+    [ "$_rs_kk" = sysctl ] || continue
+    _rs_kf="$(P "/proc/sys/net/ipv6/conf/$_rs_kn")"
+    if ! _rs_safe_path "/proc/sys/net/ipv6/conf/$_rs_kn"; then
+      bad "verify: /proc/sys/net/ipv6/conf/$_rs_kn is an unsafe or unpinned symlink"
+      _rs_vr=1
+      continue
+    fi
+    if [ ! -d "$_rs_kf" ]; then
+      bad "verify: interface $_rs_kn is gone"
+      _rs_vr=1
+      continue
+    fi
+    _rs_now=$(cat "$_rs_kf/disable_ipv6" 2>/dev/null | tr -dc '01')
+    if [ "$_rs_now" != "$_rs_kv" ]; then
+      bad "verify: net.ipv6.conf.$_rs_kn.disable_ipv6 is ${_rs_now:-unreadable}, expected $_rs_kv"
+      _rs_vr=1
+    fi
+  done < "$_rs_snap/sysctl"
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_nft_norm() { # <src> <dst> - canonical nft semantics (list or script form), counters ignored
+  _rs_nft_out=$2
+  _rs_nft_txt=$(awk '
+    function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    function norm(s) {
+      sub(/\r/, "", s)
+      gsub(/counter packets [0-9]+ bytes [0-9]+/, "counter", s)
+      gsub(/packets [0-9]+ bytes [0-9]+/, "", s)
+      gsub(/[ \t]+/, " ", s)
+      sub(/^ /, "", s); sub(/ $/, "", s)
+      gsub(/[ \t]*[{][ \t]*/, "{", s)
+      gsub(/[ \t]*[}][ \t]*/, "}", s)
+      gsub(/[ \t]*,[ \t]*/, ",", s)
+      gsub(/[ \t]*;[ \t]*/, ";", s)
+      sub(/;$/, "", s)
+      return s
+    }
+    function addattrs(f, t, c, s,   n, a, i, part, sp, k, v) {
+      n = split(s, a, ";")
+      for (i = 1; i <= n; i++) {
+        part = trim(a[i])
+        if (part == "") continue
+        sp = index(part, " ")
+        if (sp > 0) { k = substr(part, 1, sp - 1); v = trim(substr(part, sp + 1)) }
+        else { k = part; v = "" }
+        attrs[f SUBSEP t SUBSEP c SUBSEP k] = v
+      }
+    }
+    function clear_all(   k, n, ks, i) {
+      n = 0; for (k in tables) ks[++n] = k
+      for (i = 1; i <= n; i++) delete tables[ks[i]]
+      n = 0; for (k in chains) ks[++n] = k
+      for (i = 1; i <= n; i++) delete chains[ks[i]]
+      n = 0; for (k in attrs) ks[++n] = k
+      for (i = 1; i <= n; i++) delete attrs[ks[i]]
+      n = 0; for (k in rules) ks[++n] = k
+      for (i = 1; i <= n; i++) delete rules[ks[i]]
+      n = 0; for (k in rcount) ks[++n] = k
+      for (i = 1; i <= n; i++) delete rcount[ks[i]]
+    }
+    function clear_pref(pref,   k, n, ks, i) {
+      n = 0; for (k in chains) if (index(k, pref) == 1) ks[++n] = k
+      for (i = 1; i <= n; i++) delete chains[ks[i]]
+      n = 0; for (k in attrs) if (index(k, pref) == 1) ks[++n] = k
+      for (i = 1; i <= n; i++) delete attrs[ks[i]]
+      n = 0; for (k in rules) if (index(k, pref) == 1) ks[++n] = k
+      for (i = 1; i <= n; i++) delete rules[ks[i]]
+      n = 0; for (k in rcount) if (index(k, pref) == 1) ks[++n] = k
+      for (i = 1; i <= n; i++) delete rcount[ks[i]]
+    }
+    function add_rule(f, t, c, e,   key) {
+      tables[f SUBSEP t] = 1
+      chains[f SUBSEP t SUBSEP c] = 1
+      key = f SUBSEP t SUBSEP c
+      rcount[key]++
+      rules[key SUBSEP sprintf("%05d", rcount[key])] = norm(e)
+    }
+    BEGIN { format = ""; ldepth = 0; lfam = ""; ltab = ""; lchain = ""; lattr = "" }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      s = trim(line)
+      if (s == "" || s ~ /^#/) next
+      if (format == "") {
+        if (s ~ /^table[ \t]+[^ \t]+[ \t]+[^ \t{]+[ \t]+[{]/) format = "list"
+        else if (s ~ /^(add|flush|delete|insert)[ \t]/) format = "script"
+        else format = "raw"
+      }
+      if (format == "list") {
+        if (s ~ /^table[ \t]/) {
+          n = split(s, a, /[ \t]+/)
+          lfam = a[2]; ltab = a[3]; sub(/[{;].*/, "", ltab)
+          tables[lfam SUBSEP ltab] = 1
+          ldepth = 1; lchain = ""; lattr = ""
+          next
+        }
+        if (s ~ /^chain[ \t]/) {
+          n = split(s, a, /[ \t]+/)
+          lchain = a[2]; sub(/[{;].*/, "", lchain)
+          chains[lfam SUBSEP ltab SUBSEP lchain] = 1
+          ldepth = 2; lattr = ""
+          next
+        }
+        if (s == "}") {
+          if (ldepth >= 2) {
+            if (lchain != "") { if (lattr != "") addattrs(lfam, ltab, lchain, lattr); lchain = "" }
+            ldepth--
+          } else if (ldepth == 1) { ldepth = 0 }
+          next
+        }
+        if (ldepth == 1) {
+          if (s ~ /^(set|map|flowtable|element|elements|counter|quota)[ \t]/) ldepth = 2
+          print "raw|" lfam "|" ltab "|" norm(s)
+          next
+        }
+        if (ldepth == 2 && lchain != "") {
+          if (s ~ /^(type|policy|device|comment)[ \t]/) { lattr = lattr (lattr == "" ? "" : " ") s; next }
+          add_rule(lfam, ltab, lchain, s)
+          next
+        }
+        print "raw|" norm(s)
+        next
+      }
+      if (format == "script") {
+        n = split(s, a, /[ \t]+/)
+        if (a[1] == "flush" && a[2] == "ruleset") { clear_all(); next }
+        if (a[1] == "flush" && a[2] == "table") {
+          fam = a[3]; tab = a[4]; sub(/[;].*/, "", tab)
+          clear_pref(fam SUBSEP tab SUBSEP)
+          tables[fam SUBSEP tab] = 1
+          next
+        }
+        if (a[1] == "delete" && a[2] == "table") {
+          fam = a[3]; tab = a[4]; sub(/[;].*/, "", tab)
+          clear_pref(fam SUBSEP tab SUBSEP)
+          delete tables[fam SUBSEP tab]
+          next
+        }
+        if (a[1] == "delete" && a[2] == "chain") {
+          fam = a[3]; tab = a[4]; name = a[5]; sub(/[;{].*/, "", name)
+          clear_pref(fam SUBSEP tab SUBSEP name SUBSEP)
+          delete chains[fam SUBSEP tab SUBSEP name]
+          next
+        }
+        if (a[1] == "add" && a[2] == "table") {
+          fam = a[3]; tab = a[4]; sub(/[;].*/, "", tab)
+          tables[fam SUBSEP tab] = 1
+          next
+        }
+        if (a[1] == "add" && a[2] == "chain") {
+          fam = a[3]; tab = a[4]; name = a[5]; sub(/[;{].*/, "", name)
+          chains[fam SUBSEP tab SUBSEP name] = 1
+          if (index(s, "{") > 0) {
+            rest = substr(s, index(s, "{") + 1)
+            sub(/[}].*/, "", rest)
+            addattrs(fam, tab, name, rest)
+          }
+          next
+        }
+        if (a[1] == "add" && a[2] == "rule") {
+          fam = a[3]; tab = a[4]; name = a[5]
+          rest = s
+          sub(/^[a-z]+[ \t]+rule[ \t]+[^ \t]+[ \t]+[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", rest)
+          add_rule(fam, tab, name, rest)
+          next
+        }
+        print "raw|" norm(s)
+        next
+      }
+      print "raw|" norm(s)
+    }
+    END {
+      for (k in tables) { split(k, p, SUBSEP); print "table|" p[1] "|" p[2] }
+      for (k in chains) { split(k, p, SUBSEP); print "chain|" p[1] "|" p[2] "|" p[3] }
+      for (k in attrs) { split(k, p, SUBSEP); print "attr|" p[1] "|" p[2] "|" p[3] "|" p[4] "|" attrs[k] }
+      for (k in rules) { split(k, p, SUBSEP); print "rule|" p[1] "|" p[2] "|" p[3] "|" p[4] "|" rules[k] }
+    }
+  ' "$1" 2>/dev/null) || return 1
+  printf '%s\n' "$_rs_nft_txt" | LC_ALL=C sort > "$_rs_nft_out" 2>/dev/null || return 1
+}
+
+_rs_verify_net() { # _rs_verify_net <dir>
+  [ -f "$_rs_snap/net" ] || return 0
+  _rs_vr=0
+  _rs_aw=""; _rs_adev=""; _rs_aip=""
+  while IFS= read -r _rs_nline; do
+    [ -n "$_rs_nline" ] || continue
+    _rs_nk=${_rs_nline%%|*}
+    _rs_nrest=${_rs_nline#*|}
+    case "$_rs_nk" in
+      iprule)
+        _rs_now=$(_rs_iprule_state)
+        if [ "$_rs_now" != "$_rs_nrest" ]; then
+          bad "verify: ip rule state is ${_rs_now:-unobservable}, expected $_rs_nrest"
+          _rs_vr=1
+        fi ;;
+      nft-ai)
+        _rs_nv=${_rs_nrest%%|*}
+        if [ "$_rs_nv" = present ]; then
+          if nft list table inet geomask_ai_dns > "$_rs_snap/nft-ai.now" 2>/dev/null; then
+            _rs_nft_norm "$_rs_snap/nft-ai.list" "$_rs_snap/nft-ai.list.norm" \
+              && _rs_nft_norm "$_rs_snap/nft-ai.now" "$_rs_snap/nft-ai.now.norm" \
+              && cmp -s "$_rs_snap/nft-ai.list.norm" "$_rs_snap/nft-ai.now.norm" \
+              || { bad "verify: nft table inet geomask_ai_dns structure differs from the snapshot"; _rs_vr=1; }
+          else
+            bad "verify: nft table inet geomask_ai_dns is missing"
+            _rs_vr=1
+          fi
+        else
+          if nft list table inet geomask_ai_dns >/dev/null 2>&1; then
+            bad "verify: nft table inet geomask_ai_dns should be absent"
+            _rs_vr=1
+          fi
+        fi ;;
+      nft-v6)
+        _rs_nv=${_rs_nrest%%|*}
+        if [ "$_rs_nv" = present ]; then
+          if nft list chain inet fw4 geomask_no_v6 > "$_rs_snap/nft-v6.now" 2>/dev/null; then
+            _rs_nft_norm "$_rs_snap/nft-v6.list" "$_rs_snap/nft-v6.list.norm" \
+              && _rs_nft_norm "$_rs_snap/nft-v6.now" "$_rs_snap/nft-v6.now.norm" \
+              && cmp -s "$_rs_snap/nft-v6.list.norm" "$_rs_snap/nft-v6.now.norm" \
+              || { bad "verify: nft chain inet fw4 geomask_no_v6 structure differs from the snapshot"; _rs_vr=1; }
+          else
+            bad "verify: nft chain inet fw4 geomask_no_v6 is missing"
+            _rs_vr=1
+          fi
+        else
+          if nft list chain inet fw4 geomask_no_v6 >/dev/null 2>&1; then
+            bad "verify: nft chain inet fw4 geomask_no_v6 should be absent"
+            _rs_vr=1
+          fi
+        fi ;;
+      alias)
+        _rs_aw=${_rs_nrest%%|*}
+        _rs_atmp=${_rs_nrest#*|}
+        _rs_adev=${_rs_atmp%%|*}; _rs_aip=${_rs_atmp#*|}
+        [ "$_rs_aip" = "$_rs_atmp" ] && _rs_aip="" ;;
+    esac
+  done < "$_rs_snap/net"
+  if [ "$_rs_aw" = absent ] && [ -f "$_rs_snap/alias.was" ]; then
+    IFS='|' read -r _rs_adev _rs_aip < "$_rs_snap/alias.was" || true
   fi
-  initd rpcd reload >/dev/null 2>&1 || true
-  # Keep the snapshot when anything is still missing: it is the only copy of the old state.
-  [ "$_rr" = 0 ] && rm -rf "$1"
+  if ! _rs_verify_alias "$_rs_aw" "$_rs_adev" "$_rs_aip"; then
+    bad "verify: alias/interface state does not match the snapshot"
+    _rs_vr=1
+  fi
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_runtime() { # _rs_verify_runtime <dir> - enabled AND running for every service
+  [ -f "$_rs_snap/services" ] || return 0
+  _rs_vr=0
+  if ! _rs_safe_path /etc/rc.d || ! _rs_safe_path /etc/init.d; then
+    bad "verify: /etc/rc.d or /etc/init.d is behind a symlink - runtime state unreadable safely"
+    return 1
+  fi
+  while IFS='|' read -r _rs_id _rs_initd _rs_pid _rs_mode _rs_en _rs_run; do
+    [ -n "${_rs_id:-}" ] || continue
+    for _rs_is in $(printf '%s' "$_rs_initd" | tr '/' ' '); do
+      if ! _rs_safe_exec "/etc/init.d/$_rs_is"; then
+        bad "verify: init script /etc/init.d/$_rs_is is behind an unsafe or unpinned symlink"
+        _rs_vr=1
+      fi
+    done
+    _rs_now_en=$(_rs_svc_enabled "$_rs_initd")
+    _rs_now_run=$(_rs_svc_running "$_rs_pid" "$_rs_mode")
+    if [ "$_rs_now_en" != "$_rs_en" ]; then
+      bad "verify: $_rs_id enabled=$_rs_now_en, expected $_rs_en"
+      _rs_vr=1
+    fi
+    if [ "$_rs_now_run" != "$_rs_run" ]; then
+      bad "verify: $_rs_id running=$_rs_now_run, expected $_rs_run"
+      _rs_vr=1
+    fi
+  done < "$_rs_snap/services"
+  if [ -f "$_rs_snap/links" ]; then
+    while IFS='|' read -r _rs_n _rs_t; do
+      [ -n "${_rs_n:-}" ] || continue
+      _rs_l="$(P "/etc/rc.d/$_rs_n")"
+      if [ ! -L "$_rs_l" ] || [ "$(readlink "$_rs_l" 2>/dev/null)" != "$_rs_t" ]; then
+        bad "verify: autostart link $_rs_n -> $_rs_t is missing or has another target"
+        _rs_vr=1
+      fi
+    done < "$_rs_snap/links"
+  fi
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_cron() { # _rs_verify_cron <dir>
+  _rs_want=$(cat "$_rs_snap/cron" 2>/dev/null)
+  _rs_now=$(crontab -l 2>/dev/null)
+  if [ "$_rs_now" != "$_rs_want" ]; then
+    bad "verify: crontab does not match the snapshot"
+    return 1
+  fi
+  return 0
+}
+
+_rs_nr_notes() { # _rs_nr_notes <dir> - honest NR list (they are not restored by design)
+  _rs_note "MagiTrickle state is owned by magitrickled (NR): it is not overwritten, and a change makes the rollback incomplete"
+  _rs_note "mihomo provider cache and the controller API refresh are network effects (not files)"
+  _rs_note "network/firewall reload effects are verified as live state, not restored as files"
+  _rs_note "witness logs (geo-sync.log, node-audit events/pools/reports) and /tmp transients are kept"
+  return 0
+}
+
+_rs_restore_verify() { # _rs_restore_verify <dir> - the rollback is not trusted, it is verified
+  _rs_vok=0
+  _rs_verify_files || { _rs_vok=1; bad "rollback verification failed: file objects"; }
+  _rs_verify_shared || { _rs_vok=1; bad "rollback verification failed: shared files"; }
+  _rs_verify_uci || { _rs_vok=1; bad "rollback verification failed: uci keys"; }
+  _rs_verify_sysctl || { _rs_vok=1; bad "rollback verification failed: sysctl"; }
+  _rs_verify_net || { _rs_vok=1; bad "rollback verification failed: net runtime"; }
+  _rs_verify_runtime || { _rs_vok=1; bad "rollback verification failed: services/links"; }
+  _rs_verify_cron || { _rs_vok=1; bad "rollback verification failed: crontab"; }
+  if [ "$_rs_vok" != 0 ]; then
+    bad "rollback verification failed: the restored state could not be confirmed"
+    return 1
+  fi
+  return 0
+}
+
+_reinstall_restore() { # _reinstall_restore <dir> -> 0 only when the restored state is verified
+  _rs_snap="$1"
+  _rs_pin_mode=0
+  _rs_pin_enforce=1
+  _rr=0
+  _rs_check_snapshot "$_rs_snap" || return 1
+  if ! _rs_critical_paths_safe; then
+    bad "rollback incomplete / recovery required: unsafe path (symlink component) - no writes, reloads or exec were attempted"
+    return 1
+  fi
+  _rs_stop_new_services "$_rs_snap" || _rr=1
+  _rs_restore_files "$_rs_snap" || _rr=1
+  _rs_prune_temps "$_rs_snap" || _rr=1
+  _rs_restore_shared "$_rs_snap" || _rr=1
+  _rs_restore_uci "$_rs_snap" || _rr=1
+  _rs_restore_network "$_rs_snap" || _rr=1
+  _rs_restore_firewall "$_rs_snap" || _rr=1
+  _rs_restore_sysctl "$_rs_snap" || _rr=1
+  _rs_restore_links "$_rs_snap" || _rr=1
+  _rs_restore_services "$_rs_snap" || _rr=1
+  _rs_restore_cron "$_rs_snap" || _rr=1
+  _rs_nr_notes "$_rs_snap" || _rr=1
+  _rs_restore_verify "$_rs_snap" || _rr=1
+  if [ "$_rr" = 0 ]; then
+    info "откат проверен (verified rollback): файлы, UCI, сервисы и runtime соответствуют снимку"
+    rm -rf "$_rs_snap" 2>/dev/null || true
+  else
+    bad "rollback incomplete / recovery required: снимок сохранён в $_rs_snap (не удаляйте его)"
+  fi
   return $_rr
 }
 
@@ -3152,6 +5112,421 @@ _reinstall_steps() { # _reinstall_steps <vpn-url> -> 0 only when every critical 
   return 0
 }
 
+# ---- R03: package installs and the fail-closed reinstall preflight ------------
+# Package installs are FORBIDDEN inside the reinstall path: the transaction promises a
+# full rollback, and a package database plus post-install side effects cannot be rolled
+# back by the file snapshot. The reinstall therefore never installs anything (including
+# `apk add inotifywait` in step 5 - the sync watchdog falls back to a 10s poll); a missing
+# dependency is a preflight REFUSAL, not an installation.
+pkg_install() { # pkg_install <pkg>... -> 0 only when the package manager reports success
+  if [ "${GM_REINSTALL_NO_PKG:-0}" = 1 ]; then
+    warn "переустановка: автоустановка пакетов запрещена ($*) - зависимость должна быть установлена заранее"
+    return 1
+  fi
+  if have apk; then
+    info "installing: $* (apk)"
+    apk update >/dev/null 2>&1 || warn "apk update failed - trying the current index"
+    apk add "$@" >/dev/null 2>&1
+  elif have opkg; then
+    info "installing: $* (opkg)"
+    opkg update >/dev/null 2>&1 || warn "opkg update failed - trying the current index"
+    opkg install "$@" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+# The runtime objects of the reinstall write-set (tests/reinstall_write_set.json).
+# Format: id|kind|f1|f2|f3 where kind decides the fields:
+#   service  -> initd-name(s, '/'-separated) | pid-or-port | mode (pidof|pgrep|port)
+#   crontab|links -> - | - | -
+#   uci      -> probe key (uci -q get) | - | -
+#   ip-rule  -> - | - | -
+#   nft-table-> table spec | - | -
+#   alias    -> uci key of the alias address | - | -
+#   sysctl   -> /proc/sys/net/ipv6/conf | - | -
+#   file|file-shared -> install path | expected (regular|regular-or-absent) | extra (seed-risk|-)
+#   dirs     -> - | - | -      dir -> probe dir | - | -
+# Tri-state enabled/running per service: enabled from /etc/rc.d links, running from
+# pidof/pgrep/netstat. Any `unknown` is an ERROR, not a maybe.
+REINSTALL_PREFLIGHT_OBJECTS="svc.dnsmasq|service|dnsmasq|dnsmasq|pidof
+svc.mihomo|service|mihomo|mihomo|pidof
+svc.magitrickle|service|magitrickle|magitrickled|pidof
+svc.hev-socks5-tunnel|service|hev-socks5-tunnel|hev-socks5-tunnel|pidof
+svc.hev-nop2p|service|hev-nop2p|hev-socks5-tunnel|pidof
+svc.rpcd|service|rpcd|rpcd|pidof
+svc.ai-doh|service|ai-doh|5055|port
+svc.dnsmasq-ai|service|dnsmasq-ai|5353|port
+svc.geomask-syncd|service|geomask-syncd|geomask-syncd.sh|pgrep
+svc.network|service|network|netifd|pidof
+svc.firewall|service|firewall|fw4|pidof
+svc.ksmbd|service|ksmbd/ksmbd1|ksmbd|pidof
+cron.user|crontab|-|-|-
+rc.d|links|-|-|-
+uci.network|uci|network.lan|-|-
+uci.dhcp|uci|dhcp.lan|-|-
+uci.ksmbd|uci|ksmbd|-|-
+net.fwmark-rule|ip-rule|-|-|-
+net.nft-ai-dns|nft-table|inet geomask_ai_dns|-|-
+net.alias-lanai|alias|network.lanai.ipaddr|-|-
+sysctl.kernel|sysctl|/proc/sys/net/ipv6/conf|-|-
+file.passwd|file-shared|/etc/passwd|regular|-
+file.group|file-shared|/etc/group|regular|-
+shared.magitrickle-config|file-shared|/etc/magitrickle/state/config.yaml|regular-or-absent|seed-risk
+shared.zapret-exclude|file-shared|/opt/zapret/ipset/zapret-hosts-user-exclude.txt|regular-or-absent|-
+shared.zapret-force|file-shared|/opt/zapret/ipset/zapret-hosts-user.txt|regular-or-absent|-
+file.mihomo-config|file|/etc/mihomo/config.yaml|regular-or-absent|-
+dir.tracked|dirs|-|-|-
+tmp.scratch|dir|/tmp|-|-"
+
+# R03 phase 2a (review G): every write-set object whose snapshot stores BYTES
+# (manifest snapshot SB/SBA/SAP - tests/reinstall_write_set.json). The preflight
+# classifies each object's type before any mutation: a symlink would be followed by
+# cp -p (it would capture and later restore the target's bytes), an unreadable file
+# captures nothing - both are refusals. Format: install-path|expected with
+# regular-or-absent or dir-or-absent. This table is cross-checked against the manifest
+# by tests/reinstall_manifest.py (check_byte_table). Documented boundary (manifest
+# meta.preflight_boundary): dynamic temp classes, snapshot=NONE transients and runtime
+# effects without a file representation are not type-classified here.
+REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-or-absent
+/usr/lib/geomask/geomask-audit-state.py|regular-or-absent
+/usr/lib/geomask/geomask-config-tx.py|regular-or-absent
+/usr/lib/geomask/geomask-config-owner.py|regular-or-absent
+/usr/lib/geomask/geomask-apply.py|regular-or-absent
+/usr/lib/geomask/geomask-lane-torrent.py|regular-or-absent
+/usr/lib/geomask/geomask-sync-youtube.py|regular-or-absent
+/usr/lib/geomask/geomask-audit-scheduler.py|regular-or-absent
+/usr/lib/geomask/geomask-subscription-status.py|regular-or-absent
+/usr/lib/geomask/geomask-slot-patch.py|regular-or-absent
+/usr/lib/geomask/geomask-console.py|regular-or-absent
+/usr/lib/geomask/geomask-dnsguard.sh|regular-or-absent
+/usr/lib/geomask/geomask-diag-spool.py|regular-or-absent
+/usr/lib/geomask/geomask-diag-redact.py|regular-or-absent
+/usr/lib/geomask/geomask-routes.sh|regular-or-absent
+/usr/lib/geomask/geomask-module-update.py|regular-or-absent
+/usr/lib/geomask/geomask-lists-edit.py|regular-or-absent
+/usr/lib/geomask/geomask-doctor.py|regular-or-absent
+/usr/lib/geomask/99-default-vpn-route.dist|regular-or-absent
+/etc/hotplug.d/iface/99-default-vpn-route|regular-or-absent
+/etc/hotplug.d/iface/99-geomask-guard|regular-or-absent
+/usr/bin/geo-backend.sh|regular-or-absent
+/usr/libexec/rpcd/geo-sync|regular-or-absent
+/usr/share/rpcd/acl.d/luci-app-geo-sync.json|regular-or-absent
+/usr/share/luci/menu.d/luci-app-geo-sync.json|regular-or-absent
+/www/luci-static/resources/view/geo-sync/main.js|regular-or-absent
+/etc/geomask/modules-index.json|regular-or-absent
+/etc/geomask/version|regular-or-absent
+/etc/geomask/modules.json|regular-or-absent
+/etc/geomask/modules-state.json|regular-or-absent
+/root/sync_mtrickle_mihomo.sh|regular-or-absent
+/etc/mihomo/ruleset/ytdirect.yaml|regular-or-absent
+/etc/mihomo/ruleset/ytvpn.yaml|regular-or-absent
+/etc/mihomo/ruleset/torrentdirect.yaml|regular-or-absent
+/etc/mihomo/ruleset/mtrickle_bulk.yaml|regular-or-absent
+/etc/mihomo/ruleset/mtrickle.yaml|regular-or-absent
+/etc/mihomo/ruleset/ai.yaml|regular-or-absent
+/etc/mihomo/ruleset/torrentsites.yaml|regular-or-absent
+/etc/mihomo/config.yaml|regular-or-absent
+/etc/mihomo|dir-or-absent
+/etc/mihomo/ruleset|dir-or-absent
+/etc/geomask/zapret-force-keep.txt|regular-or-absent
+/etc/geomask/zapret-always-exclude.txt|regular-or-absent
+/etc/geomask/vpnwatch.conf|regular-or-absent
+/etc/geomask-nodes.conf|regular-or-absent
+/etc/geomask-ytwatch.conf|regular-or-absent
+/etc/geomask/lists/magitrickle-groups.yaml|regular-or-absent
+/usr/bin/geomask-seed-lists.py|regular-or-absent
+/usr/bin/geomask-torrent.sh|regular-or-absent
+/usr/bin/geomask-dnscheck.sh|regular-or-absent
+/usr/bin/geomask-lane.sh|regular-or-absent
+/usr/bin/geomask-morning-check.sh|regular-or-absent
+/usr/bin/geomask-vpnwatch.sh|regular-or-absent
+/usr/bin/geomask-guard.sh|regular-or-absent
+/usr/bin/geomask-node-scan.sh|regular-or-absent
+/usr/bin/geomask-ytwatch.sh|regular-or-absent
+/usr/bin/geomask-syncd.sh|regular-or-absent
+/etc/init.d/geomask-syncd|regular-or-absent
+/etc/init.d/ai-doh|regular-or-absent
+/etc/init.d/dnsmasq-ai|regular-or-absent
+/etc/dnsmasq-ai.conf|regular-or-absent
+/usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft|regular-or-absent
+/etc/geomask-aidns.uid|regular-or-absent
+/etc/passwd|regular-or-absent
+/etc/group|regular-or-absent
+/etc/magitrickle/state/config.yaml|regular-or-absent
+/opt/zapret/ipset/zapret-hosts-user-exclude.txt|regular-or-absent
+/opt/zapret/ipset/zapret-hosts-user.txt|regular-or-absent
+/etc/geomask/backup-ok|regular-or-absent
+/etc/geomask/backup-recovery|regular-or-absent
+/root/geomask-backups|dir-or-absent
+/etc/geomask|dir-or-absent
+/etc/geomask/lists|dir-or-absent
+/etc/geomask/torrent|dir-or-absent
+/etc/geomask/node-audit.json|regular-or-absent
+/etc/geomask/node-audit/state|regular-or-absent
+/etc/geomask/ipv6.state|regular-or-absent
+/etc/hev-socks5-tunnel/nop2p.yml|regular-or-absent
+/etc/init.d/hev-nop2p|regular-or-absent
+/usr/share/nftables.d/ruleset-post/99-lane-accept.nft|regular-or-absent
+/etc/mihomo/config.yaml.bak_lane|regular-or-absent
+/etc/geomask/ytwatch.state|regular-or-absent
+/etc/sysctl.d/99-disable-ipv6.conf|regular-or-absent
+/etc/nftables.d/99-geomask-no-v6.nft|regular-or-absent"
+
+PF_REASONS=""
+_pf_reason() { # collect one refusal reason (JSON later)
+  if [ -n "${PF_REASONS:-}" ]; then
+    PF_REASONS="$PF_REASONS
+$1"
+  else
+    PF_REASONS="$1"
+  fi
+}
+
+_reinstall_obj_type() { # _reinstall_obj_type <install-path> -> regular|symlink|dir|absent|unknown
+  _rot="$(P "$1")"
+  if [ -L "$_rot" ]; then printf 'symlink'; return 0; fi
+  if [ -f "$_rot" ]; then printf 'regular'; return 0; fi
+  if [ -d "$_rot" ]; then printf 'dir'; return 0; fi
+  if [ -e "$_rot" ]; then printf 'unknown'; return 0; fi    # fifo/socket/device node
+  if ls -d "$_rot" >/dev/null 2>&1; then printf 'unknown'; return 0; fi
+  printf 'absent'
+}
+
+_pf_svc_enabled() { # _pf_svc_enabled <initd-names-slash-separated> -> 0|1|unknown
+  if [ ! -d "$(P /etc/rc.d)" ] || ! ls "$(P /etc/rc.d)" >/dev/null 2>&1; then
+    printf 'unknown'; return 0
+  fi
+  for _pfe_name in $(printf '%s' "$1" | tr '/' ' '); do
+    if ls "$(P /etc/rc.d)" 2>/dev/null | grep -qE "^[SK][0-9][0-9]${_pfe_name}$"; then
+      printf '1'; return 0
+    fi
+  done
+  printf '0'    # no autostart link: a determinate "not enabled", even without init script
+}
+
+_pf_svc_running() { # _pf_svc_running <pid-or-port> <mode> -> 0|1|unknown
+  case "${2:-pidof}" in
+    pgrep)
+      have pgrep || { printf 'unknown'; return 0; }
+      pgrep -f "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      ;;
+    port)
+      if have netstat; then
+        netstat -ltnu 2>/dev/null | grep -q ":$1 " && printf '1' || printf '0'
+      else
+        printf 'unknown'
+      fi
+      ;;
+    *)
+      if have pidof; then
+        pidof "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      elif have pgrep; then
+        pgrep -x "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      else
+        printf 'unknown'
+      fi
+      ;;
+  esac
+}
+
+# Fail-closed preflight of a reinstall: run BEFORE the first mutation (backup_gate writes
+# too). The full rollback is only promised when every runtime object of the write-set
+# manifest is observable and restorable; anything unknown refuses the run. Output is one
+# JSON line on stdout:
+#   rc=0  {"ok":true,"armed":"no-package-install"}
+#   rc=1  {"ok":false,"error":"reinstall not started: unprovable state","reasons":[...]}
+# A refusal here is NOT a "rollback succeeded": nothing has been changed yet.
+reinstall_preflight() {
+  PF_REASONS=""
+  GM_REINSTALL_NO_PKG=1     # arm: from here on pkg_install refuses every package call
+  if [ -n "${GM_AUTO_LANE:-}" ]; then
+    _pf_reason "GM_AUTO_LANE is armed: geomask-lane.sh would create network/firewall uci sections and service state outside the per-object snapshot; unset GM_AUTO_LANE to reinstall"
+  fi
+  # 1) dependencies - presence only, NEVER apk/opkg
+  for _pf_d in cp mv rm mkdir chmod cmp date find sed awk grep cut tr head tail wc df \
+               mktemp tar gzip python3 curl crontab uci ip mihomo; do
+    have "$_pf_d" || _pf_reason "dependency missing: $_pf_d (auto-install is forbidden during reinstall; install it manually first)"
+  done
+  if have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    _pf_reason "dependency missing: python3-yaml (python3 -c 'import yaml' fails; auto-install is forbidden during reinstall)"
+  fi
+  _pf_scope_ai=0
+  module_selected ai_dns && [ ! -f "$(P /etc/geomask-aidns.off)" ] && _pf_scope_ai=1
+  if [ "$_pf_scope_ai" = 1 ]; then
+    for _pf_d in nft nslookup; do
+      have "$_pf_d" || _pf_reason "dependency missing: $_pf_d (ai_dns module in scope)"
+    done
+    if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
+      _pf_reason "https-dns-proxy is missing - step 4 would need a package install, which is forbidden during reinstall"
+    fi
+  fi
+  # 2) snapshot observers must be intact (crontab/rc.d/dirs/tmp), or the snapshot cannot
+  #    capture - and later prove - the state it promises to restore.
+  if ! have pidof && ! have pgrep; then
+    _pf_reason "runtime state unobservable: neither pidof nor pgrep is available"
+  fi
+  crontab -l >/dev/null 2>&1
+  _pf_rc=$?
+  case "$_pf_rc" in
+    0|1) : ;;
+    *) _pf_reason "crontab state unobservable (crontab -l rc=$_pf_rc)" ;;
+  esac
+  if [ ! -d "$(P /etc/rc.d)" ] || ! ls "$(P /etc/rc.d)" >/dev/null 2>&1; then
+    _pf_reason "rc.d autostart links unobservable: cannot enumerate /etc/rc.d"
+  fi
+  for _pf_d in /usr/lib /usr/bin /etc/mihomo; do
+    [ -d "$(P "$_pf_d")" ] && ls "$(P "$_pf_d")" >/dev/null 2>&1 \
+      || _pf_reason "snapshot observer broken: cannot enumerate $_pf_d"
+  done
+  for _pf_d in /usr/lib/geomask /etc/mihomo/ruleset; do
+    if [ -d "$(P "$_pf_d")" ] && ! ls "$(P "$_pf_d")" >/dev/null 2>&1; then
+      _pf_reason "snapshot observer broken: cannot enumerate $_pf_d"
+    fi
+  done
+  _pf_probe=$(mktemp -d "$(P /tmp)/geomask-pf-XXXXXX" 2>/dev/null)
+  if [ -n "${_pf_probe:-}" ]; then rm -rf "$_pf_probe"; else
+    _pf_reason "snapshot observer broken: cannot create a probe directory in /tmp"
+  fi
+  # 3) every runtime object of the manifest: observable and classifiable
+  while IFS='|' read -r _pf_id _pf_kind _pf_f1 _pf_f2 _pf_f3; do
+    [ -n "${_pf_id:-}" ] || continue
+    case "$_pf_kind" in
+      service)
+        case "$_pf_id" in
+          svc.ai-doh|svc.dnsmasq-ai) [ "$_pf_scope_ai" = 1 ] || continue ;;
+          svc.hev-socks5-tunnel) module_selected path_ai || module_selected ai_dns || continue ;;
+          svc.hev-nop2p) [ -n "${GM_AUTO_LANE:-}" ] || continue ;;
+          svc.ksmbd) module_selected backup_share || continue ;;
+        esac
+        _pf_en=$(_pf_svc_enabled "$_pf_f1")
+        _pf_run=$(_pf_svc_running "$_pf_f2" "$_pf_f3")
+        [ "$_pf_en" = unknown ] && _pf_reason "runtime state unobservable: $_pf_id (enabled unknown)"
+        [ "$_pf_run" = unknown ] && _pf_reason "runtime state unobservable: $_pf_id (running unknown)"
+        ;;
+      crontab) : ;;      # checked above
+      links)   : ;;      # checked above
+      uci)
+        uci -q get "$_pf_f1" >/dev/null 2>&1
+        _pf_rc=$?
+        [ "$_pf_rc" -le 1 ] || _pf_reason "uci state unobservable: $_pf_f1 (rc=$_pf_rc)"
+        ;;
+      ip-rule)
+        ip rule show >/dev/null 2>&1 || _pf_reason "ip rule state unobservable (ip rule show failed)"
+        ;;
+      nft-table)
+        [ "$_pf_scope_ai" = 1 ] || continue
+        nft list table $_pf_f1 >/dev/null 2>&1
+        _pf_rc=$?
+        [ "$_pf_rc" -le 1 ] || _pf_reason "nft state unobservable: $_pf_f1 (rc=$_pf_rc)"
+        ;;
+      alias)
+        uci -q get "$_pf_f1" >/dev/null 2>&1
+        _pf_rc=$?
+        [ "$_pf_rc" -le 1 ] || _pf_reason "alias state unobservable: $_pf_f1 (rc=$_pf_rc)"
+        ;;
+      sysctl)
+        [ "${GM_IPV6:-off}" = keep ] && continue
+        _pf_sc="$(P "$_pf_f1")"
+        if [ ! -d "$_pf_sc" ] || ! ls "$_pf_sc" >/dev/null 2>&1; then
+          _pf_reason "kernel sysctl state unobservable: $_pf_f1"
+        else
+          for _pf_k in all default; do
+            [ -r "$_pf_sc/$_pf_k/disable_ipv6" ] \
+              || _pf_reason "kernel sysctl state unobservable: $_pf_f1/$_pf_k/disable_ipv6"
+          done
+        fi
+        ;;
+      file|file-shared)
+        _pf_t=$(_reinstall_obj_type "$_pf_f1")
+        case "$_pf_t" in
+          unknown)
+            _pf_reason "unobservable object: $_pf_f1" ;;
+          symlink)
+            _pf_reason "unrestorable object: $_pf_f1 is a symlink (the snapshot restores bytes, not links)" ;;
+          dir)
+            _pf_reason "unrestorable object: $_pf_f1 is a directory, expected $_pf_f2" ;;
+          absent)
+            [ "$_pf_f2" = regular ] \
+              && _pf_reason "unrestorable object: $_pf_f1 is absent but tracked as regular" ;;
+        esac
+        case "$_pf_kind" in
+          file-shared)
+            [ -e "$(P "$_pf_f1")" ] && [ ! -r "$(P "$_pf_f1")" ] \
+              && _pf_reason "unobservable object: $_pf_f1 is not readable" ;;
+        esac
+        if [ "$_pf_f3" = seed-risk ]; then
+          # The seeder rewrites an EMPTY MagiTrickle config; that write is not covered by a
+          # proven rollback, so it must be refused before the transaction starts.
+          if [ -f "$(P "$_pf_f1")" ] \
+             && ! grep -qE '^[[:space:]]*-[[:space:]]*name:' "$(P "$_pf_f1")" 2>/dev/null; then
+            _pf_reason "MagiTrickle state: an empty $_pf_f1 would be rewritten by the seeder - rollback unprovable"
+          fi
+        fi
+        ;;
+      dirs)
+        : ;;      # checked above
+      dir)
+        _pf_probe=$(mktemp -d "$(P "$_pf_f1")/geomask-pf-XXXXXX" 2>/dev/null)
+        if [ -n "${_pf_probe:-}" ]; then rm -rf "$_pf_probe"; else
+          _pf_reason "snapshot observer broken: probe directory in $_pf_f1"
+        fi
+        ;;
+      *)
+        _pf_reason "manifest object with unknown kind: $_pf_id ($_pf_kind)" ;;
+    esac
+  done <<EOF
+$REINSTALL_PREFLIGHT_OBJECTS
+EOF
+  # R03 phase 2a (review G): every byte-snapshot write-set object is classified by type
+  # before any mutation. A symlink would be followed by cp -p (the snapshot would capture
+  # and later restore the TARGET's bytes), an unreadable file captures nothing - both make
+  # the promised rollback unprovable and refuse the run. Absence is fine: the reinstall
+  # installs these objects itself (SBA records absent).
+  while IFS='|' read -r _pf_bp _pf_be; do
+    [ -n "${_pf_bp:-}" ] || continue
+    _pf_t=$(_reinstall_obj_type "$_pf_bp")
+    case "$_pf_t" in
+      symlink)
+        if [ "$_pf_be" = dir-or-absent ] && [ -d "$(P "$_pf_bp")" ] \
+           && _rs_safe_path "$_pf_bp"; then
+          :
+        else
+          _pf_reason "unrestorable object: $_pf_bp is a symlink (the snapshot stores bytes, not links)"
+        fi ;;
+      unknown)
+        _pf_reason "unobservable object: $_pf_bp" ;;
+      dir)
+        [ "$_pf_be" = dir-or-absent ] \
+          || _pf_reason "unrestorable object: $_pf_bp is a directory, expected $_pf_be" ;;
+      regular)
+        if [ "$_pf_be" = dir-or-absent ]; then
+          _pf_reason "unrestorable object: $_pf_bp is a regular file, expected $_pf_be"
+        elif [ ! -r "$(P "$_pf_bp")" ]; then
+          _pf_reason "unobservable object: $_pf_bp is not readable (the snapshot would capture nothing)"
+        fi ;;
+    esac
+  done <<EOF
+${REINSTALL_PREFLIGHT_BYTE_FILES:-}
+EOF
+  if [ -n "${PF_REASONS:-}" ]; then
+    _pf_json=''
+    _pf_first=1
+    while IFS= read -r _pf_line; do
+      [ -n "$_pf_line" ] || continue
+      _pf_esc=$(printf '%s' "$_pf_line" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+      if [ "$_pf_first" = 1 ]; then _pf_first=0; else _pf_json="$_pf_json,"; fi
+      _pf_json="$_pf_json\"$_pf_esc\""
+    done <<EOF
+$PF_REASONS
+EOF
+    printf '{"ok":false,"error":"reinstall not started: unprovable state","reasons":[%s]}\n' "$_pf_json"
+    return 1
+  fi
+  printf '{"ok":true,"armed":"no-package-install"}\n'
+  return 0
+}
+
 # full flow: uninstall -> install geo -> rewrite mihomo 2-subs -> sync+cron -> services -> verify
 menu_reinstall() {
   hdr "REINSTALL" "Удалить -> установить -> настроить geomask"
@@ -3184,8 +5559,18 @@ menu_reinstall() {
     info "  Установите пакеты и повторите: apk add python3 python3-yaml (или opkg install ...)"
     return 1
   fi
-  backup_gate || return 1
+  # R03: fail-closed preflight BEFORE the first mutation (backup_gate writes files too).
+  # The module selection decides which runtime objects are in scope, so it is settled
+  # first; then the manifest-based preflight proves dependencies - without apk/opkg -
+  # observability of every runtime object and the snapshot observers. Anything unknown
+  # refuses the reinstall with the JSON error, nothing having been touched.
   modules_maybe_prompt
+  if ! reinstall_preflight; then
+    bad "переустановка не запущена: недоказуемое состояние (см. JSON выше)"
+    info "  Ничего не изменено. Установите недостающие зависимости вручную и повторите."
+    return 1
+  fi
+  backup_gate || return 1
   _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
   # A snapshot from an earlier failed attempt may still hold the only copy of the old
   # components: never delete a fixed name here (same rule as the backup park, F03).
@@ -3194,7 +5579,11 @@ menu_reinstall() {
   _reinstall_snapshot "$_snap" || { bad "не удалось сохранить текущие компоненты - переустановка отменена"; rm -rf "$_snap"; return 1; }
   if ! _reinstall_steps "$_vpn"; then
     bad "переустановка не завершена - возвращаю прежние компоненты"
-    _reinstall_restore "$_snap" || bad "откат неполный: копии остались в $_snap"
+    if ! _reinstall_restore "$_snap"; then
+      bad "rollback incomplete / recovery required: снимок сохранён в $_snap (не удаляйте его)"
+    else
+      info "откат проверен: прежние компоненты и runtime восстановлены"
+    fi
     return 1
   fi
   rm -rf "$_snap"

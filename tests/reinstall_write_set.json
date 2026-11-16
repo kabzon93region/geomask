@@ -1,0 +1,2730 @@
+{
+  "schema": 1,
+  "id": "geomask-reinstall-write-set",
+  "title": "Полный транзитивный write-set переустановки geomask (menu_reinstall -> _reinstall_steps)",
+  "scope": {
+    "entrypoints": [
+      "menu_reinstall",
+      "_reinstall_steps"
+    ],
+    "call_graph": [
+      "geomask_uninstall(noreload)",
+      "backup_gate -> ensure_backup",
+      "step2_apply -> save_stream*, modules_state_sync, ensure_smb_share, initd rpcd reload, rm /tmp cache",
+      "write_mihomo_config (+ api_refresh_provider), safe_mihomo_restart only with --restart",
+      "step4_apply -> aidns_generate_nft, passwd/group append, uci network.lanai, initd ai-doh/dnsmasq-ai/firewall/network, ip rule",
+      "step5_apply -> save_stream*, cron_ensure*, crontab writes, seed_lists, write_lists_assets, sync_mtrickle_mihomo.sh, node-audit schedule_set",
+      "step6_apply -> initd start (loop over SVC_LIST)",
+      "apply_ipv6_default -> geo-backend.sh ipv6 off (transitive callee)",
+      "step7_check (read-only)"
+    ],
+    "callees_scanned": [
+      "assets/sync_mtrickle_mihomo.sh (full)",
+      "assets/geomask-seed-lists.py (full)",
+      "assets/geomask-module-update.py (full)",
+      "assets/geomask-node-audit.py (full)",
+      "assets/geomask-lane.sh (full; step5 GM_AUTO_LANE, uninstall remove)",
+      "assets/geomask-ytwatch.sh (full; uninstall --reset)",
+      "assets/geo-backend.sh (IPv6 writer cluster only: cmd_ipv6.._ipv6_guard_restore + path vars)"
+    ],
+    "not_covered_here": [
+      "реальный netifd/procd/fw4/rpcd/libuci и POSIX-ядро: поведение не проверялось, только статический write-set",
+      "внешние побочные эффекты дочерних процессов (curl/API-запросы подписки, mihomo provider refresh) - перечислены как runtime-объекты, но их сетевой результат не наблюдаем файловой системой",
+      "шаг 1 (step1_apply) не вызывается из reinstall; его пакетные вызовы перечислены в forbidden как install-only"
+    ]
+  },
+  "meta": {
+    "legend": {
+      "snapshot": {
+        "SB": "байты+mode: cp -p в дерево снимка; отсутствие записывается в список absent",
+        "SBA": "SB + обязательно фиксировать отсутствие файла (absent) - без этого откат не отличает 'не было' от 'потерялось'",
+        "SAP": "прицельный снимок append-строк: записать только добавленные строки (общий файл целиком НЕ копируем)",
+        "UCI": "preimage значений/типа секции UCI + изолированная delta; при чужой pending-delta - отказ",
+        "TRI": "tri-state сервиса: enabled (rc.d-линки) + running (pidof/pgrep или порт); unknown = ошибка",
+        "CRON": "полный вывод crontab -l на момент снимка (включая пустой)",
+        "LINK": "имена rc.d-ссылок и их реальные targets (readlink), не только имена *geomask*",
+        "NFT": "вывод nft list table для наших таблиц + байты include-файлов",
+        "IPR": "точный набор ВСЕХ правил с fwmark 0x64 в виде <pref>|<table>|ours|foreign (отсортирован); verify сравнивает набор целиком",
+        "ALIAS": "preimage секции network.lanai (proto/device/ipaddr/netmask) или факт её отсутствия",
+        "SYSK": "значение disable_ipv6 по ключам all, default и КАЖДОМУ интерфейсу из /proc/sys/net/ipv6/conf/*",
+        "GEN": "генерируемый файл: снимаем байты, но восстановление допускает перегенерацию из источника",
+        "NONE": "НЕ снимается (задокументированное ограничение; см. restore=NR)"
+      },
+      "restore": {
+        "RB": "копия байтов обратно + chmod; записанный absent - удалять; сверка cmp после восстановления",
+        "RT": "прицельно: удалить только записанные append-строки и только если файл не менялся после снимка (иначе - конфликт, снимок сохраняется)",
+        "RU": "revert UCI из preimage + uci commit; при несовпадении поколения - отказ, снимок сохраняется",
+        "RS": "вернуть записанный enabled/running: остановленное остаётся остановленным, работавшее - запущенным; отказ != успех",
+        "RR": "установить точный снимок crontab (включая пустой)",
+        "RL": "восстановить ссылки по записанным targets; появившиеся чужие ссылки НЕ удалять",
+        "RF": "вернуть include/таблицу + firewall reload + проверка nft list",
+        "RI": "ip rule del ровно нашего добавленного правила",
+        "RA": "revert network.lanai + network reload + проверка адреса",
+        "RK": "записать записанные значения по каждому ключу (включая per-interface), затем sysctl -p",
+        "NR": "НЕ восстанавливаемо текущим снимком (свидетельства: логи, events/pools/reports, tmp, сетевые reload/API-эффекты). NR сам по себе не является отказом preflight - см. точное правило отказов в meta.contract; отказ только при недоказуемой компенсации (seed-risk) или ненаблюдаемом состоянии"
+      },
+      "owner": {
+        "ours": "файл создал/переписывает geomask",
+        "shared": "общий файл: параллельные писатели существуют, полное перезапрещено"
+      }
+    },
+    "contract": [
+      "Несовпадение манифеста с фактическим writer-набором = провал теста (tests/test_reinstall_manifest.py).",
+      "Точное правило отказов preflight: отказ ДО мутации происходит только (1) при отсутствии зависимости (автоустановка пакетов запрещена), (2) при ненаблюдаемом состоянии объекта или наблюдателя снимка (unknown - это ошибка, не maybe), (3) при невосстановимости объекта текущим снимком (symlink или каталог вместо байтов там, где снимок хранит байты, нечитаемый общий файл), (4) при seed-risk MagiTrickle (пустой config.yaml переписался бы seeder-ом). Объект с restore=NR сам по себе не является отказом: NR означает только, что объект не восстанавливается (свидетельства, временные файлы, сетевые reload/API-эффекты); preflight НЕ отказывает лишь из-за NR.",
+      "Снимок не удалять до подтверждённого восстановления (в т.ч. runtime); частичный/неизвестный результат держит снимок.",
+      "Phase 2b: откат ВЕРИФИЦИРУЕТСЯ, а не доверяет rc: файлы сравниваются побайтово (+mode), UCI читается обратно, nft-таблица и ip rule проверяются live, сервис обязан быть И enabled, И running как в снимке, sysctl перечитывается по КАЖДОМУ интерфейсу. Любой непроверяемый или неудачный объект -> rc!=0, снимок сохраняется, сообщение 'rollback incomplete / recovery required'. Конкурентная запись после снимка (passwd/group/cron/zapret/чужой uci delta) = конфликт, не успех. NR-объекты, у которых есть байтовый preimage (MagiTrickle state), записываются только identity+hash и НЕ перезаписываются при откате: изменение такого объекта даёт 'incomplete', а не подмену живого состояния старыми байтами.",
+      "Phase 2c: preimage общих файлов хранит управляемое состояние домена (A=active, M=managed), а не только активные строки; ksmbd восстанавливается по семантической подписи ВСЕХ опций (force_root включён), при отсутствии пакета commit не выполняется; симлинк-подмена каталога/родителя и предсказуемого temp — конфликт (запись сквозь ссылку запрещена); отсутствующий shared.*.pre — неполный снимок; отсутствующий shared-файл — допустимое состояние, а появление после снимка = incomplete; ip rule сверяется по state+pref, nft table/chain — по содержимому; .bak_v6off_* и .gm.tmp удаляются только если их не было до запуска.",
+      "Пакетные вызовы (apk/opkg) в reinstall-пути запрещены; preflight проверяет зависимости БЕЗ установки."
+    ],
+    "preflight_boundary": {
+      "classified_by_preflight": "все объекты files со snapshot SB/SBA/SAP (снимок хранит байты) классифицируются по типу: regular/dir, symlink или нечитаемое = отказ; плюс 28 runtime-объектов REINSTALL_PREFLIGHT_OBJECTS (services/cron/rc.d-ссылки/uci/ip-rule/nft/alias/sysctl)",
+      "not_classified": [
+        "dynamic-классы (dyn.*): временные и шаблонные пути (.zmnew, .bak_geomask_*, дерево снимка, rc.d-ссылки) - проверяются как классы целиком, не поштучно",
+        "объекты со snapshot NONE (transient /tmp-файлы, /root/geo-sync.log, node-audit events/pools/reports/receipt) - снимок их не хранит, они свидетельства или временные",
+        "runtime-эффекты без файлового представления (netifd/fw4 reload, mihomo API PUT /configs, ifup) - наблюдаемость ограничена, см. net_runtime",
+        "phase 2b/2c: GM_AUTO_LANE (geomask-lane.sh install) создаёт uci-секции и сервис внутри callee без журнала идентификаторов - ветка отвергается preflight И снимком ДО мутации ВСЕГДА, когда переменная вооружена (даже если скрипта ещё нет: его ставит step2); lane-файлы покрыты байтовым снимком, uci/сервис lane не восстанавливаются"
+      ],
+      "symlink_rule": "симлинк там, где снимок хранит байты (SB/SBA/SAP) - отказ preflight до мутации; для объектов вне байтового снимка (dynamic, NONE) тип не проверяется - задокументированная граница фазы 2a"
+    },
+    "symlink_policy": {
+      "rule": "a symlink component is allowed only when its resolved target is a directory (or a regular file for init-script execution), owned by root (the installer user on a non-root test host), not world-writable, and under a trusted root",
+      "trusted_roots": [
+        "/overlay",
+        "/mnt",
+        "/opt",
+        "/usr",
+        "/www",
+        "/etc"
+      ],
+      "byte_files": "a regular-file object whose leaf is a symlink is still refused: bytes are snapshotted and restored, not links",
+      "pins": "snapshot/symlinks records <logical>|<resolved>|<dev:ino> for every allowed component; restore and verify compare it before any write/reload/exec, so a target swap is incomplete",
+      "initd": "initd executes a symlinked init script only under the same policy; during restore the pin must still match"
+    },
+    "symlink_policy_short": "trusted root + root-owned + not world-writable + pinned identity"
+  },
+  "files": [
+    {
+      "id": "/usr/lib/geomask/geomask-node-audit.py",
+      "path": "/usr/lib/geomask/geomask-node-audit.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "phase": "step2+uninstall-keeps-part",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "uninstall удаляет; откат обязан вернуть"
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-audit-state.py",
+      "path": "/usr/lib/geomask/geomask-audit-state.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-config-tx.py",
+      "path": "/usr/lib/geomask/geomask-config-tx.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-config-owner.py",
+      "path": "/usr/lib/geomask/geomask-config-owner.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-apply.py",
+      "path": "/usr/lib/geomask/geomask-apply.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-lane-torrent.py",
+      "path": "/usr/lib/geomask/geomask-lane-torrent.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-sync-youtube.py",
+      "path": "/usr/lib/geomask/geomask-sync-youtube.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-audit-scheduler.py",
+      "path": "/usr/lib/geomask/geomask-audit-scheduler.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-subscription-status.py",
+      "path": "/usr/lib/geomask/geomask-subscription-status.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-slot-patch.py",
+      "path": "/usr/lib/geomask/geomask-slot-patch.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-console.py",
+      "path": "/usr/lib/geomask/geomask-console.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-dnsguard.sh",
+      "path": "/usr/lib/geomask/geomask-dnsguard.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-diag-spool.py",
+      "path": "/usr/lib/geomask/geomask-diag-spool.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-diag-redact.py",
+      "path": "/usr/lib/geomask/geomask-diag-redact.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall keeps"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "uninstall НЕ удаляет (пропуск в списке удаления) - остаётся после uninstall"
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-routes.sh",
+      "path": "/usr/lib/geomask/geomask-routes.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall keeps"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "общий helper hotplug+backend; uninstall не удаляет"
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-module-update.py",
+      "path": "/usr/lib/geomask/geomask-module-update.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall keeps"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "вызывается step2 (seed); uninstall не удаляет"
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-lists-edit.py",
+      "path": "/usr/lib/geomask/geomask-lists-edit.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall keeps"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-doctor.py",
+      "path": "/usr/lib/geomask/geomask-doctor.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall keeps"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/lib/geomask/99-default-vpn-route.dist",
+      "path": "/usr/lib/geomask/99-default-vpn-route.dist",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall keeps"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "pristine-копия hotplug-скрипта"
+    },
+    {
+      "id": "/etc/hotplug.d/iface/99-default-vpn-route",
+      "path": "/etc/hotplug.d/iface/99-default-vpn-route",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall keeps"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "hotplug-скрипт политики маршрута; общий helper geomask-routes.sh"
+    },
+    {
+      "id": "/etc/hotplug.d/iface/99-geomask-guard",
+      "path": "/etc/hotplug.d/iface/99-geomask-guard",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall keeps"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "hotplug-скрипт guard (module guard)"
+    },
+    {
+      "id": "/usr/bin/geo-backend.sh",
+      "path": "/usr/bin/geo-backend.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "RPC/UI backend; сам вызывается из apply_ipv6_default"
+    },
+    {
+      "id": "/usr/libexec/rpcd/geo-sync",
+      "path": "/usr/libexec/rpcd/geo-sync",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "RPC-экзек; удаление снимает ubus-объект после reload"
+    },
+    {
+      "id": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
+      "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "ACL RPC/UI"
+    },
+    {
+      "id": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
+      "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "меню LuCI"
+    },
+    {
+      "id": "/www/luci-static/resources/view/geo-sync/main.js",
+      "path": "/www/luci-static/resources/view/geo-sync/main.js",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "UI-страница; uninstall делает rmdir каталога geo-sync"
+    },
+    {
+      "id": "/etc/geomask/modules-index.json",
+      "path": "/etc/geomask/modules-index.json",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step2_apply"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "каталог модулей; не описывает сам себя"
+    },
+    {
+      "id": "/etc/geomask/version",
+      "path": "/etc/geomask/version",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "redirect step2_apply"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "штамп версии релиза"
+    },
+    {
+      "id": "/etc/geomask/modules.json",
+      "path": "/etc/geomask/modules.json",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "script modules_state_write (python json.dump)"
+      ],
+      "evidence": {
+        "kind": "script",
+        "function": "modules_state_write"
+      },
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "выбор модулей; читается панелью и апдейтером"
+    },
+    {
+      "id": "/etc/geomask/modules-state.json",
+      "path": "/etc/geomask/modules-state.json",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee assets/geomask-module-update.py seed_state"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "база хэшей для per-module update"
+    },
+    {
+      "id": "/root/sync_mtrickle_mihomo.sh",
+      "path": "/root/sync_mtrickle_mihomo.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "sync-скрипт; сам является callee (см. dynamic/callees)"
+    },
+    {
+      "id": "/etc/mihomo/ruleset/ytdirect.yaml",
+      "path": "/etc/mihomo/ruleset/ytdirect.yaml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step5_apply",
+        "ruleset_stub"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "генерируется sync; снимок байтов + допуск перегенерации"
+    },
+    {
+      "id": "/etc/mihomo/ruleset/ytvpn.yaml",
+      "path": "/etc/mihomo/ruleset/ytvpn.yaml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step5_apply (if missing)",
+        "ruleset_stub",
+        "callee sync_mtrickle_mihomo.sh"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "sync-managed; не затирать существующий на seed"
+    },
+    {
+      "id": "/etc/mihomo/ruleset/torrentdirect.yaml",
+      "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step5_apply (if missing)",
+        "ruleset_stub"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/etc/mihomo/ruleset/mtrickle_bulk.yaml",
+      "path": "/etc/mihomo/ruleset/mtrickle_bulk.yaml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "redirect step5_apply (seed empty)",
+        "callee sync_mtrickle_mihomo.sh"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "sync-generated; IP-правила lane"
+    },
+    {
+      "id": "/etc/mihomo/ruleset/mtrickle.yaml",
+      "path": "/etc/mihomo/ruleset/mtrickle.yaml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee sync_mtrickle_mihomo.sh"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "sync-generated из MagiTrickle"
+    },
+    {
+      "id": "/etc/mihomo/ruleset/ai.yaml",
+      "path": "/etc/mihomo/ruleset/ai.yaml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee sync_mtrickle_mihomo.sh",
+        "ruleset_stub via $rf loop"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "sync-generated"
+    },
+    {
+      "id": "/etc/mihomo/ruleset/torrentsites.yaml",
+      "path": "/etc/mihomo/ruleset/torrentsites.yaml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "ruleset stub loop write_mihomo_config"
+      ],
+      "evidence": {
+        "kind": "dynamic"
+      },
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "создаётся пустым stub (payload: []); отдельного ассета нет"
+    },
+    {
+      "id": "/etc/mihomo/config.yaml",
+      "path": "/etc/mihomo/config.yaml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "600",
+      "writers": [
+        "write_mihomo_config (patch/replace)",
+        "callee sync/api read"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "содержит URL подписок и controller secret; chmod 600 обязателен при восстановлении; runtime-provider/cache не равен файлу"
+    },
+    {
+      "id": "/etc/mihomo",
+      "path": "/etc/mihomo",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "mkdir write_mihomo_config",
+        "cp -a mihomo_trial_run"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "каталог конфигурации mihomo (trial копирует его целиком)"
+    },
+    {
+      "id": "/etc/mihomo/ruleset",
+      "path": "/etc/mihomo/ruleset",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "mkdir write_mihomo_config",
+        "mkdir ruleset_stub"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "каталог правил mihomo"
+    },
+    {
+      "id": "/etc/geomask/zapret-force-keep.txt",
+      "path": "/etc/geomask/zapret-force-keep.txt",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step5_apply (if missing)"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "правится владельцем; НЕ перезаписывать существующий"
+    },
+    {
+      "id": "/etc/geomask/zapret-always-exclude.txt",
+      "path": "/etc/geomask/zapret-always-exclude.txt",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step5_apply (if missing)",
+        "callee sync reads"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "правится владельцем; НЕ перезаписывать существующий"
+    },
+    {
+      "id": "/etc/geomask/vpnwatch.conf",
+      "path": "/etc/geomask/vpnwatch.conf",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step5_apply (if missing)"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/etc/geomask-nodes.conf",
+      "path": "/etc/geomask-nodes.conf",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step5_apply (if missing)"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/etc/geomask-ytwatch.conf",
+      "path": "/etc/geomask-ytwatch.conf",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step5_apply (if missing)",
+        "script upgrade-append (python)"
+      ],
+      "evidence": {
+        "kind": "script",
+        "function": "step5_apply"
+      },
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "при upgrade новые ключи только ДОБАВЛЯЮТСЯ; чужие значения не трогать"
+    },
+    {
+      "id": "/etc/geomask/lists/magitrickle-groups.yaml",
+      "path": "/etc/geomask/lists/magitrickle-groups.yaml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream write_lists_assets"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "шаблон списков для seeder"
+    },
+    {
+      "id": "/usr/bin/geomask-seed-lists.py",
+      "path": "/usr/bin/geomask-seed-lists.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream write_lists_assets"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "seeder MagiTrickle; callee"
+    },
+    {
+      "id": "/usr/bin/geomask-torrent.sh",
+      "path": "/usr/bin/geomask-torrent.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/bin/geomask-dnscheck.sh",
+      "path": "/usr/bin/geomask-dnscheck.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/bin/geomask-lane.sh",
+      "path": "/usr/bin/geomask-lane.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes (script only)"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "в reinstall lane НЕ удаляется (uninstall с noreload пропускает lane remove)"
+    },
+    {
+      "id": "/usr/bin/geomask-morning-check.sh",
+      "path": "/usr/bin/geomask-morning-check.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/bin/geomask-vpnwatch.sh",
+      "path": "/usr/bin/geomask-vpnwatch.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/bin/geomask-guard.sh",
+      "path": "/usr/bin/geomask-guard.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "uninstall не удаляет guard"
+    },
+    {
+      "id": "/usr/bin/geomask-node-scan.sh",
+      "path": "/usr/bin/geomask-node-scan.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/usr/bin/geomask-ytwatch.sh",
+      "path": "/usr/bin/geomask-ytwatch.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "в reinstall --reset НЕ вызывается (пины сохраняются)"
+    },
+    {
+      "id": "/usr/bin/geomask-syncd.sh",
+      "path": "/usr/bin/geomask-syncd.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "watchdog; работает без inotifywait (poll 10s)"
+    },
+    {
+      "id": "/etc/init.d/geomask-syncd",
+      "path": "/etc/init.d/geomask-syncd",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step5_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "init-скрипт; откат обязан вернуть и rc.d-линк, и running-состояние"
+    },
+    {
+      "id": "/etc/init.d/ai-doh",
+      "path": "/etc/init.d/ai-doh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step4_apply"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "AI DoH worker (dnsai)"
+    },
+    {
+      "id": "/etc/init.d/dnsmasq-ai",
+      "path": "/etc/init.d/dnsmasq-ai",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "save_stream step4_apply"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "второй dnsmasq для AI-устройств"
+    },
+    {
+      "id": "/etc/dnsmasq-ai.conf",
+      "path": "/etc/dnsmasq-ai.conf",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "redirect step4_apply (generated)"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "генерируется из uci dhcp server list; восстановление = байты или отсутствие"
+    },
+    {
+      "id": "/usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft",
+      "path": "/usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream aidns_generate_nft"
+      ],
+      "snapshot": "SBA",
+      "restore": "RF",
+      "notes": "nft include; применяется через firewall reload"
+    },
+    {
+      "id": "/etc/geomask-aidns.uid",
+      "path": "/etc/geomask-aidns.uid",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step4_apply",
+        "direct restore in _aidns_rollback"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "маркер uid dnsai"
+    },
+    {
+      "id": "/etc/passwd",
+      "path": "/etc/passwd",
+      "type": "regular",
+      "owner": "shared",
+      "mode": "644",
+      "writers": [
+        "append step4_apply (dnsai line)"
+      ],
+      "snapshot": "SAP",
+      "restore": "RT",
+      "notes": "ОБЩИЙ: полное перезапрещено; только добавленная строка dnsai; конкурентные правки = конфликт"
+    },
+    {
+      "id": "/etc/group",
+      "path": "/etc/group",
+      "type": "regular",
+      "owner": "shared",
+      "mode": "644",
+      "writers": [
+        "append step4_apply (dnsai line)"
+      ],
+      "snapshot": "SAP",
+      "restore": "RT",
+      "notes": "ОБЩИЙ: только добавленная строка dnsai"
+    },
+    {
+      "id": "/etc/config/network",
+      "path": "/etc/config/network",
+      "type": "regular",
+      "owner": "shared",
+      "mode": "644",
+      "writers": [
+        "uci commit network (lanai, ip6assign)"
+      ],
+      "evidence": {
+        "kind": "uci",
+        "package": "network"
+      },
+      "snapshot": "UCI",
+      "restore": "RU",
+      "notes": "ОБЩИЙ UCI-файл: revert только наших секций/ключей; полный restore байтами может стереть чужие правки"
+    },
+    {
+      "id": "/etc/config/dhcp",
+      "path": "/etc/config/dhcp",
+      "type": "regular",
+      "owner": "shared",
+      "mode": "644",
+      "writers": [
+        "callee geo-backend.sh: uci set dhcp.lan.{ra,dhcpv6,ndp} + uci commit dhcp"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "UCI",
+      "restore": "RU",
+      "notes": "ОБЩИЙ: revert только dhcp.lan.{ra,dhcpv6,ndp}"
+    },
+    {
+      "id": "/etc/config/ksmbd",
+      "path": "/etc/config/ksmbd",
+      "type": "regular",
+      "owner": "shared",
+      "mode": "644",
+      "writers": [
+        "uci commit ksmbd (backup_share)"
+      ],
+      "evidence": {
+        "kind": "uci",
+        "package": "ksmbd"
+      },
+      "snapshot": "UCI",
+      "restore": "RU",
+      "notes": "ОБЩИЙ: только наша секция share c name=geomask-backups"
+    },
+    {
+      "id": "/etc/magitrickle/state/config.yaml",
+      "path": "/etc/magitrickle/state/config.yaml",
+      "type": "regular",
+      "owner": "shared",
+      "mode": "644",
+      "writers": [
+        "callee geomask-seed-lists.py (write)",
+        "callee sync_mtrickle_mihomo.sh (read)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "NR",
+      "notes": "ВЛАДЕЕТ magitrickled: пишется только через seeder при остановленном демоне; полный откат не доказан - при неподтверждённом состоянии preflight отказывает"
+    },
+    {
+      "id": "/opt/zapret/ipset/zapret-hosts-user-exclude.txt",
+      "path": "/opt/zapret/ipset/zapret-hosts-user-exclude.txt",
+      "type": "regular",
+      "owner": "shared",
+      "mode": "644",
+      "writers": [
+        "callee sync_mtrickle_mihomo.sh (managed lines)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SAP",
+      "restore": "RT",
+      "notes": "ОБЩИЙ с zapret: восстанавливать только управляемые строки, чужие не трогать"
+    },
+    {
+      "id": "/opt/zapret/ipset/zapret-hosts-user.txt",
+      "path": "/opt/zapret/ipset/zapret-hosts-user.txt",
+      "type": "regular",
+      "owner": "shared",
+      "mode": "644",
+      "writers": [
+        "callee sync_mtrickle_mihomo.sh (managed lines)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SAP",
+      "restore": "RT",
+      "notes": "ОБЩИЙ с zapret: только управляемые строки"
+    },
+    {
+      "id": "/root/geo-sync.log",
+      "path": "/root/geo-sync.log",
+      "type": "regular",
+      "owner": "shared",
+      "mode": "644",
+      "writers": [
+        "callee sync_mtrickle_mihomo.sh (append)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "append-only журнал; не откатывается (доказательства), retention отдельно (R08)"
+    },
+    {
+      "id": "/etc/geomask/backup-ok",
+      "path": "/etc/geomask/backup-ok",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "redirect ensure_backup",
+        "mv ensure_backup (.tmp)"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "маркер проверенного бэкапа; .tmp-вариант в dynamic"
+    },
+    {
+      "id": "/etc/geomask/backup-recovery",
+      "path": "/etc/geomask/backup-recovery",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "redirect _backup_recovery_write",
+        "rm _backup_recovery_clear"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "журнал park-восстановления бэкапов"
+    },
+    {
+      "id": "/root/geomask-backups",
+      "path": "/root/geomask-backups",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "700",
+      "writers": [
+        "mkdir ensure_backup",
+        "mkdir/chmod ensure_smb_share"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "каталог резервных копий; ротация в dynamic; сами архивы router-backup-* - свидетельства, НЕ удалять при откате"
+    },
+    {
+      "id": "/etc/geomask",
+      "path": "/etc/geomask",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "mkdir modules_state_write",
+        "mkdir step5_apply",
+        "mkdir ensure_backup"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "каталог состояний geomask"
+    },
+    {
+      "id": "/etc/geomask/lists",
+      "path": "/etc/geomask/lists",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "mkdir write_lists_assets"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": ""
+    },
+    {
+      "id": "/etc/geomask/torrent",
+      "path": "/etc/geomask/torrent",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "mkdir step5_apply (module torrent)"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "uninstall оставляет (списки - данные оператора)"
+    },
+    {
+      "id": "/etc/geomask/node-audit.json",
+      "path": "/etc/geomask/node-audit.json",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geomask-node-audit.py (schedule_set/save_store)",
+        "script step5_apply migration"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "настройки расписаний node-audit; uninstall сохраняет намеренно"
+    },
+    {
+      "id": "/etc/geomask/node-audit/state",
+      "path": "/etc/geomask/node-audit/state",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geomask-node-audit.py"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "состояние аудита"
+    },
+    {
+      "id": "/etc/geomask/node-audit/events.jsonl",
+      "path": "/etc/geomask/node-audit/events.jsonl",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geomask-node-audit.py (append)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "append-only журнал событий - доказательства, не откатывать"
+    },
+    {
+      "id": "/etc/geomask/node-audit/pools",
+      "path": "/etc/geomask/node-audit/pools",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "callee geomask-node-audit.py"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "иммутабельные пулы; не откатывать и не удалять"
+    },
+    {
+      "id": "/etc/geomask/node-audit/reports",
+      "path": "/etc/geomask/node-audit/reports",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "callee geomask-node-audit.py"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "отчёты - свидетельства; не откатывать"
+    },
+    {
+      "id": "/etc/geomask/ipv6.state",
+      "path": "/etc/geomask/ipv6.state",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "600",
+      "writers": [
+        "callee geo-backend.sh _ipv6_save"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "запись исходных IPv6-значений (ip6assign/ra/dhcpv6/ndp + sysctl all/default + факт nft-guard)"
+    },
+    {
+      "id": "/etc/geomask/ipv6.state.tmp",
+      "path": "/etc/geomask/ipv6.state.tmp",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "600",
+      "writers": [
+        "callee geo-backend.sh _ipv6_save (transient)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "transient атомарной записи ipv6.state: пишется и mv-ится в ipv6.state либо удаляется; снимок не хранит - восстанавливать нечего"
+    },
+    {
+      "id": "/etc/hev-socks5-tunnel/nop2p.yml",
+      "path": "/etc/hev-socks5-tunnel/nop2p.yml",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geomask-lane.sh install (cat >)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "конфиг lane-туннеля VPN-noP2P (GM_AUTO_LANE); remove удаляет"
+    },
+    {
+      "id": "/etc/init.d/hev-nop2p",
+      "path": "/etc/init.d/hev-nop2p",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "callee geomask-lane.sh install"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "init-скрипт lane-сервиса hev-nop2p; remove удаляет; service-состояние см. services"
+    },
+    {
+      "id": "/usr/share/nftables.d/ruleset-post/99-lane-accept.nft",
+      "path": "/usr/share/nftables.d/ruleset-post/99-lane-accept.nft",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geomask-lane.sh _provision_netfw (cat >)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RF",
+      "notes": "nft accept include для lane (LAN/WG -> туннель); восстановление + firewall reload"
+    },
+    {
+      "id": "/usr/share/nftables.d/ruleset-post",
+      "path": "/usr/share/nftables.d/ruleset-post",
+      "type": "dir",
+      "owner": "shared",
+      "mode": "755",
+      "writers": [
+        "callee geomask-lane.sh (mkdir -p)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "каталог drop-in fw4: создаётся mkdir -p, содержимое - отдельные файлы-объекты; сам каталог не удалять и не восстанавливать"
+    },
+    {
+      "id": "/etc/mihomo/config.yaml.bak_lane",
+      "path": "/etc/mihomo/config.yaml.bak_lane",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geomask-lane.sh (cp -p preimage)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "preimage патча config.yaml lane-ом (listener добавляется/удаляется); при провалившейся валидации mihomo -t восстанавливается из него"
+    },
+    {
+      "id": "/etc/geomask/ytwatch.state",
+      "path": "/etc/geomask/ytwatch.state",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geomask-ytwatch.sh (state)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "runtime-состояние ytwatch; --reset в uninstall его сбрасывает"
+    },
+    {
+      "id": "/etc/sysctl.d/99-disable-ipv6.conf",
+      "path": "/etc/sysctl.d/99-disable-ipv6.conf",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geo-backend.sh _ipv6_kernel"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RK",
+      "notes": "файл sysctl; при восстановлении удаляется, если записано 0/0"
+    },
+    {
+      "id": "/etc/nftables.d/99-geomask-no-v6.nft",
+      "path": "/etc/nftables.d/99-geomask-no-v6.nft",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geo-backend.sh _ipv6_guard_install/_ipv6_guard_remove"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SBA",
+      "restore": "RF",
+      "notes": "guard IPv6-forwarding; восстановление по записи nft=present/absent"
+    },
+    {
+      "id": "/proc/sys/net/ipv6/conf",
+      "path": "/proc/sys/net/ipv6/conf",
+      "type": "dir",
+      "owner": "shared",
+      "mode": "kernel",
+      "writers": [
+        "callee geo-backend.sh _ipv6_kernel (per-interface writes)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "SYSK",
+      "restore": "RK",
+      "notes": "ядро: disable_ipv6 для all, default и КАЖДОГО интерфейса; интерфейсы могли появиться/исчезнуть - per-key, не default-на-все"
+    },
+    {
+      "id": "/tmp/geomask-modules-index.json",
+      "path": "/tmp/geomask-modules-index.json",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "rm step2_apply",
+        "callee geomask-module-update.py (cache write)"
+      ],
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "/tmp-кэш каталога модулей; transient, удаляется в обоих направлениях"
+    },
+    {
+      "id": "/tmp/geomask-aidns.nft",
+      "path": "/tmp/geomask-aidns.nft",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "redirect aidns_generate_nft",
+        "rm after save_stream"
+      ],
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "временный рендер nft; всегда удаляется"
+    },
+    {
+      "id": "/tmp/geomask-ytwatch.conf.new",
+      "path": "/tmp/geomask-ytwatch.conf.new",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step5_apply",
+        "rm step5_apply"
+      ],
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "временный шаблон upgrade-merge"
+    },
+    {
+      "id": "/tmp/geomask-sync.state",
+      "path": "/tmp/geomask-sync.state",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee sync_mtrickle_mihomo.sh (os.replace)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "состояние последнего sync; transient"
+    },
+    {
+      "id": "/tmp/geomask-sync.state.tmp",
+      "path": "/tmp/geomask-sync.state.tmp",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee sync_mtrickle_mihomo.sh"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "временный файл атомарной замены"
+    },
+    {
+      "id": "/tmp/geomask-module-backup",
+      "path": "/tmp/geomask-module-backup",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "755",
+      "writers": [
+        "callee geomask-module-update.py (staging)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "staging модульного апдейтера; transient"
+    },
+    {
+      "id": "/tmp/geomask-module-update.lock",
+      "path": "/tmp/geomask-module-update.lock",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geomask-module-update.py (lock)"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "lock апдейтера; transient"
+    },
+    {
+      "id": "/tmp/geomask-node-audit-receipt.json",
+      "path": "/tmp/geomask-node-audit-receipt.json",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "callee geomask-node-audit.py"
+      ],
+      "evidence": {
+        "kind": "callee"
+      },
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "transient-квитанция аудита"
+    }
+  ],
+  "dynamic": [
+    {
+      "id": "dyn.save-stream-temp",
+      "functions": [
+        "save_stream"
+      ],
+      "effects": [
+        "mkdir",
+        "redirect",
+        "rm",
+        "chmod",
+        "cp",
+        "mv"
+      ],
+      "site_regex": "\\.zmnew|bak_geomask_|\\$_t\\b|\\$_tmp\\b|\\$_m\\b",
+      "path_regex": ".*\\.(zmnew|bak_geomask_[^/]*)$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "каждый save_stream пишет <target>.zmnew и делает <target>.bak_geomask_<epoch> при замене; родительские каталоги создаются mkdir -p; бэкапы .bak_geomask_* - наши и подлежат учёту при откате. site_regex конкретный: новый неразрешимый writer с другой формой валит гейт (review D)"
+    },
+    {
+      "id": "dyn.mihomo-temps",
+      "functions": [
+        "write_mihomo_config",
+        "safe_mihomo_restart"
+      ],
+      "effects": [
+        "redirect",
+        "rm",
+        "mv",
+        "cp",
+        "chmod"
+      ],
+      "site_regex": "\\.de5rm|\\.urlnew|\\.tdnew|\\.ecnew|pre-run-|\\$_pre\\b",
+      "path_regex": ".*\\.(de5rm|urlnew|tdnew|ecnew|pre-run-[^/]*)$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "временные файлы точечного патча конфига + pre-run-копия GM_PRE_CONFIG"
+    },
+    {
+      "id": "dyn.ruleset-stub-loop",
+      "functions": [
+        "write_mihomo_config"
+      ],
+      "effects": [
+        "redirect",
+        "mkdir"
+      ],
+      "site_regex": "\\$rf\\.yaml",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "цикл правил: создаёт пустые stub для /etc/mihomo/ruleset/{mtrickle,ai,ytdirect,ytvpn,torrentdirect,torrentsites}.yaml"
+    },
+    {
+      "id": "dyn.ruleset-stub-arg",
+      "functions": [
+        "ruleset_stub"
+      ],
+      "effects": [
+        "redirect",
+        "mkdir"
+      ],
+      "site_regex": "\\$\\(P \"\\$2\"\\)",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "stub по аргументу $2 (конкретные пути разрешаются аргументами вызовов)"
+    },
+    {
+      "id": "dyn.mihomo-trial",
+      "functions": [
+        "mihomo_trial_run"
+      ],
+      "effects": [
+        "mkdir",
+        "rm",
+        "cp",
+        "redirect",
+        "sed-i"
+      ],
+      "site_regex": "\\$_td\\b",
+      "path_regex": "^/tmp/gm-trial-[^/]*$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "trial-копия конфига на сдвинутых портах; всегда удаляется; сам trial запускает mihomo-процесс"
+    },
+    {
+      "id": "dyn.backup-machinery",
+      "functions": [
+        "ensure_backup",
+        "_backup_park_restore",
+        "_backup_keep_failed",
+        "_backup_recovery_write",
+        "_backup_recovery_park"
+      ],
+      "effects": [
+        "mkdir",
+        "rm",
+        "mv",
+        "chmod",
+        "redirect",
+        "redirect-append"
+      ],
+      "site_regex": "\\$_rp\\b|\\$_rp_ok\\b|\\$_old\\b|\\$_park\\b|\\$BACKUP_RECOVERY\\b|backup-ok|backup-recovery|rm -rf \"\\$1\"",
+      "path_regex": "^(/tmp/geomask-bk-[^/]*|/root/geomask-backups/router-backup-[^/]*\\.tar\\.gz|/etc/geomask/backup-(ok|recovery)\\.tmp)$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "бэкап-механика: архивы router-backup-*.tar.gz, park-каталоги /tmp/geomask-bk-*, tmp-файлы атомарной записи backup-ok/backup-recovery; копии-свидетельства не удалять; параллельный запуск = риск потери копии (R04-класс)"
+    },
+    {
+      "id": "dyn.snapshot-tree",
+      "functions": [
+        "_reinstall_save",
+        "_reinstall_snapshot",
+        "_reinstall_restore",
+        "_rs_snap_listing",
+        "_rs_snap_cron",
+        "_rs_snap_files",
+        "_rs_snap_shared",
+        "_rs_snap_uci",
+        "_rs_snap_sysctl",
+        "_rs_snap_runtime",
+        "_rs_snap_links",
+        "_rs_snap_net",
+        "_rs_stop_new_services",
+        "_rs_restore_files",
+        "_rs_prune_temps",
+        "_rs_restore_shared",
+        "_rs_restore_uci",
+        "_rs_restore_network",
+        "_rs_restore_firewall",
+        "_rs_restore_sysctl",
+        "_rs_restore_links",
+        "_rs_restore_services",
+        "_rs_restore_cron",
+        "_rs_nr_notes",
+        "_rs_restore_verify",
+        "_rs_verify_files",
+        "_rs_verify_shared",
+        "_rs_verify_uci",
+        "_rs_verify_sysctl",
+        "_rs_verify_net",
+        "_rs_verify_runtime",
+        "_rs_verify_cron",
+        "menu_reinstall",
+        "_rs_snapshot_capture"
+      ],
+      "effects": [
+        "mkdir",
+        "rm",
+        "cp",
+        "mv",
+        "ln",
+        "chmod",
+        "redirect",
+        "redirect-append",
+        "sed-i",
+        "touch"
+      ],
+      "site_regex": "\\$1/(present|absent|rc\\.d|files|crontab)|\\$_?rs_[A-Za-z0-9_]+|\\$_snap\\b",
+      "path_regex": "^/tmp/geomask-reinstall-[^/]*$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "дерево снимка переустановки (mktemp в /tmp) и его внутренние файлы: objects/meta/listing/cron/links/services/uci/sysctl/net/shared.N.pre/files/*. Снимок хранится до ПОДТВЕРЖДЁННОГО отката и удаляется только после верификации; $1/present, $1/absent и $1/rc.d остаются совместимыми маркерами. site_regex привязан к $_rs_* и к конкретным именам дерева: новый неразрешимый writer с другой формой валит гейт (review D)"
+    },
+    {
+      "id": "dyn.uninstall-loops",
+      "functions": [
+        "geomask_uninstall"
+      ],
+      "effects": [
+        "rm"
+      ],
+      "site_regex": "\\(P \"\\$(f|m)\"\\)|P /usr/lib/geomask/\\$_m",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "циклы удаления файлов панели и /usr/lib/geomask/*"
+    },
+    {
+      "id": "dyn.rc-links",
+      "functions": [
+        "_rs_snap_links",
+        "_rs_restore_links",
+        "_rs_verify_runtime",
+        "_reinstall_snapshot",
+        "_reinstall_restore",
+        "_rs_snapshot_capture"
+      ],
+      "effects": [
+        "ln",
+        "rm",
+        "redirect-append",
+        "mkdir"
+      ],
+      "site_regex": "rc\\.d|\\$_rs_l\\b|\\$_rs_n\\b|\\$_(rl|rb|ra|rf)\\b",
+      "path_regex": "^/etc/rc\\.d/(\\*|[SK][0-9][0-9].*)$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "LINK",
+      "restore": "RL",
+      "notes": "rc.d-линки: снимок ТОЧНЫХ имён и targets (readlink, без разыменования) для сервисов манифеста; restore пересоздаёт записанные ссылки с их реальными targets и удаляет только ссылки НАШИХ сервисов, появившиеся за транзакцию. Чужие ссылки не трогаются (phase 2b)"
+    },
+    {
+      "id": "dyn.script-write",
+      "functions": [
+        "modules_state_write",
+        "step5_apply"
+      ],
+      "effects": [
+        "script-write"
+      ],
+      "site_regex": "json\\.dump\\(|open\\(sys\\.argv\\[1\\]|schedule_set\\(|open\\(live_p,",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "python-heredoc пишет /etc/geomask/modules.json (json.dump), append /etc/geomask-ytwatch.conf и schedule_set -> /etc/geomask/node-audit.json; конкретные writer-формы: новый heredoc-writer валит гейт (review D)"
+    },
+    {
+      "id": "dyn.initd-helper",
+      "functions": [
+        "initd"
+      ],
+      "effects": [
+        "dynamic-action"
+      ],
+      "site_regex": "\\$\\(P /etc/init\\.d/\\$1\\)",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "notes": "initd <svc> <action> через $(P /etc/init.d/$1): имена берутся из аргументов вызова (все перечислены в services)"
+    },
+    {
+      "id": "dyn.preflight-probe",
+      "functions": [
+        "reinstall_preflight"
+      ],
+      "effects": [
+        "rm"
+      ],
+      "site_regex": "_pf_probe",
+      "path_regex": "^/tmp/geomask-pf-[^/]*$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "наблюдатель снимка: probe-каталог mktemp в /tmp создается и сразу удаляется preflight-ом; transient"
+    },
+    {
+      "id": "dyn.callee-v6-backup",
+      "evidence": "callee",
+      "functions": [
+        "cmd_ipv6"
+      ],
+      "effects": [
+        "cp"
+      ],
+      "site_regex": "bak_v6off_",
+      "path_regex": "^/etc/config/network\\.bak_v6off_[^/]*$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "cp -n /etc/config/network -> network.bak_v6off_<epoch> (geo-backend.sh ipv6 off)"
+    },
+    {
+      "id": "dyn.nft-normalize",
+      "functions": [
+        "_rs_nft_norm"
+      ],
+      "effects": [
+        "redirect"
+      ],
+      "site_regex": "_rs_nft_out",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SNAP",
+      "restore": "RV",
+      "notes": "sed заменяет live-счётчики counter packets N bytes M на N внутри снапшот-каталога (.norm): сравнивается только структура, счётчики не влияют на успех"
+    },
+    {
+      "id": "dyn.symlink-pins",
+      "functions": [
+        "_rs_link_ok"
+      ],
+      "effects": [
+        "redirect-append"
+      ],
+      "site_regex": "symlinks",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SNAP",
+      "restore": "RV",
+      "notes": "snapshot pins the resolved target and dev:ino of every allowed symlink component; restore/verify compare them before any external action"
+    }
+  ],
+  "services": [
+    {
+      "id": "svc.dnsmasq",
+      "name": "dnsmasq",
+      "initd": "dnsmasq",
+      "pid": "dnsmasq",
+      "observe": "pidof/pgrep",
+      "scope": "всегда (step6 стартует, если остановлен)",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared",
+      "notes": "главный DNS; reinstall не должен оставлять его выключенным"
+    },
+    {
+      "id": "svc.mihomo",
+      "name": "mihomo",
+      "initd": "mihomo",
+      "pid": "mihomo",
+      "observe": "pidof + API",
+      "scope": "всегда",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours"
+    },
+    {
+      "id": "svc.magitrickle",
+      "name": "magitrickle",
+      "initd": "magitrickle",
+      "pid": "magitrickled",
+      "observe": "pidof",
+      "scope": "всегда",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared",
+      "notes": "останавливается вокруг seed_lists; исходное stopped обязано остаться stopped"
+    },
+    {
+      "id": "svc.hev-socks5-tunnel",
+      "name": "hev-socks5-tunnel",
+      "initd": "hev-socks5-tunnel",
+      "pid": "hev-socks5-tunnel",
+      "observe": "pidof",
+      "scope": "модули path_ai/ai_dns",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "svc.hev-nop2p",
+      "name": "hev-nop2p",
+      "initd": "hev-nop2p",
+      "pid": "hev-socks5-tunnel",
+      "observe": "pidof",
+      "scope": "lane VPN-noP2P (GM_AUTO_LANE; callee geomask-lane.sh)",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours",
+      "notes": "lane-инстанс hev-socks5-tunnel: install делает enable/start, remove - stop/disable; наблюдаемость того же бинарника hev-socks5-tunnel"
+    },
+    {
+      "id": "svc.rpcd",
+      "name": "rpcd",
+      "initd": "rpcd",
+      "pid": "rpcd",
+      "observe": "pidof",
+      "scope": "всегда (reload после файлов RPC/UI)",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared",
+      "notes": "ошибки reload в текущем коде игнорируются - откат обязан проверять регистрацию ubus geo-sync"
+    },
+    {
+      "id": "svc.ai-doh",
+      "name": "ai-doh",
+      "initd": "ai-doh",
+      "pid": "https-dns-proxy",
+      "observe": "netstat 127.0.0.1:5055",
+      "scope": "модуль ai_dns и нет /etc/geomask-aidns.off",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours"
+    },
+    {
+      "id": "svc.dnsmasq-ai",
+      "name": "dnsmasq-ai",
+      "initd": "dnsmasq-ai",
+      "pid": "dnsmasq",
+      "observe": "netstat <aidns-ip>:5353",
+      "scope": "модуль ai_dns и нет /etc/geomask-aidns.off",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours"
+    },
+    {
+      "id": "svc.geomask-syncd",
+      "name": "geomask-syncd",
+      "initd": "geomask-syncd",
+      "pid": "geomask-syncd.sh",
+      "observe": "pgrep -f",
+      "scope": "всегда (enable/restart в step5, stop/disable/pkill в uninstall)",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours",
+      "notes": "pkill -f по шаблону может задеть чужой процесс (см. processes)"
+    },
+    {
+      "id": "svc.network",
+      "name": "network",
+      "initd": "network",
+      "pid": "netifd",
+      "observe": "pidof netifd / ubus",
+      "scope": "всегда (reload после alias/uci)",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared",
+      "notes": "netifd: reload не равен восстановлению состояния интерфейсов - наблюдаемость ограничена"
+    },
+    {
+      "id": "svc.firewall",
+      "name": "firewall",
+      "initd": "firewall",
+      "pid": "fw4",
+      "observe": "pidof / nft list",
+      "scope": "модуль ai_dns (reload для nft include)",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "svc.ksmbd",
+      "name": "ksmbd",
+      "initd": "ksmbd|ksmbd1",
+      "pid": "ksmbd",
+      "observe": "pidof",
+      "scope": "модуль backup_share (restart при изменении share)",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "svc.dynamic-name",
+      "name": "dynamic-name",
+      "initd": "loop over SVC_LIST / $c",
+      "pid": "-",
+      "observe": "как выше",
+      "scope": "step6 и ensure_smb_share используют переменные имена",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared",
+      "notes": "покрывает вызовы initd \"$s\"/\"$c\" с динамическими именами; сами имена перечислены в этом списке"
+    }
+  ],
+  "cron": [
+    {
+      "id": "cron.guard",
+      "marker": "# geomask-guard$",
+      "line": "*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1 # geomask-guard",
+      "owner": "shared",
+      "snapshot": "CRON",
+      "restore": "RR",
+      "notes": "cron_ensure guard"
+    },
+    {
+      "id": "cron.ytwatch",
+      "marker": "# geomask-ytwatch$",
+      "line": "*/1 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch",
+      "owner": "shared",
+      "snapshot": "CRON",
+      "restore": "RR",
+      "notes": "миграция */5 -> */1 переписывает строку на месте"
+    },
+    {
+      "id": "cron.ytwatch-reset",
+      "marker": "# geomask-ytwatch-reset$",
+      "line": "20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset",
+      "owner": "shared",
+      "snapshot": "CRON",
+      "restore": "RR"
+    },
+    {
+      "id": "cron.doctor-prune",
+      "marker": "# geomask-doctor-prune$",
+      "line": "40 4 * * * /usr/lib/geomask/geomask-doctor.py prune >/dev/null 2>&1 # geomask-doctor-prune",
+      "owner": "shared",
+      "snapshot": "CRON",
+      "restore": "RR"
+    },
+    {
+      "id": "cron.vpnwatch",
+      "marker": "# geomask-vpnwatch$",
+      "line": "* * * * * /usr/bin/geomask-vpnwatch.sh --tick >/dev/null 2>&1 # geomask-vpnwatch",
+      "owner": "shared",
+      "snapshot": "CRON",
+      "restore": "RR"
+    },
+    {
+      "id": "cron.sync",
+      "marker": "sync_mtrickle_mihomo",
+      "line": "*/5 * * * * /root/sync_mtrickle_mihomo.sh",
+      "owner": "shared",
+      "snapshot": "CRON",
+      "restore": "RR"
+    },
+    {
+      "id": "cron.nodescan",
+      "marker": "geomask-node-scan",
+      "line": "30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan",
+      "owner": "shared",
+      "snapshot": "CRON",
+      "restore": "RR",
+      "notes": "legacy-ночьной аудит; не добавляется при активном per-path scheduler"
+    },
+    {
+      "id": "cron.audit-schedule-removal",
+      "marker": "geomask-audit-schedule",
+      "line": "",
+      "owner": "shared",
+      "snapshot": "CRON",
+      "restore": "RR",
+      "notes": "uninstall удаляет строки по маркеру geomask-audit-schedule"
+    },
+    {
+      "id": "cron.shared-restore",
+      "marker": "",
+      "line": "",
+      "owner": "shared",
+      "snapshot": "CRON",
+      "restore": "RR",
+      "notes": "crontab ОБЩИЙ: восстановление = точный снимок целиком; при конкурентной правке после снимка - конфликт, снимок сохраняется"
+    }
+  ],
+  "uci": [
+    {
+      "id": "uci.network",
+      "package": "network",
+      "keys": "network.lanai=interface (proto/device/ipaddr/netmask); network.lan.ip6assign",
+      "key_patterns": [
+        "^network\\.lanai(\\.(proto|device|ipaddr|netmask))?$",
+        "^network\\.lanai\\.\\$_rs_o$",
+        "^network\\.lan(\\.ip6assign)?$",
+        "^commit:network$"
+      ],
+      "delta_file": "/etc/config/network",
+      "snapshot": "UCI",
+      "restore": "RU",
+      "owner": "shared",
+      "product_rows": [
+        "network|lanai|section|proto,device,ipaddr,netmask",
+        "network|lan|option|ip6assign"
+      ]
+    },
+    {
+      "id": "uci.dhcp",
+      "package": "dhcp",
+      "keys": "dhcp.lan.ra, dhcp.lan.dhcpv6, dhcp.lan.ndp",
+      "key_patterns": [
+        "^dhcp\\.lan(\\.(ra|dhcpv6|ndp|\\$_k))?$",
+        "^commit:dhcp$"
+      ],
+      "delta_file": "/etc/config/dhcp",
+      "snapshot": "UCI",
+      "restore": "RU",
+      "owner": "shared",
+      "product_rows": [
+        "dhcp|lan|option|ra,dhcpv6,ndp"
+      ]
+    },
+    {
+      "id": "uci.ksmbd",
+      "package": "ksmbd",
+      "keys": "ksmbd.<section>=share: name/path/read_only/guest_ok/force_root",
+      "key_patterns": [
+        "^ksmbd\\.\\$_sec\\.\\$_rs_uo$",
+        "^ksmbd\\.\\$_sec\\.(name|path|read_only|guest_ok)$",
+        "^\\$_found\\.(path|read_only|guest_ok|force_root)$",
+        "^\\$_drop$",
+        "^add:ksmbd share$",
+        "^commit:ksmbd$"
+      ],
+      "delta_file": "/etc/config/ksmbd",
+      "snapshot": "UCI",
+      "restore": "RU",
+      "owner": "shared",
+      "notes": "работать только с секциями name=geomask-backups",
+      "product_rows": [
+        "ksmbd|geomask-backups|name|name,path,read_only,guest_ok,force_root"
+      ]
+    },
+    {
+      "id": "uci.lane-network",
+      "package": "network",
+      "keys": "network.$NETID=interface (proto/device) - lane VPN-noP2P (GM_AUTO_LANE)",
+      "key_patterns": [
+        "^network\\.\\$NETID(\\.(proto|device))?$"
+      ],
+      "delta_file": "/etc/config/network",
+      "snapshot": "UCI",
+      "restore": "RU",
+      "owner": "shared",
+      "evidence": {
+        "kind": "callee"
+      },
+      "notes": "callee geomask-lane.sh: uci-секция lane-туннеля; remove удаляет"
+    },
+    {
+      "id": "uci.lane-firewall",
+      "package": "firewall",
+      "keys": "firewall.$NEW (zone клон Mihomo) и firewall.$NF (lan<->lane forwardings)",
+      "key_patterns": [
+        "^firewall\\.\\$(NEW|NF)(\\.(name|network|src|dest|\\$opt))?$",
+        "^\\$(s|f)$",
+        "^add:firewall (zone|forwarding)$",
+        "^commit:firewall$"
+      ],
+      "delta_file": "/etc/config/firewall",
+      "snapshot": "UCI",
+      "restore": "RU",
+      "owner": "shared",
+      "evidence": {
+        "kind": "callee"
+      },
+      "notes": "callee geomask-lane.sh: зона/forwarding lane; remove удаляет по name=LANE_NAME"
+    }
+  ],
+  "net_runtime": [
+    {
+      "id": "net.fwmark-rule",
+      "kind": "ip-rule",
+      "object": "rule",
+      "pattern": "ip rule (add|del) pref .*fwmark",
+      "detail": "ip rule add|del pref 19902 fwmark 0x64 table 101 (AI-DNS); snapshot records ALL same-mark rules as a sorted set \"<pref>|<table>|ours|foreign\"; only pref 19902 is ours: restore repairs exactly that rule (add/remove/table), foreign same-mark changes are a conflict, verify compares the exact set",
+      "snapshot": "IPR",
+      "restore": "RI",
+      "owner": "ours",
+      "notes": "phase 2e: multiple rules with the same mark; a foreign lower-pref rule does not hide our 19902; foreign rules are never modified"
+    },
+    {
+      "id": "net.nft-ai-dns",
+      "kind": "nft-table",
+      "object": "nft",
+      "pattern": "geomask-aidns\\.nft|geomask_ai_dns",
+      "detail": "table inet geomask_ai_dns (pre_nat DNAT + out_mark skuid) через include 98-geomask-ai-dns.nft + firewall reload; снимок хранит list table, verify сравнивает содержимое (не только наличие)",
+      "snapshot": "NFT",
+      "restore": "RF",
+      "owner": "ours"
+    },
+    {
+      "id": "net.nft-v6-guard",
+      "kind": "nft-guard",
+      "object": "nft",
+      "pattern": "99-geomask-no-v6|geomask_no_v6",
+      "detail": "table inet fw4 chain geomask_no_v6 (drop ipv6 forward) из /etc/nftables.d/99-geomask-no-v6.nft; снимок хранит list chain, verify сравнивает содержимое",
+      "snapshot": "NFT",
+      "restore": "RF",
+      "owner": "ours"
+    },
+    {
+      "id": "net.alias-lanai",
+      "kind": "alias",
+      "detail": "alias-адрес AI dnsmasq на LAN-интерфейсе (network.lanai -> netifd)",
+      "snapshot": "ALIAS",
+      "restore": "RA",
+      "owner": "ours"
+    },
+    {
+      "id": "sysctl.file",
+      "kind": "sysctl-file",
+      "object": "sysctl",
+      "pattern": "sysctl -p",
+      "detail": "/etc/sysctl.d/99-disable-ipv6.conf (all+default disable_ipv6)",
+      "snapshot": "SYSK",
+      "restore": "RK",
+      "owner": "ours"
+    },
+    {
+      "id": "sysctl.kernel",
+      "kind": "sysctl-kernel",
+      "object": "sysctl",
+      "pattern": "sysctl -p",
+      "detail": "net.ipv6.conf.{all,default,<iface>}.disable_ipv6 - runtime-ядро; restore per-key для каждого interface",
+      "snapshot": "SYSK",
+      "restore": "RK",
+      "owner": "shared",
+      "notes": "восстановление default-на-все интерфейсы НЕ воспроизводит неодинаковые исходные значения (известный пробел backend)"
+    },
+    {
+      "id": "net.network-reload",
+      "kind": "netifd-reload",
+      "detail": "/etc/init.d/network reload (после uci network) - runtime-эффект",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "owner": "shared",
+      "notes": "reload не наблюдаем как файл; проверять фактические адреса/интерфейсы"
+    },
+    {
+      "id": "net.firewall-reload",
+      "kind": "fw4-reload",
+      "detail": "/etc/init.d/firewall reload (применение nft include)",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "owner": "shared"
+    },
+    {
+      "id": "net.mihomo-api",
+      "kind": "mihomo-api",
+      "detail": "PUT /configs (api_refresh_provider, sync reload) - внешний сетевой эффект, provider cache/подписка не файлы",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "owner": "ours",
+      "notes": "провал refresh НЕ является откатом; preflight обязан требовать наблюдаемость результата или отказываться"
+    }
+  ],
+  "processes": [
+    {
+      "id": "proc.syncd-pkill",
+      "name": "geomask-syncd.sh",
+      "pattern": "pkill -f geomask-syncd\\.sh",
+      "detail": "pkill -f geomask-syncd.sh (uninstall)",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "owner": "ours",
+      "notes": "pkill по шаблону может совпасть с чужим процессом; известный риск; любой другой pkill/kill валит гейт (review E)"
+    },
+    {
+      "id": "proc.trial-mihomo-kill",
+      "name": "gm-trial-mihomo",
+      "pattern": "kill -0 \"\\$_tp\"|kill \"\\$_tp\"",
+      "detail": "mihomo_trial_run останавливает собственный trial-процесс по сохранённому pid",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "owner": "ours",
+      "notes": "kill по pid собственного trial-процесса mihomo; не трогает чужие процессы"
+    }
+  ],
+  "forbidden": [
+    {
+      "id": "pkg.install",
+      "call": "apk/opkg",
+      "functions": [
+        "step1_apply",
+        "step4_apply",
+        "step5_apply",
+        "pkg_install"
+      ],
+      "effect": "apk add / opkg install / apk update",
+      "phase": "step1 - только обычный install; step4 (https-dns-proxy) и step5 (inotifywait) входят в reinstall-путь",
+      "policy": "в reinstall автoустановка пакетов ЗАПРЕЩЕНА, включая apk add inotifywait в step5 (syncd деградирует на 10s poll). Preflight обязан проверить зависимости БЕЗ установки и отказаться ДО мутации. Гарант: GM_REINSTALL_NO_PKG=1 + pkg_install.",
+      "guards": [
+        "GM_REINSTALL_NO_PKG"
+      ],
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "package DB/пост-скрипты не откатываются snapshot-ом - любая автоустановка ломает контракт полного отката"
+    }
+  ],
+  "callees": [
+    {
+      "file": "assets/sync_mtrickle_mihomo.sh",
+      "scope": "all",
+      "invoked_by": "step5_apply (GM_RESTART=1), seed_lists; cron */5",
+      "notes": "пишет ruleset-файлы mihomo, управляемые строки zapret-файлов, /tmp/geomask-sync.state, /root/geo-sync.log; дергает mihomo API"
+    },
+    {
+      "file": "assets/geomask-seed-lists.py",
+      "scope": "all",
+      "invoked_by": "seed_lists (step5_apply)",
+      "notes": "пишет /etc/magitrickle/state/config.yaml при остановленном magitrickled"
+    },
+    {
+      "file": "assets/geomask-module-update.py",
+      "scope": "all",
+      "invoked_by": "step2_apply (seed --versions)",
+      "notes": "пишет modules-state.json, /tmp-кэш/lock/staging"
+    },
+    {
+      "file": "assets/geomask-node-audit.py",
+      "scope": "all",
+      "invoked_by": "step5_apply (_migrate_nodescan_cron -> schedule_set), nodescan_schedule_active",
+      "notes": "пишет node-audit.json/state/events/pools/reports/receipt"
+    },
+    {
+      "file": "assets/geo-backend.sh",
+      "scope": {
+        "from": "^IPV6_STATE=",
+        "to": "^# AI-DNS on demand"
+      },
+      "invoked_by": "apply_ipv6_default -> geo-backend.sh ipv6 off",
+      "notes": "ядро IPv6: ipv6.state (+ipv6.state.tmp transient), sysctl.d-файл, nft guard, per-interface kernel sysctl, uci network/dhcp, network.bak_v6off_*, reload network"
+    },
+    {
+      "file": "assets/geomask-lane.sh",
+      "scope": "all",
+      "invoked_by": "step5_apply (GM_AUTO_LANE при отсутствии lane), geomask_uninstall (lane remove)",
+      "notes": "lane VPN-noP2P: /etc/hev-socks5-tunnel/nop2p.yml, /etc/init.d/hev-nop2p, nft accept include, патч /etc/mihomo/config.yaml (+ preimage .bak_lane), uci network.$NETID + firewall zone/forwardings, ifup, firewall reload, initd enable/start/stop/disable (hev-nop2p)"
+    },
+    {
+      "file": "assets/geomask-ytwatch.sh",
+      "scope": "all",
+      "invoked_by": "geomask_uninstall (ytwatch --reset); cron */1 и */4 в обычной эксплуатации",
+      "notes": "пишет /etc/geomask/ytwatch.state, управляется через /etc/geomask-ytwatch.conf (script-evidence), /var/run/magitrickle.sock - read-only IPC"
+    }
+  ],
+  "read_only": [
+    {
+      "id": "ro.module-update-config",
+      "path": "/etc/geomask/module-update.json",
+      "notes": "конфиг апдейтера; не пишется reinstall-путём"
+    },
+    {
+      "id": "ro.geomask-subs-list",
+      "path": "/etc/geomask-subs.list",
+      "notes": "реестр подписок; читается node-audit"
+    },
+    {
+      "id": "ro.boot-id",
+      "path": "/proc/sys/kernel/random/boot_id",
+      "notes": "идентификатор загрузки (node-audit)"
+    },
+    {
+      "id": "ro.hev-socks5-tunnel-dir",
+      "path": "/etc/hev-socks5-tunnel",
+      "notes": "каталог конфигов hev-socks5-tunnel (пакет); lane проверяет его наличие и пишет nop2p.yml внутрь"
+    },
+    {
+      "id": "ro.firewall-initd",
+      "path": "/etc/init.d/firewall",
+      "notes": "системный init-скрипт fw4; lane делает reload (net_runtime fw4-reload)"
+    },
+    {
+      "id": "ro.sys-class-net",
+      "path": "/sys/class/net/",
+      "notes": "перечень netdev (lane status: наличие туннеля VPN-noP2P)"
+    },
+    {
+      "id": "ro.hev-binary",
+      "path": "/usr/bin/hev-socks5-tunnel",
+      "notes": "бинарник туннеля (пакет); упоминается в init-скрипте lane"
+    },
+    {
+      "id": "ro.mihomo-binary",
+      "path": "/usr/bin/mihomo",
+      "notes": "бинарник mihomo; lane валидирует конфиг mihomo -t"
+    },
+    {
+      "id": "ro.magitrickle-sock",
+      "path": "/var/run/magitrickle.sock",
+      "notes": "IPC-сокет magitrickled (ytwatch общается с демоном)"
+    }
+  ],
+  "preflight_objects": [
+    {
+      "id": "svc.dnsmasq",
+      "kind": "service",
+      "expected": "present-or-absent",
+      "observe": "rc.d + pidof",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "svc.mihomo",
+      "kind": "service",
+      "expected": "present",
+      "observe": "rc.d + pidof",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours"
+    },
+    {
+      "id": "svc.magitrickle",
+      "kind": "service",
+      "expected": "present",
+      "observe": "rc.d + pidof",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "svc.hev-socks5-tunnel",
+      "kind": "service",
+      "expected": "present-or-absent",
+      "observe": "rc.d + pidof",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "svc.hev-nop2p",
+      "kind": "service",
+      "expected": "present-or-absent",
+      "observe": "rc.d + pidof (shared hev-socks5-tunnel binary)",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours",
+      "notes": "lane-инстанс; при вооружённом GM_AUTO_LANE preflight/снимок отказывают до мутации"
+    },
+    {
+      "id": "svc.rpcd",
+      "kind": "service",
+      "expected": "present",
+      "observe": "rc.d + pidof",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "svc.ai-doh",
+      "kind": "service",
+      "expected": "present-or-absent",
+      "observe": "rc.d + netstat :5055",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours"
+    },
+    {
+      "id": "svc.dnsmasq-ai",
+      "kind": "service",
+      "expected": "present-or-absent",
+      "observe": "rc.d + netstat :5353",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours"
+    },
+    {
+      "id": "svc.geomask-syncd",
+      "kind": "service",
+      "expected": "present",
+      "observe": "rc.d + pgrep -f",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "ours"
+    },
+    {
+      "id": "svc.network",
+      "kind": "service",
+      "expected": "present",
+      "observe": "rc.d + pidof netifd",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "svc.firewall",
+      "kind": "service",
+      "expected": "present",
+      "observe": "rc.d + pidof/nft",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "svc.ksmbd",
+      "kind": "service",
+      "expected": "present-or-absent",
+      "observe": "rc.d + pidof",
+      "snapshot": "TRI",
+      "restore": "RS",
+      "owner": "shared"
+    },
+    {
+      "id": "cron.user",
+      "kind": "crontab",
+      "expected": "observable",
+      "observe": "crontab -l: rc=0 или rc=1+пусто; rc>=2 = unknown",
+      "snapshot": "CRON",
+      "restore": "RR",
+      "owner": "shared"
+    },
+    {
+      "id": "rc.d",
+      "kind": "links",
+      "expected": "observable",
+      "observe": "ls /etc/rc.d (полная тротт-качение), readlink targets",
+      "snapshot": "LINK",
+      "restore": "RL",
+      "owner": "shared"
+    },
+    {
+      "id": "uci.network",
+      "kind": "uci",
+      "expected": "observable",
+      "observe": "uci -q get network.lan -> rc 0/1 детерминированно",
+      "snapshot": "UCI",
+      "restore": "RU",
+      "owner": "shared"
+    },
+    {
+      "id": "uci.dhcp",
+      "kind": "uci",
+      "expected": "observable",
+      "observe": "uci -q get dhcp.lan -> rc 0/1",
+      "snapshot": "UCI",
+      "restore": "RU",
+      "owner": "shared"
+    },
+    {
+      "id": "uci.ksmbd",
+      "kind": "uci",
+      "expected": "observable",
+      "observe": "uci -q show ksmbd -> rc 0/1",
+      "snapshot": "UCI",
+      "restore": "RU",
+      "owner": "shared"
+    },
+    {
+      "id": "net.fwmark-rule",
+      "kind": "ip-rule",
+      "expected": "observable",
+      "observe": "ip rule show читаем",
+      "snapshot": "IPR",
+      "restore": "RI",
+      "owner": "ours"
+    },
+    {
+      "id": "net.nft-ai-dns",
+      "kind": "nft-table",
+      "expected": "observable",
+      "observe": "nft list table inet geomask_ai_dns: rc 0 (есть) / 1 (нет)",
+      "snapshot": "NFT",
+      "restore": "RF",
+      "owner": "ours"
+    },
+    {
+      "id": "net.alias-lanai",
+      "kind": "alias",
+      "expected": "observable",
+      "observe": "uci -q get network.lanai.ipaddr + ip -4 addr show",
+      "snapshot": "ALIAS",
+      "restore": "RA",
+      "owner": "ours"
+    },
+    {
+      "id": "sysctl.kernel",
+      "kind": "sysctl",
+      "expected": "observable",
+      "observe": "чтение /proc/sys/net/ipv6/conf/{all,default,<iface>}/disable_ipv6",
+      "snapshot": "SYSK",
+      "restore": "RK",
+      "owner": "shared"
+    },
+    {
+      "id": "file.passwd",
+      "kind": "file-shared",
+      "expected": "regular",
+      "observe": "файл читаем; строка dnsai присутствует/отсутствует детерминированно",
+      "snapshot": "SAP",
+      "restore": "RT",
+      "owner": "shared"
+    },
+    {
+      "id": "file.group",
+      "kind": "file-shared",
+      "expected": "regular",
+      "observe": "файл читаем",
+      "snapshot": "SAP",
+      "restore": "RT",
+      "owner": "shared"
+    },
+    {
+      "id": "shared.magitrickle-config",
+      "kind": "file-shared",
+      "expected": "regular-or-absent",
+      "observe": "тип классифицируем; владелец - magitrickled",
+      "snapshot": "SBA",
+      "restore": "NR",
+      "owner": "shared",
+      "notes": "если перезапись seeder-ом не компенсируема - отказ"
+    },
+    {
+      "id": "shared.zapret-exclude",
+      "kind": "file-shared",
+      "expected": "regular-or-absent",
+      "observe": "тип классифицируем",
+      "snapshot": "SAP",
+      "restore": "RT",
+      "owner": "shared"
+    },
+    {
+      "id": "shared.zapret-force",
+      "kind": "file-shared",
+      "expected": "regular-or-absent",
+      "observe": "тип классифицируем",
+      "snapshot": "SAP",
+      "restore": "RT",
+      "owner": "shared"
+    },
+    {
+      "id": "file.mihomo-config",
+      "kind": "file",
+      "expected": "regular-or-absent",
+      "observe": "тип классифицируем; содержимое не логируется (secret/URL)",
+      "snapshot": "SB",
+      "restore": "RB",
+      "owner": "ours"
+    },
+    {
+      "id": "dir.tracked",
+      "kind": "dirs",
+      "expected": "observable",
+      "observe": "ls /usr/lib/geomask, /etc/mihomo/ruleset, glob /usr/bin/geomask* успешен",
+      "snapshot": "SB",
+      "restore": "RB",
+      "owner": "ours"
+    },
+    {
+      "id": "tmp.scratch",
+      "kind": "dir",
+      "expected": "observable",
+      "observe": "mktemp -d в $(P /tmp) успешен и удаляем",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "owner": "ours"
+    }
+  ]
+}

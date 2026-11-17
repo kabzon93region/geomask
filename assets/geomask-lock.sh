@@ -15,8 +15,11 @@
 #   * Fixed lock order, enforced at run time: a process may only take locks with a strictly
 #     higher rank than every lock it already holds (gm_lock_rank). Downward nesting is
 #     refused with rc=4 instead of deadlocking. The order is:
-#       maintenance(10) -> console(20) -> cron(25) -> config-tx(30) -> route-<table>(40)
-#       -> sync(45) -> devices(60) -> subs(65)
+#       maintenance(10) -> console(20) -> cron(25) -> config-tx(30) -> routes-worker(35)
+#       -> route-<table>(40) -> sync(45) -> devices(60) -> subs(65)
+#   routes-worker is the R05 single-flight queue worker: it is taken before the per-table lock
+#   (so two workers cannot fight over one table) and after config-tx (a panel transaction may
+#   hold config-tx and then ask the queue to apply, never the other way around).
 #   cron sits before config-tx because the uninstall (under maintenance) removes crontab lines
 #   and then asks the lane helper to rewrite the mihomo config; the reverse nesting never
 #   happens (the transaction and the lane manager never touch cron).
@@ -58,6 +61,7 @@ gm_lock_rank() {
     maintenance) printf '10' ;;
     console)     printf '20' ;;
     config-tx)   printf '30' ;;
+    routes-worker) printf '35' ;;
     route-*)     printf '40' ;;
     sync)        printf '45' ;;
     cron)        printf '25' ;;

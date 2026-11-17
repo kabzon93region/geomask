@@ -70,8 +70,15 @@
 - `ai` — весь трафик через AI-туннель, правило `from <IP> lookup 101` (19900).
 - `realtz` — обычный путь mihomo (маскированный IP), реальный только часовой пояс (на стороне клиента).
 
-Правила создаёт/пересоздаёт `geo-backend.sh` (`_apply_routing`) и hotplug `99-default-vpn-route`
-(при `ifup`). Оба используют приоритет `19900`; удаление — по `from <ip> lookup <table>`, не по pref.
+Правила создаёт/пересоздаёт `geo-backend.sh` (`_apply_routing`) и worker очереди
+`99-default-vpn-route` → `geomask-routes.sh` (при `ifup`; hotplug только ставит событие в
+очередь, применяет worker). Оба используют приоритет `19900`; удаление — по
+`from <ip> lookup <table>`, не по pref.
+
+Очередь route-событий: `pending-<t>` / `work-<t>` / `error-<t>` / `parked-<t>` в
+`/tmp/geomask-routes`. Диагностика: `ls -l /tmp/geomask-routes`, `cat /tmp/geomask-routes/error-100`;
+дренаж вручную — `gm_route_drain` из `/usr/lib/geomask/geomask-routes.sh` (или дождаться
+guard/cron, ≤5 мин).
 
 ## Что решает маршрут, а что — правила mihomo
 

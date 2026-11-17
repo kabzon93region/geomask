@@ -17,8 +17,39 @@ Python использует `fcntl.flock` на **тех же файлах** (э�
   попытка. BusyBox `flock` не имеет `-w`, поэтому ожидание = `flock -n` + `sleep 1` до бюджета.
 * Фиксированный порядок захвата (rank), проверяется в рантайме: захват lock с rank ≤ уже
   удерживаемого max завершается `rc=4`, повторный захват того же имени — `rc=3`. Порядок:
-  `maintenance(10) → console(20) → cron(25) → config-tx(30) → route-<table>(40) → sync(45)
-  → devices(60) → subs(65)`.
+  `maintenance(10) → console(20) → cron(25) → config-tx(30) → routes-worker(35) →
+  route-<table>(40) → sync(45) → devices(60) → subs(65)`.
+* `routes-worker(35)` — single-flight очередь route-событий (R05). Worker берёт его первым и
+  только потом `route-<table>(40)`: два worker'а не могут одновременно бороться за одну
+  таблицу. Обратный порядок запрещён: писатель таблицы не берёт worker-lock (тест рангов).
+* Очередь: очередь живёт в `GM_ROUTE_STATE_DIR` (default `/tmp/geomask-routes`), файлы
+  `pending-<t>` / `work-<t>` / `error-<t>` / `parked-<t>`. `gm_route_enqueue <t>` пишет
+  `pending-<t>` через temp+`mv` **до** любого spawn; worker атомарно `mv pending→work`,
+  удаляет `work` только после успеха. Новый `pending`, появившийся за время sync, даёт ещё
+  один проход (generation recheck).
+* rc-контракт `geomask_routes_sync`: `0` ok, `75` busy (route-lock занят), `76` retryable read
+  до мутации, `77` неудачная мутация (`replace`/`delete`/`cp`, а также чужой occupant
+  префикса), `2` нет lock-примитива, `4` инверсия рангов. `1` больше не используется:
+  вызывающий не мог отличить «повторить» от «отказать».
+* Worker: `GM_ROUTE_LOCK_WAIT=2` на каждую попытку (родитель мог экспортировать 0), только
+  `75/76` ретраятся — ≤5 попыток, backoff `1/2/4/8`, ≤3 активации, общий cap ~30 с. `77/2/4`
+  не ретраятся: `77` — ownership-конфликт, его разбирает R12; событие уходит в `parked-<t>` +
+  `error-<t>` (ts/rc/attempts) и ждёт **нового** события. Перед стартом worker вызывает
+  `gm_lock_close_inherited`, иначе унаследованный fd держал бы console/updater-lock.
+* ifup-hotplug (`99-default-vpn-route`) больше не берёт route-lock и не запускает `ip`/`uci`:
+  он только `gm_route_enqueue` + detached worker. Контракт выхода: `0` — событие принято в
+  очередь (не «применено»), `1` — pending не записан, `2` — нет lock-примитива. Ожидание TUN
+  и все ретраи — внутри worker'а, ограниченно.
+* Drain: `gm_route_drain` (inline, без spawn) вызывается в guard/cron (вне console-lock) и в
+  установщике под `maintenance`; установщик по-прежнему читает `error-100`. Drain делает
+  ровно одну попытку НА ТАБЛИЦУ ЗА ВЫЗОВ, но обходит ВСЕ pending-таблицы (100/101/102 и
+  новое поколение, появившееся во время sync): busy/readable-rc возвращает событие в
+  `pending-*` (не паркует), `77/2/4` паркует только эту таблицу, остальные продолжают
+  обрабатываться. Поэтому cron-прогон не «останавливает автоматику» из-за временно занятой
+  таблицы и одна проблемная таблица не блокирует другие.
+* `rc=2` helper'а с существующим backend (не создать/не открыть lock-dir: ENOSPC/EACCES)
+  трактуется как retryable `76`; только отсутствие самого примитива остаётся терминальным
+  `2` (fail closed / park). Внешний набор кодов не меняется.
 * Нет `flock` на Linux → `rc=2`, writer обязан отказать (fail-closed). mkdir-fallback удалён.
   Non-Linux (Windows-host тестов) — документированный portable-backend (O_EXCL), на роутере
   не выбирается; `SIGKILL`-release и inode-идентичность там не проверяются.
@@ -39,6 +70,12 @@ Python использует `fcntl.flock` на **тех же файлах** (э�
   остатки прибирает `REINSTALL_TEMP_GLOBS` в `_rs_prune_temps`.
 * Guard берёт `console` и делает route-sync **no-wait** (`GM_ROUTE_LOCK_WAIT=0` в subshell):
   занятая таблица 102 пропускается с WARN до следующего прогона, `console off` не ждёт 20 с.
+  До этого блока guard вызывает `gm_route_drain` вне console-lock: очередь route-событий
+  разбирается cron-прогоном, а не ожиданием внутри чужой секции.
+* Console/rpc (`geo-backend.sh`): `_console_rule_on` использует короткий бюджет
+  `GM_CONSOLE_ROUTE_WAIT=2` (а не 20 с под console-lock), busy/read-rc возвращается как
+  `"retryable":true`; `_ai_routes_ensure` не ставит `default dev AI`, если таблица 101 не
+  синхронизирована, и `_apply_routing` не добавляет правило в такую таблицу.
 * Scanner держит ОДИН бэкап на вид (`config.yaml.bak_nodescan`, `...bak_aiguard`), заменяемый
   атомарно, а не файл на каждый скан; ошибка записи бэкапа (ENOSPC/замена) логируется
   `WARN ... NOT saved`, и скан **продолжается без бэкапа** — осознанный выбор: бэкап
@@ -57,7 +94,8 @@ Python использует `fcntl.flock` на **тех же файлах** (э�
 
 | Ресурс | Lock | Где |
 |---|---|---|
-| таблицы 100/101/102 (`owned-*`) | `route-<n>`, hotplug — no-wait | `geomask-routes.sh`, `99-default-vpn-route` |
+| таблицы 100/101/102 (`owned-*`) | `route-<n>` (пишет worker), hotplug только очередь | `geomask-routes.sh`, `99-default-vpn-route` |
+| очередь route-событий (`pending/work/error/parked`) | `routes-worker` (single flight) | `geomask-routes.sh`, hotplug-spawn, guard/cron drain, установщик |
 | console on/off ↔ guard | `console` (guard — no-wait) | `geo-backend.sh`, `geomask-guard.sh` |
 | `/etc/mihomo/config.yaml` (транзакция) | `config-tx` = `/etc/geomask/node-audit/state/.config-tx.lock` | `geomask-config-tx.py` |
 | node-scan → config.yaml | тот же `config-tx` (дайджест-CAS внутри lock) | `geomask-node-scan.sh` |
@@ -99,6 +137,14 @@ conflict/verify-проверками отката.
 ## Что осталось / границы
 
 * `ip rule`/nft (R14) — несколько писателей без общего lock: вне объёма R04.
+* R05: `77` (неудачная мутация) намеренно **не** ретраится. Ownership/reconcile маршрутов
+  (повторный `replace` после чужого occupant'а, восстановление `owned`) — R12; очередь
+  паркует событие и ждёт нового ifup.
+* Очередь не демон: `pending-*` старше последнего drain не чистится по возрасту, а drain
+  запускается только guard/cron (каждые 5 мин) и установщиком. Если TUN так и не поднялся,
+  событие остаётся `pending-*` (deferred, не parked) и будет применено при первом успешном
+  подъёме/дренаже. Отдельного таймера/expiry нет — это осознанно: потеря ifup-события и была
+  дефектом R05.
 * Fixed-temp writers (P2/P3, не блокеры): `geomask-ytwatch.sh:190` (state),
   `geomask-vpnwatch.sh:109` (cursor), `/tmp/geomask-ytwatch.conf.new`,
   `geomask-audit-scheduler.py` (`schedule-runs.json.tmp`).
@@ -108,9 +154,10 @@ conflict/verify-проверками отката.
 * Старый pid-updater (`/tmp/geomask-upd/pid`) невидим новому `updater`-lock: одно пересекающееся
   обновление сразу после апгрейда возможно. После первого запуска новой версии — нет.
 * OS/стенд: семантика `flock(2)`, release после SIGKILL, `/proc`, fd-inheritance, BusyBox
-  applet, overlay/tmpfs, procd/netifd — **Linux-only**, на Windows не проверяются; зелёный
-  Windows-прогон не является доказательством Linux-рантайма.
-* Windows-тесты R04 проверяют логику/статику: отказ второго writer'а при no-wait, бюджет
+  applet, overlay/tmpfs, procd/netifd, реальные `ip`/netns — **Linux-only**, на Windows не
+  проверяются; зелёный Windows-прогон не является доказательством Linux-рантайма.
+* Windows-тесты R04/R05 проверяют логику/статику: отказ второго writer'а при no-wait, бюджет
   ожидания, запрет обратного порядка/повтора, fail-closed при отсутствии примитива,
-  no-wait hotplug, отсутствие reclaim-кода и совпадение путей tx/node-scan. kernel-тесты
-  помечены skip.
+  очередь/rc/retry/park worker'а, top-entrypoint hotplug (<1 с, pending, ноль `ip`), drain после
+  release, отсутствие reclaim-кода и совпадение путей tx/node-scan. kernel-тесты (flock,
+  наследование fd, release после SIGKILL) помечены skip.

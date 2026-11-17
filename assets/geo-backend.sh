@@ -724,7 +724,7 @@ cmd_dev_add() {
       /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     fi
   fi
-  _apply_routing
+  _apply_routing || warn "routing not fully applied - see $LOG"
   echo "$(date +%FT%T) DEV add $IP mode=$MODE ($NAME)" >> "$LOG"
   cmd_status
 }
@@ -772,7 +772,7 @@ cmd_dev_del() {
       warn "dhcp host $_sec no longer matches $IP - left in place"
     fi
   fi
-  _apply_routing
+  _apply_routing || warn "routing not fully applied - see $LOG"
   echo "$(date +%FT%T) DEV del $IP" >> "$LOG"
   cmd_status
 }
@@ -971,6 +971,9 @@ _aidns_sync() {
 # (re)apply routing for all managed devices:
 #   bypass -> direct (19900) | realtz -> normal mihomo path | ai -> AI tunnel (19900 -> table 101 -> dev AI)
 _apply_routing() {
+  # A failed AI lane is not a reason to point an AI device at an empty table (black hole):
+  # remember the failure and return it after the per-device loop (R05 D7).
+  _ar_fail=0
   # drop stale per-device rules first (we re-add per mode)
   if [ -f "$DEVICES" ]; then
     while read -r dip dmode dname; do
@@ -983,13 +986,32 @@ _apply_routing() {
       if [ "$dmode" = "bypass" ]; then
         ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup main
       elif [ "$dmode" = "ai" ]; then
-        _ai_tun_ensure
-           ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
+        if _ai_tun_ensure; then
+          ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
+        else
+          _ar_fail=1
+          echo "$(date +%FT%T) AI tunnel not ready - rule for $dip not installed" >> "$LOG"
+        fi
       fi
     done < "$DEVICES"
   fi
   _hotplug_sync
-  _aidns_sync
+  _aidns_sync || _ar_fail=1
+  return "$_ar_fail"
+}
+
+# Table 101 must be filled BEFORE its default is installed and before any per-device rule is
+# pointed at it: a default in a table without the LAN prefixes black-holes the device (R05 D7).
+# The rc of the shared sync is propagated, not ignored.
+_ai_routes_ensure() {
+  _gm_sync_routes 101
+  _are=$?
+  if [ "$_are" != 0 ]; then
+    echo "$(date +%FT%T) AI table 101 not synced (rc=$_are) - default and device rules skipped" >> "$LOG"
+    return "$_are"
+  fi
+  ip route replace table 101 default dev "$AI_TUN_DEV" 2>/dev/null || return 77
+  return 0
 }
 
 # provision AI tunnel on first use: hev-socks5-tunnel instance #2 (own TUN "AI",
@@ -1090,8 +1112,9 @@ EOF
     /etc/init.d/firewall reload >/dev/null 2>&1
   fi
   # table 101: LAN/host routes must stay local, only internet goes to AI tunnel
-  _gm_sync_routes 101
-  ip route replace table 101 default dev "$AI_TUN_DEV" 2>/dev/null
+  _ai_routes_ensure
+  _are_tun=$?
+  [ "$_are_tun" = 0 ] || return "$_are_tun"
   echo "$(date +%FT%T) AI_TUN provisioned" >> "$LOG"
 }
 
@@ -2164,6 +2187,10 @@ TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}
 # released by the kernel, the lock file is never deleted and there is no PID to guess. The
 # emergency path waits a bounded number of seconds and then fails; it never works unserialised.
 CONSOLE_LOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-locks/console.lock}
+# R05: `on` holds `console` while it fills table 102. Waiting 20 s for `route-102` inside that
+# window made the kill switch answer "console is busy" for the whole budget. The route table is
+# a separate writer: a short try-wait is enough, and a busy table is a RETRYABLE error.
+CONSOLE_ROUTE_WAIT=${GM_CONSOLE_ROUTE_WAIT:-2}
 
 _console_get() { sed -n "s/^$1=//p" "$CONSOLE_STATE" 2>/dev/null | head -1; }
 
@@ -2282,9 +2309,20 @@ _console_fw_ensure() {
   /etc/init.d/firewall reload >/dev/null 2>&1
 }
 
-_console_rule_on() { # _console_rule_on <ip>
-  _gm_sync_routes "$CONSOLE_TABLE" || return 1
-  ip route replace table "$CONSOLE_TABLE" default dev "$CONSOLE_TUN_DEV" 2>/dev/null || return 1
+_console_rule_on() { # _console_rule_on <ip> -> 0, 75/76 (retryable) or 77 (mutation failed)
+  # Short route budget, restored afterwards: other callers of the shared helper keep the
+  # default. A busy table is reported, never waited out under the console lock (R05 D6).
+  _cro_saved=${GM_ROUTE_LOCK_WAIT-}
+  GM_ROUTE_LOCK_WAIT=$CONSOLE_ROUTE_WAIT
+  export GM_ROUTE_LOCK_WAIT
+  _gm_sync_routes "$CONSOLE_TABLE"
+  _cro=$?
+  # Restore a concrete budget: an unset variable would make the next acquire see '' and fail
+  # closed with rc=2. The helper default is 20 s.
+  GM_ROUTE_LOCK_WAIT=${_cro_saved:-20}
+  export GM_ROUTE_LOCK_WAIT
+  [ "$_cro" = 0 ] || return "$_cro"
+  ip route replace table "$CONSOLE_TABLE" default dev "$CONSOLE_TUN_DEV" 2>/dev/null || return 77
   while ip rule del from "$1" lookup "$CONSOLE_TABLE" 2>/dev/null; do :; done
   ip rule add pref "$CONSOLE_RULE_PREF" from "$1" lookup "$CONSOLE_TABLE" 2>/dev/null
 }
@@ -2333,7 +2371,10 @@ _console_cfg_restore() {
 # A failed switch: name the step, put the pre-switch config back and say honestly whether the
 # live file really is the old one again. The preimage is kept only when the restore failed -
 # then it is the only working copy left, and the answer has to say where it is.
-_console_on_fail() { # _console_on_fail <step> <message>
+# A busy route table is marked `"retryable":true`: the caller may repeat the switch at once.
+_console_on_fail() { # _console_on_fail <step> <message> [retryable]
+  _cof_retry=""
+  [ "${3:-}" = retryable ] && _cof_retry=',"retryable":true'
   _restored=false
   if _console_cfg_restore "$_orig"; then
     _restored=true
@@ -2343,12 +2384,12 @@ _console_on_fail() { # _console_on_fail <step> <message>
   # Every failure path ends here; none of them may return with the lane lock still held.
   _console_unlock
   if [ "$_restored" = true ]; then
-    printf '{"ok":false,"step":"%s","restored":true,"error":"%s - previous config restored"}\n' "$1" "$2"
+    printf '{"ok":false%s,"step":"%s","restored":true,"error":"%s - previous config restored"}\n' "$_cof_retry" "$1" "$2"
   else
     # Not verified is not the same as "left patched": the transaction rolls back on its own, so
     # the bytes may already be the old ones while mihomo or the controller still refuses to
     # confirm it. Say what is certain and where the working copy is.
-    printf '{"ok":false,"step":"%s","restored":false,"error":"%s - RESTORE NOT VERIFIED (mihomo -t or the controller did not confirm it); the live config may still be the patched one, the pre-switch copy is kept at %s"}\n' "$1" "$2" "$_orig"
+    printf '{"ok":false%s,"step":"%s","restored":false,"error":"%s - RESTORE NOT VERIFIED (mihomo -t or the controller did not confirm it); the live config may still be the patched one, the pre-switch copy is kept at %s"}\n' "$_cof_retry" "$1" "$2" "$_orig"
   fi
   _console_unlock
   return 1
@@ -2513,7 +2554,19 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   }
   _console_tun_ensure || { _console_on_fail tun "console tunnel did not come up"; return 1; }
   _console_fw_ensure || { _console_on_fail firewall "console firewall zone not created"; return 1; }
-  _console_rule_on "$_ip" || { _console_on_fail rule "console route rule not installed"; return 1; }
+  _console_rule_on "$_ip"
+  _crr=$?
+  if [ "$_crr" != 0 ]; then
+    case "$_crr" in
+      75|76)
+        # The table is owned by another writer right now. Do not turn that into a generic
+        # failure: the caller can retry as soon as the table is free (R05 D6).
+        _console_on_fail rule "console route table $CONSOLE_TABLE is busy - retry" retryable ;;
+      *)
+        _console_on_fail rule "console route rule not installed (rc=$_crr)" ;;
+    esac
+    return 1
+  fi
   rm -f "$_orig" "$_cand" 2>/dev/null
   # enabled is the COMMIT MARKER: written last, so a crash never leaves "on" without an address
   # for the watchdog and the kill switch to work with. `countries` and `sub` are written ALWAYS,

@@ -23,8 +23,13 @@ conntrack -L 2>/dev/null | grep <ip>  # dst=198.19.0.1 → AI; dst=198.18.0.1 �
 
 ```sh
 ip rule del priority 32580 from <ip> 2>/dev/null
-ACTION=ifup /etc/hotplug.d/iface/99-default-vpn-route
+ACTION=ifup /etc/hotplug.d/iface/99-default-vpn-route   # ставит событие в очередь
+sh -c '. /usr/lib/geomask/geomask-routes.sh; gm_route_drain'  # применить сразу
 ```
+
+`ifup` больше не применяет маршруты синхронно: он только пишет `pending-100` и запускает
+worker (netifd не должен ждать route-lock). Если `pending-100` остался, смотрите
+`/tmp/geomask-routes/error-100` и `parked-100`; guard/cron разбирает очередь каждые 5 минут.
 
 Подробнее — [ROUTING.md](ROUTING.md), [AI-DEVICES.md](AI-DEVICES.md).
 

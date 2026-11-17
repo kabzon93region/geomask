@@ -48,6 +48,15 @@ concurrent writers (only cooperative fixtures), PID reuse, `ENOSPC`, overlay siz
 (185 MB), BusyBox `ash` semantics (Git Bash is bash; dash is not ash), network end-to-end,
 DNS/VPN/UDP behaviour, and any property of a live router's configuration.
 
+R04/R05 specifically: the Windows run proves the lock **logic** (refusal, budget, rank
+`routes-worker=35` between `config-tx=30` and `route-<n>=40`), the queue protocol
+(`pending -> work`, atomic rename, one drain pass over ALL pending tables, generation
+recheck, bounded retry/park, 77 not retried) and the top-entrypoint timing/exit contract
+against stubs. It does **not** prove `flock(2)` release after `SIGKILL`, inode identity,
+descriptor inheritance by a detached worker, real `ip route`/`ip rule`, netns, procd/netifd
+call paths or PPPoE stalls. Those are `B-LINUX-POSIX` / `B-ROUTER` and are skipped with those
+reasons; a router/stand run is required before deployment.
+
 ## Why `test_sandbox_guard.py` is only a detector
 
 It runs six of the 72 modules and compares `(mtime_ns, size)` of regular files in a short

@@ -2690,8 +2690,11 @@ step7_check() {
     if [ -s "$(P "$_rf")" ]; then info "routing: $_rf present"
     else bad "routing: $_rf missing - VPN policy will not be applied on ifup"; _need=1; fi
   done
-  if [ -f "$(P /tmp/geomask-routes/error-100)" ]; then
-    bad "routing: last route sync failed ($(cat "$(P /tmp/geomask-routes/error-100)" 2>/dev/null)) - LAN may go direct"
+  # The route queue worker writes error-<table> in GM_ROUTE_STATE_DIR (default /tmp/...).
+  # step 7 keeps reporting the last failed sync, but through the injectable root (R05).
+  _rq_dir=${GM_ROUTE_STATE_DIR:-$(P /tmp/geomask-routes)}
+  if [ -f "$_rq_dir/error-100" ]; then
+    bad "routing: last route sync failed ($(cat "$_rq_dir/error-100" 2>/dev/null)) - LAN may go direct"
     _need=1
   fi
   # IPv6 is not tunnelled (mihomo ipv6: false, IPv4-only policy): if the router or the LAN
@@ -2881,6 +2884,25 @@ run_step() { # run_step N  (interactive/auto common logic)
     SKIP=$((SKIP+1))
     return 2
   fi
+}
+
+# R05: the installer holds `maintenance` and applies the queued ifup route events INLINE.
+# It must not spawn a detached worker: the result has to be visible before step 7 reads
+# error-<table>, and a child would outlive the maintenance section that authorised the change.
+drain_route_queue() {
+  _dr_lib=${GM_ROUTES_LIB:-$(P /usr/lib/geomask/geomask-routes.sh)}
+  [ -r "$_dr_lib" ] || return 0
+  _dr_state=${GM_ROUTE_STATE_DIR:-$(P /tmp/geomask-routes)}
+  (
+    GM_ROUTE_STATE_DIR=$_dr_state
+    GM_ROUTE_DRAIN=1
+    GM_ROUTE_TUN_WAIT=0
+    export GM_ROUTE_STATE_DIR GM_ROUTE_DRAIN GM_ROUTE_TUN_WAIT
+    . "$_dr_lib" 2>/dev/null || exit 0
+    command -v gm_route_drain >/dev/null 2>&1 || exit 0
+    gm_route_drain
+  ) >/dev/null 2>&1
+  return $?
 }
 
 # ============================================================ terminal UI
@@ -5776,6 +5798,8 @@ menu_reinstall() {
     return 1
   fi
   backup_gate || { gm_lock_release maintenance; return 1; }
+  # R05: catch up on ifup events queued before the reinstall, inline under `maintenance`.
+  drain_route_queue || warn "route queue not fully applied before reinstall - see error-100"
   _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; gm_lock_release maintenance; return 1; }
   # A snapshot from an earlier failed attempt may still hold the only copy of the old
   # components: never delete a fixed name here (same rule as the backup park, F03).
@@ -5792,6 +5816,9 @@ menu_reinstall() {
     gm_lock_release maintenance
     return 1
   fi
+  # R05: the reinstall may have been preceded by ifup events that queued while the old helper
+  # was still in place; apply them with the new helper while `maintenance` is still held.
+  drain_route_queue || warn "route queue not fully applied after reinstall - see error-100"
   rm -rf "$_snap"
   gm_lock_release maintenance
   log "Пересстановка geomask завершена."

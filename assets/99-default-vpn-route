@@ -2,127 +2,76 @@
 # Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
 # Devices from /etc/geo-devices.list with mode=bypass go DIRECT (real IP), never via VPN.
 # Devices with mode=realtz follow normal mihomo routing (masked IP), only tz is real (PC-side).
-# NOTE: runs inside netifd's ifup path -> MUST NOT block here (would stall PPPoE auth / WAN).
+#
+# R05: this file runs inside netifd's ifup path. It must NOT block here (that would stall PPPoE
+# auth / WAN) and it must not LOSE the event either. Therefore it only records what has to be
+# applied - `pending-100`, plus `pending-101`/`pending-102` when those lanes have devices - and
+# spawns ONE detached worker (`geomask-routes.sh`, `routes-worker` lock). All `ip`, `uci`,
+# waiting for the TUN and retries happen in that worker.
+#
+# Exit contract (read by the worker/procd logs, not by netifd):
+#   0  the event is queued (NOT "the routes are applied")
+#   1  the pending event could not be written
+#   2  the lock primitive is unavailable - nothing can ever apply the event, so do not lie
 [ "$ACTION" = "ifup" ] || exit 0
 
-# This router's names, not the owner's: LAN device from uci, mihomo TUN from its config.
-LAN_DEV=$(uci -q get network.lan.device 2>/dev/null)
-[ -n "$LAN_DEV" ] || LAN_DEV=$(uci -q get network.lan.ifname 2>/dev/null)
-[ -n "$LAN_DEV" ] || LAN_DEV=br-lan
-TUN_DEV=$(awk '/^tun:/{f=1;next} f&&/^[^ ]/{exit} f&&/^[[:space:]]*device:/{gsub(/^[[:space:]]*device:[[:space:]]*/,"");print;exit}' \
-          /etc/mihomo/config.yaml 2>/dev/null)
-case "$TUN_DEV" in ''|*[!a-zA-Z0-9._-]*) TUN_DEV=Mihomo ;; esac
+GM_ROUTE_STATE_DIR=${GM_ROUTE_STATE_DIR:-/tmp/geomask-routes}
+MIHOMO_CONF=${MIHOMO_CONF:-/etc/mihomo/config.yaml}
+DEVICES=${DEVICES:-/etc/geo-devices.list}
+GM_ROUTES_LIB=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
+GM_CONSOLE_STATE=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
+export GM_ROUTE_STATE_DIR MIHOMO_CONF DEVICES GM_ROUTES_LIB GM_CONSOLE_STATE
 
-sync_table() { # sync_table <table> - mirror LAN connected routes, drop only our own stale ones
-  # The implementation lives in /usr/lib/geomask/geomask-routes.sh so the hotplug path and
-  # the panel (geo-backend.sh) cannot drift apart. Without it nothing is changed at all: a
-  # partial install must not leave the LAN pointing into a table we cannot maintain.
-  _rl=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
-  if [ ! -r "$_rl" ]; then
-    command -v logger >/dev/null 2>&1 && logger -t geomask "route sync skipped: $_rl missing"
-    return 1
-  fi
-  # R05: this runs inside netifd's ifup. The route lock is try-lock only here: a table that
-  # is busy (panel apply, another ifup) is left to its owner and reported, never waited for.
-  GM_ROUTE_LOCK_WAIT=0
-  export GM_ROUTE_LOCK_WAIT
-  . "$_rl"
-  geomask_routes_sync "$1"
-}
+if [ ! -r "$GM_ROUTES_LIB" ]; then
+  command -v logger >/dev/null 2>&1 \
+    && logger -t geomask "route event not queued: $GM_ROUTES_LIB is missing"
+  exit 2
+fi
+# shellcheck disable=SC1090
+. "$GM_ROUTES_LIB" || exit 2
 
-apply_routes() {
-  # The policy rule sends ALL LAN traffic into table 100, so that table must carry the LAN
-  # subnets first. If the sync fails, adding the rule would break the LAN and skipping it
-  # would send the LAN out with the real IP: keep the previous state and record the failure
-  # where --check and the panel can see it.
-  if ! sync_table 100; then
-    mkdir -p /tmp/geomask-routes 2>/dev/null
-    date '+%F %T' > /tmp/geomask-routes/error-100 2>/dev/null
-    command -v logger >/dev/null 2>&1 && logger -t geomask "route table 100 not synced - LAN routing left as is"
-    return 1
-  fi
-  rm -f /tmp/geomask-routes/error-100 2>/dev/null
-  ip route replace table 100 default dev "$TUN_DEV" 2>/dev/null
-  ip rule show | grep -q '32760:' || ip rule add priority 32760 iif "$LAN_DEV" lookup 100
-  # --- WireGuard peers are remote LAN clients (10.10.0.0/24). Without this rule their
-  #     traffic falls through to main (real WAN IP), so anything blocked for the ISP -
-  #     YouTube first of all - fails on the phone while local network still works.
-  #     Same table as br-lan, so LAN access and the tunnel policy both keep working.
-  #     The rule needs the device to exist: add it only once the link is up. ---
-  if ip link show Wireguard >/dev/null 2>&1; then
-    ip rule show | grep -q 'iif Wireguard lookup 100' || ip rule add priority 32759 iif Wireguard lookup 100
-  fi
-  # --- ICMP bypass: must stay ABOVE the magitrickle fwmark rule base. That base
-  #     is dynamic (drifts down as groups grow): observed 32558..32609 over time.
-  #     A low pref (19901) is always above it, so ping to a marked IP never dies
-  #     inside the TUN. Direct via pppoe-wan. Guard reseats the rule to
-  #     (base - 100) when the base drifts, so presence is checked by SEMANTICS,
-  #     never by the 19901 prefix (v1.6.2: ifup never adds a duplicate). ---
-  ip rule show | grep -q "iif $LAN_DEV ipproto icmp lookup main" || ip rule add priority 19901 iif "$LAN_DEV" ipproto icmp lookup main
-  # --- AI-DNS: DNS of AI-mode devices exits through the AI tunnel (no DNS leak).
-  #     The DoH worker runs as user dnsai; its sockets are marked 0x64 by the
-  #     nft table geomask_ai_dns, and this rule sends the marked traffic to
-  #     table 101 -> dev AI. pref 19902 stays ABOVE the magitrickle fwmark base
-  #     (dynamic, observed 32558..32609) so magitrickle marks never preempt it.
-  #     Opt-out: touch /etc/geomask-aidns.off ---
-  if [ ! -f /etc/geomask-aidns.off ] && [ -f /etc/geomask-aidns.uid ]; then
-    ip rule show | grep -q 'fwmark 0x64' || ip rule add pref 19902 fwmark 0x64 table 101
-  fi
-  # --- per-device rules: a low pref (19900) keeps a device rule ABOVE the
-  #     magitrickle fwmark base (dynamic, observed 32558..32609), so marking can
-  #     never preempt it; LAN stays local ---
-  # --- bypass-mode devices ---
-  if [ -f /etc/geo-devices.list ]; then
-    while read -r dip dmode dname; do
-      case "$dip" in ''|'#'*) continue ;; esac
-      [ "$dmode" = "bypass" ] || continue
-      ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup main
-    done < /etc/geo-devices.list
-    # --- ai-mode devices (the whole device goes through the AI tunnel; LAN stays local in table 101) ---
-    if grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' /etc/geo-devices.list; then
-      if ip link show AI >/dev/null 2>&1; then
-        # Per-device rules are added only when table 101 really carries the LAN subnets and a
-        # default: otherwise an AI device would be black-holed after a reboot.
-        if sync_table 101 && ip route replace table 101 default dev AI 2>/dev/null; then
-          while read -r dip dmode dname; do
-            case "$dip" in ''|'#'*) continue ;; esac
-            [ "$dmode" = "ai" ] || continue
-             ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
-          done < /etc/geo-devices.list
-        else
-          command -v logger >/dev/null 2>&1 && logger -t geomask "table 101 not ready - AI device rules skipped"
-        fi
-      fi
-    fi
-  fi
-  # --- console lane (table 102): the policy rule sends the console device into this table, and
-  #     after a reboot the table starts empty. Without the LAN prefixes the console loses the
-  #     local network, and without a default it leaves with the real address. The rule itself
-  #     belongs to the watchdog (it holds the lane lock); the table is filled here, on ifup, so
-  #     the lane works before the next guard run (review 15.11, #9). ---
-  _clane=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
-  _ctbl=${CONSOLE_TABLE:-102}
-  _ctun=${CONSOLE_TUN_DEV:-Console}
-  if [ -f "$_clane" ] && [ "$(sed -n 's/^enabled=//p' "$_clane" 2>/dev/null | head -1)" = 1 ]; then
-    if sync_table "$_ctbl"; then
-      if ! ip route replace table "$_ctbl" default dev "$_ctun" 2>/dev/null; then
-        command -v logger >/dev/null 2>&1 && logger -t geomask "console table $_ctbl: default not set"
-      fi
-    else
-      command -v logger >/dev/null 2>&1 \
-        && logger -t geomask "console table $_ctbl not synced - the LAN may be hidden from the console"
-    fi
-  fi
+# Enqueue every applicable table; a failure for one lane must NOT cancel the worker for the
+# events that were already written. Exit code reports the worst failure after the spawn.
+_enq_rc=0
+_enq_any=0
+enqueue() { # enqueue <table>; records the outcome, never exits early
+  gm_route_enqueue "$1"
+  case "$?" in
+    0) _enq_any=1 ;;
+    2) [ "$_enq_rc" = 0 ] && _enq_rc=2 ;;
+    *) [ "$_enq_rc" = 0 ] && _enq_rc=1 ;;
+  esac
   return 0
 }
 
-if ip link show "$TUN_DEV" >/dev/null 2>&1; then
-  apply_routes
-else
-  # Mihomo TUN not up yet: retry in BACKGROUND so netifd is never stalled (fixes PPPoE hangs).
-  ( i=0; while [ $i -lt 20 ]; do
-      ip link show "$TUN_DEV" >/dev/null 2>&1 && { sleep 1; apply_routes; exit 0; }
-      i=$((i+1)); sleep 1
-    done ) >/dev/null 2>&1 &
+# The normal lane always has an event on ifup: the worker decides (bounded) whether the TUN is
+# up yet, and a later drain applies what was deferred.
+enqueue 100
+
+# AI lane: only when a device is managed in ai mode. Reading the list is not a network action.
+if [ -f "$DEVICES" ] && grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' "$DEVICES" 2>/dev/null; then
+  enqueue 101
 fi
-exit 0
+
+# Console lane: only while the panel says it is on. The guard owns the rule; the worker fills
+# the table so the console keeps its LAN before the next guard run.
+if [ -f "$GM_CONSOLE_STATE" ] \
+   && [ "$(sed -n 's/^enabled=//p' "$GM_CONSOLE_STATE" 2>/dev/null | head -1)" = 1 ]; then
+  enqueue 102
+fi
+
+# Detached, descriptor-clean worker. `gm_lock_close_inherited` runs before it takes any lock:
+# otherwise the child would keep a console/updater descriptor of its caller and hold that lock
+# for as long as the worker lives. The whole body is a subshell, so the spawn never delays ifup.
+# Spawn whenever AT LEAST ONE table was accepted: a partial enqueue failure (e.g. 101 could not
+# be written) does not throw away the pending-100 event.
+if [ "$_enq_any" = 1 ]; then
+  (
+    cd / 2>/dev/null
+    command -v gm_lock_close_inherited >/dev/null 2>&1 && gm_lock_close_inherited
+    # shellcheck disable=SC1090
+    . "$GM_ROUTES_LIB" 2>/dev/null || exit 0
+    gm_route_worker
+  ) >/dev/null 2>&1 &
+fi
+exit "$_enq_rc"

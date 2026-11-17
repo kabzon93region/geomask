@@ -50,7 +50,8 @@ geomask ставит на OpenWrt-роутер домашний стек обх�
 | `/etc/config/mihomo` | Конфиг mihomo (провайдеры, группы, правила, listeners) |
 | `/etc/mihomo/ruleset/{mtrickle,ai,ytdirect}.yaml` | rule-providers (file, classical) |
 | `/root/sync_mtrickle_mihomo.sh` | Синк magitrickle → mihomo |
-| `/etc/hotplug.d/iface/99-default-vpn-route` | Роутинг LAN→TUN, per-device `ip rule` |
+| `/etc/hotplug.d/iface/99-default-vpn-route` | Очередь ifup-события (`pending-<table>`) + detached worker; сам `ip` не вызывает |
+| `/usr/lib/geomask/geomask-routes.sh` | Route-writer: sync таблиц, default/rules, очередь и bounded worker (rank 35) |
 | `/usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft` | nft-таблица AI-DNS (`geomask_ai_dns`) |
 | `/etc/init.d/{ai-doh,dnsmasq-ai}` | Второй DoH-воркер и второй dnsmasq для AI-DNS |
 | `/etc/geo-devices.list` | Список устройств: `IP mode name` (`bypass`/`ai`/`realtz`) |

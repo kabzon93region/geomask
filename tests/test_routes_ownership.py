@@ -267,11 +267,16 @@ class RoutesOwnershipTests(_RoutesCase):
                          self.read('deleted'))
 
     def test_a_foreign_occupant_is_reported_not_overwritten(self):
-        """A wanted prefix taken by a foreign route: keep it, refuse to install, report rc=1."""
+        """A wanted prefix taken by a foreign route: keep it, refuse to install, rc=77 (R05).
+
+        77 is the "mutation failed / ownership conflict" code: the queue must PARK the event
+        instead of retrying - a retry would repeat the same replace against the same foreign
+        occupant (R12 owns reconciliation).
+        """
         wanted = '10.0.0.0/24 via 192.168.1.3 dev br-lan'
         foreign = '10.0.0.0/24 via 9.9.9.9 dev eth9'
         result = self.run_sync(main=[LAN_CONNECTED, wanted], installed=[foreign], owned=None)
-        self.assertEqual(self.rc(result), 1, 'a table that does not match `desired` is a failure')
+        self.assertEqual(self.rc(result), 77, 'a table that does not match `desired` must be 77')
         self.assertIn(foreign, self.table())
         self.assertNotIn(wanted, self.table())
 
@@ -296,7 +301,7 @@ class RoutesLockTests(_RoutesCase):
         self.hold_lock()
         result = self.run_sync(main=[LAN_CONNECTED, wanted], installed=[LAN_CONNECTED],
                                owned=[LAN_CONNECTED], lock_wait=1)
-        self.assertEqual(self.rc(result), 1, 'a busy table was synced anyway')
+        self.assertEqual(self.rc(result), 75, 'a busy table must be reported as retryable (75)')
         self.assertEqual(self.table(), [LAN_CONNECTED], 'the table was changed by the loser')
         self.assertEqual(self.owned(), [LAN_CONNECTED], 'the owned file was overwritten')
         self.assertFalse([call for call in self.calls() if call.startswith('route replace')],
@@ -316,6 +321,38 @@ class RoutesLockTests(_RoutesCase):
         self.assertIn(LAN_CONNECTED, self.table())
         self.assertTrue(legacy.exists(), 'the new code deleted a legacy lock it does not own')
 
+    def test_the_worker_rank_sits_between_config_tx_and_the_table(self):
+        """R05: routes-worker(35) nests inside config-tx(30) and outside route-<n>(40).
+
+        No inversion: a worker may take the table lock, but a table writer may not take the
+        worker lock; config-tx -> worker is the panel/transaction -> queue direction.
+        """
+        script = self.case / 'ranks.sh'
+        script.write_text(
+            'GM_LOCK_DIR=%s\n'
+            'GM_CONFIG_TX_LOCK=%s\n'
+            'GM_LOCK_LIB=%s\n'
+            '. "$GM_LOCK_LIB"\n'
+            'gm_lock_acquire config-tx 0; printf "TX=%%s\\n" "$?"\n'
+            'gm_lock_acquire routes-worker 0; printf "W=%%s\\n" "$?"\n'
+            'gm_lock_acquire route-100 0; printf "T=%%s\\n" "$?"\n'
+            'gm_lock_release_all\n'
+            'gm_lock_acquire route-100 0; printf "T2=%%s\\n" "$?"\n'
+            'gm_lock_acquire routes-worker 0; printf "W2=%%s\\n" "$?"\n'
+            'gm_lock_release_all\n'
+            % (self.case.joinpath('locks').as_posix(),
+               self.case.joinpath('locks', 'tx.lock').as_posix(),
+               (ROOT / 'assets' / 'geomask-lock.sh').as_posix()),
+            encoding='utf-8', newline='\n')
+        result = subprocess.run([BASH, script.as_posix()], cwd=str(self.case),
+                                capture_output=True, text=True, encoding='utf-8', timeout=60)
+        self.assertIn('TX=0', result.stdout, result.stdout + result.stderr)
+        self.assertIn('W=0', result.stdout, 'routes-worker did not nest inside config-tx')
+        self.assertIn('T=0', result.stdout, 'route-100 did not nest inside routes-worker')
+        self.assertIn('T2=0', result.stdout)
+        self.assertIn('W2=4', result.stdout,
+                      'the table writer was allowed to take the worker lock (rank inversion)')
+
     def test_the_lock_is_released_after_a_successful_run(self):
         result = self.run_sync(main=[LAN_CONNECTED], installed=[], owned=None)
         self.assertEqual(self.rc(result), 0, result.stdout + result.stderr)
@@ -326,7 +363,8 @@ class RoutesLockTests(_RoutesCase):
         (self.case / 'no-addrs').write_text('', encoding='utf-8')
         (self.case / 'no-main').write_text('', encoding='utf-8')
         result = self.run_sync(main=[], installed=[], owned=None)
-        self.assertEqual(self.rc(result), 1)
+        self.assertEqual(self.rc(result), 76,
+                         'an unreadable table/state is a retryable read failure (76)')
         self.assertTrue(self.lock_is_free(), 'a failed sync kept the table lock')
 
     def test_two_syncs_do_not_lose_each_other_prefixes(self):

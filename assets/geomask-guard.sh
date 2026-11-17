@@ -21,6 +21,19 @@ DEVS=/etc/geo-devices.list
 CHAIN="ip mangle PREROUTING"
 [ -f "$DEVS" ] || { log "SKIP: $DEVS missing"; exit 0; }
 
+# ---------- (0) R05 route queue drain ----------
+# The ifup hotplug only queues `pending-<table>`; its detached worker may find the route lock
+# busy and leave the event for later. Cron is the backstop: apply what is queued, inline and
+# bounded. This runs BEFORE the console block and OUTSIDE its lock - the drain takes
+# routes-worker then route-<table>, one short try per table; a busy table stays pending and is
+# retried by the next guard run, never held under the console lock.
+CROUTES=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
+if [ -r "$CROUTES" ]; then
+  ( GM_ROUTE_DRAIN=1; GM_ROUTE_TUN_WAIT=0
+    export GM_ROUTE_DRAIN GM_ROUTE_TUN_WAIT
+    . "$CROUTES" && gm_route_drain ) >/dev/null 2>&1 || true
+fi
+
 IPS=$(awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && ($2=="ai" || $2=="bypass") {print $1}' "$DEVS" | tr '\n' ' ')
 NEED_FLUSH=""
 
@@ -208,6 +221,8 @@ fi
 # reboot left the console leaving with the real address (review 15.11, #9).
 CTUN=${GM_CONSOLE_TUN:-Console}
 CTBL=${GM_CONSOLE_TABLE:-102}
+# Kept here as well as at the drain above: the console block is exercised on its own by the
+# tests, and a missing variable must not turn a watchdog run into a crash.
 CROUTES=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
 console_lock() { # 0 only with the kernel lock held; busy or no primitive = skip, never forced
   command -v gm_lock_acquire >/dev/null 2>&1 || return 1

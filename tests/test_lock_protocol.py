@@ -80,8 +80,10 @@ class LockHelperTests(unittest.TestCase):
             'set -u\n'
             'CASE=%s\n'
             'GM_LOCK_DIR=%s\n'
+            'GM_CONFIG_TX_LOCK=%s\n'
             'GM_LOCK_LIB=%s\n'
             '. "$GM_LOCK_LIB"\n' % (sh_quote(posix(self.case)), sh_quote(posix(self.locks)),
+                                   sh_quote(posix(self.locks / 'tx.lock')),
                                    sh_quote(posix(HELPER))) + body,
             encoding='utf-8', newline='\n')
         return path
@@ -159,6 +161,22 @@ class LockHelperTests(unittest.TestCase):
         self.assertIn('lock order violation', combined)
         self.assertIn('already holds', combined)
 
+    def test_routes_worker_nests_between_config_tx_and_the_table(self):
+        """R05: the queue worker is rank 35 - inside config-tx(30), outside route-<n>(40)."""
+        result = self.run_script('ranks.sh',
+                          'gm_lock_acquire config-tx 0; printf "A=%s\\n" "$?"\n'
+                          'gm_lock_acquire routes-worker 0; printf "B=%s\\n" "$?"\n'
+                          'gm_lock_acquire route-100 0; printf "C=%s\\n" "$?"\n'
+                          'gm_lock_release_all\n'
+                          'gm_lock_acquire route-100 0; printf "D=%s\\n" "$?"\n'
+                          'gm_lock_acquire routes-worker 0; printf "E=%s\\n" "$?"\n'
+                          'gm_lock_release_all\n')
+        self.assertIn('A=0', result.stdout, result.stdout + result.stderr)
+        self.assertIn('B=0', result.stdout, 'routes-worker did not nest inside config-tx')
+        self.assertIn('C=0', result.stdout, 'route-100 did not nest inside routes-worker')
+        self.assertIn('D=0', result.stdout)
+        self.assertIn('E=4', result.stdout, 'a table writer took the queue-worker lock')
+
     def test_a_missing_primitive_fails_closed_on_linux(self):
         # A stripped PATH whose `uname` says Linux and which has no `flock`: every acquisition
         # must return 2 and nothing may be created. There is no mkdir fallback to fall back to.
@@ -200,59 +218,102 @@ class LockHelperTests(unittest.TestCase):
 
 @unittest.skipIf(BASH is None, 'bash is required')
 class HotplugNoWaitTests(unittest.TestCase):
-    """The ifup path must never wait for the route lock (R05 intersection with R04)."""
+    """R05: the ifup entrypoint accepts the event and returns at once, with no `ip` of its own.
+
+    The old test extracted only the `sync_table` block and drove it directly; that stayed green
+    while the top-level script exited 0 after losing the event (R05 D10). This test runs the
+    REAL `/etc/hotplug.d/iface/99-default-vpn-route` against a busy route-100.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.case = Path(self.tmp.name)
+        (self.case / 'state').mkdir()
+        (self.case / 'locks').mkdir()
+        (self.case / 'calls.log').write_text('', encoding='utf-8')
+        (self.case / 'tbl-100').write_text('', encoding='utf-8')
+        (self.case / 'stubs.sh').write_text(r'''
+uci() {
+  case "$1" in -q) shift ;; esac
+  case "$*" in
+    'show firewall') printf 'firewall.@zone[0]=zone\nfirewall.@zone[0].name=lan\nfirewall.@zone[0].network=lan\n' ;;
+    'get firewall.@zone[0].name') printf lan ;;
+    'get firewall.@zone[0].network') printf lan ;;
+    'get network.lan.device') printf br-lan ;;
+    'get network.lan.ifname') return 1 ;;
+    *) return 1 ;;
+  esac
+}
+ip() {
+  printf '%s\n' "$*" >> "$CASE/calls.log"
+  case "$*" in
+    "link show Mihomo") return 0 ;;
+    "link show "*) return 1 ;;
+    "route show table main") printf '192.168.1.0/24 dev br-lan scope link\n' ;;
+    "route show table 100") return 0 ;;
+    "-4 addr show br-lan") printf '    inet 192.168.1.1/24 scope global br-lan\n' ;;
+  esac
+  return 0
+}
+logger() { :; }
+''', encoding='utf-8', newline='\n')
+        (self.case / 'mihomo.yaml').write_text('tun:\n  device: Mihomo\n', encoding='utf-8',
+                                               newline='\n')
+        (self.case / 'devices.list').write_text('', encoding='utf-8')
+        (self.case / 'console.state').write_text('enabled=0\n', encoding='utf-8')
 
-    def test_the_hotplug_sync_is_a_try_lock(self):
-        text = HOTPLUG.read_text(encoding='utf-8')
-        self.assertIn('GM_ROUTE_LOCK_WAIT=0', text,
-                      'the hotplug path does not force the no-wait mode')
-        self.assertIn('export GM_ROUTE_LOCK_WAIT', text)
-        # The same snippet must actually return at once when the table is locked by somebody
-        # else: a real second process holds the lock, the hotplug `sync_table` is asked.
-        state = self.case / 'state'
-        state.mkdir()
-        locks = self.case / 'locks'
-        holder_script = self.case / 'holder.sh'
-        holder_script.write_text(
-            'GM_LOCK_DIR=%s\n. %s\ngm_lock_acquire route-100 0 || exit 9\n'
-            'printf held > %s\nsleep 10\n'
-            % (sh_quote(posix(locks)), sh_quote(posix(HELPER)),
+    def hold(self):
+        script = self.case / 'hold.sh'
+        script.write_text(
+            'GM_LOCK_DIR=%s\nGM_LOCK_LIB=%s\n. "$GM_LOCK_LIB"\n'
+            'gm_lock_acquire route-100 0 || exit 9\n'
+            'printf held > %s\nsleep 20\n'
+            % (sh_quote(posix(self.case / 'locks')), sh_quote(posix(HELPER)),
                sh_quote(posix(self.case / 'held'))),
             encoding='utf-8', newline='\n')
-        holder = subprocess.Popen([BASH, posix(holder_script)], cwd=str(self.case))
-        self.addCleanup(reap, holder)
+        proc = subprocess.Popen([BASH, posix(script)], cwd=str(self.case))
+        self.addCleanup(reap, proc)
         for _ in range(200):
             if (self.case / 'held').exists():
-                break
+                return
             time.sleep(0.05)
-        self.assertTrue((self.case / 'held').exists(), 'the lock holder never started')
+        self.fail('the route-100 holder never started')
 
-        start = text.index('sync_table() {')
-        end = text.index('\napply_routes()', start)
-        block = text[start:end]
+    def test_the_entrypoint_returns_at_once_and_keeps_the_event(self):
+        self.hold()
         script = self.case / 'run.sh'
-        # The block is shipped code, but the file around it is an entrypoint (it exits unless
-        # ACTION=ifup and reads /etc): only the function itself is run, with injected roots.
         script.write_text(
-            'set -u\nCASE=%s\nGM_ROUTES_LIB=%s\nGM_LOCK_DIR=%s\nGM_ROUTE_STATE_DIR=%s\n'
+            'set -u\n'
+            'CASE=%s\n'
+            'export CASE\n'
+            '. "$CASE/stubs.sh"\n'
+            'GM_ROUTE_STATE_DIR="$CASE/state"\n'
+            'GM_LOCK_DIR="$CASE/locks"\n'
+            'GM_LOCK_LIB=%s\n'
+            'GM_ROUTES_LIB=%s\n'
+            'MIHOMO_CONF="$CASE/mihomo.yaml"\n'
+            'DEVICES="$CASE/devices.list"\n'
+            'GM_CONSOLE_STATE="$CASE/console.state"\n'
+            'export GM_ROUTE_STATE_DIR GM_LOCK_DIR GM_LOCK_LIB GM_ROUTES_LIB\n'
+            'export MIHOMO_CONF DEVICES GM_CONSOLE_STATE\n'
+            'mkdir() { case "$*" in *"/tmp/geomask-routes"*) return 1 ;; esac; command mkdir "$@"; }\n'
+            'ACTION=ifup\n'
             '. %s\n'
-            '%s\n'
-            'sync_table 100\nRC=$?\n'
-            'printf "RC=%%s\\n" "$RC"\n'
-            % (sh_quote(posix(self.case)), sh_quote(posix(ROUTES)), sh_quote(posix(locks)),
-               sh_quote(posix(state)), sh_quote(posix(HELPER)), block),
+            % (sh_quote(posix(self.case)), sh_quote(posix(HELPER)), sh_quote(posix(ROUTES)),
+               sh_quote(posix(HOTPLUG))),
             encoding='utf-8', newline='\n')
         started = time.monotonic()
         result = subprocess.run([BASH, posix(script)], cwd=str(self.case), capture_output=True,
                                 text=True, encoding='utf-8', timeout=60)
         elapsed = time.monotonic() - started
-        self.assertIn('RC=1', result.stdout, result.stdout + result.stderr)
-        self.assertLess(elapsed, 3, 'the hotplug path waited for the route lock')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertLess(elapsed, 1.5, 'the ifup path waited for the route lock (%.2fs)' % elapsed)
+        self.assertTrue((self.case / 'state' / 'pending-100').exists(),
+                        'the busy event was not queued')
+        calls = (self.case / 'calls.log').read_text(encoding='utf-8')
+        self.assertNotIn('route replace', calls)
+        self.assertNotIn('rule add', calls)
 
 
 class StaticContractTests(unittest.TestCase):
@@ -284,6 +345,25 @@ class StaticContractTests(unittest.TestCase):
         self.assertIn('gm_lock_acquire "route-$1" "$GM_ROUTE_LOCK_WAIT"', self.routes)
         self.assertIn('gm_lock_release "route-$1"', self.routes)
         self.assertNotIn('lock-$1"', self.routes)
+
+    def test_the_rank_table_has_the_route_worker_between_config_tx_and_route(self):
+        body = self.helper[self.helper.index('gm_lock_rank()'):]
+        body = body[:body.index('\n}\n')]
+        ranks = dict(re.findall(r"^\s{4}([a-z*()-]+)\)\s+printf '(\d+)'", body, re.M))
+        self.assertEqual(ranks.get('maintenance'), '10')
+        self.assertEqual(ranks.get('console'), '20')
+        self.assertEqual(ranks.get('cron'), '25')
+        self.assertEqual(ranks.get('config-tx'), '30')
+        self.assertEqual(ranks.get('routes-worker'), '35')
+        self.assertEqual(ranks.get('route-*'), '40')
+        self.assertEqual(ranks.get('sync'), '45')
+        self.assertEqual(ranks.get('devices'), '60')
+        self.assertEqual(ranks.get('subs'), '65')
+        ordered = ['maintenance', 'console', 'cron', 'config-tx', 'routes-worker', 'route-*',
+                   'sync', 'devices', 'subs']
+        self.assertEqual([int(ranks[name]) for name in ordered],
+                         sorted(int(ranks[name]) for name in ordered),
+                         'the rank table is not strictly increasing')
 
     def test_console_lock_is_shared_by_backend_and_guard(self):
         self.assertIn('gm_lock_acquire console', self.backend)

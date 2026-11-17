@@ -1,4 +1,4 @@
-"""The console lane after a reboot: LAN prefixes in table 102 and a default that is ours.
+"""The console lane after a reboot: the ifup event is queued, the guard fills table 102.
 
 Review 14-15.11.2026, point 9. The policy rule sends the console device into table 102, and
 after a reboot that table starts empty. The guard put back the rule and *a* default, but never
@@ -6,21 +6,26 @@ mirrored the LAN prefixes into the table, and its check was `grep '^default'`: t
 netifd restores for every table (via 192.168.1.1, dev br-lan) passed it, so the console kept
 leaving with the real address and lost the local network at the same time.
 
-Both halves of the lane are covered here: the ifup hotplug script (so the table is usable
-before the guard runs) and the guard's own console block. Every command is a stub inside the
-test's temporary directory - no router, no `/etc`, no host `/tmp`.
+R05 moved the ifup work into the route queue: the hotplug script only records
+`pending-102` when the panel says the lane is on, and the worker/drain fills the table. The
+guard's own console block still repairs the rule and the default every 5 minutes.
+
+Every command is a stub inside the test's temporary directory - no router, no `/etc`, no host
+`/tmp`.
 """
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / 'assets' / 'geomask-guard.sh'
 HOTPLUG = ROOT / 'assets' / '99-default-vpn-route'
+LOCKLIB = ROOT / 'assets' / 'geomask-lock.sh'
+ROUTES = ROOT / 'assets' / 'geomask-routes.sh'
 GUARD_TEXT = GUARD.read_text(encoding='utf-8')
-HOTPLUG_TEXT = HOTPLUG.read_text(encoding='utf-8')
 
 GUARD_START = '# ---------- (E) console lane watchdog ----------'
 GUARD_END = '# ---------- (D) AI-DNS self-heal ----------'
@@ -41,16 +46,8 @@ def win(path):
     return str(Path(path).resolve()).replace('\\', '/')
 
 
-def hotplug_function(name):
-    """Whole function from the hotplug script, braces at column 0."""
-    lines = HOTPLUG_TEXT.splitlines()
-    start = next((i for i, line in enumerate(lines) if line.startswith(name + '() {')), None)
-    if start is None:
-        raise AssertionError('function %s not found in the hotplug script' % name)
-    for index in range(start + 1, len(lines)):
-        if lines[index] == '}':
-            return '\n'.join(lines[start:index + 1])
-    raise AssertionError('function %s has no closing brace' % name)
+def q(value):
+    return "'" + str(value).replace("'", "'\\''") + "'"
 
 
 def guard_block():
@@ -90,10 +87,21 @@ IP_STUB = r'''ip() {
     *) return 0 ;;
   esac
 }
+uci() {
+  case "$1" in -q) shift ;; esac
+  case "$*" in
+    'show firewall') printf 'firewall.@zone[0]=zone\nfirewall.@zone[0].name=lan\nfirewall.@zone[0].network=lan\n' ;;
+    'get firewall.@zone[0].name') printf lan ;;
+    'get firewall.@zone[0].network') printf lan ;;
+    'get network.lan.device') printf br-lan ;;
+    'get network.lan.ifname') return 1 ;;
+    *) return 1 ;;
+  esac
+}
 '''
 
-# The shared route helper, replaced by a recorder: this test is about *whether* the table is
-# synced, not about the helper's ownership rules (tests/test_routes_ownership.py owns those).
+# The shared route helper, replaced by a recorder: these guard tests are about *whether* the
+# table is synced, not about the helper's ownership rules (test_routes_ownership.py owns those).
 ROUTES_STUB = r'''geomask_routes_sync() {
   printf '%s\n' "$1" >> "$CASE/syncs"
   return 0
@@ -103,6 +111,8 @@ ROUTES_STUB = r'''geomask_routes_sync() {
 
 @unittest.skipIf(BASH is None, 'bash is required')
 class ConsoleRebootTests(unittest.TestCase):
+    """The guard block: rule re-seat and a default that is really ours."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -125,15 +135,16 @@ class ConsoleRebootTests(unittest.TestCase):
             'GM_CONSOLE_STATE="%s"\n'
             'GM_CONSOLE_LOCK="%s/console.lock"\n'
             'GM_ROUTES_LIB="%s"\n'
+            'CROUTES="$GM_ROUTES_LIB"\n'
             'GM_CONSOLE_TUN="Console"\n'
             'GM_LOCK_DIR="%s/locks"\n'
             'GM_LOCK_LIB="%s"\n'
             'export CASE GM_CONSOLE_STATE GM_CONSOLE_LOCK GM_ROUTES_LIB GM_CONSOLE_TUN GM_LOCK_DIR GM_LOCK_LIB\n'
-            '. "$GM_LOCK_LIB"\n'
             'logger() { printf "%%s\n" "$*" >> "$CASE/logger.log"; }\n'
             'conntrack() { return 0; }\n'
             % (win(self.case), win(self.state), win(self.case), win(self.lib),
-               win(self.case), win(ROOT / 'assets' / 'geomask-lock.sh')))
+               win(self.case), win(LOCKLIB))
+        )
 
     def run_script(self, body, prefix=''):
         script = self.write('run.sh', 'set -u\n' + self.environment() + IP_STUB
@@ -155,42 +166,6 @@ class ConsoleRebootTests(unittest.TestCase):
             return []
         return [line for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
 
-    # ---------------------------------------------------------------- ifup hotplug
-    def hotplug_body(self):
-        """The shipped functions plus the two values the file derives before calling them.
-
-        `TUN_DEV` comes from the mihomo config and `LAN_DEV` from uci in the real script, so the
-        test supplies them exactly as the file would. `CONSOLE_TABLE`/`CONSOLE_TUN_DEV` are left
-        out on purpose: their defaults live in `apply_routes` and must be the ones under test.
-        """
-        return ('TUN_DEV=Mihomo\nLAN_DEV=br-lan\n'
-                + '\n'.join(hotplug_function(name) for name in ('sync_table', 'apply_routes')))
-
-    def test_ifup_gives_the_console_table_its_lan_prefixes(self):
-        """Table 102 is empty after a reboot; the rule points the console straight into it."""
-        self.write('tbl-100', '')
-        self.write('tbl-102', '')
-        result = self.run_script('apply_routes; printf "RC=%s\\n" "$?"',
-                                 prefix=self.hotplug_body())
-        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
-        self.assertIn('102', self.syncs(),
-                      'the console table was never mirrored on ifup: %r' % (self.syncs(),))
-        self.assertEqual(self.table(102), ['default dev Console'],
-                         'the console table has no default through its own tunnel')
-        self.assertEqual(self.table(100), ['default dev Mihomo'],
-                         'the normal lane regressed')
-
-    def test_ifup_leaves_the_console_table_alone_while_the_lane_is_off(self):
-        self.state.write_text('enabled=0\nip=192.168.1.177\n', encoding='utf-8', newline='\n')
-        self.write('tbl-100', '')
-        result = self.run_script('apply_routes; printf "RC=%s\\n" "$?"',
-                                 prefix=self.hotplug_body())
-        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
-        self.assertNotIn('102', self.syncs(), 'a switched-off lane still synced its table')
-        self.assertEqual(self.table(102), [], 'a switched-off lane still got a default route')
-        self.assertNotIn('table 102', '\n'.join(self.calls()))
-
-    # ---------------------------------------------------------------- guard block
     def test_the_guard_restores_the_lan_prefixes_in_table_102(self):
         self.write('tbl-102', 'default dev Console')
         result = self.run_script(guard_block(), prefix='log() { logger -t geomask-guard "$*"; }')
@@ -214,6 +189,99 @@ class ConsoleRebootTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn('route replace table 102', '\n'.join(self.calls()),
                          'the correct default was rewritten on every watchdog run')
+
+
+@unittest.skipIf(BASH is None, 'bash is required')
+class HotplugQueueTests(unittest.TestCase):
+    """R05: ifup only queues the console table; it does not run ip itself."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.case = Path(self.tmp.name)
+        (self.case / 'state').mkdir()
+        (self.case / 'locks').mkdir()
+        for name in ('calls.log', 'rules'):
+            (self.case / name).write_text('', encoding='utf-8', newline='\n')
+        (self.case / 'tbl-100').write_text('', encoding='utf-8')
+        (self.case / 'tbl-102').write_text('', encoding='utf-8')
+        (self.case / 'mihomo.yaml').write_text('tun:\n  device: Mihomo\n', encoding='utf-8')
+        (self.case / 'devices.list').write_text('', encoding='utf-8')
+        (self.case / 'console.state').write_text('enabled=1\nip=192.168.1.177\n',
+                                                 encoding='utf-8')
+        (self.case / 'stubs.sh').write_text(IP_STUB, encoding='utf-8', newline='\n')
+
+    def hold_worker(self):
+        script = self.case / 'hold.sh'
+        script.write_text(
+            'GM_LOCK_DIR=%s\nGM_LOCK_LIB=%s\n. "$GM_LOCK_LIB"\n'
+            'gm_lock_acquire routes-worker 0 || exit 9\n'
+            'printf held > %s\nsleep 20\n'
+            % (q(win(self.case / 'locks')), q(win(LOCKLIB)), q(win(self.case / 'held'))),
+            encoding='utf-8', newline='\n')
+        proc = subprocess.Popen([BASH, win(script)], cwd=str(self.case))
+        self.addCleanup(reap, proc)
+        for _ in range(200):
+            if (self.case / 'held').exists():
+                return
+            time.sleep(0.05)
+        self.fail('the worker-lock holder never started')
+
+    def run_hotplug(self, enabled=True):
+        if not enabled:
+            (self.case / 'console.state').write_text('enabled=0\n', encoding='utf-8')
+        script = self.case / 'run.sh'
+        script.write_text(
+            'set -u\n'
+            'CASE=%s\n'
+            'export CASE\n'
+            '. "$CASE/stubs.sh"\n'
+            'GM_ROUTE_STATE_DIR="$CASE/state"\n'
+            'GM_LOCK_DIR="$CASE/locks"\n'
+            'GM_LOCK_LIB=%s\n'
+            'GM_ROUTES_LIB=%s\n'
+            'MIHOMO_CONF="$CASE/mihomo.yaml"\n'
+            'DEVICES="$CASE/devices.list"\n'
+            'GM_CONSOLE_STATE="$CASE/console.state"\n'
+            'export GM_ROUTE_STATE_DIR GM_LOCK_DIR GM_LOCK_LIB GM_ROUTES_LIB\n'
+            'export MIHOMO_CONF DEVICES GM_CONSOLE_STATE\n'
+            'mkdir() { case "$*" in *"/tmp/geomask-routes"*) return 1 ;; esac; command mkdir "$@"; }\n'
+            'ACTION=ifup\n'
+            '. %s\n'
+            % (q(win(self.case)), q(win(LOCKLIB)), q(win(ROUTES)), q(win(HOTPLUG))),
+            encoding='utf-8', newline='\n')
+        return subprocess.run([BASH, win(script)], cwd=str(self.case), capture_output=True,
+                              text=True, encoding='utf-8', timeout=60)
+
+    def pending(self):
+        return sorted(p.name for p in (self.case / 'state').glob('pending-*'))
+
+    def test_ifup_queues_the_console_table_when_the_lane_is_on(self):
+        self.hold_worker()
+        result = self.run_hotplug(enabled=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('pending-102', self.pending(),
+                      'the console event was not queued: %r' % (self.pending(),))
+        calls = '\n'.join((self.case / 'calls.log').read_text(encoding='utf-8').splitlines())
+        self.assertNotIn('route replace', calls, 'ifup mutated the table itself')
+
+    def test_ifup_leaves_the_console_table_alone_while_the_lane_is_off(self):
+        self.hold_worker()
+        result = self.run_hotplug(enabled=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('pending-102', self.pending(),
+                         'a switched-off lane still queued its table')
+        self.assertNotIn('table 102', '\n'.join(
+            (self.case / 'calls.log').read_text(encoding='utf-8').splitlines()))
+
+
+def reap(proc):
+    try:
+        proc.kill()
+        proc.wait(timeout=10)
+        time.sleep(0.2)
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':

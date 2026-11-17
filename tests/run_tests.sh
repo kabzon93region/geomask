@@ -173,6 +173,7 @@ write_summary() { # write_summary <rc>
     echo "== GEOMASK TEST RUNNER SUMMARY =="
     echo "date: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
     echo "mode: scenario suite (S1-S59) + preflight"
+    [ -n "${GM_SCENARIO_FILTER:-}" ] && echo "scenario filter: $GM_SCENARIO_FILTER (self-contained only)"
     echo "modules: not run in this mode; set GM_TESTS_DIR=<dir> for the per-module gate"
     echo "scenarios: pass=$pass fail=$failn skip=$skipped timeout=$timeouts unknown_skip=$skip_unknown"
     echo "environment:"
@@ -189,11 +190,113 @@ trap 'write_summary $?' EXIT
 
 rm -rf "$HERE/root_empty" "$HERE/root_healthy" "$HERE/root_apply" "$HERE/state"
 mkdir -p "$HERE/state" "$HERE/root_empty/tmp" "$HERE/root_healthy/tmp" "$HERE/root_apply/tmp"
+export GM_STATE="$HERE/state"
+
+# ---------- S11 as a self-contained scenario (R05 review) ----------
+# The ifup path is asynchronous by design: hotplug queues `pending-100` and spawns a worker.
+# This scenario therefore (a) injects the lock/routes/state roots into the sandbox, (b) holds
+# `routes-worker` so the detached worker is a deterministic no-op, (c) releases it and drains
+# inline, and only then asserts the installed rule. Running it twice is safe: every artefact
+# lives under $HERE/state/s11 and is recreated at the start.
+scenario_s11() {
+  _s11_f0=$failn
+  echo "=== S11: ICMP check semantic (no dup after reseat) ==="
+  if grep -q "grep -q '19901:'" "$SCRIPT"; then
+    echo "FAIL: S11 installer still checks ICMP by pref 19901"; failn=$((failn+1))
+  else
+    echo "PASS: S11 no pref-based ICMP check in installer"; pass=$((pass+1))
+  fi
+  _s11="$HERE/state/s11"
+  rm -rf "$_s11"
+  mkdir -p "$_s11/locks" "$_s11/routes"
+  printf 'tun:\n  device: Mihomo\n' > "$_s11/mihomo.yaml"
+  : > "$_s11/devices.list"
+  printf 'enabled=0\n' > "$_s11/console.state"
+  echo '20100: from all iif br-lan ipproto icmp lookup main' > "$HERE/state/ip_rules"
+  _s11_routes="$HERE/../assets/geomask-routes.sh"
+  _s11_lock="$HERE/../assets/geomask-lock.sh"
+
+  # Hold the queue worker so the hotplug's detached worker exits at once (no race).
+  (
+    GM_LOCK_DIR="$_s11/locks"
+    GM_LOCK_LIB="$_s11_lock"
+    export GM_LOCK_DIR GM_LOCK_LIB
+    . "$_s11_lock"
+    gm_lock_acquire routes-worker 0 || exit 9
+    printf held > "$_s11/held"
+    _i=0
+    while [ ! -f "$_s11/release" ] && [ "$_i" -lt 100 ]; do sleep 0.1; _i=$((_i+1)); done
+    gm_lock_release routes-worker
+  ) &
+  _s11_holder=$!
+  _i=0
+  while [ ! -f "$_s11/held" ] && [ "$_i" -lt 100 ]; do sleep 0.1; _i=$((_i+1)); done
+  if [ -f "$_s11/held" ]; then
+    echo "PASS: S11 route-worker holder started"; pass=$((pass+1))
+  else
+    echo "FAIL: S11 route-worker holder did not start"; failn=$((failn+1))
+    kill "$_s11_holder" 2>/dev/null || true
+  fi
+
+  ACTION=ifup \
+    GM_ROUTES_LIB="$_s11_routes" GM_LOCK_LIB="$_s11_lock" \
+    GM_LOCK_DIR="$_s11/locks" GM_CONFIG_TX_LOCK="$_s11/config-tx.lock" \
+    GM_ROUTE_STATE_DIR="$_s11/routes" \
+    MIHOMO_CONF="$_s11/mihomo.yaml" DEVICES="$_s11/devices.list" \
+    GM_CONSOLE_STATE="$_s11/console.state" \
+    sh "$HERE/../assets/99-default-vpn-route" >"$HERE/last_out.txt" 2>&1
+  _s11_rc=$?
+  if [ "$_s11_rc" = 0 ]; then
+    echo "PASS: S11 hotplug accepted the event (rc=0)"; pass=$((pass+1))
+  else
+    echo "FAIL: S11 hotplug rc=$_s11_rc (want 0)"
+    tail -10 "$HERE/last_out.txt" | sed 's/^/    | /'; failn=$((failn+1))
+  fi
+  if [ -f "$_s11/routes/pending-100" ]; then
+    echo "PASS: S11 hotplug queued pending-100"; pass=$((pass+1))
+  else
+    echo "FAIL: S11 pending-100 missing after ifup"; failn=$((failn+1))
+  fi
+
+  printf release > "$_s11/release"
+  wait "$_s11_holder" 2>/dev/null || true
+
+  GM_ROUTE_STATE_DIR="$_s11/routes" GM_LOCK_DIR="$_s11/locks" \
+    GM_LOCK_LIB="$_s11_lock" GM_CONFIG_TX_LOCK="$_s11/config-tx.lock" \
+    MIHOMO_CONF="$_s11/mihomo.yaml" DEVICES="$_s11/devices.list" \
+    GM_CONSOLE_STATE="$_s11/console.state" \
+    sh -c '. "$1"; gm_route_drain' sh "$_s11_routes" >"$HERE/last_out.txt" 2>&1
+  _s11_drain=$?
+  if [ "$_s11_drain" = 0 ]; then
+    echo "PASS: S11 drain applied the queue (rc=0)"; pass=$((pass+1))
+  else
+    echo "FAIL: S11 drain rc=$_s11_drain (want 0)"
+    tail -10 "$HERE/last_out.txt" | sed 's/^/    | /'; failn=$((failn+1))
+  fi
+
+  _icmp_n=$(grep -c 'ipproto icmp' "$HERE/state/ip_rules")
+  if [ "$_icmp_n" = 1 ]; then
+    echo "PASS: S11 reseated ICMP rule not duplicated"; pass=$((pass+1))
+  else
+    echo "FAIL: S11 icmp rules now: $_icmp_n (want 1)"; sed 's/^/    | /' "$HERE/state/ip_rules"; failn=$((failn+1))
+  fi
+  contains "$HERE/state/ip_rules" "priority 32760" "S11 drain installed table-100 policy"
+  [ "$failn" = "$_s11_f0" ]
+}
+
+# R05 review: run one self-contained scenario only. Off by default; S11 is the supported
+# target because it owns its sandbox. Other IDs are refused instead of silently running all.
+if [ -n "${GM_SCENARIO_FILTER:-}" ]; then
+  case "$GM_SCENARIO_FILTER" in
+    S11) scenario_s11; _s11_filter_rc=$? ;;
+    *) echo "FAIL: GM_SCENARIO_FILTER=$GM_SCENARIO_FILTER: only S11 is self-contained"; _s11_filter_rc=2 ;;
+  esac
+  exit "$_s11_filter_rc"
+fi
 
 # ---------- scenario 1: empty root -> everything FAILs, script still exits cleanly ----------
 echo "=== S1: empty root, --check ==="
 : > "$HERE/state/services"; : > "$HERE/state/ubus_objects"; : > "$HERE/state/crontab"; : > "$HERE/state/ip_rules"
-export GM_STATE="$HERE/state"
 export GM_PREFIX="$HERE/root_empty"
 t "S1 check exits nonzero" 1 sh "$SCRIPT" --check
 contains "$HERE/last_out.txt" "SUMMARY" "S1 prints summary"
@@ -462,21 +565,9 @@ contains "$HERE/last_out.txt" "router-backup" "S10 full backup created"
 # ---------- scenario 11: ICMP rule presence check is semantic (v1.6.2) ----------
 # Guard reseats our rules to pref (base - 100) when the magitrickle base drifts;
 # the hotplug must NOT add a duplicate when the ICMP rule lives at another pref.
-echo "=== S11: ICMP check semantic (no dup after reseat) ==="
-if grep -q "grep -q '19901:'" "$SCRIPT"; then
-  echo "FAIL: S11 installer still checks ICMP by pref 19901"; failn=$((failn+1))
-else
-  echo "PASS: S11 no pref-based ICMP check in installer"; pass=$((pass+1))
-fi
-echo '20100: from all iif br-lan ipproto icmp lookup main' > "$HERE/state/ip_rules"
-ACTION=ifup GM_ROUTES_LIB="$HERE/../assets/geomask-routes.sh" sh "$HERE/../assets/99-default-vpn-route" >"$HERE/last_out.txt" 2>&1
-_icmp_n=$(grep -c 'ipproto icmp' "$HERE/state/ip_rules")
-if [ "$_icmp_n" = 1 ]; then
-  echo "PASS: S11 reseated ICMP rule not duplicated"; pass=$((pass+1))
-else
-  echo "FAIL: S11 icmp rules now: $_icmp_n (want 1)"; sed 's/^/    | /' "$HERE/state/ip_rules"; failn=$((failn+1))
-fi
-contains "$HERE/state/ip_rules" "priority 32760" "S11 hotplug actually ran"
+# R05: the scenario is a function so `GM_SCENARIO_FILTER=S11` can run it alone; it injects
+# the lock/route state roots and drains deterministically (no race with the detached worker).
+scenario_s11
 
 # ---------- scenario 12: self-update feature wiring (v1.7.0) ----------
 echo "=== S12: self-update markers/methods ==="

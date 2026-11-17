@@ -230,7 +230,7 @@ ip() { case "$*" in "link show "*) return 0 ;; esac; return 0; }
     # ------------------------------------------------------------ route sync
     ROUTE_SOURCE = ROOT / 'assets' / 'geomask-routes.sh'
 
-    def route_sync(self, main, table, owned=None, fail_main=False, source=None):
+    def route_sync(self, main, table, owned=None, fail_main=False):
         state = self.case / 'routes'
         state.mkdir(exist_ok=True)
         if owned is not None:
@@ -266,20 +266,13 @@ ip() { case "$*" in "link show "*) return 0 ;; esac; return 0; }
                 'GM_LOCK_DIR=' + posix(self.case / 'locks') + '\n'
                 'GM_LOCK_LIB=' + posix(ROOT / 'assets' / 'geomask-lock.sh') + '\n'
                 '. "$GM_LOCK_LIB"\n')
-        if source is None:
-            return self.run_script('geomask_routes_sync 100; printf "\\nRC=%s\\n" "$?"',
-                                   functions=['_gm_route_owned', '_gm_route_networks',
-                                              '_gm_route_devices', '_gm_route_normalize',
-                                              '_gm_route_local_lines', '_gm_route_in_prefix',
-                                              '_gm_route_cleanup', 'geomask_routes_sync'],
-                                   source=self.ROUTE_SOURCE, extra=stub)
-        # the hotplug wrapper sources the shared helper, so the helper is written where the
-        # wrapper expects it and the wrapper is driven exactly as netifd would drive it
-        lib = self.case / 'geomask-routes.sh'
-        lib.write_text(self.ROUTE_SOURCE.read_text(encoding='utf-8'), encoding='utf-8')
-        return self.run_script('sync_table 100; printf "\\nRC=%s\\n" "$?"',
-                               functions=['sync_table'], source=source,
-                               extra='GM_ROUTES_LIB=' + posix(lib) + '\n' + stub)
+        return self.run_script('geomask_routes_sync 100; printf "\\nRC=%s\\n" "$?"',
+                               functions=['_gm_route_owned', '_gm_route_networks',
+                                          '_gm_route_devices', '_gm_route_normalize',
+                                          '_gm_route_local_lines', '_gm_route_in_prefix',
+                                          '_gm_route_cleanup', '_gm_route_lock',
+                                          '_gm_route_unlock', 'geomask_routes_sync'],
+                               source=self.ROUTE_SOURCE, extra=stub)
 
     def test_only_lan_connected_routes_are_mirrored(self):
         """A public prefix that appears on the WAN must never enter the tunnel table."""
@@ -319,19 +312,32 @@ ip() { case "$*" in "link show "*) return 0 ;; esac; return 0; }
         self.assertNotIn('DEL', result.stdout)
         self.assertIn('RC=0', result.stdout)
 
-    def test_hotplug_uses_the_same_helper(self):
-        main = ['10.0.0.0/24 dev br-lan scope link']
-        result = self.route_sync(main, [], source=ROOT / 'assets' / '99-default-vpn-route')
-        self.assertIn('REPLACE route replace table 100 10.0.0.0/24', result.stdout)
+    def test_hotplug_hands_the_event_to_the_shared_helper(self):
+        """R05: ifup only queues; the shared helper owns the ip/uci work."""
+        text = (ROOT / 'assets' / '99-default-vpn-route').read_text(encoding='utf-8')
+        self.assertIn('gm_route_enqueue', text)
+        self.assertIn('GM_ROUTES_LIB', text)
+        self.assertIn('gm_route_worker', text)
+        self.assertNotIn('geomask_routes_sync', text,
+                         'the netifd path still runs the route writer itself')
+        self.assertNotIn('sync_table', text)
+        self.assertNotIn('apply_routes', text)
 
     def test_hotplug_without_the_helper_changes_nothing(self):
-        source = ROOT / 'assets' / '99-default-vpn-route'
-        result = self.run_script('sync_table 100; printf "\\nRC=%s\\n" "$?"',
-                                 functions=['sync_table'], source=source,
-                                 extra='GM_ROUTES_LIB=/nonexistent/geomask-routes.sh\n'
-                                       'logger() { :; }\n')
-        self.assertNotIn('REPLACE', result.stdout)
-        self.assertIn('RC=1', result.stdout)
+        """No route helper = no lock primitive and no queue: exit 2, nothing written."""
+        state = self.case / 'routes-state'
+        result = self.run_script(
+            'ACTION=ifup\n'
+            '. ' + repr(posix(ROOT / 'assets' / '99-default-vpn-route')) + '\n'
+            'printf "AFTER\\n"\n',
+            functions=[],
+            extra='GM_ROUTES_LIB=/nonexistent/geomask-routes.sh\n'
+                  'GM_ROUTE_STATE_DIR=' + posix(state) + '\n'
+                  'export GM_ROUTES_LIB GM_ROUTE_STATE_DIR\n'
+                  'logger() { :; }\n')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertNotIn('AFTER', result.stdout, 'the entrypoint continued without a helper')
+        self.assertFalse(state.exists(), 'a missing helper still created route state')
 
     # ------------------------------------------------------------ SMB share
     SMB_FUNCS = ['_smb_sections', '_smb_ours', 'ensure_smb_share']

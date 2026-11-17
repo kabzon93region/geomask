@@ -330,7 +330,7 @@ console_lock() { # 0 only with the kernel lock held; busy or no primitive = skip
 # all: that is a degraded state, never silence.
 valid_ipv4() {
   case "$1" in
-    ''|*[!0-9.]*) return 1 ;;
+    ''|*[!0-9.]*|.*|*.|*..*) return 1 ;;
   esac
   _vi_o=$1
   _vi_n=0
@@ -355,7 +355,7 @@ console_rule_present() { # console_rule_present <ip>
   ip rule show 2>/dev/null | grep -q "^19903:.*from $1 lookup $CTBL"
 }
 if console_lock; then
-  if [ -f "$CS" ]; then
+  if [ -f "$CS" ] && [ -r "$CS" ]; then
     CEN=$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)
     CIP=$(sed -n 's/^ip=//p' "$CS" 2>/dev/null | head -1)
     if [ "$CEN" = "1" ]; then
@@ -381,7 +381,10 @@ if console_lock; then
           log "WARN console routes helper missing ($CROUTES)"
         fi
         if ! console_rule_present "$CIP"; then
-          while ip rule del from "$CIP" lookup "$CTBL" 2>/dev/null; do :; done
+          # Only our own stale 19903 rule may be removed. Deleting `from <ip> lookup 102`
+          # without a pref also deleted a foreign rule (15000: from <ip> lookup 102) and
+          # then claimed the lane was "re-seated" (R10a P3).
+          while ip rule del pref 19903 from "$CIP" lookup "$CTBL" 2>/dev/null; do :; done
           if ip rule add pref 19903 from "$CIP" lookup "$CTBL" 2>/dev/null; then
             log "console rule re-seated for $CIP"
             conntrack -D -s "$CIP" >/dev/null 2>&1
@@ -418,6 +421,14 @@ if console_lock; then
     else
       RC_DEGRADED=1
       log "DEGRADED: console state has an unknown enabled='$CEN' - not touching the lane"
+    fi
+  else
+    # A missing state file is the normal "console lane was never configured" case. An
+    # existing path that is not a readable regular file is different: the block used to
+    # disappear silently and report rc=0 (R10a P3). Say it and do not touch the lane.
+    if [ -e "$CS" ] || [ -L "$CS" ]; then
+      RC_DEGRADED=1
+      log "DEGRADED: console state unreadable ($CS) - not touching the lane"
     fi
   fi
   gm_lock_release console

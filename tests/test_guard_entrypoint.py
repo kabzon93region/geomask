@@ -386,6 +386,48 @@ class GuardEntrypointTests(unittest.TestCase):
         self.assertIn('console rule removed', self.read('logger.log'))
         self.assertEqual(result.returncode, 0, result.stdout + self.read('logger.log'))
 
+    def test_enabled_console_keeps_a_foreign_rule_with_the_same_lookup(self):
+        # R10a P3: the enabled=1 repair deleted every `from <ip> lookup 102` rule, not only
+        # our pref 19903. A foreign 15000 rule must survive; ours is added next to it.
+        self.write('console.state', 'enabled=1\nip=10.20.30.40\n')
+        self.write('rules', BASE_RULES
+                   + '15000:\tfrom 10.20.30.40 lookup 102\n')
+        result = self.run_guard()
+        rules = '\n'.join(self.lines('rules'))
+        self.assertIn('15000:', rules,
+                      'a foreign rule with the same from/lookup was removed')
+        self.assertIn('19903:', rules,
+                      'the owned console rule was not added')
+        self.assertIn('rule add pref 19903 from 10.20.30.40 lookup 102',
+                      '\n'.join(self.lines('ip.calls')))
+        self.assertIn('console rule re-seated', self.read('logger.log'))
+        self.assertEqual(result.returncode, 0, result.stdout + self.read('logger.log'))
+
+    def test_enabled_console_rejects_an_ip_with_a_trailing_dot(self):
+        # R10a P3: valid_ipv4 accepted `10.20.30.40.`, so the guard called
+        # `ip rule add ... from 10.20.30.40.` and reported rc=0 instead of DEGRADED.
+        self.write('console.state', 'enabled=1\nip=10.20.30.40.\n')
+        result = self.run_guard()
+        log = self.read('logger.log')
+        self.assertIn('DEGRADED', log)
+        self.assertIn("invalid ip '10.20.30.40.'", log)
+        self.assertEqual(result.returncode, 1, result.stdout + log)
+        self.assertNotIn('10.20.30.40.', '\n'.join(self.lines('ip.calls')),
+                         'the invalid address reached ip')
+        self.assertNotIn('pref 19903', '\n'.join(self.lines('ip.adds')))
+
+    def test_unreadable_console_state_is_degraded_and_does_not_mutate(self):
+        # R10a P3: `[ -f "$CS" ]` had no else, so a directory/FIFO at the state path made
+        # the whole console block disappear with rc=0. It must be loud and mutation-free.
+        self.console.unlink()
+        self.console.mkdir()
+        result = self.run_guard()
+        log = self.read('logger.log')
+        self.assertIn('console state unreadable', log)
+        self.assertEqual(result.returncode, 1, result.stdout + log)
+        self.assertEqual(self.lines('ip.adds'), [],
+                         'the guard mutated the console lane without a readable state')
+
     def test_console_default_must_point_at_the_console_tun(self):
         self.write('console.state', 'enabled=1\nip=10.20.30.40\n')
         self.write('tbl-102', 'default via 192.168.1.1 dev br-lan\n')

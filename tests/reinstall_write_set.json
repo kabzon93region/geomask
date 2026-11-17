@@ -1521,20 +1521,6 @@
       "notes": "/tmp-кэш каталога модулей; transient, удаляется в обоих направлениях"
     },
     {
-      "id": "/tmp/geomask-aidns.nft",
-      "path": "/tmp/geomask-aidns.nft",
-      "type": "regular",
-      "owner": "ours",
-      "mode": "644",
-      "writers": [
-        "redirect aidns_generate_nft",
-        "rm after save_stream"
-      ],
-      "snapshot": "NONE",
-      "restore": "NR",
-      "notes": "временный рендер nft; всегда удаляется"
-    },
-    {
       "id": "/tmp/geomask-ytwatch.conf.new",
       "path": "/tmp/geomask-ytwatch.conf.new",
       "type": "regular",
@@ -1650,6 +1636,23 @@
       "snapshot": "SBA",
       "restore": "RB",
       "notes": "каждый save_stream пишет <target>.zmnew и делает <target>.bak_geomask_<epoch> при замене; родительские каталоги создаются mkdir -p; бэкапы .bak_geomask_* - наши и подлежат учёту при откате. site_regex конкретный: новый неразрешимый writer с другой формой валит гейт (review D)"
+    },
+    {
+      "id": "dyn.aidns-nft-temp",
+      "functions": [
+        "aidns_generate_nft"
+      ],
+      "effects": [
+        "redirect",
+        "rm"
+      ],
+      "site_regex": "\\$_aidns_tmp",
+      "path_regex": "/tmp/geomask-aidns\\.[^/]*$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "mktemp-файл рендера AI-DNS nft; путь в P /tmp, удаляется в каждой ветке (trap + rm). Фиксированного имени в /tmp больше нет (R06 M3)"
     },
     {
       "id": "dyn.mihomo-temps",
@@ -2299,7 +2302,7 @@
       "id": "net.nft-ai-dns",
       "kind": "nft-table",
       "object": "nft",
-      "pattern": "geomask-aidns\\.nft|geomask_ai_dns",
+      "pattern": "geomask-aidns\\.nft|geomask_ai_dns|\\$_aidns_tmp",
       "detail": "table inet geomask_ai_dns (pre_nat DNAT + out_mark skuid) через include 98-geomask-ai-dns.nft + firewall reload; снимок хранит list table, verify сравнивает содержимое (не только наличие)",
       "snapshot": "NFT",
       "restore": "RF",

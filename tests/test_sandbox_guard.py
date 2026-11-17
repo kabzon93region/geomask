@@ -7,27 +7,38 @@ the AI-DNS state into `/tmp`, and `test_recovery_wiring` opened a transaction un
 writes into `C:\\...\\etc` under Git-Bash.
 
 What this module does: it runs six named modules with `HOME`/`TMPDIR` inside a temporary
-directory and compares a `(mtime_ns, size)` snapshot of a few watched places before and after.
-Anything new or touched there is reported with the module name and the path, so "the test
-passed" cannot hide an obvious write to the host.
+directory and compares a snapshot of a few watched places before and after. The snapshot
+carries `(kind, mode, ino, size, mtime_ns, ctime_ns, uid, nlink, link target)` for regular
+files, directories and symlinks, plus a SHA-256 of regular files up to 4 MiB. That makes a
+deletion, `chmod`, symlink substitution, create+delete in a watched directory (its mtime
+changes) and a same-size/same-mtime rewrite visible inside the watched set.
 
 What it does NOT do (R06): it does not intercept, block, namespace, chroot or audit anything;
-it sees only six modules of the suite, only regular files, and it misses deletion, `chmod`,
-symlink substitution and same-size/same-mtime rewrites. It cannot see the network. A module
-that skipped every test still returns 0 from unittest, so the guard now treats "ran 0 tests"
-and "skipped every test" as problems as well. A clean guard run means "no change was noticed
-in the watched subset", never "the suite is isolated". See tests/BOUNDARIES.md.
+it sees only six modules of the suite and a short watched list, and it cannot see a
+same-size/same-mtime rewrite of a file larger than 4 MiB (metadata only: inode, size, times,
+mode), a create+delete in a directory it does not snapshot, or the network. A module that
+skipped every test still returns 0 from unittest, so the guard treats "ran 0 tests", "all
+tests skipped" and a run that executed nothing as problems as well. A clean guard run means
+"no change was noticed in the watched subset", never "the suite is isolated". This is a
+detector, not a sandbox. See tests/BOUNDARIES.md.
 """
+import hashlib
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+# Full-content hash catches a same-size/same-mtime rewrite. The cap keeps a snapshot from
+# reading an archive or a log twice per module; larger files are covered by inode/mode/size/
+# mtime_ns/ctime_ns only, which is stated in the boundary above.
+HASH_LIMIT = 4 * 1024 * 1024
 
 
 def find_bash():
@@ -89,6 +100,7 @@ def snapshot(host_dirs=None, tmp_roots=None, repo_root=None):
     for root in (host_dirs or []):
         if not root.is_dir():
             continue
+        _record(seen, root)
         for path in root.rglob('*'):
             _record(seen, path)
     for root in (tmp_roots or []):
@@ -108,18 +120,46 @@ def snapshot(host_dirs=None, tmp_roots=None, repo_root=None):
     return seen
 
 
+def _digest(path, st):
+    if not stat.S_ISREG(st.st_mode) or st.st_size > HASH_LIMIT:
+        return None
+    hasher = hashlib.sha256()
+    try:
+        with open(path, 'rb') as handle:
+            while True:
+                chunk = handle.read(262144)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    except OSError:
+        return 'unreadable'
+    return hasher.hexdigest()
+
+
 def _record(seen, path):
     try:
-        if not path.is_file():
-            return
-        stat = path.stat()
+        st = path.lstat()
     except OSError:
         return
-    seen[str(path)] = (stat.st_mtime_ns, stat.st_size)
+    target = None
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            target = os.readlink(path)
+        except OSError:
+            target = 'unreadable'
+    seen[str(path)] = (
+        stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_ino, st.st_size,
+        st.st_mtime_ns, st.st_ctime_ns, getattr(st, 'st_uid', -1),
+        getattr(st, 'st_nlink', -1), target, _digest(path, st),
+    )
 
 
 def added(before, after):
     return sorted(path for path in after if path not in before)
+
+
+def removed(before, after):
+    return sorted(path for path in before if path not in after)
 
 
 def touched(before, after):
@@ -140,6 +180,78 @@ class SandboxGuardTests(unittest.TestCase):
             after = snapshot([watched], [Path(tmp) / 'spool'], None)
             self.assertIn(str(watched / 'geomask-aidns.state'), added(before, after))
             self.assertIn(str(watched / 'quiet.txt'), touched(before, after))
+
+    def test_the_guard_notices_a_deleted_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watched = Path(tmp) / 'watched'
+            watched.mkdir()
+            victim = watched / 'quiet.txt'
+            victim.write_text('same', encoding='utf-8')
+            before = snapshot([watched], [], None)
+            victim.unlink()
+            after = snapshot([watched], [], None)
+            self.assertIn(str(victim), removed(before, after))
+
+    def test_the_guard_notices_chmod(self):
+        # Only the mode bits are modelled (Windows ACLs remain B-WIN-ACL); the read-only bit
+        # is visible through st_mode on both hosts, so the detector test is cross-platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            watched = Path(tmp) / 'watched'
+            watched.mkdir()
+            victim = watched / 'quiet.txt'
+            victim.write_text('same', encoding='utf-8')
+            original = stat.S_IMODE(victim.stat().st_mode)
+            before = snapshot([watched], [], None)
+            os.chmod(victim, 0o444)
+            after = snapshot([watched], [], None)
+            try:
+                self.assertIn(str(victim), touched(before, after))
+            finally:
+                os.chmod(victim, original)
+
+    def test_the_guard_notices_a_symlink_substitution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watched = Path(tmp) / 'watched'
+            watched.mkdir()
+            victim = watched / 'quiet.txt'
+            victim.write_text('same', encoding='utf-8')
+            target = Path(tmp) / 'outside.txt'
+            target.write_text('outside', encoding='utf-8')
+            before = snapshot([watched], [], None)
+            victim.unlink()
+            try:
+                victim.symlink_to(target)
+            except OSError as exc:
+                self.skipTest('no-native-symlink: %s' % exc)
+            after = snapshot([watched], [], None)
+            self.assertIn(str(victim), touched(before, after))
+
+    def test_the_guard_notices_create_and_delete_between_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watched = Path(tmp) / 'watched'
+            watched.mkdir()
+            before = snapshot([watched], [], None)
+            time.sleep(0.02)
+            ghost = watched / 'ghost.txt'
+            ghost.write_text('here and gone', encoding='utf-8')
+            ghost.unlink()
+            after = snapshot([watched], [], None)
+            self.assertIn(str(watched), touched(before, after),
+                          'the watched directory mtime did not record create+delete')
+
+    def test_the_guard_notices_a_same_size_same_mtime_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            watched = Path(tmp) / 'watched'
+            watched.mkdir()
+            victim = watched / 'quiet.txt'
+            victim.write_text('AAAA', encoding='utf-8')
+            original = victim.stat()
+            before = snapshot([watched], [], None)
+            victim.write_text('BBBB', encoding='utf-8')
+            os.utime(victim, ns=(original.st_atime_ns, original.st_mtime_ns))
+            after = snapshot([watched], [], None)
+            self.assertIn(str(victim), touched(before, after),
+                          'a same-size/same-mtime rewrite was invisible to the content hash')
 
     def test_no_module_writes_outside_its_sandbox(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,6 +281,8 @@ class SandboxGuardTests(unittest.TestCase):
                 after = snapshot(HOST_DIRS, TMP_ROOTS, ROOT)
                 for path in added(before, after):
                     problems.append('%s created %s' % (module, path))
+                for path in removed(before, after):
+                    problems.append('%s deleted %s' % (module, path))
                 for path in touched(before, after):
                     problems.append('%s changed %s' % (module, path))
                 before = after

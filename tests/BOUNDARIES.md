@@ -26,7 +26,8 @@ six modules, not an enforcement boundary (see below).
 * Symlink-aware code paths **only** when the native-symlink probe succeeds (see
   `B-WIN-NOSYMLINK`). A copy is not a symlink, and a copy-based green does not count.
 * Test-harness honesty: a module that ran zero tests or skipped all of them is not "ok";
-  a timeout is reported as a timeout; an unknown skip reason fails the run.
+  a timeout is reported as a timeout; an unknown skip reason fails the run; a module below
+  its `tests/expected-counts.json` entry and a run that executed no test fail the verdict.
 
 ## What a Windows / Git Bash run does NOT prove
 
@@ -46,7 +47,7 @@ six modules, not an enforcement boundary (see below).
 Also not proven anywhere in this suite: crash/power-loss/SIGKILL between steps, real
 concurrent writers (only cooperative fixtures), PID reuse, `ENOSPC`, overlay size limits
 (185 MB), BusyBox `ash` semantics (Git Bash is bash; dash is not ash), network end-to-end,
-DNS/VPN/UDP behaviour, and any property of a live router's configuration.
+DNS/VPN/UDP behaviour, and any property of a live router's configuration. Pending (R06 M3): a Linux namespace/strace job that proves live-path containment at the syscall level is not implemented; `tests/test_live_paths.py` is a static source check only.
 
 R04/R05 specifically: the Windows run proves the lock **logic** (refusal, budget, rank
 `routes-worker=35` between `config-tx=30` and `route-<n>=40`), the queue protocol
@@ -78,19 +79,25 @@ injection is still required.
 
 ## Why `test_sandbox_guard.py` is only a detector
 
-It runs six of the 72 modules and compares `(mtime_ns, size)` of regular files in a short
-watched list before and after each module. It does not intercept syscalls, mount
-namespaces, chroot, seccomp, `LD_PRELOAD`, audit or block the network. It cannot see:
+It runs six of the suite's modules and takes a metadata snapshot of a short watched list
+before and after each module. A record carries `(kind, mode, ino, size, mtime_ns, ctime_ns,
+uid, nlink, symlink target)` plus a SHA-256 of regular files up to 4 MiB. That makes
+deletion, `chmod`, symlink substitution, create+delete in a watched directory (its mtime
+changes) and a same-size/same-mtime rewrite visible inside the watched set. It does not
+intercept syscalls, mount namespaces, chroot, seccomp, `LD_PRELOAD`, audit or block the
+network. It still cannot see:
 
-* deletion, `chmod`, ownership changes, symlink substitution, create+delete inside one module;
-* a same-size rewrite with a restored mtime;
+* create+delete in a directory outside the watched set;
+* a same-size/same-mtime rewrite of a regular file larger than 4 MiB (inode/mode/size/times
+  are present, content is not);
+* ownership changes on a host without readable `st_uid` (Windows ACLs are `B-WIN-ACL`);
 * any module outside its `MODULES` list, and most host paths outside its short list;
 * Git Bash `/etc` vs Python `Path('/etc')` on Windows (only `/tmp` is mapped).
 
 Therefore a clean guard run means "no change was noticed in the watched subset". It never
 means "the suite is isolated" or "the full suite is safe to run on a work machine". The
-guard now also fails when a watched module ran zero tests or skipped all of them, and it
-reports timeouts as timeouts, but that is still detection after the fact.
+guard also fails when a watched module ran zero tests or skipped all of them, and it reports
+timeouts as timeouts, but that is still detection after the fact.
 
 ## When the full suite may run
 
@@ -111,8 +118,12 @@ whose reason does not map to this list makes the run fail. The list lives in
 `tests/testgate.py` (`ALLOWED_SKIPS`); changing it is a reviewed policy change, not a test
 detail. Adding a skip with a new reason without updating this file is a bug.
 
-Final numbers (tests/skips per module) are recomputed in R11 after the other R-tasks; this
-document describes the mechanism, not a promise about a particular count.
+`tests/expected-counts.json` carries a **minimum** test count per module. The gate fails a
+module that ran fewer tests than its entry, a module that ran zero tests, and a whole run
+where no test actually executed (all skipped); running more tests than the entry is allowed.
+Update the entry when you add tests to a module. Final numbers are recomputed in R11 after
+the other R-tasks; this document describes the mechanism, not a promise about a particular
+count.
 
 ## Running the gate
 

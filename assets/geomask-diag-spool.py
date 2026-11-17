@@ -327,13 +327,18 @@ def read_sidecar(spool, name, digest=True):
     return record
 
 
+def sidecar_payload(record):
+    """The exact bytes write_sidecar stores; the quota uses the same function."""
+    return (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
+
+
 def write_sidecar(spool, name, record):
     temporary = '.sidecar-' + secrets.token_hex(16)
     fd = spool.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
     try:
         if POSIX:
             os.fchmod(fd, 0o600)
-        payload = (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
+        payload = sidecar_payload(record)
         while payload:
             written = os.write(fd, payload)
             if written <= 0:
@@ -361,8 +366,10 @@ def scan(directory):
       sidecars  bundle name -> lstat of its .json (any type: read_sidecar still decides);
       orphans   [(sidecar name, lstat)] whose archive is not a regular file here;
       temps     [(name, lstat)] .sidecar-* / .part-* leftovers;
-      stages    [(name, lstat)] geomask-console-diag.XXXXXX directories.
-    Foreign names (router-backup-*.tar.gz, notes.txt, ...) stay out of every list.
+      stages    [(name, lstat)] geomask-console-diag.XXXXXX directories owned by this euid.
+    Foreign names (router-backup-*.tar.gz, notes.txt, ...) stay out of every list. A
+    staging directory with our name mask but another uid is not ours: TMPDIR is 1777, so
+    any local user can create such a directory and a root sweep must not delete it.
     """
     entries = {}
     for name in directory.names():
@@ -376,7 +383,8 @@ def scan(directory):
             archives[name] = st
         elif name.endswith('.json') and valid_name(name[:-5]):
             sidecars[name[:-5]] = st
-        elif STAGE_PATTERN.match(name) and stat.S_ISDIR(st.st_mode):
+        elif (STAGE_PATTERN.match(name) and stat.S_ISDIR(st.st_mode)
+              and st.st_uid == EUID):
             stages.append((name, st))
         elif name.startswith(TEMPORARY_PREFIXES) and not stat.S_ISDIR(st.st_mode):
             temps.append((name, st))
@@ -412,7 +420,20 @@ def _order(directory, archives):
 
 
 def _unlink(directory, name):
+    """Remove one name only when it is ours and not a shared inode.
+
+    `lstat` first: a bundle or sidecar whose uid is not ours, or which has more than one
+    link, is not deleted. The spool/share can contain files created by root or a local user
+    (TMPDIR is 1777), and retention must not unlink a hardlink to somebody else's data.
+    `protected_name` still wins before any of that.
+    """
     if protected_name(name):
+        return False
+    try:
+        st = directory.lstat(name)
+    except (OSError, Refused):
+        return False
+    if st is None or st.st_uid != EUID or st.st_nlink > 1:
         return False
     try:
         directory.unlink(name)
@@ -425,16 +446,33 @@ def _unlink(directory, name):
 
 def _unlink_pair(directory, name):
     """Archive first, then its sidecar: the reverse order would hide a 2 MiB orphan."""
-    removed = 1 if _unlink(directory, name) else 0
+    gone = _unlink(directory, name)
+    if not gone:
+        try:
+            still_there = directory.lstat(name) is not None
+        except (OSError, Refused):
+            still_there = True
+        if still_there:
+            # The archive is ours but protected (hardlink/foreign uid) or could not be
+            # removed: keep its passport as well, instead of turning the pair into an
+            # orphan.
+            return 0
+    removed = 1 if gone else 0
     if _unlink(directory, name + '.json'):
         removed += 1
     return removed
 
 
-def _evict(directory, archives, sidecars, order, keep_name, grace, files, quota, now, floor=1):
-    """Evict oldest-first until both limits hold; never the registering bundle."""
+def _evict(directory, archives, sidecars, order, keep_name, grace, files, quota, now, floor=1,
+           pending=0):
+    """Evict oldest-first until both limits hold; never the registering bundle.
+
+    `pending` is the exact size of a passport that is about to be written: registration
+    must not see room for the archive alone and then exceed the quota by the sidecar.
+    """
     removed = 0
-    while len(archives) > files or measure(archives, sidecars)[1] > quota:
+    while (len(archives) > files
+           or measure(archives, sidecars)[1] + pending > quota):
         if len(archives) <= floor:
             break
         victim = None
@@ -531,9 +569,11 @@ def _retain(directory, keep_hour, quota, files):
     if keep_hour:
         for name in sorted(archives):
             if now - archives[name].st_mtime > keep_hour * 3600:
-                removed += _unlink_pair(directory, name)
-                archives.pop(name, None)
-                sidecars.pop(name, None)
+                gone = _unlink_pair(directory, name)
+                if gone:
+                    removed += gone
+                    archives.pop(name, None)
+                    sidecars.pop(name, None)
     # 2. Sidecars whose archive was deleted by hand or by an earlier pass.
     for name, st in orphans:
         if now - st.st_mtime > ORPHAN_AGE and _unlink(directory, name):
@@ -767,6 +807,10 @@ def cmd_register(path, archive, quota=None, files=None, grace=None):
                           created_ns=time.time_ns())
         finally:
             os.close(fd)
+        # The passport is written after the quota decision, so its exact serialized size is
+        # part of that decision. The same helper builds the bytes write_sidecar stores, so
+        # the estimate cannot drift from the real file by a field or a newline.
+        sidecar_bytes = len(sidecar_payload(record))
         # Quota is enforced here and only here: the archive is closed and hashed, and the
         # whole measure -> evict -> accept step runs under one lock, so a parallel exporter
         # cannot slip between "there is room" and "write the sidecar" (R08).
@@ -774,16 +818,23 @@ def cmd_register(path, archive, quota=None, files=None, grace=None):
             archives, sidecars, _, _, _ = scan(spool)
             if name not in archives:
                 refuse('bundle changed during registration')
+            # A re-registered bundle may already have a passport counted by measure(); only
+            # the growth of the replacement counts as pending bytes.
+            pending = sidecar_bytes
+            shadow = sidecars.get(name)
+            if shadow is not None and stat.S_ISREG(shadow.st_mode):
+                pending = max(0, sidecar_bytes - shadow.st_size)
             _evict(spool, archives, sidecars, _order(spool, archives), name, grace,
-                   files, quota, time.time())
+                   files, quota, time.time(), pending=pending)
             count, taken = measure(archives, sidecars)
             if count > files:
                 _unlink_pair(spool, name)
                 refuse('архив не помещается: квота %d файлов, свежие архивы защищены %d с'
                        % (files, grace))
-            if taken > quota:
+            if taken + pending > quota:
                 _unlink_pair(spool, name)
-                refuse('архив %d байт не помещается в квоту %d' % (record['bytes'], quota))
+                refuse('архив %d байт и паспорт %d байт не помещаются в квоту %d'
+                       % (record['bytes'], sidecar_bytes, quota))
             try:
                 write_sidecar(spool, name, record)
             except BaseException:

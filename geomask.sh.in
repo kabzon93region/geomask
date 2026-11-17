@@ -1940,6 +1940,14 @@ aidns_generate_nft() { # (re)write the nft include from the current ai device li
   _list=""
   for _ip in $_ips; do _list="$_list $_ip,"; done
   _list=${_list%,}
+  # mktemp, not the fixed /tmp/geomask-aidns.nft this function used to write: /tmp is
+  # world-writable, so a local user could plant that name and redirect root's write.
+  # P() keeps the temporary on the root the run is pointed at (the tests' GM_PREFIX).
+  _aidns_tmp=$(mktemp "$(P /tmp)/geomask-aidns.XXXXXX" 2>/dev/null) || {
+    bad "cannot create a temporary file for AI-DNS rules"
+    return 1
+  }
+  trap 'rm -f "$_aidns_tmp"' EXIT HUP INT TERM
   {
     printf '# geomask AI-DNS (auto-generated from /etc/geo-devices.list - do not edit)\n'
     printf '# DNS of AI-mode devices goes into the AI tunnel: no DNS leak, no geo mismatch.\n'
@@ -1952,17 +1960,25 @@ aidns_generate_nft() { # (re)write the nft include from the current ai device li
     if [ -n "$_list" ]; then
       printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to %s:%s\n' "$_list" "$AIDNS_IP" "$AIDNS_DNS_PORT"
     fi
-  } > /tmp/geomask-aidns.nft || { rm -f /tmp/geomask-aidns.nft; bad "cannot render AI-DNS rules"; return 1; }
-  if nft -c -f /tmp/geomask-aidns.nft >/dev/null 2>&1; then
-    if save_stream /usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft 644 < /tmp/geomask-aidns.nft; then
-      rm -f /tmp/geomask-aidns.nft
+  } > "$_aidns_tmp" || {
+    rm -f "$_aidns_tmp"
+    trap - EXIT HUP INT TERM
+    bad "cannot render AI-DNS rules"
+    return 1
+  }
+  if nft -c -f "$_aidns_tmp" >/dev/null 2>&1; then
+    if save_stream /usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft 644 < "$_aidns_tmp"; then
+      rm -f "$_aidns_tmp"
+      trap - EXIT HUP INT TERM
       return 0
     fi
-    rm -f /tmp/geomask-aidns.nft
+    rm -f "$_aidns_tmp"
+    trap - EXIT HUP INT TERM
     bad "cannot write the AI-DNS include - DNS interception is not installed"
     return 1
   fi
-  rm -f /tmp/geomask-aidns.nft
+  rm -f "$_aidns_tmp"
+  trap - EXIT HUP INT TERM
   bad "generated AI-DNS nft rules failed syntax check"
   return 1
 }

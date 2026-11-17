@@ -358,6 +358,53 @@ class RetentionTests(DiagCase):
         self.assertTrue(foreign.exists())
         self.assertEqual(answer['removed'], 1)
 
+    def test_staging_sweep_ignores_a_stage_owned_by_another_uid(self):
+        # TMPDIR is 1777: a local user can create the name mask. Only a directory owned by
+        # this euid is ours; the sweep must leave the other one (and its contents) alone.
+        staging = self.root / 'tmp'
+        staging.mkdir()
+        ours = staging / 'geomask-console-diag.Ours01'
+        (ours / 'member').mkdir(parents=True)
+        foreign = staging / 'geomask-console-diag.Othe01'
+        (foreign / 'member').mkdir(parents=True)
+        self.age(ours, 8000)
+        self.age(foreign, 8000)
+        original_lstat = m.os.lstat
+        euid = m.EUID
+
+        def foreign_uid(path, *args, **kwargs):
+            st = original_lstat(path, *args, **kwargs)
+            if os.path.basename(os.fspath(path)) == foreign.name:
+                values = list(st)
+                values[4] = euid + 1
+                return os.stat_result(values)
+            return st
+
+        m.os.lstat = foreign_uid
+        try:
+            answer = self.retained(stage_dir=str(staging))
+        finally:
+            m.os.lstat = original_lstat
+        self.assertFalse(ours.exists(), 'our own staging directory was not swept')
+        self.assertTrue(foreign.exists(), 'a staging directory of a foreign uid was removed')
+        self.assertTrue((foreign / 'member').exists())
+        self.assertEqual(answer['removed'], 1)
+
+    def test_a_hardlinked_bundle_is_not_unlinked(self):
+        # POSIX-only per the task: on Windows the guard's nlink semantics are not a claim.
+        if os.name != 'posix':
+            self.skipTest('posix-only: hardlink st_nlink is the property under test')
+        archive = self.make(self.bundle('20260109-000000.777'), b'h' * 512)
+        self.register(archive)
+        os.link(archive, self.root / 'second-link')
+        self.age(archive, 25 * 3600)
+        self.age(self.sidecar(archive), 25 * 3600)
+        answer = self.retained(keep_hour=24)
+        self.assertTrue(archive.exists(), 'a hardlinked bundle was unlinked')
+        self.assertTrue(self.sidecar(archive).exists(),
+                        'the passport of a protected bundle was removed')
+        self.assertEqual(answer['removed'], 0)
+
     @unittest.skipUnless(os.name == 'posix', 'posix-only: symlink inside a staging directory')
     def test_staging_removal_does_not_follow_a_link(self):
         outside = self.root / 'outside.txt'
@@ -486,6 +533,27 @@ class QuotaTests(DiagCase):
         self.assertIn('200', text)
         self.assertFalse(archive.exists())
         self.assertFalse(self.sidecar(archive).exists())
+
+    def test_the_quota_includes_the_passport_bytes(self):
+        # The archive alone fits, the pair does not: the exact pair size passes and one
+        # byte less is refused with the archive and the temporary cleaned up.
+        archive = self.make(self.bundle('20260101-000000.222'), b'p' * 100)
+        self.register(archive, quota=1 << 20, files=8)
+        sidecar = self.sidecar(archive)
+        pair = archive.stat().st_size + sidecar.stat().st_size
+        sidecar.unlink()
+        with self.grace(0):
+            self.register(archive, quota=pair, files=8)
+        self.assertTrue(archive.exists())
+        self.assertTrue(sidecar.exists())
+        self.assertEqual(archive.stat().st_size + sidecar.stat().st_size, pair)
+        sidecar.unlink()
+        with self.assertRaises(m.Refused):
+            self.register(archive, quota=pair - 1, files=8)
+        self.assertFalse(archive.exists(), 'the refused archive stayed in the spool')
+        self.assertFalse(sidecar.exists(), 'a passport survived a refused registration')
+        leftovers = [name for name in os.listdir(self.spool) if name.startswith('.sidecar-')]
+        self.assertEqual(leftovers, [])
 
     def test_sidecar_enospc_removes_the_archive_and_leaves_no_temporary(self):
         archive = self.make(self.bundle('20260101-000000.111'), b'z' * 512)

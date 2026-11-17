@@ -1098,7 +1098,9 @@ _aidns_sync() {
     echo "$(date +%FT%T) AI-DNS: LAN address unreadable - ruleset left as is" >> "$LOG"
     return 0
   fi
-  _tmp=/tmp/geomask-aidns.nft.$$
+  # mktemp, not /tmp/geomask-aidns.nft.$$: a predictable pid-suffixed name in a
+  # world-writable directory can be planted before this process starts (R06 M3).
+  _tmp=$(mktemp "${TMPDIR:-/tmp}/geomask-aidns.XXXXXX" 2>/dev/null) || return 0
   {
     printf '# geomask AI-DNS (auto-generated from /etc/geo-devices.list - do not edit)\n'
     printf '# DNS of AI-mode devices goes into the AI tunnel: no DNS leak, no geo mismatch.\n'

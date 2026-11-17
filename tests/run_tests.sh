@@ -109,8 +109,11 @@ if [ -n "${GM_TESTS_DIR:-}" ] && [ "${GM_RUN_SCENARIOS:-0}" != "1" ]; then
     exit 1
   fi
   GM_MODULE_TIMEOUT=${GM_MODULE_TIMEOUT:-600}
+  GM_EXPECTED_COUNTS=${GM_EXPECTED_COUNTS:-$HERE/expected-counts.json}
+  pf "expected counts: $GM_EXPECTED_COUNTS (minimum tests per module; update when tests are added)"
   GM_PREFLIGHT_FILE="$GM_PREFLIGHT" "$GM_PY" -B "$HERE/testgate.py" run \
-    --tests-dir "$GM_TESTS_DIR" --log-dir "$GM_LOG_DIR" --timeout "$GM_MODULE_TIMEOUT"
+    --tests-dir "$GM_TESTS_DIR" --log-dir "$GM_LOG_DIR" --timeout "$GM_MODULE_TIMEOUT" \
+    --expected-counts "$GM_EXPECTED_COUNTS"
   _mrc=$?
   echo "summary: $GM_LOG_DIR/summary.txt"
   exit "$_mrc"

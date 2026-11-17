@@ -7145,7 +7145,9 @@ _aidns_sync() {
     echo "$(date +%FT%T) AI-DNS: LAN address unreadable - ruleset left as is" >> "$LOG"
     return 0
   fi
-  _tmp=/tmp/geomask-aidns.nft.$$
+  # mktemp, not /tmp/geomask-aidns.nft.$$: a predictable pid-suffixed name in a
+  # world-writable directory can be planted before this process starts (R06 M3).
+  _tmp=$(mktemp "${TMPDIR:-/tmp}/geomask-aidns.XXXXXX" 2>/dev/null) || return 0
   {
     printf '# geomask AI-DNS (auto-generated from /etc/geo-devices.list - do not edit)\n'
     printf '# DNS of AI-mode devices goes into the AI tunnel: no DNS leak, no geo mismatch.\n'
@@ -16125,13 +16127,18 @@ def read_sidecar(spool, name, digest=True):
     return record
 
 
+def sidecar_payload(record):
+    """The exact bytes write_sidecar stores; the quota uses the same function."""
+    return (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
+
+
 def write_sidecar(spool, name, record):
     temporary = '.sidecar-' + secrets.token_hex(16)
     fd = spool.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
     try:
         if POSIX:
             os.fchmod(fd, 0o600)
-        payload = (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
+        payload = sidecar_payload(record)
         while payload:
             written = os.write(fd, payload)
             if written <= 0:
@@ -16159,8 +16166,10 @@ def scan(directory):
       sidecars  bundle name -> lstat of its .json (any type: read_sidecar still decides);
       orphans   [(sidecar name, lstat)] whose archive is not a regular file here;
       temps     [(name, lstat)] .sidecar-* / .part-* leftovers;
-      stages    [(name, lstat)] geomask-console-diag.XXXXXX directories.
-    Foreign names (router-backup-*.tar.gz, notes.txt, ...) stay out of every list.
+      stages    [(name, lstat)] geomask-console-diag.XXXXXX directories owned by this euid.
+    Foreign names (router-backup-*.tar.gz, notes.txt, ...) stay out of every list. A
+    staging directory with our name mask but another uid is not ours: TMPDIR is 1777, so
+    any local user can create such a directory and a root sweep must not delete it.
     """
     entries = {}
     for name in directory.names():
@@ -16174,7 +16183,8 @@ def scan(directory):
             archives[name] = st
         elif name.endswith('.json') and valid_name(name[:-5]):
             sidecars[name[:-5]] = st
-        elif STAGE_PATTERN.match(name) and stat.S_ISDIR(st.st_mode):
+        elif (STAGE_PATTERN.match(name) and stat.S_ISDIR(st.st_mode)
+              and st.st_uid == EUID):
             stages.append((name, st))
         elif name.startswith(TEMPORARY_PREFIXES) and not stat.S_ISDIR(st.st_mode):
             temps.append((name, st))
@@ -16210,7 +16220,20 @@ def _order(directory, archives):
 
 
 def _unlink(directory, name):
+    """Remove one name only when it is ours and not a shared inode.
+
+    `lstat` first: a bundle or sidecar whose uid is not ours, or which has more than one
+    link, is not deleted. The spool/share can contain files created by root or a local user
+    (TMPDIR is 1777), and retention must not unlink a hardlink to somebody else's data.
+    `protected_name` still wins before any of that.
+    """
     if protected_name(name):
+        return False
+    try:
+        st = directory.lstat(name)
+    except (OSError, Refused):
+        return False
+    if st is None or st.st_uid != EUID or st.st_nlink > 1:
         return False
     try:
         directory.unlink(name)
@@ -16223,16 +16246,33 @@ def _unlink(directory, name):
 
 def _unlink_pair(directory, name):
     """Archive first, then its sidecar: the reverse order would hide a 2 MiB orphan."""
-    removed = 1 if _unlink(directory, name) else 0
+    gone = _unlink(directory, name)
+    if not gone:
+        try:
+            still_there = directory.lstat(name) is not None
+        except (OSError, Refused):
+            still_there = True
+        if still_there:
+            # The archive is ours but protected (hardlink/foreign uid) or could not be
+            # removed: keep its passport as well, instead of turning the pair into an
+            # orphan.
+            return 0
+    removed = 1 if gone else 0
     if _unlink(directory, name + '.json'):
         removed += 1
     return removed
 
 
-def _evict(directory, archives, sidecars, order, keep_name, grace, files, quota, now, floor=1):
-    """Evict oldest-first until both limits hold; never the registering bundle."""
+def _evict(directory, archives, sidecars, order, keep_name, grace, files, quota, now, floor=1,
+           pending=0):
+    """Evict oldest-first until both limits hold; never the registering bundle.
+
+    `pending` is the exact size of a passport that is about to be written: registration
+    must not see room for the archive alone and then exceed the quota by the sidecar.
+    """
     removed = 0
-    while len(archives) > files or measure(archives, sidecars)[1] > quota:
+    while (len(archives) > files
+           or measure(archives, sidecars)[1] + pending > quota):
         if len(archives) <= floor:
             break
         victim = None
@@ -16329,9 +16369,11 @@ def _retain(directory, keep_hour, quota, files):
     if keep_hour:
         for name in sorted(archives):
             if now - archives[name].st_mtime > keep_hour * 3600:
-                removed += _unlink_pair(directory, name)
-                archives.pop(name, None)
-                sidecars.pop(name, None)
+                gone = _unlink_pair(directory, name)
+                if gone:
+                    removed += gone
+                    archives.pop(name, None)
+                    sidecars.pop(name, None)
     # 2. Sidecars whose archive was deleted by hand or by an earlier pass.
     for name, st in orphans:
         if now - st.st_mtime > ORPHAN_AGE and _unlink(directory, name):
@@ -16565,6 +16607,10 @@ def cmd_register(path, archive, quota=None, files=None, grace=None):
                           created_ns=time.time_ns())
         finally:
             os.close(fd)
+        # The passport is written after the quota decision, so its exact serialized size is
+        # part of that decision. The same helper builds the bytes write_sidecar stores, so
+        # the estimate cannot drift from the real file by a field or a newline.
+        sidecar_bytes = len(sidecar_payload(record))
         # Quota is enforced here and only here: the archive is closed and hashed, and the
         # whole measure -> evict -> accept step runs under one lock, so a parallel exporter
         # cannot slip between "there is room" and "write the sidecar" (R08).
@@ -16572,16 +16618,23 @@ def cmd_register(path, archive, quota=None, files=None, grace=None):
             archives, sidecars, _, _, _ = scan(spool)
             if name not in archives:
                 refuse('bundle changed during registration')
+            # A re-registered bundle may already have a passport counted by measure(); only
+            # the growth of the replacement counts as pending bytes.
+            pending = sidecar_bytes
+            shadow = sidecars.get(name)
+            if shadow is not None and stat.S_ISREG(shadow.st_mode):
+                pending = max(0, sidecar_bytes - shadow.st_size)
             _evict(spool, archives, sidecars, _order(spool, archives), name, grace,
-                   files, quota, time.time())
+                   files, quota, time.time(), pending=pending)
             count, taken = measure(archives, sidecars)
             if count > files:
                 _unlink_pair(spool, name)
                 refuse('архив не помещается: квота %d файлов, свежие архивы защищены %d с'
                        % (files, grace))
-            if taken > quota:
+            if taken + pending > quota:
                 _unlink_pair(spool, name)
-                refuse('архив %d байт не помещается в квоту %d' % (record['bytes'], quota))
+                refuse('архив %d байт и паспорт %d байт не помещаются в квоту %d'
+                       % (record['bytes'], sidecar_bytes, quota))
             try:
                 write_sidecar(spool, name, record)
             except BaseException:
@@ -16933,7 +16986,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-diag-spool.py",
           "source": "assets/geomask-diag-spool.py",
           "mode": "0755",
-          "sha256": "65f64a6cca8de6cbca46c4a868e6dab322530609818aa05018303d95aaf6888a"
+          "sha256": "502f9f3e55d88af04a64a59c63d2130759857ebbf24362725398ab170c86f22b"
         },
         {
           "path": "/usr/lib/geomask/geomask-dnsguard.sh",
@@ -17085,7 +17138,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "40cb1630004b038445e3b66705335ffab9967c71335eb8c7321d1d4822de0287"
+          "sha256": "5f2effd7f92013c7bc9b63ba8b04b1b0d666496775962595ff02a59693c61ba6"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -20339,6 +20392,14 @@ aidns_generate_nft() { # (re)write the nft include from the current ai device li
   _list=""
   for _ip in $_ips; do _list="$_list $_ip,"; done
   _list=${_list%,}
+  # mktemp, not the fixed /tmp/geomask-aidns.nft this function used to write: /tmp is
+  # world-writable, so a local user could plant that name and redirect root's write.
+  # P() keeps the temporary on the root the run is pointed at (the tests' GM_PREFIX).
+  _aidns_tmp=$(mktemp "$(P /tmp)/geomask-aidns.XXXXXX" 2>/dev/null) || {
+    bad "cannot create a temporary file for AI-DNS rules"
+    return 1
+  }
+  trap 'rm -f "$_aidns_tmp"' EXIT HUP INT TERM
   {
     printf '# geomask AI-DNS (auto-generated from /etc/geo-devices.list - do not edit)\n'
     printf '# DNS of AI-mode devices goes into the AI tunnel: no DNS leak, no geo mismatch.\n'
@@ -20351,17 +20412,25 @@ aidns_generate_nft() { # (re)write the nft include from the current ai device li
     if [ -n "$_list" ]; then
       printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to %s:%s\n' "$_list" "$AIDNS_IP" "$AIDNS_DNS_PORT"
     fi
-  } > /tmp/geomask-aidns.nft || { rm -f /tmp/geomask-aidns.nft; bad "cannot render AI-DNS rules"; return 1; }
-  if nft -c -f /tmp/geomask-aidns.nft >/dev/null 2>&1; then
-    if save_stream /usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft 644 < /tmp/geomask-aidns.nft; then
-      rm -f /tmp/geomask-aidns.nft
+  } > "$_aidns_tmp" || {
+    rm -f "$_aidns_tmp"
+    trap - EXIT HUP INT TERM
+    bad "cannot render AI-DNS rules"
+    return 1
+  }
+  if nft -c -f "$_aidns_tmp" >/dev/null 2>&1; then
+    if save_stream /usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft 644 < "$_aidns_tmp"; then
+      rm -f "$_aidns_tmp"
+      trap - EXIT HUP INT TERM
       return 0
     fi
-    rm -f /tmp/geomask-aidns.nft
+    rm -f "$_aidns_tmp"
+    trap - EXIT HUP INT TERM
     bad "cannot write the AI-DNS include - DNS interception is not installed"
     return 1
   fi
-  rm -f /tmp/geomask-aidns.nft
+  rm -f "$_aidns_tmp"
+  trap - EXIT HUP INT TERM
   bad "generated AI-DNS nft rules failed syntax check"
   return 1
 }

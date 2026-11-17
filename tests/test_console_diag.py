@@ -13,12 +13,15 @@ temporary directory, the share folder and the opt-in marker all live in the test
 from pathlib import Path
 import base64
 import hashlib
+import io
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,17 +91,17 @@ class ConsoleDiagTests(unittest.TestCase):
                                                newline='\n')
 
     def run_body(self, body, functions=('cmd_console_diag',), maximum=None,
-                 stubs=STUBS, diag_py=None):
+                 stubs=STUBS, diag_py=None, keep='24', spool_py=None):
         lines = [
             'set -u',
             'CONSOLE_STATE="%s"' % posix(self.state),
             'export TMPDIR="%s"' % posix(self.spool),
             'export TMP="%s" TEMP="%s"' % (posix(self.case), posix(self.case)),
             'DIAG_SPOOL="%s"' % posix(self.spool),
-            'DIAG_SPOOL_PY="%s"' % posix(ROOT / 'assets' / 'geomask-diag-spool.py'),
+            'DIAG_SPOOL_PY="%s"' % posix(spool_py or (ROOT / 'assets' / 'geomask-diag-spool.py')),
             'BACKUP_DIR="%s"' % posix(self.share),
             'SMB_SHARE_ENABLE="%s"' % posix(self.marker),
-            'CONSOLE_DIAG_KEEP_H=24',
+            'CONSOLE_DIAG_KEEP_H=%s' % keep,
             'CONSOLE_TABLE=102',
             'CONSOLE_TUN_DEV=Console',
             'BACKEND_VERSION=test',
@@ -114,6 +117,7 @@ class ConsoleDiagTests(unittest.TestCase):
             lines.append('GM_CONSOLE_DIAG_MAX=%s' % maximum)
         lines += [stubs]
         lines += [extract('_console_diag_fail'), extract('_console_diag_redact'),
+                  extract('_console_diag_json'), extract('_diag_uint'), extract('_diag_run'),
                   extract('_console_get'), extract('json_esc')]
         lines += [extract(name) for name in functions]
         lines += [body]
@@ -168,6 +172,193 @@ class ConsoleDiagTests(unittest.TestCase):
         leftovers = [entry.name for entry in self.spool.iterdir()
                      if entry.name.startswith('geomask-console-diag.')]
         self.assertEqual(leftovers, [], 'a per-request directory was left behind')
+
+    # ---------------------------------------------------------------- R08: retention and bounds
+    def test_keep_junk_does_not_abort_the_backend_and_still_sweeps(self):
+        ancient = self.spool / 'geomask-console-diag-20000101-000000.111.tar.gz'
+        ancient.write_bytes(b'old bundle')
+        ancient_sidecar = self.spool / (ancient.name + '.json')
+        ancient_sidecar.write_text('{"schema":1}\n', encoding='utf-8')
+        stamp = time.time() - 25 * 3600
+        for path in (ancient, ancient_sidecar):
+            os.utime(path, (stamp, stamp))
+        answer = self.run_diag(keep='24h')
+        self.assertTrue(answer['ok'], answer)
+        self.assertFalse(ancient.exists(),
+                         'the clamped retention window was not applied')
+        self.assertFalse(ancient_sidecar.exists(),
+                         'the sidecar outlived the archive it describes')
+
+    def test_partial_tar_with_a_zero_exit_is_not_trusted(self):
+        half = self.case / 'half.tar.gz'
+        with tarfile.open(str(half), 'w:gz') as bundle:
+            data = b'x' * 4096
+            info = tarfile.TarInfo('member.txt')
+            info.size = len(data)
+            bundle.addfile(info, io.BytesIO(data))
+        raw = half.read_bytes()
+        half.write_bytes(raw[:max(1, len(raw) // 2)])
+        stubs = STUBS + (
+            "\ntar() {\n  case \"$*\" in\n    *-tzf*) return 1 ;;\n"
+            "    *) cp '%s' \"$2\"; return 0 ;;\n  esac\n}\n" % posix(half))
+        answer = self.run_diag(stubs=stubs)
+        self.assertFalse(answer['ok'], answer)
+        self.assertIn('cannot pack the bundle', answer['error'])
+        self.assert_packs_nothing()
+
+    def test_partial_tar_with_an_error_exit_reports_the_reason(self):
+        half = self.case / 'half.tar.gz'
+        half.write_bytes(b'\x1f\x8b\x08\x00partial')
+        stubs = STUBS + (
+            "\ntar() {\n  case \"$*\" in\n    *-tzf*) return 1 ;;\n"
+            "    *) cp '%s' \"$2\"\n"
+            "       printf 'write error: No space left on device\\n' >&2\n"
+            "       return 1 ;;\n  esac\n}\n" % posix(half))
+        answer = self.run_diag(stubs=stubs)
+        self.assertFalse(answer['ok'], answer)
+        self.assertIn('No space left on device', answer['error'])
+        self.assert_packs_nothing()
+
+    def test_share_copy_failure_is_reported_without_a_partial_file(self):
+        wrapper = self.case / 'spool-no-space.py'
+        wrapper.write_text(
+            'import runpy, sys\n'
+            'REAL = %r\n'
+            'if sys.argv[1:2] == ["copy-share"]:\n'
+            '    print(\'{"ok":false,"reason":"no-space"}\')\n'
+            '    sys.exit(1)\n'
+            'runpy.run_path(REAL, run_name="__main__")\n'
+            % str(ROOT / 'assets' / 'geomask-diag-spool.py'), encoding='utf-8')
+        self.marker.write_text('', encoding='utf-8')
+        answer = self.run_diag(spool_py=wrapper)
+        self.assertTrue(answer['ok'], answer)
+        self.assertFalse(answer['shared'])
+        self.assertEqual(answer['share_note'], 'no-space')
+        self.assertEqual(list(self.share.iterdir()), [],
+                         'a failed copy left a .part-* or the final name in the share')
+
+    def test_share_is_swept_even_without_the_marker(self):
+        self.marker.unlink(missing_ok=True)
+        stale = self.share / 'geomask-console-diag-20000101-000000.111.tar.gz'
+        stale.write_bytes(b'old copy')
+        stamp = time.time() - 25 * 3600
+        os.utime(stale, (stamp, stamp))
+        backup = self.share / 'router-backup-20260101-000000.tar.gz'
+        backup.write_bytes(b'backup')
+        notes = self.share / 'notes.txt'
+        notes.write_text('keep')
+        answer = self.run_diag()
+        self.assertTrue(answer['ok'], answer)
+        self.assertFalse(answer['shared'])
+        self.assertFalse(stale.exists(),
+                         'a stale share copy survived without the opt-in marker')
+        self.assertTrue(backup.exists(), 'the router backup was swept from the share')
+        self.assertTrue(notes.exists())
+
+    def test_producer_bounds_and_valid_placeholders(self):
+        connections = self.case / 'big-connections.json'
+        records = ','.join('{"id":"c%05d","host":"h%05d.example"}' % (index, index)
+                           for index in range(14000))
+        connections.write_text('{"connections":[' + records + ']}', encoding='utf-8',
+                               newline='\n')
+        group = self.case / 'big-group.json'
+        members = ','.join('{"name":"node-%04d"}' % index for index in range(4000))
+        group.write_text('{"name":"CONSOLE","members":[' + members + ']}', encoding='utf-8',
+                         newline='\n')
+        nft = self.case / 'big-nft.txt'
+        nft.write_text(''.join('counter comment line %d\n' % index for index in range(4001)),
+                       encoding='utf-8', newline='\n')
+        logs = self.case / 'long-log.txt'
+        logs.write_text('mihomo: keep me\nmihomo: ' + ('L%d' % 7) * 1100
+                        + '\nmihomo: keep me too\n', encoding='utf-8', newline='\n')
+        long_yaml = self.case / 'long-config.yaml'
+        proxies = ''.join('  - name: "node-%05d"\n    type: ss\n    server: h%05d.example\n'
+                          '    port: 8388\n' % (index, index) for index in range(7000))
+        long_yaml.write_text('mixed-port: 7890\nproxies:\n' + proxies, encoding='utf-8',
+                             newline='\n')
+        self.assertGreater(connections.stat().st_size, 524288)
+        self.assertGreater(group.stat().st_size, 65536)
+        self.assertGreater(long_yaml.stat().st_size, 524288)
+        stubs = r'''
+uci() { return 0; }
+nft() { cat '@NFT@'; }
+conntrack() { return 0; }
+controller_curl() {
+  case "$*" in
+    *proxies/CONSOLE*) cat '@GROUP@' ;;
+    *connections*) cat '@CONN@' ;;
+  esac
+}
+ip() { printf '10: from 192.168.1.177 lookup 102\n'; }
+logread() { cat '@LOG@'; }
+'''
+        for key, path in (('@NFT@', nft), ('@GROUP@', group), ('@CONN@', connections),
+                          ('@LOG@', logs)):
+            stubs = stubs.replace(key, posix(path))
+        (self.case / 'config.yaml').write_text(long_yaml.read_text(encoding='utf-8'),
+                                               encoding='utf-8', newline='\n')
+        answer = self.run_diag(stubs=stubs)
+        self.assertTrue(answer['ok'], answer)
+        members = {}
+        with tarfile.open(self.spool / self.bundle_name(answer), 'r:gz') as bundle:
+            for member in bundle.getmembers():
+                if member.isfile():
+                    members[member.name.rsplit('/', 1)[-1]] = bundle.extractfile(member).read()
+        oversized_connections = json.loads(members['connections.json'])
+        self.assertEqual(oversized_connections['error'], 'response too large')
+        self.assertGreater(oversized_connections['bytes'], 524288)
+        oversized_group = json.loads(members['group-CONSOLE.json'])
+        self.assertEqual(oversized_group['error'], 'response too large')
+        self.assertGreater(oversized_group['bytes'], 65536)
+        self.assertEqual(len(members['nft.txt'].splitlines()), 4000,
+                         'the nft producer was not bounded at 4000 lines')
+        text = members['logread.txt'].decode('utf-8')
+        self.assertIn('keep me', text)
+        self.assertNotIn('L7' * 1100, text, 'an oversized log line reached the bundle')
+        self.assertIn('dropped 1', text, 'the dropped log lines are not marked')
+        self.assertEqual(members['config.masked.yaml'].decode('utf-8').strip(),
+                         'error: config too large')
+
+    def test_staging_budget_refuses_before_tar(self):
+        big = self.case / 'big-ip.txt'
+
+        def line(index):
+            body = ''.join(chr(97 + (index + offset) % 26) for offset in range(800))
+            return '10: from 192.168.1.%d lookup 102 %s' % (index % 250, body)
+
+        big.write_text('\n'.join(line(index) for index in range(2000)) + '\n',
+                       encoding='utf-8', newline='\n')
+        self.assertGreater(big.stat().st_size, 1536 * 1024)
+        stubs = STUBS + (
+            '\nip() {\n'
+            '  case "$*" in\n'
+            "    *rule*) cat '%s' ;;\n"
+            "    *) printf '10: from 192.168.1.177 lookup 102\\n' ;;\n"
+            '  esac\n'
+            '}\n' % posix(big))
+        answer = self.run_diag(stubs=stubs)
+        self.assertFalse(answer['ok'], answer)
+        self.assertIn('слишком велико', answer['error'])
+        self.assertIn('KiB', answer['error'])
+        self.assert_packs_nothing()
+
+    def test_conntrack_is_skipped_with_a_summary_line_without_timeout(self):
+        stubs = STUBS + (
+            '\ncommand() {\n'
+            '  if [ "$1" = "-v" ] && [ "$2" = "timeout" ]; then return 1; fi\n'
+            '  builtin command "$@"\n'
+            '}\n')
+        answer = self.run_diag(stubs=stubs)
+        self.assertTrue(answer['ok'], answer)
+        members = {}
+        with tarfile.open(self.spool / self.bundle_name(answer), 'r:gz') as bundle:
+            for member in bundle.getmembers():
+                if member.isfile():
+                    members[member.name.rsplit('/', 1)[-1]] = bundle.extractfile(member).read()
+        self.assertNotIn('conntrack-console.txt', members,
+                         'conntrack ran without a timeout applet')
+        self.assertIn('conntrack', members['summary.txt'].decode('utf-8'))
+        self.assertIn('timeout', members['summary.txt'].decode('utf-8'))
 
     # ---------------------------------------------------------------- R02: redaction
     E2E_SENTINELS = (

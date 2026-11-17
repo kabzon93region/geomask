@@ -57,6 +57,25 @@ descriptor inheritance by a detached worker, real `ip route`/`ip rule`, netns, p
 call paths or PPPoE stalls. Those are `B-LINUX-POSIX` / `B-ROUTER` and are skipped with those
 reasons; a router/stand run is required before deployment.
 
+R12 specifically: `test_routes_ownership.py` proves the ownership reconcile against a stateful
+`ip` stub with injectable refusals - a refused `replace`/`delete`/record write keeps the old
+record and a later pass repairs the table, a partial run records every prefix it installed, a
+foreign occupant is never overwritten, a record for a route removed externally drops out, a
+failed `ip route show` before the first mutation is `76` (record untouched) and after a mutation
+is `77` (old record kept), an empty successful read-back does not erase the record, tables are
+isolated, no `*.tmp` survives, and a parked `77` leaves a `retry-<table>` marker that is not
+queue work, that one drain converts, and that survives a refused conversion. The structural key
+(`prefix`/`via`/`dev`/`src`, kernel decoration and a route type word ignored) is exercised in
+every phase: a decorated stale record is deleted by the installed line, a changed `desired`
+line repairs a decorated old form, and a raced foreign line with another `src` is neither
+recorded nor deleted. It does **not** prove the real refusal codes of `iproute2`, kernel
+normalisation of `ip route show` output (`linkdown`, `expires`, `proto`, `metric`, multipath),
+the real scheduling of a same-prefix race on a live table, BusyBox `ip`/`awk`, `mv` atomicity
+on overlayfs/tmpfs, a `src` that changes while the route stays installed, or a foreign route
+that differs from ours only by `proto`/`metric` or is byte-identical (accepted as ours by the
+line/key comparison). Those are `B-ROUTER` / `B-LINUX-POSIX`; a Linux/router stand with fault
+injection is still required.
+
 ## Why `test_sandbox_guard.py` is only a detector
 
 It runs six of the 72 modules and compares `(mtime_ns, size)` of regular files in a short

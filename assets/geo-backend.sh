@@ -26,8 +26,16 @@ BACKUP_DIR=${GM_BACKUP_DIR:-/root/geomask-backups}
 # The backup folder is published over SMB only after the owner opts in with this marker; the
 # diagnostic bundle must not land there without it (review 15.11, #14).
 SMB_SHARE_ENABLE=${GM_SMB_SHARE_ENABLE:-/etc/geomask/backup-share.enable}
-# How long a bundle may sit in the temporary directory before it is removed (hours).
+# How long a bundle may sit in the temporary spool or in the published share before it is
+# removed (hours). The value is clamped to 1..720 by _diag_uint before any arithmetic: a
+# junk value like `24h` used to abort the whole back end inside $((...)) before any JSON.
 CONSOLE_DIAG_KEEP_H=${GM_CONSOLE_DIAG_KEEP:-24}
+# Independent budgets for the two media (R08): the spool is tmpfs/RAM, the share is the
+# persistent overlay, so one may not evict the other. GM_CONSOLE_DIAG_QUOTA and
+# GM_CONSOLE_DIAG_SHARE_QUOTA are MiB (clamped 2..64), GM_CONSOLE_DIAG_FILES is the spool
+# archive count (clamped 1..32), GM_CONSOLE_DIAG_SHARE_FILES the share count (1..16).
+# Default: spool 8 MiB / 4 archives, share 6 MiB / 3 copies.
+
 DHCP_OWNED=/etc/geomask/dhcp-hosts   # id|ip|mac of host sections geomask created
 # Device/subscription lists are read-modify-written by the panel and the guard. The RMW is
 # serialised by the shared kernel `devices` lock and the temporary file is per-process, so two
@@ -2609,6 +2617,58 @@ _console_diag_redact() { # $1 = uci|yaml|json|text|nft, $2 = stage, $3 = output 
   return 0
 }
 
+# A bounded JSON member (R08): the raw response is measured first, because a truncated JSON
+# body breaks both the redactor and the panel parser. Over the limit it is replaced with a
+# valid, self-describing object; the raw file is removed either way.
+_console_diag_json() { # $1 = stage, $2 = raw file, $3 = output file, $4 = limit bytes
+  _cdj_bytes=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
+  case "$_cdj_bytes" in ''|*[!0-9]*) _cdj_bytes=0 ;; esac
+  if [ "$_cdj_bytes" -gt "$4" ]; then
+    rm -f "$2" 2>/dev/null
+    printf '{"error":"response too large","bytes":%s}\n' "$_cdj_bytes" > "$3"
+    return 0
+  fi
+  if "$PYTHON_BIN" -B "$DIAG_PY" redact json < "$2" > "$3" 2>/dev/null; then
+    rm -f "$2" 2>/dev/null
+    return 0
+  fi
+  rm -f "$2" 2>/dev/null
+  _console_diag_fail "$1"
+  return 1
+}
+
+# Sanitised, clamped environment number (R08). A junk value falls back to its default, a
+# six-digit one clamps to the maximum before arithmetic: `GM_CONSOLE_DIAG_KEEP=24h` used to
+# abort the back end inside $((...)) before any JSON reached rpcd. No leading zeros either:
+# ash reads `08` as an invalid octal constant.
+_diag_uint() { # $1 = value, $2 = default, $3 = minimum, $4 = maximum
+  _diag_uint_v=${1:-}
+  case "$_diag_uint_v" in
+    ''|*[!0-9]*) _diag_uint_v=$2 ;;
+  esac
+  _diag_uint_v=$(printf '%s' "$_diag_uint_v" | sed 's/^0*//')
+  [ -n "$_diag_uint_v" ] || _diag_uint_v=0
+  case "$_diag_uint_v" in ??????*) _diag_uint_v=$4 ;; esac
+  _diag_uint_v=$((_diag_uint_v + 0))
+  [ "$_diag_uint_v" -lt "$3" ] && _diag_uint_v=$3
+  [ "$_diag_uint_v" -gt "$4" ] && _diag_uint_v=$4
+  printf '%s' "$_diag_uint_v"
+}
+
+# `timeout` can only bound a real binary: a router/test stub may be a shell function, and
+# timeout(1) would not see it (it would report "command not found" and hide the producer).
+# Without a `timeout` applet the command runs unbounded; the caller decides if that is ok.
+_diag_run() { # $1 = seconds, rest = command
+  _diag_run_secs=$1
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    case "$(command -v "$1" 2>/dev/null)" in
+      /*) timeout "$_diag_run_secs" "$@"; return $? ;;
+    esac
+  fi
+  "$@"
+}
+
 # One archive with everything needed to diagnose the console path from a distance. The
 # masking is done by the shipped redactor, and `verify` is the last gate: an unmasked bundle
 # is never handed out (review 15.11, R02).
@@ -2633,13 +2693,20 @@ cmd_console_diag() {
   _dir=$(mktemp -d "$_tmpd/geomask-console-diag.XXXXXX" 2>/dev/null)
   [ -n "$_dir" ] || { printf '{"ok":false,"error":"cannot create a private bundle directory"}\n'; return 1; }
   chmod 700 "$_dir" 2>/dev/null
-  # Nothing older than the retention window stays on the router: these archives carry the
-  # masked-but-still-descriptive state of the console lane. The sidecar goes with the archive
-  # or a missing archive would still look registered.
-  find "$DIAG_SPOOL" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz' \
-    -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
-  find "$DIAG_SPOOL" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz.json' \
-    -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
+  # Retention is one helper pass (age by mtime -> orphan sidecars -> stale temporary files
+  # -> staging directories -> count -> bytes), not two `find -mmin` sweeps: the pair used to
+  # diverge on the window boundary and leave a sidecar whose archive was already gone. The
+  # helper only lstats (no hashing), never follows a link, and never touches foreign names
+  # (`router-backup-*`). A retention error must not block a fresh archive: its JSON is
+  # ignored here. Numbers are clamped before any arithmetic reaches the helper.
+  _diag_keep=$(_diag_uint "${CONSOLE_DIAG_KEEP_H:-24}" 24 1 720)
+  _diag_quota=$(( $(_diag_uint "${GM_CONSOLE_DIAG_QUOTA:-8}" 8 2 64) * 1048576 ))
+  _diag_files=$(_diag_uint "${GM_CONSOLE_DIAG_FILES:-4}" 4 1 32)
+  _diag_share_quota=$(( $(_diag_uint "${GM_CONSOLE_DIAG_SHARE_QUOTA:-6}" 6 2 64) * 1048576 ))
+  _diag_share_files=$(_diag_uint "${GM_CONSOLE_DIAG_SHARE_FILES:-3}" 3 1 16)
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$DIAG_SPOOL" \
+    --keep-h "$_diag_keep" --quota "$_diag_quota" --files "$_diag_files" \
+    --stage-dir "$_tmpd" >/dev/null 2>&1
   # Without the redactor the bundle cannot be masked; an unmasked archive is worse than no
   # archive at all, so the request fails closed.
   [ -f "$DIAG_PY" ] || {
@@ -2653,26 +2720,69 @@ cmd_console_diag() {
     printf 'backend %s\n' "$BACKEND_VERSION"
   } > "$_dir/summary.txt" 2>/dev/null
   [ -f /etc/geomask/version ] && cat /etc/geomask/version >> "$_dir/summary.txt" 2>&1
-  ip -4 rule show > "$_dir/ip-rule.txt" 2>&1
-  ip -4 route show table "$CONSOLE_TABLE" > "$_dir/route-table-$CONSOLE_TABLE.txt" 2>&1
-  ip -4 addr show "$CONSOLE_TUN_DEV" > "$_dir/tun.txt" 2>&1
-  uci -q show firewall 2>&1 | _console_diag_redact uci uci:firewall "$_dir/firewall.uci" || return 1
-  uci -q show network 2>&1 | _console_diag_redact uci uci:network "$_dir/network.uci" || return 1
-  nft list ruleset 2>&1 | _console_diag_redact nft nft:ruleset "$_dir/nft.txt" || return 1
-  [ -n "$_ip" ] && conntrack -L -s "$_ip" > "$_dir/conntrack-console.txt" 2>&1
+  # Producers are bounded at the source (R08): the 2 MiB creation cap used to be checked only
+  # after the whole state was collected, so a router with a large nft ruleset or a long
+  # connection list rebuilt and discarded the archive on every click. Line bounds are safe for
+  # text; JSON and YAML go through a size gate with a valid placeholder, because cutting them
+  # would break their parser (and verify). Timeouts keep a broken producer from hanging the
+  # whole panel call.
+  ip -4 rule show 2>&1 | head -n 2000 > "$_dir/ip-rule.txt"
+  ip -4 route show table "$CONSOLE_TABLE" 2>&1 | head -n 2000 > "$_dir/route-table-$CONSOLE_TABLE.txt"
+  ip -4 addr show "$CONSOLE_TUN_DEV" 2>&1 | head -n 2000 > "$_dir/tun.txt"
+  _diag_run 10 uci -q show firewall 2>&1 | head -n 2000 \
+    | _console_diag_redact uci uci:firewall "$_dir/firewall.uci" || return 1
+  _diag_run 10 uci -q show network 2>&1 | head -n 2000 \
+    | _console_diag_redact uci uci:network "$_dir/network.uci" || return 1
+  _diag_run 10 nft list ruleset 2>&1 | head -n 4000 \
+    | _console_diag_redact nft nft:ruleset "$_dir/nft.txt" || return 1
+  if [ -n "$_ip" ]; then
+    if command -v timeout >/dev/null 2>&1; then
+      _diag_run 5 conntrack -L -s "$_ip" 2>&1 | head -n 2000 > "$_dir/conntrack-console.txt"
+    else
+      # An unbounded conntrack dump on a busy router is worse than a missing member: do not
+      # create the file, and say so in the summary instead of failing the whole archive.
+      printf 'conntrack: пропущено — на роутере нет утилиты timeout\n' >> "$_dir/summary.txt"
+    fi
+  fi
   logread 2>/dev/null | grep -iE 'mihomo|hev|geomask|console' | tail -400 \
+    | awk 'length($0) > 2048 { dropped++; next }
+           { print }
+           END { if (dropped) printf "[geomask] dropped %d log lines longer than 2048 bytes\n", dropped }' \
     | _console_diag_redact text text:logread "$_dir/logread.txt" || return 1
   if [ -x "$CONSOLE_PY" ] && [ -f "$MIHOMO_CONF" ]; then
     "$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" 2>/dev/null \
       | _console_diag_redact json json:console-config "$_dir/console-config.json" || return 1
   fi
-  controller_curl -s -m5 "$MIHOMO_API/proxies/CONSOLE" 2>/dev/null \
-    | _console_diag_redact json json:group-CONSOLE "$_dir/group-CONSOLE.json" || return 1
-  controller_curl -s -m5 "$MIHOMO_API/connections" 2>/dev/null \
-    | _console_diag_redact json json:connections "$_dir/connections.json" || return 1
-  # The mihomo config carries subscription URLs and the controller secret.
+  controller_curl -s -m5 "$MIHOMO_API/proxies/CONSOLE" > "$_dir/.raw-group.$$" 2>/dev/null
+  _console_diag_json json:group-CONSOLE "$_dir/.raw-group.$$" \
+    "$_dir/group-CONSOLE.json" 65536 || return 1
+  controller_curl -s -m5 "$MIHOMO_API/connections" > "$_dir/.raw-connections.$$" 2>/dev/null
+  _console_diag_json json:connections "$_dir/.raw-connections.$$" \
+    "$_dir/connections.json" 524288 || return 1
+  # The mihomo config carries subscription URLs and the controller secret. It is the one
+  # member that must not be truncated, so an oversized config becomes an explicit marker.
   if [ -f "$MIHOMO_CONF" ]; then
-    _console_diag_redact yaml yaml:mihomo "$_dir/config.masked.yaml" < "$MIHOMO_CONF" || return 1
+    _diag_yaml_bytes=$(wc -c < "$MIHOMO_CONF" 2>/dev/null | tr -d ' ')
+    case "$_diag_yaml_bytes" in ''|*[!0-9]*) _diag_yaml_bytes=0 ;; esac
+    if [ "$_diag_yaml_bytes" -gt 524288 ]; then
+      printf 'error: config too large\n' > "$_dir/config.masked.yaml"
+    else
+      _console_diag_redact yaml yaml:mihomo "$_dir/config.masked.yaml" \
+        < "$MIHOMO_CONF" || return 1
+    fi
+  fi
+  # Staging budget: 1.5 MiB of text already compresses into an archive the 2 MiB creation cap
+  # accepts, so a bigger staging tree means a pathological state. Refuse before verify/tar
+  # and name the three biggest members instead of spending the work and discarding it later.
+  _diag_du=$(du -sk "$_dir" 2>/dev/null | awk '{print $1}')
+  case "$_diag_du" in ''|*[!0-9]*) _diag_du=0 ;; esac
+  if [ "$_diag_du" -gt 1536 ]; then
+    _diag_top=$(du -k "$_dir"/* 2>/dev/null | sort -rn | head -3 \
+      | awk '{printf "%s (%s KiB); ", $2, $1}')
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"состояние слишком велико для бандла: %s KiB > 1536 KiB; крупнейшие: %s"}\n' \
+      "$_diag_du" "$(json_esc "${_diag_top:-unknown}")"
+    return 1
   fi
   # Last gate: unknown content must not be packed. `verify` prints file:line: kind.
   _diag_secret=$("$PYTHON_BIN" -B "$DIAG_PY" verify "$_dir" 2>&1)
@@ -2685,18 +2795,40 @@ cmd_console_diag() {
     return 1
   fi
   _tgz="$DIAG_SPOOL/geomask-console-diag-$(date +%Y%m%d-%H%M%S).$$.tar.gz"
-  ( umask 077; tar -czf "$_tgz" -C "$_tmpd" "$(basename "$_dir")" >/dev/null 2>&1 ) || {
+  # tar's stderr lives in TMPDIR, never in the staging directory: it is not a bundle member,
+  # and its last line is what the JSON refusal quotes (bounded to 200 bytes).
+  _tar_err="$_tmpd/geomask-tar.$$.err"
+  ( umask 077; tar -czf "$_tgz" -C "$_tmpd" "$(basename "$_dir")" >/dev/null 2>"$_tar_err" ) || {
+    _diag_tar_detail=$(tail -1 "$_tar_err" 2>/dev/null | cut -c1-200)
     rm -rf "$_dir" 2>/dev/null
-    rm -f "$_tgz" 2>/dev/null
-    printf '{"ok":false,"error":"cannot pack the bundle"}\n'; return 1
+    rm -f "$_tgz" "$_tar_err" 2>/dev/null
+    printf '{"ok":false,"error":"cannot pack the bundle: %s"}\n' \
+      "$(json_esc "${_diag_tar_detail:-tar failed}")"
+    return 1
   }
+  # A partial write can still return 0 on BusyBox tar: the archive is accepted only after a
+  # full read-back of its table of contents (the same gate cmd_backup uses). This also catches
+  # an archive truncated through the same inode by an external process, which register would
+  # otherwise hash and hand out as a valid but broken gzip.
+  if ! tar -tzf "$_tgz" >/dev/null 2>"$_tar_err"; then
+    _diag_tar_detail=$(tail -1 "$_tar_err" 2>/dev/null | cut -c1-200)
+    rm -rf "$_dir" 2>/dev/null
+    rm -f "$_tgz" "$_tar_err" 2>/dev/null
+    printf '{"ok":false,"error":"cannot pack the bundle: %s"}\n' \
+      "$(json_esc "${_diag_tar_detail:-archive is not a valid tar.gz}")"
+    return 1
+  fi
+  rm -f "$_tar_err" 2>/dev/null
   chmod 600 "$_tgz" 2>/dev/null
   rm -rf "$_dir" 2>/dev/null
   # Registration records (dev, ino, link count, size, sha256) in <archive>.json; a failure
   # removes the archive so an unregistered bundle cannot linger in the spool.
   # Fixed creation/registration cap: 2 MiB, checked before SMB copy. Larger archives
   # are deleted, not left for SMB/SSH. GM_CONSOLE_DIAG_MAX only controls transport.
-  _diag_reg=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" register "$DIAG_SPOOL" "$_tgz" 2>/dev/null)
+  # The quota is enforced inside register (after the hash, under flock): it evicts the oldest
+  # registered bundle instead of refusing, but never the one being registered.
+  _diag_reg=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" register "$DIAG_SPOOL" "$_tgz" \
+    --quota "$_diag_quota" --files "$_diag_files" 2>/dev/null)
   _diag_reg_rc=$?
   if [ "$_diag_reg_rc" != 0 ]; then
     rm -f "$_tgz" 2>/dev/null
@@ -2709,15 +2841,37 @@ cmd_console_diag() {
   # The helper measured the archive from its descriptor; the shell must not read it again.
   _diag_bytes=$(printf '%s\n' "$_diag_reg" | sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p')
   case "$_diag_bytes" in ''|*[!0-9]*) _diag_bytes=0 ;; esac
+  # The share is swept before and after the copy regardless of the opt-in marker: revoking it
+  # must not leave yesterday's copies on the overlay forever (R08). The helper only touches
+  # `geomask-console-diag-*` names, so `router-backup-*` and foreign files are invisible to it.
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$BACKUP_DIR" --share \
+    --keep-h "$_diag_keep" --quota "$_diag_share_quota" --files "$_diag_share_files" \
+    >/dev/null 2>&1
   # Into the share only when the owner opted in with the marker: before this the archive was
   # copied into a folder that may be published over SMB, without asking (review 15.11, #14).
+  # The copy itself is temp + fsync + rename inside the helper, so over SMB the owner sees
+  # either nothing or a complete 0600 file - never half a copy under the final name (R08).
   _shared=false
-  if [ -f "$SMB_SHARE_ENABLE" ] && [ -d "$BACKUP_DIR" ] && [ -w "$BACKUP_DIR" ]; then
-    cp -f "$_tgz" "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null \
-      && chmod 600 "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null && _shared=true
+  _share_note=''
+  if [ -f "$SMB_SHARE_ENABLE" ]; then
+    _diag_copy=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" copy-share "$_tgz" "$BACKUP_DIR" \
+      "$(basename "$_tgz")" 2>/dev/null)
+    case "$_diag_copy" in
+      *'"ok":true'*) _shared=true ;;
+      *)
+        _share_note=$(printf '%s\n' "$_diag_copy" \
+          | sed -n 's/.*"reason":"\([a-z-]*\)".*/\1/p')
+        case "$_share_note" in ''|*[!a-z-]*) _share_note=failed ;; esac
+        ;;
+    esac
+  else
+    _share_note=disabled
   fi
-  printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s}\n' \
-    "$_tgz" "$_diag_bytes" "$_shared"
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$BACKUP_DIR" --share \
+    --keep-h "$_diag_keep" --quota "$_diag_share_quota" --files "$_diag_share_files" \
+    >/dev/null 2>&1
+  printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s,"share_note":"%s"}\n' \
+    "$_tgz" "$_diag_bytes" "$_shared" "$_share_note"
 }
 
 # The panel used to get only a path on the router, so the owner had to find the archive by hand
@@ -2733,7 +2887,8 @@ cmd_console_diag_get() {
     printf '{"ok":false,"error":"spool helper missing"}\n'; return 1
   }
   "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" get "$DIAG_SPOOL" "${1:-}" \
-    --max "${GM_CONSOLE_DIAG_MAX:-2097152}" --ttl "${CONSOLE_DIAG_KEEP_H:-24}"
+    --max "${GM_CONSOLE_DIAG_MAX:-2097152}" \
+    --ttl "$(_diag_uint "${CONSOLE_DIAG_KEEP_H:-24}" 24 1 720)"
   return $?
 }
 

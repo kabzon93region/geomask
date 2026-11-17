@@ -34,6 +34,13 @@
 #     returns rc=2 and the caller must refuse to mutate. There is NO mkdir/O_EXCL fallback on
 #     Linux - that would bring back the reclaim race R04 is about.
 #
+# Safety: this file performs no dynamic code evaluation, starts no shell with a command
+# string, and uses no dynamically named shell variables. The lock path and the lock name are DATA: paths reach
+# `exec` only as quoted words, state lives in fixed variables (_GM_PATH_5..9) and in a
+# token list "name=fd", and every descriptor operation is a literal `exec 5..9`. A path or a
+# name that contains quotes, `$(...)`, backticks, `;`, `&` or spaces is never executed.
+# The name is validated (`[A-Za-z][A-Za-z0-9-]*`) and a path containing a newline is refused.
+#
 # Non-Linux hosts (the Windows-hosted test suite) have neither flock(2) nor /proc. There the
 # helper uses an atomic O_EXCL file (noclobber) created once and removed only by its owner.
 # This backend exists so that caller logic can be exercised off-router; it is never selected
@@ -45,29 +52,33 @@
 #   GM_CONFIG_TX_LOCK  CANONICAL path of the config-transaction lock, shared with
 #                      geomask-config-tx.py, geomask-node-scan.sh and geomask-torrent.sh
 #   GM_LOCK_TX_FILE    legacy alias of GM_CONFIG_TX_LOCK (test roots only)
-#   GM_LOCK_FDS      reserved descriptors, highest first (default "9 8 7 6 5")
+#   GM_LOCK_FDS      reserved descriptors; must be a subset of 5 6 7 8 9
 
 GM_LOCK_DIR=${GM_LOCK_DIR:-/tmp/geomask-locks}
 GM_LOCK_TX_FILE=${GM_CONFIG_TX_LOCK:-${GM_LOCK_TX_FILE:-/etc/geomask/node-audit/state/.config-tx.lock}}
-GM_LOCK_FDS=${GM_LOCK_FDS:-9 8 7 6 5}
+GM_LOCK_FDS=${GM_LOCK_FDS:-5 6 7 8 9}
 GM_LOCK_MAX_RANK=${GM_LOCK_MAX_RANK:-0}
 GM_LOCK_STACK=${GM_LOCK_STACK:-}
-GM_LOCK_FDS_USED=${GM_LOCK_FDS_USED:-}
+_GM_PATH_5=${_GM_PATH_5:-}
+_GM_PATH_6=${_GM_PATH_6:-}
+_GM_PATH_7=${_GM_PATH_7:-}
+_GM_PATH_8=${_GM_PATH_8:-}
+_GM_PATH_9=${_GM_PATH_9:-}
 
 # The rank table is the lock order. Unknown names get 90 so a new writer is the outermost -
 # an earlier rank could otherwise turn a lawful sequence into a refused one silently.
 gm_lock_rank() {
   case "$1" in
-    maintenance) printf '10' ;;
-    console)     printf '20' ;;
-    config-tx)   printf '30' ;;
+    maintenance)   printf '10' ;;
+    console)       printf '20' ;;
+    cron)          printf '25' ;;
+    config-tx)     printf '30' ;;
     routes-worker) printf '35' ;;
-    route-*)     printf '40' ;;
-    sync)        printf '45' ;;
-    cron)        printf '25' ;;
-    devices)     printf '60' ;;
-    subs)        printf '65' ;;
-    *)           printf '90' ;;
+    route-*)       printf '40' ;;
+    sync)          printf '45' ;;
+    devices)       printf '60' ;;
+    subs)          printf '65' ;;
+    *)             printf '90' ;;
   esac
 }
 
@@ -96,66 +107,132 @@ gm_lock_backend() {
   esac
 }
 
-_gm_lock_var() { # _gm_lock_var <prefix> <name> -> variable name, '-' and '/' become '_'
-  printf '%s_%s' "$1" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9' '_')"
-}
-
-_gm_lock_fd_of() { # echoes the descriptor held for <name>, empty when not held here
-  _gm_v=$(_gm_lock_var _GM_LOCK_FD "$1")
-  eval "printf '%s' \"\${$_gm_v:-}\""
-}
-
-_gm_lock_held() { # 0 when this shell holds <name>
-  [ -n "$(_gm_lock_fd_of "$1")" ]
-}
-
-_gm_lock_track() { # _gm_lock_track <name> <fd> <path>
-  eval "$(_gm_lock_var _GM_LOCK_FD "$1")='$2'"
-  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")='$3'"
-  GM_LOCK_FDS_USED="$GM_LOCK_FDS_USED $2"
-  GM_LOCK_STACK="$GM_LOCK_STACK $1"
-  _gm_r=$(gm_lock_rank "$1")
-  [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
+_gm_lock_fds_ok() {
+  for _gm_f in $GM_LOCK_FDS; do
+    case "$_gm_f" in
+      5|6|7|8|9) : ;;
+      *) return 1 ;;
+    esac
+  done
   return 0
 }
 
-_gm_lock_forget() { # _gm_lock_forget <name> <fd>
-  eval "$(_gm_lock_var _GM_LOCK_FD "$1")=''"
-  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")=''"
-  _gm_used=''
-  for _gm_u in $GM_LOCK_FDS_USED; do
-    [ "$_gm_u" = "$2" ] || _gm_used="$_gm_used $_gm_u"
+# Echo the descriptor held for <name>, empty when this shell does not hold it.
+_gm_lock_fd_of() {
+  for _gm_t in $GM_LOCK_STACK; do
+    case "$_gm_t" in
+      "$1"=*) printf '%s' "${_gm_t#*=}"; return 0 ;;
+    esac
   done
-  GM_LOCK_FDS_USED=$_gm_used
-  _gm_new=''
-  for _gm_s in $GM_LOCK_STACK; do
-    [ "$_gm_s" = "$1" ] || _gm_new="$_gm_new $_gm_s"
+  return 1
+}
+
+_gm_lock_held() { _gm_lock_fd_of "$1" >/dev/null 2>&1; }
+
+_gm_lock_fd_used() { # 0 when <fd> is in the stack
+  for _gm_t in $GM_LOCK_STACK; do
+    [ "${_gm_t#*=}" = "$1" ] && return 0
   done
-  GM_LOCK_STACK=$_gm_new
+  return 1
+}
+
+_gm_lock_recalc_rank() {
   GM_LOCK_MAX_RANK=0
-  for _gm_s in $GM_LOCK_STACK; do
-    _gm_r=$(gm_lock_rank "$_gm_s")
+  for _gm_t in $GM_LOCK_STACK; do
+    _gm_r=$(gm_lock_rank "${_gm_t%%=*}")
     [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
   done
   return 0
 }
 
-_gm_lock_free_fd() { # echoes the first reserved descriptor not used by this shell
-  for _gm_c in $GM_LOCK_FDS; do
-    case " $GM_LOCK_FDS_USED " in
-      *" $_gm_c "*) continue ;;
+_gm_lock_path_of() { # the path stored for a reserved descriptor
+  case "$1" in
+    5) printf '%s' "$_GM_PATH_5" ;;
+    6) printf '%s' "$_GM_PATH_6" ;;
+    7) printf '%s' "$_GM_PATH_7" ;;
+    8) printf '%s' "$_GM_PATH_8" ;;
+    9) printf '%s' "$_GM_PATH_9" ;;
+  esac
+}
+
+_gm_lock_set_path() { # <fd> <path> - literal slots, no dynamic variable names
+  case "$1" in
+    5) _GM_PATH_5=$2 ;;
+    6) _GM_PATH_6=$2 ;;
+    7) _GM_PATH_7=$2 ;;
+    8) _GM_PATH_8=$2 ;;
+    9) _GM_PATH_9=$2 ;;
+  esac
+}
+
+_gm_lock_track() { # <name> <fd> <path>
+  _gm_lock_set_path "$2" "$3"
+  if [ -n "$GM_LOCK_STACK" ]; then
+    GM_LOCK_STACK="$GM_LOCK_STACK $1=$2"
+  else
+    GM_LOCK_STACK="$1=$2"
+  fi
+  _gm_lock_recalc_rank
+}
+
+_gm_lock_forget() { # <name> <fd>
+  _gm_lock_set_path "$2" ''
+  _gm_new=''
+  for _gm_t in $GM_LOCK_STACK; do
+    case "$_gm_t" in
+      "$1"=*) : ;;
+      *) _gm_new="${_gm_new:+$_gm_new }$_gm_t" ;;
     esac
+  done
+  GM_LOCK_STACK=$_gm_new
+  _gm_lock_recalc_rank
+}
+
+_gm_lock_free_fd() {
+  for _gm_c in $GM_LOCK_FDS; do
+    _gm_lock_fd_used "$_gm_c" && continue
     printf '%s' "$_gm_c"
     return 0
   done
   return 1
 }
 
-# Acquire <name>. rc: 0 held, 1 busy/timeout, 2 primitive unavailable (fail closed),
-# 3 already held by this shell, 4 lock order violated. On 1/2/4 nothing is held.
+# Open <fd> on <path> with a literal `exec`. A plain `: >>path` first creates the file and
+# proves writability, so a redirection error is reported by us (rc=2) instead of possibly
+# terminating a non-interactive shell on the `exec` line.
+_gm_lock_open() { # <fd> <path>
+  { : >>"$2"; } 2>/dev/null || return 1
+  case "$1" in
+    5) exec 5<>"$2" 2>/dev/null ;;
+    6) exec 6<>"$2" 2>/dev/null ;;
+    7) exec 7<>"$2" 2>/dev/null ;;
+    8) exec 8<>"$2" 2>/dev/null ;;
+    9) exec 9<>"$2" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+_gm_lock_close_fd() { # <fd>
+  case "$1" in
+    5) exec 5>&- 2>/dev/null ;;
+    6) exec 6>&- 2>/dev/null ;;
+    7) exec 7>&- 2>/dev/null ;;
+    8) exec 8>&- 2>/dev/null ;;
+    9) exec 9>&- 2>/dev/null ;;
+  esac
+  return 0
+}
+
+# Acquire <name>. rc: 0 held, 1 busy/timeout, 2 primitive unavailable / bad input (fail
+# closed), 3 already held by this shell, 4 lock order violated. On 1/2/3/4 nothing is held.
 gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
   _gm_name=$1
   _gm_wait=${2:-0}
+  case "$_gm_name" in
+    ''|[!A-Za-z]*|*[!A-Za-z0-9-]*)
+      echo "geomask-lock: invalid lock name '$_gm_name' (letters, digits and '-', must start with a letter)" >&2
+      return 2 ;;
+  esac
   # A non-numeric budget is a caller bug, not "wait forever": refuse it before the deadline
   # comparison, otherwise `[ N -ge abc ]` errors and the retry loop never terminates.
   case "$_gm_wait" in
@@ -164,6 +241,26 @@ gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
       return 2 ;;
   esac
   [ "$_gm_wait" -gt 3600 ] && _gm_wait=3600
+  _gm_lock_fds_ok || {
+    echo "geomask-lock: GM_LOCK_FDS='$GM_LOCK_FDS' is not a subset of 5 6 7 8 9 - refusing to lock" >&2
+    return 2
+  }
+  # Reject a newline in the path SOURCE: command substitution would silently drop a trailing
+  # newline, so checking only the composed path is not enough. The path is data, not code.
+  _gm_src=${3:-}
+  if [ -z "$_gm_src" ]; then
+    if [ "$_gm_name" = config-tx ]; then
+      _gm_src=$GM_LOCK_TX_FILE
+    else
+      _gm_src=$GM_LOCK_DIR
+    fi
+  fi
+  case "$_gm_src" in
+    *'
+'*)
+      echo "geomask-lock: the lock path of '$_gm_name' contains a newline - refusing to lock" >&2
+      return 2 ;;
+  esac
   _gm_path=$(gm_lock_path "$_gm_name" "${3:-}")
   _gm_rank=$(gm_lock_rank "$_gm_name")
 
@@ -202,12 +299,12 @@ gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
         return 0
       fi
     else
-      if eval "exec $_gm_fd>>\"\$_gm_path\"" 2>/dev/null; then
+      if _gm_lock_open "$_gm_fd" "$_gm_path"; then
         if flock -n "$_gm_fd" 2>/dev/null; then
           _gm_lock_track "$_gm_name" "$_gm_fd" "$_gm_path"
           return 0
         fi
-        eval "exec $_gm_fd>&-"
+        _gm_lock_close_fd "$_gm_fd"
       else
         echo "geomask-lock: cannot open the lock file $_gm_path - refusing to lock $_gm_name" >&2
         return 2
@@ -223,23 +320,21 @@ gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
 
 gm_lock_release() { # gm_lock_release <name>
   _gm_name=$1
-  _gm_fd=$(_gm_lock_fd_of "$_gm_name")
-  [ -n "$_gm_fd" ] || return 0
-  _gm_pv=$(_gm_lock_var _GM_LOCK_PATH "$_gm_name")
-  eval "_gm_path=\${$_gm_pv:-}"
+  _gm_fd=$(_gm_lock_fd_of "$_gm_name") || return 0
+  _gm_path=$(_gm_lock_path_of "$_gm_fd")
   if [ "$(gm_lock_backend)" = portable ]; then
     [ -f "$_gm_path" ] && rm -f "$_gm_path" 2>/dev/null
   else
     flock -u "$_gm_fd" 2>/dev/null
-    eval "exec $_gm_fd>&-"
+    _gm_lock_close_fd "$_gm_fd"
   fi
   _gm_lock_forget "$_gm_name" "$_gm_fd"
   return 0
 }
 
 gm_lock_release_all() {
-  for _gm_name in $GM_LOCK_STACK; do
-    gm_lock_release "$_gm_name"
+  for _gm_t in $GM_LOCK_STACK; do
+    gm_lock_release "${_gm_t%%=*}"
   done
 }
 
@@ -257,12 +352,15 @@ gm_lock_busy() { # gm_lock_busy <name> [path]
 }
 
 # Close the reserved descriptors in this process WITHOUT unlocking: flock lives on the open
-# file description, so another process (the updater runner) still holds the lock.
+# file description, so another process (the updater runner) still holds the lock. Literal
+# descriptors only - descriptors 0/1/2 and anything the caller opened are never touched.
 gm_lock_close_inherited() {
-  for _gm_c in $GM_LOCK_FDS; do
-    eval "exec $_gm_c>&-" 2>/dev/null
-  done
-  GM_LOCK_FDS_USED=''
+  exec 5>&- 2>/dev/null
+  exec 6>&- 2>/dev/null
+  exec 7>&- 2>/dev/null
+  exec 8>&- 2>/dev/null
+  exec 9>&- 2>/dev/null
+  _GM_PATH_5=''; _GM_PATH_6=''; _GM_PATH_7=''; _GM_PATH_8=''; _GM_PATH_9=''
   GM_LOCK_STACK=''
   GM_LOCK_MAX_RANK=0
   return 0

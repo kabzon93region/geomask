@@ -170,7 +170,7 @@
           "path": "/usr/lib/geomask/geomask-diag-spool.py",
           "source": "assets/geomask-diag-spool.py",
           "mode": "0755",
-          "sha256": "03dc6a10c3ce82e2cca18f596c9a7bbf84cfd818d6f919760092cc56f29d6d71"
+          "sha256": "65f64a6cca8de6cbca46c4a868e6dab322530609818aa05018303d95aaf6888a"
         },
         {
           "path": "/usr/lib/geomask/geomask-dnsguard.sh",
@@ -194,7 +194,7 @@
           "path": "/usr/lib/geomask/geomask-lock.sh",
           "source": "assets/geomask-lock.sh",
           "mode": "0644",
-          "sha256": "a0ff86b94376fe893cbdea35ec4c4f87473e386c9e0442e5a9cfc554fb635bbb"
+          "sha256": "e2c6843e8f2534129367aedc468e17ec0584fdd4dc91b95282e74f58a4117e1b"
         },
         {
           "path": "/usr/lib/geomask/geomask-node-audit.py",
@@ -206,7 +206,7 @@
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "deee61c9d0547854b726b32ca52559fb710ebb3da22c8fd007c8394192ae8b06"
+          "sha256": "df56e3299be4008f423f99316084a3d8282513ad030851393d17984d99f65e46"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
@@ -256,7 +256,7 @@
           "path": "/usr/bin/geomask-dnscheck.sh",
           "source": "assets/geomask-dnscheck.sh",
           "mode": "0755",
-          "sha256": "ed78c6663368aa1d7154a8ce2afbbceb29cd8d863f03623738a4b32e707d1b70"
+          "sha256": "139d87177332772c7f131f0ef065a5e23bc456d6205b27e37750f4875bd046ea"
         },
         {
           "path": "/usr/bin/geomask-morning-check.sh",
@@ -306,7 +306,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "610956d06d8c58608fd04522273ecfc245f50eb423c1f65182c642aefe27a4dd"
+          "sha256": "1ddaec27a7df0e2d6e84b3d72179041287ffb881e89e767bd1ba2a37538113de"
         }
       ]
     },
@@ -322,7 +322,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "fcaa8dab238e2a1ce34ef31404b121ee8207d46f07378005d1fadded236a88fb"
+          "sha256": "52d0c2db2e0fe8a24241fee6772417cc363d3e59a1b002202523f8a5bee2b060"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",

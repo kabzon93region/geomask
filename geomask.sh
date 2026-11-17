@@ -539,6 +539,13 @@ export GM_CONFIG_TX_LOCK GM_LOCK_DIR
 #     returns rc=2 and the caller must refuse to mutate. There is NO mkdir/O_EXCL fallback on
 #     Linux - that would bring back the reclaim race R04 is about.
 #
+# Safety: this file performs no dynamic code evaluation, starts no shell with a command
+# string, and uses no dynamically named shell variables. The lock path and the lock name are DATA: paths reach
+# `exec` only as quoted words, state lives in fixed variables (_GM_PATH_5..9) and in a
+# token list "name=fd", and every descriptor operation is a literal `exec 5..9`. A path or a
+# name that contains quotes, `$(...)`, backticks, `;`, `&` or spaces is never executed.
+# The name is validated (`[A-Za-z][A-Za-z0-9-]*`) and a path containing a newline is refused.
+#
 # Non-Linux hosts (the Windows-hosted test suite) have neither flock(2) nor /proc. There the
 # helper uses an atomic O_EXCL file (noclobber) created once and removed only by its owner.
 # This backend exists so that caller logic can be exercised off-router; it is never selected
@@ -550,29 +557,33 @@ export GM_CONFIG_TX_LOCK GM_LOCK_DIR
 #   GM_CONFIG_TX_LOCK  CANONICAL path of the config-transaction lock, shared with
 #                      geomask-config-tx.py, geomask-node-scan.sh and geomask-torrent.sh
 #   GM_LOCK_TX_FILE    legacy alias of GM_CONFIG_TX_LOCK (test roots only)
-#   GM_LOCK_FDS      reserved descriptors, highest first (default "9 8 7 6 5")
+#   GM_LOCK_FDS      reserved descriptors; must be a subset of 5 6 7 8 9
 
 GM_LOCK_DIR=${GM_LOCK_DIR:-/tmp/geomask-locks}
 GM_LOCK_TX_FILE=${GM_CONFIG_TX_LOCK:-${GM_LOCK_TX_FILE:-/etc/geomask/node-audit/state/.config-tx.lock}}
-GM_LOCK_FDS=${GM_LOCK_FDS:-9 8 7 6 5}
+GM_LOCK_FDS=${GM_LOCK_FDS:-5 6 7 8 9}
 GM_LOCK_MAX_RANK=${GM_LOCK_MAX_RANK:-0}
 GM_LOCK_STACK=${GM_LOCK_STACK:-}
-GM_LOCK_FDS_USED=${GM_LOCK_FDS_USED:-}
+_GM_PATH_5=${_GM_PATH_5:-}
+_GM_PATH_6=${_GM_PATH_6:-}
+_GM_PATH_7=${_GM_PATH_7:-}
+_GM_PATH_8=${_GM_PATH_8:-}
+_GM_PATH_9=${_GM_PATH_9:-}
 
 # The rank table is the lock order. Unknown names get 90 so a new writer is the outermost -
 # an earlier rank could otherwise turn a lawful sequence into a refused one silently.
 gm_lock_rank() {
   case "$1" in
-    maintenance) printf '10' ;;
-    console)     printf '20' ;;
-    config-tx)   printf '30' ;;
+    maintenance)   printf '10' ;;
+    console)       printf '20' ;;
+    cron)          printf '25' ;;
+    config-tx)     printf '30' ;;
     routes-worker) printf '35' ;;
-    route-*)     printf '40' ;;
-    sync)        printf '45' ;;
-    cron)        printf '25' ;;
-    devices)     printf '60' ;;
-    subs)        printf '65' ;;
-    *)           printf '90' ;;
+    route-*)       printf '40' ;;
+    sync)          printf '45' ;;
+    devices)       printf '60' ;;
+    subs)          printf '65' ;;
+    *)             printf '90' ;;
   esac
 }
 
@@ -601,66 +612,132 @@ gm_lock_backend() {
   esac
 }
 
-_gm_lock_var() { # _gm_lock_var <prefix> <name> -> variable name, '-' and '/' become '_'
-  printf '%s_%s' "$1" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9' '_')"
-}
-
-_gm_lock_fd_of() { # echoes the descriptor held for <name>, empty when not held here
-  _gm_v=$(_gm_lock_var _GM_LOCK_FD "$1")
-  eval "printf '%s' \"\${$_gm_v:-}\""
-}
-
-_gm_lock_held() { # 0 when this shell holds <name>
-  [ -n "$(_gm_lock_fd_of "$1")" ]
-}
-
-_gm_lock_track() { # _gm_lock_track <name> <fd> <path>
-  eval "$(_gm_lock_var _GM_LOCK_FD "$1")='$2'"
-  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")='$3'"
-  GM_LOCK_FDS_USED="$GM_LOCK_FDS_USED $2"
-  GM_LOCK_STACK="$GM_LOCK_STACK $1"
-  _gm_r=$(gm_lock_rank "$1")
-  [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
+_gm_lock_fds_ok() {
+  for _gm_f in $GM_LOCK_FDS; do
+    case "$_gm_f" in
+      5|6|7|8|9) : ;;
+      *) return 1 ;;
+    esac
+  done
   return 0
 }
 
-_gm_lock_forget() { # _gm_lock_forget <name> <fd>
-  eval "$(_gm_lock_var _GM_LOCK_FD "$1")=''"
-  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")=''"
-  _gm_used=''
-  for _gm_u in $GM_LOCK_FDS_USED; do
-    [ "$_gm_u" = "$2" ] || _gm_used="$_gm_used $_gm_u"
+# Echo the descriptor held for <name>, empty when this shell does not hold it.
+_gm_lock_fd_of() {
+  for _gm_t in $GM_LOCK_STACK; do
+    case "$_gm_t" in
+      "$1"=*) printf '%s' "${_gm_t#*=}"; return 0 ;;
+    esac
   done
-  GM_LOCK_FDS_USED=$_gm_used
-  _gm_new=''
-  for _gm_s in $GM_LOCK_STACK; do
-    [ "$_gm_s" = "$1" ] || _gm_new="$_gm_new $_gm_s"
+  return 1
+}
+
+_gm_lock_held() { _gm_lock_fd_of "$1" >/dev/null 2>&1; }
+
+_gm_lock_fd_used() { # 0 when <fd> is in the stack
+  for _gm_t in $GM_LOCK_STACK; do
+    [ "${_gm_t#*=}" = "$1" ] && return 0
   done
-  GM_LOCK_STACK=$_gm_new
+  return 1
+}
+
+_gm_lock_recalc_rank() {
   GM_LOCK_MAX_RANK=0
-  for _gm_s in $GM_LOCK_STACK; do
-    _gm_r=$(gm_lock_rank "$_gm_s")
+  for _gm_t in $GM_LOCK_STACK; do
+    _gm_r=$(gm_lock_rank "${_gm_t%%=*}")
     [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
   done
   return 0
 }
 
-_gm_lock_free_fd() { # echoes the first reserved descriptor not used by this shell
-  for _gm_c in $GM_LOCK_FDS; do
-    case " $GM_LOCK_FDS_USED " in
-      *" $_gm_c "*) continue ;;
+_gm_lock_path_of() { # the path stored for a reserved descriptor
+  case "$1" in
+    5) printf '%s' "$_GM_PATH_5" ;;
+    6) printf '%s' "$_GM_PATH_6" ;;
+    7) printf '%s' "$_GM_PATH_7" ;;
+    8) printf '%s' "$_GM_PATH_8" ;;
+    9) printf '%s' "$_GM_PATH_9" ;;
+  esac
+}
+
+_gm_lock_set_path() { # <fd> <path> - literal slots, no dynamic variable names
+  case "$1" in
+    5) _GM_PATH_5=$2 ;;
+    6) _GM_PATH_6=$2 ;;
+    7) _GM_PATH_7=$2 ;;
+    8) _GM_PATH_8=$2 ;;
+    9) _GM_PATH_9=$2 ;;
+  esac
+}
+
+_gm_lock_track() { # <name> <fd> <path>
+  _gm_lock_set_path "$2" "$3"
+  if [ -n "$GM_LOCK_STACK" ]; then
+    GM_LOCK_STACK="$GM_LOCK_STACK $1=$2"
+  else
+    GM_LOCK_STACK="$1=$2"
+  fi
+  _gm_lock_recalc_rank
+}
+
+_gm_lock_forget() { # <name> <fd>
+  _gm_lock_set_path "$2" ''
+  _gm_new=''
+  for _gm_t in $GM_LOCK_STACK; do
+    case "$_gm_t" in
+      "$1"=*) : ;;
+      *) _gm_new="${_gm_new:+$_gm_new }$_gm_t" ;;
     esac
+  done
+  GM_LOCK_STACK=$_gm_new
+  _gm_lock_recalc_rank
+}
+
+_gm_lock_free_fd() {
+  for _gm_c in $GM_LOCK_FDS; do
+    _gm_lock_fd_used "$_gm_c" && continue
     printf '%s' "$_gm_c"
     return 0
   done
   return 1
 }
 
-# Acquire <name>. rc: 0 held, 1 busy/timeout, 2 primitive unavailable (fail closed),
-# 3 already held by this shell, 4 lock order violated. On 1/2/4 nothing is held.
+# Open <fd> on <path> with a literal `exec`. A plain `: >>path` first creates the file and
+# proves writability, so a redirection error is reported by us (rc=2) instead of possibly
+# terminating a non-interactive shell on the `exec` line.
+_gm_lock_open() { # <fd> <path>
+  { : >>"$2"; } 2>/dev/null || return 1
+  case "$1" in
+    5) exec 5<>"$2" 2>/dev/null ;;
+    6) exec 6<>"$2" 2>/dev/null ;;
+    7) exec 7<>"$2" 2>/dev/null ;;
+    8) exec 8<>"$2" 2>/dev/null ;;
+    9) exec 9<>"$2" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+_gm_lock_close_fd() { # <fd>
+  case "$1" in
+    5) exec 5>&- 2>/dev/null ;;
+    6) exec 6>&- 2>/dev/null ;;
+    7) exec 7>&- 2>/dev/null ;;
+    8) exec 8>&- 2>/dev/null ;;
+    9) exec 9>&- 2>/dev/null ;;
+  esac
+  return 0
+}
+
+# Acquire <name>. rc: 0 held, 1 busy/timeout, 2 primitive unavailable / bad input (fail
+# closed), 3 already held by this shell, 4 lock order violated. On 1/2/3/4 nothing is held.
 gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
   _gm_name=$1
   _gm_wait=${2:-0}
+  case "$_gm_name" in
+    ''|[!A-Za-z]*|*[!A-Za-z0-9-]*)
+      echo "geomask-lock: invalid lock name '$_gm_name' (letters, digits and '-', must start with a letter)" >&2
+      return 2 ;;
+  esac
   # A non-numeric budget is a caller bug, not "wait forever": refuse it before the deadline
   # comparison, otherwise `[ N -ge abc ]` errors and the retry loop never terminates.
   case "$_gm_wait" in
@@ -669,6 +746,26 @@ gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
       return 2 ;;
   esac
   [ "$_gm_wait" -gt 3600 ] && _gm_wait=3600
+  _gm_lock_fds_ok || {
+    echo "geomask-lock: GM_LOCK_FDS='$GM_LOCK_FDS' is not a subset of 5 6 7 8 9 - refusing to lock" >&2
+    return 2
+  }
+  # Reject a newline in the path SOURCE: command substitution would silently drop a trailing
+  # newline, so checking only the composed path is not enough. The path is data, not code.
+  _gm_src=${3:-}
+  if [ -z "$_gm_src" ]; then
+    if [ "$_gm_name" = config-tx ]; then
+      _gm_src=$GM_LOCK_TX_FILE
+    else
+      _gm_src=$GM_LOCK_DIR
+    fi
+  fi
+  case "$_gm_src" in
+    *'
+'*)
+      echo "geomask-lock: the lock path of '$_gm_name' contains a newline - refusing to lock" >&2
+      return 2 ;;
+  esac
   _gm_path=$(gm_lock_path "$_gm_name" "${3:-}")
   _gm_rank=$(gm_lock_rank "$_gm_name")
 
@@ -707,12 +804,12 @@ gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
         return 0
       fi
     else
-      if eval "exec $_gm_fd>>\"\$_gm_path\"" 2>/dev/null; then
+      if _gm_lock_open "$_gm_fd" "$_gm_path"; then
         if flock -n "$_gm_fd" 2>/dev/null; then
           _gm_lock_track "$_gm_name" "$_gm_fd" "$_gm_path"
           return 0
         fi
-        eval "exec $_gm_fd>&-"
+        _gm_lock_close_fd "$_gm_fd"
       else
         echo "geomask-lock: cannot open the lock file $_gm_path - refusing to lock $_gm_name" >&2
         return 2
@@ -728,23 +825,21 @@ gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
 
 gm_lock_release() { # gm_lock_release <name>
   _gm_name=$1
-  _gm_fd=$(_gm_lock_fd_of "$_gm_name")
-  [ -n "$_gm_fd" ] || return 0
-  _gm_pv=$(_gm_lock_var _GM_LOCK_PATH "$_gm_name")
-  eval "_gm_path=\${$_gm_pv:-}"
+  _gm_fd=$(_gm_lock_fd_of "$_gm_name") || return 0
+  _gm_path=$(_gm_lock_path_of "$_gm_fd")
   if [ "$(gm_lock_backend)" = portable ]; then
     [ -f "$_gm_path" ] && rm -f "$_gm_path" 2>/dev/null
   else
     flock -u "$_gm_fd" 2>/dev/null
-    eval "exec $_gm_fd>&-"
+    _gm_lock_close_fd "$_gm_fd"
   fi
   _gm_lock_forget "$_gm_name" "$_gm_fd"
   return 0
 }
 
 gm_lock_release_all() {
-  for _gm_name in $GM_LOCK_STACK; do
-    gm_lock_release "$_gm_name"
+  for _gm_t in $GM_LOCK_STACK; do
+    gm_lock_release "${_gm_t%%=*}"
   done
 }
 
@@ -762,12 +857,15 @@ gm_lock_busy() { # gm_lock_busy <name> [path]
 }
 
 # Close the reserved descriptors in this process WITHOUT unlocking: flock lives on the open
-# file description, so another process (the updater runner) still holds the lock.
+# file description, so another process (the updater runner) still holds the lock. Literal
+# descriptors only - descriptors 0/1/2 and anything the caller opened are never touched.
 gm_lock_close_inherited() {
-  for _gm_c in $GM_LOCK_FDS; do
-    eval "exec $_gm_c>&-" 2>/dev/null
-  done
-  GM_LOCK_FDS_USED=''
+  exec 5>&- 2>/dev/null
+  exec 6>&- 2>/dev/null
+  exec 7>&- 2>/dev/null
+  exec 8>&- 2>/dev/null
+  exec 9>&- 2>/dev/null
+  _GM_PATH_5=''; _GM_PATH_6=''; _GM_PATH_7=''; _GM_PATH_8=''; _GM_PATH_9=''
   GM_LOCK_STACK=''
   GM_LOCK_MAX_RANK=0
   return 0
@@ -5949,8 +6047,16 @@ BACKUP_DIR=${GM_BACKUP_DIR:-/root/geomask-backups}
 # The backup folder is published over SMB only after the owner opts in with this marker; the
 # diagnostic bundle must not land there without it (review 15.11, #14).
 SMB_SHARE_ENABLE=${GM_SMB_SHARE_ENABLE:-/etc/geomask/backup-share.enable}
-# How long a bundle may sit in the temporary directory before it is removed (hours).
+# How long a bundle may sit in the temporary spool or in the published share before it is
+# removed (hours). The value is clamped to 1..720 by _diag_uint before any arithmetic: a
+# junk value like `24h` used to abort the whole back end inside $((...)) before any JSON.
 CONSOLE_DIAG_KEEP_H=${GM_CONSOLE_DIAG_KEEP:-24}
+# Independent budgets for the two media (R08): the spool is tmpfs/RAM, the share is the
+# persistent overlay, so one may not evict the other. GM_CONSOLE_DIAG_QUOTA and
+# GM_CONSOLE_DIAG_SHARE_QUOTA are MiB (clamped 2..64), GM_CONSOLE_DIAG_FILES is the spool
+# archive count (clamped 1..32), GM_CONSOLE_DIAG_SHARE_FILES the share count (1..16).
+# Default: spool 8 MiB / 4 archives, share 6 MiB / 3 copies.
+
 DHCP_OWNED=/etc/geomask/dhcp-hosts   # id|ip|mac of host sections geomask created
 # Device/subscription lists are read-modify-written by the panel and the guard. The RMW is
 # serialised by the shared kernel `devices` lock and the temporary file is per-process, so two
@@ -8532,6 +8638,58 @@ _console_diag_redact() { # $1 = uci|yaml|json|text|nft, $2 = stage, $3 = output 
   return 0
 }
 
+# A bounded JSON member (R08): the raw response is measured first, because a truncated JSON
+# body breaks both the redactor and the panel parser. Over the limit it is replaced with a
+# valid, self-describing object; the raw file is removed either way.
+_console_diag_json() { # $1 = stage, $2 = raw file, $3 = output file, $4 = limit bytes
+  _cdj_bytes=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
+  case "$_cdj_bytes" in ''|*[!0-9]*) _cdj_bytes=0 ;; esac
+  if [ "$_cdj_bytes" -gt "$4" ]; then
+    rm -f "$2" 2>/dev/null
+    printf '{"error":"response too large","bytes":%s}\n' "$_cdj_bytes" > "$3"
+    return 0
+  fi
+  if "$PYTHON_BIN" -B "$DIAG_PY" redact json < "$2" > "$3" 2>/dev/null; then
+    rm -f "$2" 2>/dev/null
+    return 0
+  fi
+  rm -f "$2" 2>/dev/null
+  _console_diag_fail "$1"
+  return 1
+}
+
+# Sanitised, clamped environment number (R08). A junk value falls back to its default, a
+# six-digit one clamps to the maximum before arithmetic: `GM_CONSOLE_DIAG_KEEP=24h` used to
+# abort the back end inside $((...)) before any JSON reached rpcd. No leading zeros either:
+# ash reads `08` as an invalid octal constant.
+_diag_uint() { # $1 = value, $2 = default, $3 = minimum, $4 = maximum
+  _diag_uint_v=${1:-}
+  case "$_diag_uint_v" in
+    ''|*[!0-9]*) _diag_uint_v=$2 ;;
+  esac
+  _diag_uint_v=$(printf '%s' "$_diag_uint_v" | sed 's/^0*//')
+  [ -n "$_diag_uint_v" ] || _diag_uint_v=0
+  case "$_diag_uint_v" in ??????*) _diag_uint_v=$4 ;; esac
+  _diag_uint_v=$((_diag_uint_v + 0))
+  [ "$_diag_uint_v" -lt "$3" ] && _diag_uint_v=$3
+  [ "$_diag_uint_v" -gt "$4" ] && _diag_uint_v=$4
+  printf '%s' "$_diag_uint_v"
+}
+
+# `timeout` can only bound a real binary: a router/test stub may be a shell function, and
+# timeout(1) would not see it (it would report "command not found" and hide the producer).
+# Without a `timeout` applet the command runs unbounded; the caller decides if that is ok.
+_diag_run() { # $1 = seconds, rest = command
+  _diag_run_secs=$1
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    case "$(command -v "$1" 2>/dev/null)" in
+      /*) timeout "$_diag_run_secs" "$@"; return $? ;;
+    esac
+  fi
+  "$@"
+}
+
 # One archive with everything needed to diagnose the console path from a distance. The
 # masking is done by the shipped redactor, and `verify` is the last gate: an unmasked bundle
 # is never handed out (review 15.11, R02).
@@ -8556,13 +8714,20 @@ cmd_console_diag() {
   _dir=$(mktemp -d "$_tmpd/geomask-console-diag.XXXXXX" 2>/dev/null)
   [ -n "$_dir" ] || { printf '{"ok":false,"error":"cannot create a private bundle directory"}\n'; return 1; }
   chmod 700 "$_dir" 2>/dev/null
-  # Nothing older than the retention window stays on the router: these archives carry the
-  # masked-but-still-descriptive state of the console lane. The sidecar goes with the archive
-  # or a missing archive would still look registered.
-  find "$DIAG_SPOOL" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz' \
-    -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
-  find "$DIAG_SPOOL" -maxdepth 1 -name 'geomask-console-diag-*.tar.gz.json' \
-    -mmin +"$((CONSOLE_DIAG_KEEP_H * 60))" -exec rm -f {} \; 2>/dev/null
+  # Retention is one helper pass (age by mtime -> orphan sidecars -> stale temporary files
+  # -> staging directories -> count -> bytes), not two `find -mmin` sweeps: the pair used to
+  # diverge on the window boundary and leave a sidecar whose archive was already gone. The
+  # helper only lstats (no hashing), never follows a link, and never touches foreign names
+  # (`router-backup-*`). A retention error must not block a fresh archive: its JSON is
+  # ignored here. Numbers are clamped before any arithmetic reaches the helper.
+  _diag_keep=$(_diag_uint "${CONSOLE_DIAG_KEEP_H:-24}" 24 1 720)
+  _diag_quota=$(( $(_diag_uint "${GM_CONSOLE_DIAG_QUOTA:-8}" 8 2 64) * 1048576 ))
+  _diag_files=$(_diag_uint "${GM_CONSOLE_DIAG_FILES:-4}" 4 1 32)
+  _diag_share_quota=$(( $(_diag_uint "${GM_CONSOLE_DIAG_SHARE_QUOTA:-6}" 6 2 64) * 1048576 ))
+  _diag_share_files=$(_diag_uint "${GM_CONSOLE_DIAG_SHARE_FILES:-3}" 3 1 16)
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$DIAG_SPOOL" \
+    --keep-h "$_diag_keep" --quota "$_diag_quota" --files "$_diag_files" \
+    --stage-dir "$_tmpd" >/dev/null 2>&1
   # Without the redactor the bundle cannot be masked; an unmasked archive is worse than no
   # archive at all, so the request fails closed.
   [ -f "$DIAG_PY" ] || {
@@ -8576,26 +8741,69 @@ cmd_console_diag() {
     printf 'backend %s\n' "$BACKEND_VERSION"
   } > "$_dir/summary.txt" 2>/dev/null
   [ -f /etc/geomask/version ] && cat /etc/geomask/version >> "$_dir/summary.txt" 2>&1
-  ip -4 rule show > "$_dir/ip-rule.txt" 2>&1
-  ip -4 route show table "$CONSOLE_TABLE" > "$_dir/route-table-$CONSOLE_TABLE.txt" 2>&1
-  ip -4 addr show "$CONSOLE_TUN_DEV" > "$_dir/tun.txt" 2>&1
-  uci -q show firewall 2>&1 | _console_diag_redact uci uci:firewall "$_dir/firewall.uci" || return 1
-  uci -q show network 2>&1 | _console_diag_redact uci uci:network "$_dir/network.uci" || return 1
-  nft list ruleset 2>&1 | _console_diag_redact nft nft:ruleset "$_dir/nft.txt" || return 1
-  [ -n "$_ip" ] && conntrack -L -s "$_ip" > "$_dir/conntrack-console.txt" 2>&1
+  # Producers are bounded at the source (R08): the 2 MiB creation cap used to be checked only
+  # after the whole state was collected, so a router with a large nft ruleset or a long
+  # connection list rebuilt and discarded the archive on every click. Line bounds are safe for
+  # text; JSON and YAML go through a size gate with a valid placeholder, because cutting them
+  # would break their parser (and verify). Timeouts keep a broken producer from hanging the
+  # whole panel call.
+  ip -4 rule show 2>&1 | head -n 2000 > "$_dir/ip-rule.txt"
+  ip -4 route show table "$CONSOLE_TABLE" 2>&1 | head -n 2000 > "$_dir/route-table-$CONSOLE_TABLE.txt"
+  ip -4 addr show "$CONSOLE_TUN_DEV" 2>&1 | head -n 2000 > "$_dir/tun.txt"
+  _diag_run 10 uci -q show firewall 2>&1 | head -n 2000 \
+    | _console_diag_redact uci uci:firewall "$_dir/firewall.uci" || return 1
+  _diag_run 10 uci -q show network 2>&1 | head -n 2000 \
+    | _console_diag_redact uci uci:network "$_dir/network.uci" || return 1
+  _diag_run 10 nft list ruleset 2>&1 | head -n 4000 \
+    | _console_diag_redact nft nft:ruleset "$_dir/nft.txt" || return 1
+  if [ -n "$_ip" ]; then
+    if command -v timeout >/dev/null 2>&1; then
+      _diag_run 5 conntrack -L -s "$_ip" 2>&1 | head -n 2000 > "$_dir/conntrack-console.txt"
+    else
+      # An unbounded conntrack dump on a busy router is worse than a missing member: do not
+      # create the file, and say so in the summary instead of failing the whole archive.
+      printf 'conntrack: пропущено — на роутере нет утилиты timeout\n' >> "$_dir/summary.txt"
+    fi
+  fi
   logread 2>/dev/null | grep -iE 'mihomo|hev|geomask|console' | tail -400 \
+    | awk 'length($0) > 2048 { dropped++; next }
+           { print }
+           END { if (dropped) printf "[geomask] dropped %d log lines longer than 2048 bytes\n", dropped }' \
     | _console_diag_redact text text:logread "$_dir/logread.txt" || return 1
   if [ -x "$CONSOLE_PY" ] && [ -f "$MIHOMO_CONF" ]; then
     "$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" 2>/dev/null \
       | _console_diag_redact json json:console-config "$_dir/console-config.json" || return 1
   fi
-  controller_curl -s -m5 "$MIHOMO_API/proxies/CONSOLE" 2>/dev/null \
-    | _console_diag_redact json json:group-CONSOLE "$_dir/group-CONSOLE.json" || return 1
-  controller_curl -s -m5 "$MIHOMO_API/connections" 2>/dev/null \
-    | _console_diag_redact json json:connections "$_dir/connections.json" || return 1
-  # The mihomo config carries subscription URLs and the controller secret.
+  controller_curl -s -m5 "$MIHOMO_API/proxies/CONSOLE" > "$_dir/.raw-group.$$" 2>/dev/null
+  _console_diag_json json:group-CONSOLE "$_dir/.raw-group.$$" \
+    "$_dir/group-CONSOLE.json" 65536 || return 1
+  controller_curl -s -m5 "$MIHOMO_API/connections" > "$_dir/.raw-connections.$$" 2>/dev/null
+  _console_diag_json json:connections "$_dir/.raw-connections.$$" \
+    "$_dir/connections.json" 524288 || return 1
+  # The mihomo config carries subscription URLs and the controller secret. It is the one
+  # member that must not be truncated, so an oversized config becomes an explicit marker.
   if [ -f "$MIHOMO_CONF" ]; then
-    _console_diag_redact yaml yaml:mihomo "$_dir/config.masked.yaml" < "$MIHOMO_CONF" || return 1
+    _diag_yaml_bytes=$(wc -c < "$MIHOMO_CONF" 2>/dev/null | tr -d ' ')
+    case "$_diag_yaml_bytes" in ''|*[!0-9]*) _diag_yaml_bytes=0 ;; esac
+    if [ "$_diag_yaml_bytes" -gt 524288 ]; then
+      printf 'error: config too large\n' > "$_dir/config.masked.yaml"
+    else
+      _console_diag_redact yaml yaml:mihomo "$_dir/config.masked.yaml" \
+        < "$MIHOMO_CONF" || return 1
+    fi
+  fi
+  # Staging budget: 1.5 MiB of text already compresses into an archive the 2 MiB creation cap
+  # accepts, so a bigger staging tree means a pathological state. Refuse before verify/tar
+  # and name the three biggest members instead of spending the work and discarding it later.
+  _diag_du=$(du -sk "$_dir" 2>/dev/null | awk '{print $1}')
+  case "$_diag_du" in ''|*[!0-9]*) _diag_du=0 ;; esac
+  if [ "$_diag_du" -gt 1536 ]; then
+    _diag_top=$(du -k "$_dir"/* 2>/dev/null | sort -rn | head -3 \
+      | awk '{printf "%s (%s KiB); ", $2, $1}')
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"состояние слишком велико для бандла: %s KiB > 1536 KiB; крупнейшие: %s"}\n' \
+      "$_diag_du" "$(json_esc "${_diag_top:-unknown}")"
+    return 1
   fi
   # Last gate: unknown content must not be packed. `verify` prints file:line: kind.
   _diag_secret=$("$PYTHON_BIN" -B "$DIAG_PY" verify "$_dir" 2>&1)
@@ -8608,18 +8816,40 @@ cmd_console_diag() {
     return 1
   fi
   _tgz="$DIAG_SPOOL/geomask-console-diag-$(date +%Y%m%d-%H%M%S).$$.tar.gz"
-  ( umask 077; tar -czf "$_tgz" -C "$_tmpd" "$(basename "$_dir")" >/dev/null 2>&1 ) || {
+  # tar's stderr lives in TMPDIR, never in the staging directory: it is not a bundle member,
+  # and its last line is what the JSON refusal quotes (bounded to 200 bytes).
+  _tar_err="$_tmpd/geomask-tar.$$.err"
+  ( umask 077; tar -czf "$_tgz" -C "$_tmpd" "$(basename "$_dir")" >/dev/null 2>"$_tar_err" ) || {
+    _diag_tar_detail=$(tail -1 "$_tar_err" 2>/dev/null | cut -c1-200)
     rm -rf "$_dir" 2>/dev/null
-    rm -f "$_tgz" 2>/dev/null
-    printf '{"ok":false,"error":"cannot pack the bundle"}\n'; return 1
+    rm -f "$_tgz" "$_tar_err" 2>/dev/null
+    printf '{"ok":false,"error":"cannot pack the bundle: %s"}\n' \
+      "$(json_esc "${_diag_tar_detail:-tar failed}")"
+    return 1
   }
+  # A partial write can still return 0 on BusyBox tar: the archive is accepted only after a
+  # full read-back of its table of contents (the same gate cmd_backup uses). This also catches
+  # an archive truncated through the same inode by an external process, which register would
+  # otherwise hash and hand out as a valid but broken gzip.
+  if ! tar -tzf "$_tgz" >/dev/null 2>"$_tar_err"; then
+    _diag_tar_detail=$(tail -1 "$_tar_err" 2>/dev/null | cut -c1-200)
+    rm -rf "$_dir" 2>/dev/null
+    rm -f "$_tgz" "$_tar_err" 2>/dev/null
+    printf '{"ok":false,"error":"cannot pack the bundle: %s"}\n' \
+      "$(json_esc "${_diag_tar_detail:-archive is not a valid tar.gz}")"
+    return 1
+  fi
+  rm -f "$_tar_err" 2>/dev/null
   chmod 600 "$_tgz" 2>/dev/null
   rm -rf "$_dir" 2>/dev/null
   # Registration records (dev, ino, link count, size, sha256) in <archive>.json; a failure
   # removes the archive so an unregistered bundle cannot linger in the spool.
   # Fixed creation/registration cap: 2 MiB, checked before SMB copy. Larger archives
   # are deleted, not left for SMB/SSH. GM_CONSOLE_DIAG_MAX only controls transport.
-  _diag_reg=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" register "$DIAG_SPOOL" "$_tgz" 2>/dev/null)
+  # The quota is enforced inside register (after the hash, under flock): it evicts the oldest
+  # registered bundle instead of refusing, but never the one being registered.
+  _diag_reg=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" register "$DIAG_SPOOL" "$_tgz" \
+    --quota "$_diag_quota" --files "$_diag_files" 2>/dev/null)
   _diag_reg_rc=$?
   if [ "$_diag_reg_rc" != 0 ]; then
     rm -f "$_tgz" 2>/dev/null
@@ -8632,15 +8862,37 @@ cmd_console_diag() {
   # The helper measured the archive from its descriptor; the shell must not read it again.
   _diag_bytes=$(printf '%s\n' "$_diag_reg" | sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p')
   case "$_diag_bytes" in ''|*[!0-9]*) _diag_bytes=0 ;; esac
+  # The share is swept before and after the copy regardless of the opt-in marker: revoking it
+  # must not leave yesterday's copies on the overlay forever (R08). The helper only touches
+  # `geomask-console-diag-*` names, so `router-backup-*` and foreign files are invisible to it.
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$BACKUP_DIR" --share \
+    --keep-h "$_diag_keep" --quota "$_diag_share_quota" --files "$_diag_share_files" \
+    >/dev/null 2>&1
   # Into the share only when the owner opted in with the marker: before this the archive was
   # copied into a folder that may be published over SMB, without asking (review 15.11, #14).
+  # The copy itself is temp + fsync + rename inside the helper, so over SMB the owner sees
+  # either nothing or a complete 0600 file - never half a copy under the final name (R08).
   _shared=false
-  if [ -f "$SMB_SHARE_ENABLE" ] && [ -d "$BACKUP_DIR" ] && [ -w "$BACKUP_DIR" ]; then
-    cp -f "$_tgz" "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null \
-      && chmod 600 "$BACKUP_DIR/$(basename "$_tgz")" 2>/dev/null && _shared=true
+  _share_note=''
+  if [ -f "$SMB_SHARE_ENABLE" ]; then
+    _diag_copy=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" copy-share "$_tgz" "$BACKUP_DIR" \
+      "$(basename "$_tgz")" 2>/dev/null)
+    case "$_diag_copy" in
+      *'"ok":true'*) _shared=true ;;
+      *)
+        _share_note=$(printf '%s\n' "$_diag_copy" \
+          | sed -n 's/.*"reason":"\([a-z-]*\)".*/\1/p')
+        case "$_share_note" in ''|*[!a-z-]*) _share_note=failed ;; esac
+        ;;
+    esac
+  else
+    _share_note=disabled
   fi
-  printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s}\n' \
-    "$_tgz" "$_diag_bytes" "$_shared"
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$BACKUP_DIR" --share \
+    --keep-h "$_diag_keep" --quota "$_diag_share_quota" --files "$_diag_share_files" \
+    >/dev/null 2>&1
+  printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s,"share_note":"%s"}\n' \
+    "$_tgz" "$_diag_bytes" "$_shared" "$_share_note"
 }
 
 # The panel used to get only a path on the router, so the owner had to find the archive by hand
@@ -8656,7 +8908,8 @@ cmd_console_diag_get() {
     printf '{"ok":false,"error":"spool helper missing"}\n'; return 1
   }
   "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" get "$DIAG_SPOOL" "${1:-}" \
-    --max "${GM_CONSOLE_DIAG_MAX:-2097152}" --ttl "${CONSOLE_DIAG_KEEP_H:-24}"
+    --max "${GM_CONSOLE_DIAG_MAX:-2097152}" \
+    --ttl "$(_diag_uint "${CONSOLE_DIAG_KEEP_H:-24}" 24 1 720)"
   return $?
 }
 
@@ -8755,8 +9008,14 @@ ASSET_EOF
 #   * a route through the WAN (public gateway) is never mirrored;
 #   * only routes recorded as ours (the owned file, full route lines) are replaced or
 #     removed; a foreign entry on the same prefix is left alone;
-#   * the owned file is rewritten from what is really installed, even after a partial
-#     failure, so no entry stays in the table without an owner.
+#   * the owned file is an ownership RECORD, not a write-ahead log: it lists the routes this
+#     helper installed and that are still installed. A refused replace/delete keeps the old
+#     record, so the next sync still recognises its own route and retries it; a route that is
+#     no longer installed drops out of the record. Every phase compares ONE structural key
+#     (prefix/via/dev/src, kernel decoration ignored), so a normalised installed form is the
+#     same route for the occupant check, the delete and the record; a foreign route whose key
+#     differs is never claimed or deleted, and only the indistinguishable same-key case is the
+#     documented residual (R12).
 #
 # R05: the helper also owns the QUEUE between netifd and the writer. The ifup hotplug path
 # must never wait for the route lock (it runs inside netifd's ifup and could stall PPPoE/WAN),
@@ -8764,13 +9023,16 @@ ASSET_EOF
 # `routes-worker` lock (rank 35, single flight), takes `route-<table>` (rank 40) per attempt
 # with GM_ROUTE_LOCK_WAIT=2, and applies the default route/rules that used to live in the
 # hotplug script. A busy or unreadable table is retried a bounded number of times; a failed
-# mutation is never retried (R12 owns ownership reconciliation) and parks the event.
+# mutation is never retried inside the worker. R12 owns ownership reconciliation: such an
+# event is parked with a `retry-<table>` marker, and the next drain turns that marker into one
+# new attempt (a stable link sends no ifup event that could re-arm it).
 #
 # Return codes of geomask_routes_sync (the reason the queue can decide retry vs park):
 #   0  the table is consistent with `desired`
 #   75 busy: another writer owns route-<table> (retryable)
 #   76 retryable read/precondition failure BEFORE any mutation (retryable)
-#   77 a mutation failed: replace/delete/cp, or a foreign occupant blocked ours (NOT retried)
+#   77 a mutation failed: replace/delete, the write of the owned record, the read-back of the
+#      table after a mutation, or a foreign occupant blocked ours (NOT retried)
 #   2  the lock primitive is unavailable (fail closed; the caller must refuse to mutate)
 #   4  lock order inversion (caller bug; never retried)
 # 1 is not used any more: a generic failure could not tell "retry" from "fail closed".
@@ -8782,6 +9044,10 @@ ASSET_EOF
 #                    installer's step 7 check
 #   parked-<table>   the worker gave up after the bounded retries; a NEW pending event for the
 #                    same table re-arms it (gm_route_enqueue removes parked-<table>)
+#   retry-<table>    R12: a park with rc=77 leaves it, and the next gm_route_drain converts it
+#                    into one pending event. It is NOT a queue entry: _gm_route_has_queue
+#                    ignores it, so an ifup never spawns a worker for a marker. A success or a
+#                    new enqueue removes it.
 
 GM_ROUTE_STATE_DIR=${GM_ROUTE_STATE_DIR:-/tmp/geomask-routes}
 
@@ -8839,15 +9105,22 @@ _gm_route_normalize() { # stdin: a.b.c.d/len -> network/len
 
 # Connected prefixes of the LAN devices, derived from the addresses themselves. Used for the
 # gateway check and as the fallback when the routing table cannot be read: a policy table
-# with a default route must keep the LAN reachable.
-_gm_route_local_lines() { # prints "<network/len> dev <device>"
+# with a default route must keep the LAN reachable. The line names `src` so the fallback
+# `desired` line is structurally identical to the installed form (R12 round 2: without it
+# every later sync would call our own normalised route foreign).
+_gm_route_local_lines() { # prints "<network/len> dev <device> src <address>"
   for _rp_dev in $(_gm_route_devices); do
-    ip -4 addr show "$_rp_dev" 2>/dev/null \
-      | sed -n 's/.*inet \([0-9][0-9.]*\/[0-9][0-9]*\).*/\1/p' \
-      | _gm_route_normalize \
-      | while IFS= read -r _rp; do
-          [ -n "$_rp" ] && printf '%s dev %s\n' "$_rp" "$_rp_dev"
-        done
+    _rp_seen=""
+    for _rp in $(ip -4 addr show "$_rp_dev" 2>/dev/null \
+      | sed -n 's/.*inet \([0-9][0-9.]*\/[0-9][0-9]*\).*/\1/p'); do
+      _rnet=$(printf '%s\n' "$_rp" | _gm_route_normalize)
+      [ -n "$_rnet" ] || continue
+      # One line per prefix, with the FIRST address as src (the primary one on OpenWrt): an
+      # alias on the same prefix must not become the source address of the desired route.
+      case " $_rp_seen " in *" $_rnet "*) continue ;; esac
+      _rp_seen="$_rp_seen $_rnet"
+      printf '%s dev %s src %s\n' "$_rnet" "$_rp_dev" "${_rp%%/*}"
+    done
   done
 }
 
@@ -8933,9 +9206,17 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> rc per the header
   _state=$(_gm_route_dir)
   _main="$_state/main-$_rt.$$"
   _want="$_state/want-$_rt.$$"
-  _new="$_state/new-$_rt.$$"
   _cur="$_state/cur-$_rt.$$"
   _occ="$_state/occ-$_rt.$$"
+  _after="$_state/after-$_rt.$$"
+  # R12: the record is written through a per-process temp and an atomic rename in the same
+  # directory, so a refused or killed write can never truncate the file that is still valid.
+  _owned_new="$_state/owned-$_rt.tmp.$$"
+  _post="$_state/post-$_rt.$$"
+  _k_owned="$_state/kown-$_rt.$$"
+  _k_want="$_state/kwant-$_rt.$$"
+  _foreign="$_state/foreign-$_rt.$$"
+  _del="$_state/del-$_rt.$$"
 
   _devs=$(_gm_route_devices)
   _local_lines=$(_gm_route_local_lines)
@@ -8968,12 +9249,12 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> rc per the header
     # would send the LAN into the tunnel.
     printf '%s\n' "$_local_lines" >> "$_want"
   else
-    _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ"
     _gm_route_unlock "$_rt"
     return 76
   fi
   if [ ! -s "$_want" ]; then
-    _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ"
     _gm_route_unlock "$_rt"
     return 76
   fi
@@ -8981,13 +9262,70 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> rc per the header
   # What is installed now. Ownership is decided against this snapshot, and a failed read
   # means nothing is touched at all: a blind `replace` could take a route somebody else owns.
   if ! ip route show table "$_rt" > "$_cur" 2>/dev/null; then
-    _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ"
+    _gm_route_unlock "$_rt"
+    return 76
+  fi
+
+  # A record that exists but cannot be read would make every occupant look foreign (no
+  # mutation, no loss) yet would also drop our entries from the reconciled file. Fail closed
+  # before the first mutation: a directory in place of the file, a broken mode.
+  if [ -e "$_owned" ] && { [ ! -f "$_owned" ] || [ ! -r "$_owned" ]; }; then
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ"
+    _gm_route_unlock "$_rt"
+    return 76
+  fi
+
+  # R12 (round 2): ONE structural key, used by every phase - not only for the read-back.
+  #   key = prefix|via|dev|src, where a missing src is "-" (so a line that carries a foreign
+  #   src never matches a line without one), the destination may follow a route type word, and
+  #   kernel decoration (proto, metric, expires, linkdown, mtu, scope, table) is not part of
+  #   the key. An occupant is ours when its key is in the record or in `desired`; a recorded
+  #   line is installed when its key is in the fresh table; the new record keeps installed
+  #   lines whose key is in the old record or in `desired`. A stale/kernel-normalised record
+  #   therefore stays useful in Phase 1 and Phase 3 as well, and a foreign route whose
+  #   prefix/via/dev/src differs is never ours, never deleted and never recorded.
+  _route_awk='
+    function key(s,   n, a, i, via, dev, src, pfx, first) {
+      n = split(s, a, " ")
+      if (n == 0) return ""
+      first = a[1]
+      pfx = first
+      if (first == "unicast" || first == "blackhole" || first == "unreachable" || first == "prohibit" || first == "throw" || first == "local" || first == "broadcast" || first == "multicast" || first == "anycast" || first == "nat") pfx = a[2]
+      via = "-"; dev = "-"; src = "-"
+      for (i = 2; i <= n; i++) {
+        if (a[i] == "via") via = a[i+1]
+        else if (a[i] == "dev") dev = a[i+1]
+        else if (a[i] == "src") src = a[i+1]
+      }
+      return pfx "|" via "|" dev "|" src
+    }
+    FILENAME == of { okeys[$0] = 1; next }
+    FILENAME == wf { wkeys[$0] = 1; next }
+    FILENAME == df { dkeys[$0] = 1; next }
+    mode == "keys" { if (NF > 0) print key($0); next }
+    mode == "foreign" { if ((key($0) in okeys) || (key($0) in wkeys)) next; print; next }
+    mode == "delete" { if (key($0) in wkeys) next; if (key($0) in okeys) print; next }
+    mode == "record" { if ((key($0) in okeys) || (key($0) in dkeys)) print; next }
+  '
+  _prep=0
+  : > "$_k_owned" 2>/dev/null || _prep=1
+  : > "$_k_want" 2>/dev/null || _prep=1
+  if [ "$_prep" = 0 ] && [ -f "$_owned" ]; then
+    awk -v mode=keys "$_route_awk" "$_owned" > "$_k_owned" 2>/dev/null || _prep=1
+  fi
+  if [ "$_prep" = 0 ]; then
+    awk -v mode=keys "$_route_awk" "$_want" > "$_k_want" 2>/dev/null || _prep=1
+  fi
+  if [ "$_prep" != 0 ]; then
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ" "$_k_owned" "$_k_want"
     _gm_route_unlock "$_rt"
     return 76
   fi
 
   _fail=0
-  : > "$_new"
+  _wrote=""
+  # Phase 1+2 (R12): authorise the prefix, then replace it.
   while IFS= read -r _r; do
     [ -n "$_r" ] || continue
     _pfx=${_r%% *}
@@ -8999,42 +9337,111 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> rc per the header
     # match is by whole word, not by the first column; a typed route is foreign by definition.
     awk -v p="$_pfx" '{ for (i = 1; i <= NF; i++) if ($i == p) { print; break } }' "$_cur" > "$_occ"
     if [ -s "$_occ" ]; then
-      _foreign=0
-      while IFS= read -r _c; do
-        grep -qxF "$_c" "$_owned" 2>/dev/null || _foreign=1
-      done < "$_occ"
-      if [ "$_foreign" = 1 ]; then
-        # A foreign entry on this prefix stays. rc=77: the table is not what `desired` wants
-        # and retrying the same replace cannot fix an ownership conflict (R12).
+      # An occupant is ours when its structural key is in the record OR equals a desired line:
+      # that accepts the decorated/kernel-normalised installed form of our own route (a stale
+      # raw record, a lost record after a wiped /tmp, a refused write of the record) and still
+      # refuses a route whose prefix/via/dev/src differ. The old byte-identical test missed the
+      # normalised form and called our own route foreign (R12 review, round 2).
+      : > "$_foreign"
+      _fo=0
+      awk -v mode=foreign -v of="$_k_owned" -v wf="$_k_want" "$_route_awk" \
+        "$_k_owned" "$_k_want" "$_occ" > "$_foreign" 2>/dev/null || _fo=1
+      if [ "$_fo" != 0 ] || [ -s "$_foreign" ]; then
+        # A foreign entry on this prefix stays, and our own entries on it are left alone too:
+        # rc=77, because the table is not what `desired` wants and repeating the same replace
+        # cannot fix an ownership conflict. The old record keeps our line, so a later sync
+        # still recognises it (R12: it used to drop the line and lock the prefix as foreign).
         _fail=1
         continue
       fi
     fi
     if ip route replace table "$_rt" $_r 2>/dev/null; then
-      printf '%s\n' "$_r" >> "$_new"
+      _wrote="$_wrote $_pfx"
     else
+      # R12: the old line (if any) stays installed and keeps its record; the next sync sees it
+      # as ours and retries instead of declaring it foreign.
       _fail=1
     fi
   done < "$_want"
 
-  # Remove only recorded routes that are no longer wanted, and only by their full line: an
-  # entry of ours may have been replaced by somebody else since, and `ip route del <prefix>`
-  # cannot distinguish the two. A record that is no longer installed is not a failure.
-  if [ -f "$_owned" ]; then
-    while IFS= read -r _o; do
-      [ -n "$_o" ] || continue
-      grep -qxF "$_o" "$_want" && continue
-      grep -qxF "$_o" "$_cur" || continue
-      ip route del table "$_rt" $_o 2>/dev/null || _fail=1
-    done < "$_owned"
+  # Phase 3 (R12): remove recorded routes that are no longer wanted. The delete names the line
+  # that is ACTUALLY installed (the kernel may print a decorated/normalised form) and is
+  # matched by structural key against the record, so a foreign route that only shares the
+  # prefix is not deleted. The snapshot is taken AFTER Phase 2: a successful `replace` has
+  # already changed the old line, and deleting that old text would fail on a real kernel
+  # (R12 review, round 2). A refused delete leaves the line installed; Phase 4 keeps its
+  # record, so the next sync retries the delete (it used to become a silent orphan, rc 0).
+  if [ -s "$_k_owned" ]; then
+    if ! ip route show table "$_rt" > "$_post" 2>/dev/null; then
+      _fail=1
+    else
+      : > "$_del"
+      _dbo=0
+      awk -v mode=delete -v of="$_k_owned" -v wf="$_k_want" "$_route_awk" \
+        "$_k_owned" "$_k_want" "$_post" > "$_del" 2>/dev/null || _dbo=1
+      if [ "$_dbo" != 0 ]; then
+        _fail=1
+      else
+        while IFS= read -r _d; do
+          [ -n "$_d" ] || continue
+          ip route del table "$_rt" $_d 2>/dev/null || _fail=1
+        done < "$_del"
+      fi
+    fi
   fi
 
-  # Record what is really installed, even after a partial failure: an entry left in the table
-  # without an owner could never be cleaned up later.
-  cp -f "$_new" "$_owned" 2>/dev/null || _fail=1
-  _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
+  # Phase 4 (R12): the record must describe what is installed now, and only what is ours.
+  # `_new` (the lines this run managed to replace) was the old source of the record: a refused
+  # replace or delete dropped a live route from it, so the next sync declared that route
+  # foreign and never retried it (refused replace) or never removed it (refused delete).
+  #
+  # Exactly two kinds of installed lines may be recorded:
+  #   (a) a line whose structural key is in the OLD record (a refused delete leaves the line
+  #       installed; a stale or kernel-normalised record still recognises it);
+  #   (b) a line whose structural key equals a desired line (a byte-identical desired line
+  #       returns to the record even when a foreign neighbour blocked its replace).
+  # `_route_awk` is the one key used here, in Phase 1 and in Phase 3: prefix/via/dev/src with
+  # kernel decoration ignored. A prefix alone is NOT a reason to record a line - after
+  # `replace` another writer can add a route on the same prefix before the read-back, and the
+  # old `prefix in _wrote` rule recorded that foreign line (R12 review, D1). A route that
+  # disappeared on its own drops out instead of being trusted blindly.
+  if ! ip route show table "$_rt" > "$_after" 2>/dev/null; then
+    # The mutations already happened, so this is a mutation-reporting failure (77), never the
+    # retryable pre-mutation read (76): a 76 would make the caller repeat the mutations. The
+    # old record is the conservative claim and is left untouched.
+    _fail=1
+  else
+    _wf=0
+    if [ ! -s "$_after" ] && { [ -s "$_owned" ] || [ -n "$_wrote" ]; }; then
+      # A successful read that returns NOTHING while we own or wrote routes is not an empty
+      # table: recording it would erase live ownership. Keep the old record and report 77.
+      _wf=1
+    elif ! awk -v mode=record -v of="$_k_owned" -v df="$_k_want" "$_route_awk" \
+         "$_k_owned" "$_k_want" "$_after" > "$_owned_new" 2>/dev/null; then
+      _wf=1
+    fi
+    if [ "$_wf" != 0 ]; then
+      # The filtered record could not be written completely (or the read-back was empty):
+      # keep the old file - a truncated record would lose routes forever - and report 77.
+      _fail=1
+    else
+      chmod 600 "$_owned_new" 2>/dev/null
+      # A rename in the same directory is the write: the old record survives any failure,
+      # including ENOSPC/EROFS and a killed sync (R12: `cp -f` truncated it first).
+      mv -f "$_owned_new" "$_owned" 2>/dev/null || _fail=1
+    fi
+  fi
+
+  _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ" "$_post" "$_after" \
+    "$_owned_new" "$_k_owned" "$_k_want" "$_foreign" "$_del"
   _gm_route_unlock "$_rt"
-  [ "$_fail" = 0 ] && return 0
+  if [ "$_fail" = 0 ]; then
+    # R12 (D5): a successful sync proves the table is consistent again, so a retry marker left
+    # by an earlier hard failure has done its job. This also covers a direct sync from the
+    # console/panel, which never goes through the worker's own success branch.
+    rm -f "$_state/retry-$_rt" 2>/dev/null
+    return 0
+  fi
   return 77
 }
 
@@ -9078,11 +9485,15 @@ gm_route_enqueue() { # gm_route_enqueue <table>
     rm -f "$_ge_tmp" 2>/dev/null
     return 1
   }
-  # A new event re-arms a table that the worker had parked.
+  # A new event re-arms a table that the worker had parked (it is also the trigger R12 needs,
+  # so the retry marker of a previous hard failure has done its job).
   rm -f "$_ge_dir/parked-$_ge_t" 2>/dev/null
+  rm -f "$_ge_dir/retry-$_ge_t" 2>/dev/null
   return 0
 }
 
+# Queue entries only: pending and work. `retry-<table>` (R12) is deliberately NOT one - the
+# hotplug path must not spawn a worker for a marker; only a drain turns it into work.
 _gm_route_has_queue() {
   _hq_dir=$(_gm_route_dir)
   for _hq_f in "$_hq_dir"/pending-* "$_hq_dir"/work-*; do
@@ -9319,6 +9730,25 @@ _gm_route_park() {
     mv -f "$_pk_tmp" "$_pk_dir/error-$_pk_t" 2>/dev/null
   fi
   rm -f "$_pk_tmp" 2>/dev/null
+  # R12: a hard failure (77) leaves a retry marker. The next drain converts it into one more
+  # attempt - on a stable link no new ifup arrives, so a parked event would otherwise never be
+  # reconciled. 77 keeps its "not retried by the worker" contract: the next attempt happens in
+  # a LATER drain run, never in this one. The marker must survive a hostile filesystem: when
+  # the atomic rename is refused, write it in place instead of losing the retry (D4).
+  if [ "$_pk_rc" = 77 ]; then
+    _pk_rm="$_pk_dir/retry-$_pk_t.$$"
+    _pk_gen=$(printf '%s.%s' "$(date +%s 2>/dev/null)" "$$")
+    _pk_ok=0
+    if printf '%s\n' "$_pk_gen" > "$_pk_rm" 2>/dev/null; then
+      chmod 600 "$_pk_rm" 2>/dev/null
+      mv -f "$_pk_rm" "$_pk_dir/retry-$_pk_t" 2>/dev/null && _pk_ok=1
+    fi
+    if [ "$_pk_ok" = 0 ]; then
+      printf '%s\n' "$_pk_gen" > "$_pk_dir/retry-$_pk_t" 2>/dev/null \
+        || _gm_route_log "route table $_pk_t: cannot leave a retry marker after rc=77"
+    fi
+    rm -f "$_pk_rm" 2>/dev/null
+  fi
   mv -f "$_pk_path" "$_pk_dir/parked-$_pk_t" 2>/dev/null || rm -f "$_pk_path" 2>/dev/null
   _gm_route_log "route table $_pk_t parked (rc=$_pk_rc, attempts=$_pk_att) - waiting for a new ifup event"
   return 0
@@ -9374,6 +9804,7 @@ gm_route_worker() {
       0)
         rm -f "$_gw_path" 2>/dev/null
         rm -f "$(_gm_route_state_file error "$_gw_t")" 2>/dev/null
+        rm -f "$(_gm_route_state_file retry "$_gw_t")" 2>/dev/null
         _gm_route_prune_temps
         _gw_rc=0
         _gw_stop=0 ;;
@@ -9421,6 +9852,30 @@ gm_route_worker() {
   return "$_gw_rc"
 }
 
+# R12: `_gm_route_park` leaves `retry-<table>` after a hard failure (77). A stable PPPoE link
+# sends no new ifup event, so the parked event alone would never be reconciled. One drain run
+# converts each marker into a pending event (once: a failure during this very drain writes a
+# NEW marker, which waits for the next run). A pending/work event for the same table already
+# triggers it, so the marker is simply dropped there. It is deliberately NOT a queue entry:
+# `_gm_route_has_queue` ignores it, or every ifup would spawn a worker for a marker.
+# A refused conversion must KEEP the marker (D4): deleting it on ENOSPC/EACCES would leave the
+# table parked with nothing to retry it until an unrelated ifup.
+_gm_route_retry_all() {
+  _ry_dir=$(_gm_route_dir)
+  for _ry_f in "$_ry_dir"/retry-*; do
+    [ -f "$_ry_f" ] || continue
+    _ry_t=${_ry_f##*-}
+    case "$_ry_t" in ''|*[!0-9]*) continue ;; esac
+    if [ -f "$_ry_dir/pending-$_ry_t" ] || [ -f "$_ry_dir/work-$_ry_t" ]; then
+      rm -f "$_ry_f" 2>/dev/null
+      continue
+    fi
+    mv -f "$_ry_f" "$_ry_dir/pending-$_ry_t" 2>/dev/null \
+      || _gm_route_log "route table $_ry_t: retry marker could not become a pending event"
+  done
+  return 0
+}
+
 # Backstop for the guard/cron and the installer: apply the queue inline, without spawning a
 # detached worker (the installer holds `maintenance`, and an inline call keeps the result
 # observable before it reads error-<table>). Every pending table is processed in one call.
@@ -9429,6 +9884,7 @@ gm_route_drain() {
   GM_ROUTE_TUN_WAIT=0
   export GM_ROUTE_DRAIN GM_ROUTE_TUN_WAIT
   _gm_route_prune_temps
+  _gm_route_retry_all
   gm_route_worker
 }
 ASSET_EOF
@@ -9471,6 +9927,13 @@ ASSET_EOF
 #     returns rc=2 and the caller must refuse to mutate. There is NO mkdir/O_EXCL fallback on
 #     Linux - that would bring back the reclaim race R04 is about.
 #
+# Safety: this file performs no dynamic code evaluation, starts no shell with a command
+# string, and uses no dynamically named shell variables. The lock path and the lock name are DATA: paths reach
+# `exec` only as quoted words, state lives in fixed variables (_GM_PATH_5..9) and in a
+# token list "name=fd", and every descriptor operation is a literal `exec 5..9`. A path or a
+# name that contains quotes, `$(...)`, backticks, `;`, `&` or spaces is never executed.
+# The name is validated (`[A-Za-z][A-Za-z0-9-]*`) and a path containing a newline is refused.
+#
 # Non-Linux hosts (the Windows-hosted test suite) have neither flock(2) nor /proc. There the
 # helper uses an atomic O_EXCL file (noclobber) created once and removed only by its owner.
 # This backend exists so that caller logic can be exercised off-router; it is never selected
@@ -9482,29 +9945,33 @@ ASSET_EOF
 #   GM_CONFIG_TX_LOCK  CANONICAL path of the config-transaction lock, shared with
 #                      geomask-config-tx.py, geomask-node-scan.sh and geomask-torrent.sh
 #   GM_LOCK_TX_FILE    legacy alias of GM_CONFIG_TX_LOCK (test roots only)
-#   GM_LOCK_FDS      reserved descriptors, highest first (default "9 8 7 6 5")
+#   GM_LOCK_FDS      reserved descriptors; must be a subset of 5 6 7 8 9
 
 GM_LOCK_DIR=${GM_LOCK_DIR:-/tmp/geomask-locks}
 GM_LOCK_TX_FILE=${GM_CONFIG_TX_LOCK:-${GM_LOCK_TX_FILE:-/etc/geomask/node-audit/state/.config-tx.lock}}
-GM_LOCK_FDS=${GM_LOCK_FDS:-9 8 7 6 5}
+GM_LOCK_FDS=${GM_LOCK_FDS:-5 6 7 8 9}
 GM_LOCK_MAX_RANK=${GM_LOCK_MAX_RANK:-0}
 GM_LOCK_STACK=${GM_LOCK_STACK:-}
-GM_LOCK_FDS_USED=${GM_LOCK_FDS_USED:-}
+_GM_PATH_5=${_GM_PATH_5:-}
+_GM_PATH_6=${_GM_PATH_6:-}
+_GM_PATH_7=${_GM_PATH_7:-}
+_GM_PATH_8=${_GM_PATH_8:-}
+_GM_PATH_9=${_GM_PATH_9:-}
 
 # The rank table is the lock order. Unknown names get 90 so a new writer is the outermost -
 # an earlier rank could otherwise turn a lawful sequence into a refused one silently.
 gm_lock_rank() {
   case "$1" in
-    maintenance) printf '10' ;;
-    console)     printf '20' ;;
-    config-tx)   printf '30' ;;
+    maintenance)   printf '10' ;;
+    console)       printf '20' ;;
+    cron)          printf '25' ;;
+    config-tx)     printf '30' ;;
     routes-worker) printf '35' ;;
-    route-*)     printf '40' ;;
-    sync)        printf '45' ;;
-    cron)        printf '25' ;;
-    devices)     printf '60' ;;
-    subs)        printf '65' ;;
-    *)           printf '90' ;;
+    route-*)       printf '40' ;;
+    sync)          printf '45' ;;
+    devices)       printf '60' ;;
+    subs)          printf '65' ;;
+    *)             printf '90' ;;
   esac
 }
 
@@ -9533,66 +10000,132 @@ gm_lock_backend() {
   esac
 }
 
-_gm_lock_var() { # _gm_lock_var <prefix> <name> -> variable name, '-' and '/' become '_'
-  printf '%s_%s' "$1" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9' '_')"
-}
-
-_gm_lock_fd_of() { # echoes the descriptor held for <name>, empty when not held here
-  _gm_v=$(_gm_lock_var _GM_LOCK_FD "$1")
-  eval "printf '%s' \"\${$_gm_v:-}\""
-}
-
-_gm_lock_held() { # 0 when this shell holds <name>
-  [ -n "$(_gm_lock_fd_of "$1")" ]
-}
-
-_gm_lock_track() { # _gm_lock_track <name> <fd> <path>
-  eval "$(_gm_lock_var _GM_LOCK_FD "$1")='$2'"
-  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")='$3'"
-  GM_LOCK_FDS_USED="$GM_LOCK_FDS_USED $2"
-  GM_LOCK_STACK="$GM_LOCK_STACK $1"
-  _gm_r=$(gm_lock_rank "$1")
-  [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
+_gm_lock_fds_ok() {
+  for _gm_f in $GM_LOCK_FDS; do
+    case "$_gm_f" in
+      5|6|7|8|9) : ;;
+      *) return 1 ;;
+    esac
+  done
   return 0
 }
 
-_gm_lock_forget() { # _gm_lock_forget <name> <fd>
-  eval "$(_gm_lock_var _GM_LOCK_FD "$1")=''"
-  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")=''"
-  _gm_used=''
-  for _gm_u in $GM_LOCK_FDS_USED; do
-    [ "$_gm_u" = "$2" ] || _gm_used="$_gm_used $_gm_u"
+# Echo the descriptor held for <name>, empty when this shell does not hold it.
+_gm_lock_fd_of() {
+  for _gm_t in $GM_LOCK_STACK; do
+    case "$_gm_t" in
+      "$1"=*) printf '%s' "${_gm_t#*=}"; return 0 ;;
+    esac
   done
-  GM_LOCK_FDS_USED=$_gm_used
-  _gm_new=''
-  for _gm_s in $GM_LOCK_STACK; do
-    [ "$_gm_s" = "$1" ] || _gm_new="$_gm_new $_gm_s"
+  return 1
+}
+
+_gm_lock_held() { _gm_lock_fd_of "$1" >/dev/null 2>&1; }
+
+_gm_lock_fd_used() { # 0 when <fd> is in the stack
+  for _gm_t in $GM_LOCK_STACK; do
+    [ "${_gm_t#*=}" = "$1" ] && return 0
   done
-  GM_LOCK_STACK=$_gm_new
+  return 1
+}
+
+_gm_lock_recalc_rank() {
   GM_LOCK_MAX_RANK=0
-  for _gm_s in $GM_LOCK_STACK; do
-    _gm_r=$(gm_lock_rank "$_gm_s")
+  for _gm_t in $GM_LOCK_STACK; do
+    _gm_r=$(gm_lock_rank "${_gm_t%%=*}")
     [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
   done
   return 0
 }
 
-_gm_lock_free_fd() { # echoes the first reserved descriptor not used by this shell
-  for _gm_c in $GM_LOCK_FDS; do
-    case " $GM_LOCK_FDS_USED " in
-      *" $_gm_c "*) continue ;;
+_gm_lock_path_of() { # the path stored for a reserved descriptor
+  case "$1" in
+    5) printf '%s' "$_GM_PATH_5" ;;
+    6) printf '%s' "$_GM_PATH_6" ;;
+    7) printf '%s' "$_GM_PATH_7" ;;
+    8) printf '%s' "$_GM_PATH_8" ;;
+    9) printf '%s' "$_GM_PATH_9" ;;
+  esac
+}
+
+_gm_lock_set_path() { # <fd> <path> - literal slots, no dynamic variable names
+  case "$1" in
+    5) _GM_PATH_5=$2 ;;
+    6) _GM_PATH_6=$2 ;;
+    7) _GM_PATH_7=$2 ;;
+    8) _GM_PATH_8=$2 ;;
+    9) _GM_PATH_9=$2 ;;
+  esac
+}
+
+_gm_lock_track() { # <name> <fd> <path>
+  _gm_lock_set_path "$2" "$3"
+  if [ -n "$GM_LOCK_STACK" ]; then
+    GM_LOCK_STACK="$GM_LOCK_STACK $1=$2"
+  else
+    GM_LOCK_STACK="$1=$2"
+  fi
+  _gm_lock_recalc_rank
+}
+
+_gm_lock_forget() { # <name> <fd>
+  _gm_lock_set_path "$2" ''
+  _gm_new=''
+  for _gm_t in $GM_LOCK_STACK; do
+    case "$_gm_t" in
+      "$1"=*) : ;;
+      *) _gm_new="${_gm_new:+$_gm_new }$_gm_t" ;;
     esac
+  done
+  GM_LOCK_STACK=$_gm_new
+  _gm_lock_recalc_rank
+}
+
+_gm_lock_free_fd() {
+  for _gm_c in $GM_LOCK_FDS; do
+    _gm_lock_fd_used "$_gm_c" && continue
     printf '%s' "$_gm_c"
     return 0
   done
   return 1
 }
 
-# Acquire <name>. rc: 0 held, 1 busy/timeout, 2 primitive unavailable (fail closed),
-# 3 already held by this shell, 4 lock order violated. On 1/2/4 nothing is held.
+# Open <fd> on <path> with a literal `exec`. A plain `: >>path` first creates the file and
+# proves writability, so a redirection error is reported by us (rc=2) instead of possibly
+# terminating a non-interactive shell on the `exec` line.
+_gm_lock_open() { # <fd> <path>
+  { : >>"$2"; } 2>/dev/null || return 1
+  case "$1" in
+    5) exec 5<>"$2" 2>/dev/null ;;
+    6) exec 6<>"$2" 2>/dev/null ;;
+    7) exec 7<>"$2" 2>/dev/null ;;
+    8) exec 8<>"$2" 2>/dev/null ;;
+    9) exec 9<>"$2" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+_gm_lock_close_fd() { # <fd>
+  case "$1" in
+    5) exec 5>&- 2>/dev/null ;;
+    6) exec 6>&- 2>/dev/null ;;
+    7) exec 7>&- 2>/dev/null ;;
+    8) exec 8>&- 2>/dev/null ;;
+    9) exec 9>&- 2>/dev/null ;;
+  esac
+  return 0
+}
+
+# Acquire <name>. rc: 0 held, 1 busy/timeout, 2 primitive unavailable / bad input (fail
+# closed), 3 already held by this shell, 4 lock order violated. On 1/2/3/4 nothing is held.
 gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
   _gm_name=$1
   _gm_wait=${2:-0}
+  case "$_gm_name" in
+    ''|[!A-Za-z]*|*[!A-Za-z0-9-]*)
+      echo "geomask-lock: invalid lock name '$_gm_name' (letters, digits and '-', must start with a letter)" >&2
+      return 2 ;;
+  esac
   # A non-numeric budget is a caller bug, not "wait forever": refuse it before the deadline
   # comparison, otherwise `[ N -ge abc ]` errors and the retry loop never terminates.
   case "$_gm_wait" in
@@ -9601,6 +10134,26 @@ gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
       return 2 ;;
   esac
   [ "$_gm_wait" -gt 3600 ] && _gm_wait=3600
+  _gm_lock_fds_ok || {
+    echo "geomask-lock: GM_LOCK_FDS='$GM_LOCK_FDS' is not a subset of 5 6 7 8 9 - refusing to lock" >&2
+    return 2
+  }
+  # Reject a newline in the path SOURCE: command substitution would silently drop a trailing
+  # newline, so checking only the composed path is not enough. The path is data, not code.
+  _gm_src=${3:-}
+  if [ -z "$_gm_src" ]; then
+    if [ "$_gm_name" = config-tx ]; then
+      _gm_src=$GM_LOCK_TX_FILE
+    else
+      _gm_src=$GM_LOCK_DIR
+    fi
+  fi
+  case "$_gm_src" in
+    *'
+'*)
+      echo "geomask-lock: the lock path of '$_gm_name' contains a newline - refusing to lock" >&2
+      return 2 ;;
+  esac
   _gm_path=$(gm_lock_path "$_gm_name" "${3:-}")
   _gm_rank=$(gm_lock_rank "$_gm_name")
 
@@ -9639,12 +10192,12 @@ gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
         return 0
       fi
     else
-      if eval "exec $_gm_fd>>\"\$_gm_path\"" 2>/dev/null; then
+      if _gm_lock_open "$_gm_fd" "$_gm_path"; then
         if flock -n "$_gm_fd" 2>/dev/null; then
           _gm_lock_track "$_gm_name" "$_gm_fd" "$_gm_path"
           return 0
         fi
-        eval "exec $_gm_fd>&-"
+        _gm_lock_close_fd "$_gm_fd"
       else
         echo "geomask-lock: cannot open the lock file $_gm_path - refusing to lock $_gm_name" >&2
         return 2
@@ -9660,23 +10213,21 @@ gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
 
 gm_lock_release() { # gm_lock_release <name>
   _gm_name=$1
-  _gm_fd=$(_gm_lock_fd_of "$_gm_name")
-  [ -n "$_gm_fd" ] || return 0
-  _gm_pv=$(_gm_lock_var _GM_LOCK_PATH "$_gm_name")
-  eval "_gm_path=\${$_gm_pv:-}"
+  _gm_fd=$(_gm_lock_fd_of "$_gm_name") || return 0
+  _gm_path=$(_gm_lock_path_of "$_gm_fd")
   if [ "$(gm_lock_backend)" = portable ]; then
     [ -f "$_gm_path" ] && rm -f "$_gm_path" 2>/dev/null
   else
     flock -u "$_gm_fd" 2>/dev/null
-    eval "exec $_gm_fd>&-"
+    _gm_lock_close_fd "$_gm_fd"
   fi
   _gm_lock_forget "$_gm_name" "$_gm_fd"
   return 0
 }
 
 gm_lock_release_all() {
-  for _gm_name in $GM_LOCK_STACK; do
-    gm_lock_release "$_gm_name"
+  for _gm_t in $GM_LOCK_STACK; do
+    gm_lock_release "${_gm_t%%=*}"
   done
 }
 
@@ -9694,12 +10245,15 @@ gm_lock_busy() { # gm_lock_busy <name> [path]
 }
 
 # Close the reserved descriptors in this process WITHOUT unlocking: flock lives on the open
-# file description, so another process (the updater runner) still holds the lock.
+# file description, so another process (the updater runner) still holds the lock. Literal
+# descriptors only - descriptors 0/1/2 and anything the caller opened are never touched.
 gm_lock_close_inherited() {
-  for _gm_c in $GM_LOCK_FDS; do
-    eval "exec $_gm_c>&-" 2>/dev/null
-  done
-  GM_LOCK_FDS_USED=''
+  exec 5>&- 2>/dev/null
+  exec 6>&- 2>/dev/null
+  exec 7>&- 2>/dev/null
+  exec 8>&- 2>/dev/null
+  exec 9>&- 2>/dev/null
+  _GM_PATH_5=''; _GM_PATH_6=''; _GM_PATH_7=''; _GM_PATH_8=''; _GM_PATH_9=''
   GM_LOCK_STACK=''
   GM_LOCK_MAX_RANK=0
   return 0
@@ -14616,20 +15170,30 @@ if __name__ == '__main__':
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-diag-spool.py 755 <<'ASSET_EOF'
 #!/usr/bin/env python3
-"""Registered diagnostic downloads. Linux uses pinned, no-follow directory descriptors.
+"""Registered diagnostic downloads: private spool, retention, quota and share copies.
 
-Windows tests exercise content/identity rejection, not Linux kernel/0700 guarantees.
-No fallback exporter may reopen a verified archive by pathname.
+Linux uses pinned, no-follow directory descriptors. Windows tests exercise content,
+identity, quota, retention and share-copy algorithms - not Linux kernel, 0700, flock(2),
+fsync, fs-error or ksmbd guarantees. No fallback exporter may reopen a verified archive
+by pathname.
 """
 import base64
+import errno
 import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import stat
 import sys
+import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows test hosts have no flock(2); see Locked.
+    fcntl = None
 
 EUID = os.geteuid() if hasattr(os, 'geteuid') else 0
 PREFIX = 'geomask-console-diag-'
@@ -14642,9 +15206,45 @@ MAXIMUM = CREATION_MAXIMUM  # Default transport limit; get --max may be lower or
 SCHEMA = 1
 POSIX = os.name == 'posix'
 
+# Retention/quota defaults (R08). The shell clamps its environment into these ranges and
+# passes the result on the command line; the helper only rejects impossible values, so the
+# algorithm stays testable with tiny fixtures.
+QUOTA = 8 * 1024 * 1024
+FILES = 4
+SHARE_QUOTA = 6 * 1024 * 1024
+SHARE_FILES = 3
+KEEP_HOURS = 24
+KEEP_MAXIMUM = 720
+QUOTA_MINIMUM = 2 * 1024 * 1024
+QUOTA_MAXIMUM = 64 * 1024 * 1024
+FILES_MAXIMUM = 32
+SHARE_FILES_MAXIMUM = 16
+# Age windows in seconds.
+GRACE = 120            # a just-created bundle is not a candidate for eviction
+ORPHAN_AGE = 300       # sidecar whose archive is gone
+TEMPORARY_AGE = 3600   # .sidecar-<hex> / .part-<hex> left by a killed writer
+STAGE_AGE = 7200       # geomask-console-diag.XXXXXX staging directory
+STAGE_PATTERN = re.compile(r'^geomask-console-diag\.[A-Za-z0-9]{6}$')
+TEMPORARY_PREFIXES = ('.sidecar-', '.part-')
+PROTECTED_PREFIXES = ('router-backup-',)
+COPY_CHUNK = 262144
+_LOCK = threading.RLock()
+
 
 class Refused(Exception):
     """Fail closed with a JSON error."""
+
+
+class NotPrivate(Refused):
+    """Refusal that is a permission policy decision, not a missing target."""
+
+
+class ShareRefused(Exception):
+    """A share copy that did not happen; the caller only needs the machine reason."""
+
+    def __init__(self, reason):
+        Exception.__init__(self, reason)
+        self.reason = reason
 
 
 def refuse(message):
@@ -14667,11 +15267,30 @@ def valid_name(name):
                     for c in name))
 
 
+def protected_name(name):
+    """Names retention must never touch, even if a future pattern would match them."""
+    return isinstance(name, str) and name.startswith(PROTECTED_PREFIXES)
+
+
 def private(st):
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != EUID:
         refuse('spool is not private: not our directory')
     if POSIX and stat.S_IMODE(st.st_mode) & 0o077:
         refuse('spool is not private: group/other permissions')
+
+
+def shared(st):
+    """The backup folder may be 0755: it is published by ksmbd. Group/other write is not."""
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != EUID:
+        refuse('share is not our directory')
+    if POSIX and stat.S_IMODE(st.st_mode) & 0o022:
+        raise NotPrivate('share is group/other writable')
+
+
+def staging(st):
+    """TMPDIR is 1777 on OpenWrt: only the strict name pattern makes a child ours."""
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != EUID:
+        refuse('staging directory is not ours')
 
 
 def walk_directory(path):
@@ -14706,12 +15325,19 @@ def walk_directory(path):
 
 
 class Spool:
-    def __init__(self, path):
+    """A pinned directory: the 0700 spool, the published share or a staging folder."""
+
+    POLICIES = {'private': private, 'share': shared, 'staging': staging}
+
+    def __init__(self, path, kind='private'):
+        if kind not in self.POLICIES:
+            refuse('unknown directory kind')
+        self.kind = kind
         self.path = os.path.abspath(path)
         self.fd = walk_directory(self.path)
         try:
             self.st = os.fstat(self.fd) if POSIX else os.lstat(self.path)
-            private(self.st)
+            self.POLICIES[kind](self.st)
         except BaseException:
             if self.fd is not None:
                 os.close(self.fd)
@@ -14724,11 +15350,11 @@ class Spool:
         fd = walk_directory(self.path)
         try:
             st = os.fstat(fd) if POSIX else os.lstat(self.path)
-            private(st)
+            self.POLICIES[self.kind](st)
             if identity(st) != identity(self.st):
                 refuse('spool identity changed')
             if POSIX:
-                private(os.fstat(self.fd))
+                self.POLICIES[self.kind](os.fstat(self.fd))
         finally:
             if fd is not None:
                 os.close(fd)
@@ -14762,6 +15388,14 @@ class Spool:
         self.check()
         return os.listdir(self.fd if POSIX else self.path)
 
+    def lstat(self, name):
+        try:
+            if POSIX:
+                return os.lstat(name, dir_fd=self.fd)
+            return os.lstat(os.path.join(self.path, name))
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+
     def replace(self, source, target):
         self.check()
         if POSIX:
@@ -14776,6 +15410,37 @@ class Spool:
             os.unlink(os.path.join(self.path, name))
 
 
+class Locked:
+    """Serialise inventory -> evict -> register on the pinned directory descriptor.
+
+    POSIX takes flock(2) on the directory descriptor, so two backend processes cannot both
+    see room for their bundle. Windows test hosts have no fcntl: the module mutex keeps the
+    same algorithm linear there, which is the only guarantee claimed off Linux.
+    """
+
+    def __init__(self, spool):
+        self.spool = spool
+        self.flocked = False
+
+    def __enter__(self):
+        _LOCK.acquire()
+        try:
+            if fcntl is not None and POSIX and self.spool.fd is not None:
+                fcntl.flock(self.spool.fd, fcntl.LOCK_EX)
+                self.flocked = True
+        except BaseException:
+            _LOCK.release()
+            raise
+        return self
+
+    def __exit__(self, *unused):
+        try:
+            if self.flocked:
+                fcntl.flock(self.spool.fd, fcntl.LOCK_UN)
+        finally:
+            _LOCK.release()
+
+
 def check_file(st, what):
     if not stat.S_ISREG(st.st_mode) or st.st_uid != EUID or st.st_nlink != 1:
         refuse('%s must be our regular single-link file' % what)
@@ -14783,11 +15448,11 @@ def check_file(st, what):
         refuse('%s is empty' % what)
 
 
-def read_all(fd, maximum):
+def read_all(fd, maximum, digest=True):
     """Read at most maximum+1 bytes even if a same-inode writer grows the file."""
     chunks = []
     total = 0
-    digest = hashlib.sha256()
+    hasher = hashlib.sha256() if digest else None
     while True:
         chunk = os.read(fd, min(262144, maximum - total + 1))
         if not chunk:
@@ -14795,12 +15460,13 @@ def read_all(fd, maximum):
         total += len(chunk)
         if total > maximum:
             refuse('file exceeds bounded read limit')
-        digest.update(chunk)
+        if hasher is not None:
+            hasher.update(chunk)
         chunks.append(chunk)
-    return digest.hexdigest(), total, b''.join(chunks)
+    return (hasher.hexdigest() if hasher is not None else None), total, b''.join(chunks)
 
 
-def read_sidecar(spool, name):
+def read_sidecar(spool, name, digest=True):
     try:
         fd = spool.open(name + '.json')
     except FileNotFoundError:
@@ -14810,7 +15476,7 @@ def read_sidecar(spool, name):
         check_file(before, 'sidecar')
         if before.st_size > SIDECAR_LIMIT:
             refuse('sidecar is oversized')
-        _, total, payload = read_all(fd, before.st_size)
+        _, total, payload = read_all(fd, before.st_size, digest)
         if total != before.st_size or signature(before) != signature(os.fstat(fd)):
             refuse('sidecar changed while read')
     finally:
@@ -14857,6 +15523,370 @@ def write_sidecar(spool, name, record):
             pass
 
 
+# --------------------------------------------------------------- retention inventory
+def scan(directory):
+    """lstat-only inventory. Never hashes, never opens a bundle, never follows a link.
+
+    Returns (archives, sidecars, orphans, temps, stages):
+      archives  name -> lstat of a regular file with a valid bundle name;
+      sidecars  bundle name -> lstat of its .json (any type: read_sidecar still decides);
+      orphans   [(sidecar name, lstat)] whose archive is not a regular file here;
+      temps     [(name, lstat)] .sidecar-* / .part-* leftovers;
+      stages    [(name, lstat)] geomask-console-diag.XXXXXX directories.
+    Foreign names (router-backup-*.tar.gz, notes.txt, ...) stay out of every list.
+    """
+    entries = {}
+    for name in directory.names():
+        st = directory.lstat(name)
+        if st is not None:
+            entries[name] = st
+    archives, sidecars, stages, temps = {}, {}, [], []
+    for name in sorted(entries):
+        st = entries[name]
+        if valid_name(name) and stat.S_ISREG(st.st_mode):
+            archives[name] = st
+        elif name.endswith('.json') and valid_name(name[:-5]):
+            sidecars[name[:-5]] = st
+        elif STAGE_PATTERN.match(name) and stat.S_ISDIR(st.st_mode):
+            stages.append((name, st))
+        elif name.startswith(TEMPORARY_PREFIXES) and not stat.S_ISDIR(st.st_mode):
+            temps.append((name, st))
+    orphans = [(name + '.json', st) for name, st in sidecars.items() if name not in archives]
+    return archives, sidecars, orphans, temps, stages
+
+
+def measure(archives, sidecars):
+    """(archives, bytes): sidecar bodies belong to the budget, foreign names do not."""
+    total = 0
+    for name, st in archives.items():
+        total += st.st_size
+        shadow = sidecars.get(name)
+        if shadow is not None and stat.S_ISREG(shadow.st_mode):
+            total += shadow.st_size
+    return len(archives), total
+
+
+def _created_ns(directory, name, st):
+    """Eviction order follows the registered creation time, with mtime as fallback.
+
+    The sidecar is bounded to 64 KiB and is read without hashing: retention costs lstats
+    plus a few small JSON parses, never a sha256 pass over the archives.
+    """
+    try:
+        return read_sidecar(directory, name, digest=False)['created_ns']
+    except (Refused, OSError):
+        return st.st_mtime_ns
+
+
+def _order(directory, archives):
+    return sorted(archives, key=lambda name: (_created_ns(directory, name, archives[name]), name))
+
+
+def _unlink(directory, name):
+    if protected_name(name):
+        return False
+    try:
+        directory.unlink(name)
+        return True
+    except FileNotFoundError:
+        return False
+    except (OSError, Refused):
+        return False
+
+
+def _unlink_pair(directory, name):
+    """Archive first, then its sidecar: the reverse order would hide a 2 MiB orphan."""
+    removed = 1 if _unlink(directory, name) else 0
+    if _unlink(directory, name + '.json'):
+        removed += 1
+    return removed
+
+
+def _evict(directory, archives, sidecars, order, keep_name, grace, files, quota, now, floor=1):
+    """Evict oldest-first until both limits hold; never the registering bundle."""
+    removed = 0
+    while len(archives) > files or measure(archives, sidecars)[1] > quota:
+        if len(archives) <= floor:
+            break
+        victim = None
+        for name in order:
+            if name not in archives or name == keep_name:
+                continue
+            if grace and now - archives[name].st_mtime < grace:
+                continue
+            victim = name
+            break
+        if victim is None:
+            break
+        gone = _unlink_pair(directory, victim)
+        if gone == 0 and directory.lstat(victim) is not None:
+            # Windows may deny unlink while another registrar is hashing the file: stop
+            # instead of spinning, and let the caller decide what does not fit.
+            break
+        removed += gone
+        archives.pop(victim, None)
+        sidecars.pop(victim, None)
+    return removed
+
+
+def _remove_tree_fd(parent_fd, name):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=parent_fd)
+    except OSError:
+        return False
+    try:
+        for child in os.listdir(fd):
+            try:
+                child_st = os.lstat(child, dir_fd=fd)
+            except OSError:
+                continue
+            if stat.S_ISDIR(child_st.st_mode):
+                _remove_tree_fd(fd, child)
+            else:
+                try:
+                    os.unlink(child, dir_fd=fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(fd)
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+        return True
+    except OSError:
+        return False
+
+
+def _remove_tree_path(path, depth=0):
+    if depth > 32:
+        return False
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    for child in names:
+        full = os.path.join(path, child)
+        try:
+            child_st = os.lstat(full)
+        except OSError:
+            continue
+        if (stat.S_ISDIR(child_st.st_mode) and not stat.S_ISLNK(child_st.st_mode)
+                and not getattr(child_st, 'st_reparse_tag', 0)):
+            _remove_tree_path(full, depth + 1)
+        else:
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+    try:
+        os.rmdir(path)
+        return True
+    except OSError:
+        return False
+
+
+def _remove_tree(directory, name):
+    """Remove one staging directory without following any link inside it."""
+    if POSIX:
+        return _remove_tree_fd(directory.fd, name)
+    return _remove_tree_path(os.path.join(directory.path, name))
+
+
+def _retain(directory, keep_hour, quota, files):
+    archives, sidecars, orphans, temps, stages = scan(directory)
+    before, _ = measure(archives, sidecars)
+    now = time.time()
+    removed = 0
+    orphaned = 0
+    # 1. Age, archive and sidecar as one pair.
+    if keep_hour:
+        for name in sorted(archives):
+            if now - archives[name].st_mtime > keep_hour * 3600:
+                removed += _unlink_pair(directory, name)
+                archives.pop(name, None)
+                sidecars.pop(name, None)
+    # 2. Sidecars whose archive was deleted by hand or by an earlier pass.
+    for name, st in orphans:
+        if now - st.st_mtime > ORPHAN_AGE and _unlink(directory, name):
+            removed += 1
+            orphaned += 1
+    # 3. Temporary files of a killed writer.
+    for name, st in temps:
+        if now - st.st_mtime > TEMPORARY_AGE and _unlink(directory, name):
+            removed += 1
+    # 4. Staging directories of a killed export (inside the spool only in tests; the
+    #    backend passes TMPDIR as --stage-dir, which is swept by sweep_stages()).
+    for name, st in stages:
+        if now - st.st_mtime > STAGE_AGE and _remove_tree(directory, name):
+            removed += 1
+    # 5. Count, then 6. bytes: the old goes before the merely extra.
+    order = _order(directory, archives)
+    removed += _evict(directory, archives, sidecars, order, None, 0, files, quota, now)
+    kept, total = measure(archives, sidecars)
+    return {'kept': kept, 'files': before, 'bytes': total,
+            'removed': removed, 'orphans': orphaned}
+
+
+def sweep_stages(path):
+    """Sweep geomask-console-diag.XXXXXX directories in a non-private TMPDIR."""
+    removed = 0
+    try:
+        with Spool(path, 'staging') as staging_dir:
+            with Locked(staging_dir):
+                now = time.time()
+                for name, st in scan(staging_dir)[4]:
+                    if now - st.st_mtime > STAGE_AGE and _remove_tree(staging_dir, name):
+                        removed += 1
+    except (Refused, OSError):
+        return 0
+    return removed
+
+
+def cmd_retain(path, keep_hour=None, quota=None, files=None, share=False, stage_dir=None):
+    keep_hour = KEEP_HOURS if keep_hour is None else keep_hour
+    quota = QUOTA if quota is None else quota
+    files = FILES if files is None else files
+    if type(keep_hour) is not int or not 0 <= keep_hour <= KEEP_MAXIMUM:
+        refuse('invalid keep hours')
+    if type(quota) is not int or quota < 1:
+        refuse('invalid quota')
+    if type(files) is not int or files < 1:
+        refuse('invalid files')
+    kind = 'share' if share else 'private'
+    with Spool(path, kind) as spool:
+        with Locked(spool):
+            summary = _retain(spool, keep_hour, quota, files)
+        # The staging sweep runs after the spool lock is released: with TMPDIR inside the
+        # spool the two directories are the same, and a second flock on another descriptor
+        # of that directory would deadlock (the spool pass already swept it).
+        if stage_dir and (os.path.normcase(os.path.abspath(stage_dir))
+                          != os.path.normcase(spool.path)):
+            summary['removed'] += sweep_stages(stage_dir)
+    return {'ok': True, 'kept': summary['kept'], 'files': summary['files'],
+            'bytes': summary['bytes'], 'removed': summary['removed'],
+            'orphans': summary['orphans']}
+
+
+# ------------------------------------------------------------------- share copy
+def _share_reason(exc):
+    if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+        return 'missing'
+    if getattr(exc, 'errno', None) == errno.ENOTDIR:
+        # POSIX hits this when the destination is a plain file, not a directory.
+        return 'missing'
+    if isinstance(exc, PermissionError):
+        return 'perm'
+    if getattr(exc, 'errno', None) in (errno.ENOSPC, getattr(errno, 'EDQUOT', -1),
+                                       errno.EFBIG):
+        return 'no-space'
+    return 'perm'
+
+
+def _write_all(fd, chunk):
+    view = chunk
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno.ENOSPC, 'short copy write')
+        view = view[written:]
+
+
+def _copy_share(share, source, name):
+    try:
+        source_fd = os.open(source, os.O_RDONLY | getattr(os, 'O_BINARY', 0)
+                            | getattr(os, 'O_NONBLOCK', 0)
+                            | (os.O_NOFOLLOW if POSIX else 0))
+    except FileNotFoundError:
+        raise ShareRefused('missing')
+    except PermissionError:
+        raise ShareRefused('perm')
+    temporary = '.part-' + secrets.token_hex(16)
+    target_fd = None
+    try:
+        source_st = os.fstat(source_fd)
+        if (not stat.S_ISREG(source_st.st_mode) or source_st.st_uid != EUID
+                or source_st.st_nlink != 1 or source_st.st_size <= 0
+                or source_st.st_size > CREATION_MAXIMUM):
+            raise ShareRefused('missing')
+        try:
+            target_fd = share.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            if POSIX:
+                os.fchmod(target_fd, 0o600)
+            copied = 0
+            while copied < source_st.st_size:
+                chunk = os.read(source_fd, min(COPY_CHUNK, source_st.st_size - copied))
+                if not chunk:
+                    raise OSError(errno.EIO, 'short source read')
+                _write_all(target_fd, chunk)
+                copied += len(chunk)
+            if copied != source_st.st_size or os.fstat(target_fd).st_size != source_st.st_size:
+                raise OSError(errno.ENOSPC, 'short copy')
+            os.fsync(target_fd)
+            os.close(target_fd)
+            target_fd = None
+            share.replace(temporary, name)
+            try:
+                if POSIX:
+                    os.utime(name, ns=(source_st.st_mtime_ns, source_st.st_mtime_ns),
+                             dir_fd=share.fd, follow_symlinks=False)
+                else:
+                    os.utime(os.path.join(share.path, name),
+                             ns=(source_st.st_mtime_ns, source_st.st_mtime_ns))
+            except OSError:
+                _unlink(share, name)
+                raise ShareRefused('perm')
+        except ShareRefused:
+            raise
+        except PermissionError:
+            raise ShareRefused('perm')
+        except OSError as exc:
+            raise ShareRefused(_share_reason(exc))
+    finally:
+        os.close(source_fd)
+        if target_fd is not None:
+            try:
+                os.close(target_fd)
+            except OSError:
+                pass
+        try:
+            share.unlink(temporary)
+        except OSError:
+            pass
+    return {'ok': True, 'name': name, 'bytes': source_st.st_size}
+
+
+def cmd_copy_share(source, destination, name):
+    """Copy one registered bundle into the published folder: temp -> fsync -> rename.
+
+    The reader over SMB sees either nothing or a complete 0600 file whose mtime is the
+    bundle's own, so the share and the spool expire together.
+    """
+    if not valid_name(name):
+        raise ShareRefused('missing')
+    try:
+        share = Spool(destination, 'share')
+    except NotPrivate as exc:
+        raise ShareRefused('mode' if 'writable' in str(exc) else 'missing')
+    except FileNotFoundError:
+        raise ShareRefused('missing')
+    except PermissionError:
+        raise ShareRefused('perm')
+    except Refused:
+        raise ShareRefused('missing')
+    except OSError as exc:
+        raise ShareRefused(_share_reason(exc))
+    with share:
+        try:
+            return _copy_share(share, os.path.abspath(source), name)
+        except FileNotFoundError:
+            raise ShareRefused('missing')
+        except PermissionError:
+            raise ShareRefused('perm')
+        except OSError as exc:
+            raise ShareRefused(_share_reason(exc))
+
+
+# ------------------------------------------------------------------- operations
 def cmd_init(path):
     # Pin and validate the parent before creation; do not chmod an existing directory.
     absolute = os.path.abspath(path)
@@ -14878,7 +15908,14 @@ def cmd_init(path):
     return {'ok': True, 'spool': path}
 
 
-def cmd_register(path, archive):
+def cmd_register(path, archive, quota=None, files=None, grace=None):
+    quota = QUOTA if quota is None else quota
+    files = FILES if files is None else files
+    grace = GRACE if grace is None else grace
+    if type(quota) is not int or quota < 1:
+        refuse('invalid quota')
+    if type(files) is not int or files < 1:
+        refuse('invalid files')
     absolute = os.path.abspath(archive)
     if os.path.normcase(os.path.dirname(absolute)) != os.path.normcase(os.path.abspath(path)):
         refuse('archive is not directly inside spool')
@@ -14899,11 +15936,74 @@ def cmd_register(path, archive):
             record = dict(schema=SCHEMA, name=name, dev=before.st_dev, ino=before.st_ino,
                           bytes=total, uid=before.st_uid, sha256=digest, created=int(time.time()),
                           created_ns=time.time_ns())
-            write_sidecar(spool, name, record)
-            spool.check()
         finally:
             os.close(fd)
-    return {'ok': True, 'name': name, 'bytes': total, 'sha256': digest}
+        # Quota is enforced here and only here: the archive is closed and hashed, and the
+        # whole measure -> evict -> accept step runs under one lock, so a parallel exporter
+        # cannot slip between "there is room" and "write the sidecar" (R08).
+        with Locked(spool):
+            archives, sidecars, _, _, _ = scan(spool)
+            if name not in archives:
+                refuse('bundle changed during registration')
+            _evict(spool, archives, sidecars, _order(spool, archives), name, grace,
+                   files, quota, time.time())
+            count, taken = measure(archives, sidecars)
+            if count > files:
+                _unlink_pair(spool, name)
+                refuse('архив не помещается: квота %d файлов, свежие архивы защищены %d с'
+                       % (files, grace))
+            if taken > quota:
+                _unlink_pair(spool, name)
+                refuse('архив %d байт не помещается в квоту %d' % (record['bytes'], quota))
+            try:
+                write_sidecar(spool, name, record)
+            except BaseException:
+                # ENOSPC here must not leave a registered-looking pair behind: the archive
+                # is removed as well (its sidecar temp is cleaned by write_sidecar).
+                _unlink_pair(spool, name)
+                raise
+            spool.check()
+    return {'ok': True, 'name': name, 'bytes': record['bytes'], 'sha256': digest}
+
+
+def _open_registered(spool, record):
+    """Open the archive and prove identity/size. None means 'candidate is gone'."""
+    try:
+        fd = spool.open(record['name'])
+    except (FileNotFoundError, Refused):
+        return None
+    try:
+        st = os.fstat(fd)
+        if (identity(st) != (record['dev'], record['ino']) or st.st_uid != record['uid']
+                or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1
+                or st.st_size != record['bytes'] or st.st_size <= 0):
+            os.close(fd)
+            return None
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _newest_valid(spool):
+    """Newest structurally valid registered bundle; an orphan sidecar is skipped."""
+    candidates = []
+    for entry in spool.names():
+        if not entry.endswith('.json'):
+            continue
+        base = entry[:-5]
+        if not valid_name(base):
+            continue
+        try:
+            candidates.append(read_sidecar(spool, base))
+        except (Refused, OSError):
+            continue
+    for record in sorted(candidates, key=lambda item: (item['created_ns'], item['name']),
+                         reverse=True):
+        fd = _open_registered(spool, record)
+        if fd is not None:
+            return record, fd
+    refuse('архива нет: no registered bundle')
 
 
 def cmd_get(path, name, maximum, ttl):
@@ -14914,23 +16014,16 @@ def cmd_get(path, name, maximum, ttl):
         refuse('invalid ttl')
     with Spool(path) as spool:
         if not name:
-            candidates = []
-            for entry in spool.names():
-                if entry.endswith('.json') and valid_name(entry[:-5]):
-                    try:
-                        record = read_sidecar(spool, entry[:-5])
-                        candidates.append((record['created_ns'], entry[:-5]))
-                    except (Refused, OSError):
-                        continue
-            if not candidates:
-                refuse('архива нет: no registered bundle')
-            name = max(candidates)[1]
-        if not valid_name(name):
-            refuse('not a diagnostic bundle name')
-        record = read_sidecar(spool, name)
-        if ttl is not None and record['created'] + ttl * 3600 < time.time():
-            refuse('bundle expired')
-        fd = spool.open(name)
+            record, fd = _newest_valid(spool)
+            name = record['name']
+        else:
+            if not valid_name(name):
+                refuse('not a diagnostic bundle name')
+            record = read_sidecar(spool, name)
+            try:
+                fd = spool.open(name)
+            except FileNotFoundError:
+                refuse('архива нет: файл удалён')
         try:
             before = os.fstat(fd)
             check_file(before, 'bundle')
@@ -14938,6 +16031,8 @@ def cmd_get(path, name, maximum, ttl):
                 refuse('bundle identity changed')
             if before.st_size != record['bytes']:
                 refuse('bundle size changed')
+            if ttl is not None and record['created'] + ttl * 3600 < time.time():
+                refuse('архив просрочен: старше %g ч — соберите новый' % ttl)
             if before.st_size > maximum:
                 refuse('bundle is %s bytes, over the %s-byte download cap' % (before.st_size, maximum))
             digest, total, payload = read_all(fd, before.st_size)
@@ -14954,31 +16049,81 @@ def cmd_get(path, name, maximum, ttl):
             os.close(fd)
 
 
+def _option_uint(text, what, minimum=1):
+    if not isinstance(text, str) or not text.isdigit():
+        refuse('invalid ' + what)
+    value = int(text)
+    if value < minimum:
+        refuse('invalid ' + what)
+    return value
+
+
+def _options(pairs, allowed):
+    values = {}
+    if len(pairs) % 2:
+        refuse('invalid options')
+    for key, value in zip(pairs[::2], pairs[1::2]):
+        if key not in allowed:
+            refuse('unknown option')
+        values[key] = value
+    return values
+
+
 def cli(args):
     if len(args) == 2 and args[0] == 'init':
         return cmd_init(args[1])
-    if len(args) == 3 and args[0] == 'register':
-        return cmd_register(args[1], args[2])
-    if len(args) >= 3 and args[0] == 'get':
-        maximum, ttl = MAXIMUM, 24.0
-        options = args[3:]
-        if len(options) % 2:
-            refuse('invalid options')
-        for key, value in zip(options[::2], options[1::2]):
-            if key == '--max':
-                maximum = int(value)
-            elif key == '--ttl':
-                ttl = float(value)
+    if len(args) >= 3 and args[0] == 'register':
+        values = _options(args[3:], ('--quota', '--files'))
+        quota = _option_uint(values['--quota'], 'quota') if '--quota' in values else None
+        files = _option_uint(values['--files'], 'files') if '--files' in values else None
+        return cmd_register(args[1], args[2], quota, files)
+    if len(args) >= 2 and args[0] == 'retain':
+        options = list(args[2:])
+        keep_hour, quota, files, share, stage_dir = None, None, None, False, None
+        index = 0
+        while index < len(options):
+            key = options[index]
+            if key == '--share':
+                share = True
+                index += 1
+                continue
+            if index + 1 >= len(options):
+                refuse('invalid options')
+            value = options[index + 1]
+            if key == '--keep-h':
+                keep_hour = _option_uint(value, 'keep hours', 0)
+            elif key == '--quota':
+                quota = _option_uint(value, 'quota')
+            elif key == '--files':
+                files = _option_uint(value, 'files')
+            elif key == '--stage-dir':
+                stage_dir = value
             else:
                 refuse('unknown option')
+            index += 2
+        return cmd_retain(args[1], keep_hour, quota, files, share, stage_dir)
+    if len(args) == 4 and args[0] == 'copy-share':
+        return cmd_copy_share(args[1], args[2], args[3])
+    if len(args) >= 3 and args[0] == 'get':
+        maximum, ttl = MAXIMUM, 24.0
+        values = _options(args[3:], ('--max', '--ttl'))
+        if '--max' in values:
+            maximum = int(values['--max'])
+        if '--ttl' in values:
+            ttl = float(values['--ttl'])
         return cmd_get(args[1], args[2], maximum, ttl)
-    refuse('usage: init spool | register spool path | get spool name [--max N] [--ttl H]')
+    refuse('usage: init spool | register spool path [--quota N] [--files N] '
+           '| get spool name [--max N] [--ttl H] '
+           '| retain dir [--keep-h H] [--quota N] [--files N] [--share] [--stage-dir D] '
+           '| copy-share src dir name')
 
 
 def main():
     try:
         answer = cli(sys.argv[1:])
         rc = 0
+    except ShareRefused as exc:
+        answer, rc = {'ok': False, 'reason': exc.reason}, 1
     except (Refused, OSError, ValueError) as exc:
         answer, rc = {'ok': False, 'error': str(exc)}, 1
     sys.stdout.buffer.write((json.dumps(answer, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8'))
@@ -15161,7 +16306,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-diag-spool.py",
           "source": "assets/geomask-diag-spool.py",
           "mode": "0755",
-          "sha256": "03dc6a10c3ce82e2cca18f596c9a7bbf84cfd818d6f919760092cc56f29d6d71"
+          "sha256": "65f64a6cca8de6cbca46c4a868e6dab322530609818aa05018303d95aaf6888a"
         },
         {
           "path": "/usr/lib/geomask/geomask-dnsguard.sh",
@@ -15185,7 +16330,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-lock.sh",
           "source": "assets/geomask-lock.sh",
           "mode": "0644",
-          "sha256": "a0ff86b94376fe893cbdea35ec4c4f87473e386c9e0442e5a9cfc554fb635bbb"
+          "sha256": "e2c6843e8f2534129367aedc468e17ec0584fdd4dc91b95282e74f58a4117e1b"
         },
         {
           "path": "/usr/lib/geomask/geomask-node-audit.py",
@@ -15197,7 +16342,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "deee61c9d0547854b726b32ca52559fb710ebb3da22c8fd007c8394192ae8b06"
+          "sha256": "df56e3299be4008f423f99316084a3d8282513ad030851393d17984d99f65e46"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
@@ -15247,7 +16392,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-dnscheck.sh",
           "source": "assets/geomask-dnscheck.sh",
           "mode": "0755",
-          "sha256": "ed78c6663368aa1d7154a8ce2afbbceb29cd8d863f03623738a4b32e707d1b70"
+          "sha256": "139d87177332772c7f131f0ef065a5e23bc456d6205b27e37750f4875bd046ea"
         },
         {
           "path": "/usr/bin/geomask-morning-check.sh",
@@ -15297,7 +16442,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "610956d06d8c58608fd04522273ecfc245f50eb423c1f65182c642aefe27a4dd"
+          "sha256": "1ddaec27a7df0e2d6e84b3d72179041287ffb881e89e767bd1ba2a37538113de"
         }
       ]
     },
@@ -15313,7 +16458,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "fcaa8dab238e2a1ce34ef31404b121ee8207d46f07378005d1fadded236a88fb"
+          "sha256": "52d0c2db2e0fe8a24241fee6772417cc363d3e59a1b002202523f8a5bee2b060"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -36998,8 +38143,14 @@ ASSET_EOF
 #!/bin/sh
 # geomask-dnscheck.sh - read-only DNS safety audit (geomask v1.22.1+).
 #
-#   geomask-dnscheck.sh            full audit (probes the network, ~20 s)
-#   geomask-dnscheck.sh --quick    configuration only, no outbound probes
+#   geomask-dnscheck.sh            full audit (probes the network)
+#   geomask-dnscheck.sh --quick    configuration only: NO network calls at all
+#
+# Exit contract (R10a):
+#   0  every check this mode performs ran and passed (warnings do not fail the audit)
+#   1  at least one performed check found a problem (FAIL)
+#   2  UNKNOWN: a check could not be performed (no nslookup, no usable LAN address,
+#      no python3, no mihomo config, an unreadable /etc/hosts) - never a silent OK
 #
 # It exists because of two incidents seen on routers of this kind:
 #   1) a DoH proxy and an ad blocker both force-redirect port 53, the proxy bootstraps its
@@ -37008,27 +38159,99 @@ ASSET_EOF
 #   2) a "bypass" address pinned into /etc/hosts goes stale, so every client keeps dialling
 #      a dead IP and the site breaks even though the tunnel itself is fine.
 # Nothing here changes anything: it only reports.
+#
+# R10a fixes:
+#   * the nslookup exit code is checked, and the answer is read only AFTER `Name:` - the
+#     server `Address:` line is never an answer; both `Address:` and BusyBox `Address N:`
+#     shapes are understood;
+#   * the LAN resolver address comes from UCI `network.lan.device`/`ifname` + `ip -4 addr
+#     show` (fallback `br-lan`), never from a hardcoded 192.168.0.1;
+#   * `--quick` really makes no outbound probe (the old code still ran two nslookups);
+#   * a missing python3 or a missing /etc/mihomo/config.yaml is UNKNOWN (rc 2), not "working".
+#
+# Environment overrides exist for the Windows-hosted tests only; the router never sets them:
+#   GM_MIHOMO_CONFIG  mihomo config (default /etc/mihomo/config.yaml)
+#   GM_HOSTS          hosts file (default /etc/hosts)
+#   GM_NET_DIR        tunnel sysfs directory (default /sys/class/net)
+#   GM_RULESET_DIR    mihomo ruleset directory (default /etc/mihomo/ruleset)
+#   GM_PYTHON         python3 binary (default python3)
 QUICK=${1:-}
-FAIL=0; WARN=0
+FAIL=0; WARN=0; UNKNOWN=0
 ok()   { printf '  OK    %s\n' "$1"; }
 warn() { printf '  WARN  %s\n' "$1"; WARN=$((WARN+1)); }
 bad()  { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL+1)); }
+unknown() { printf '  UNKNOWN  %s\n' "$1"; UNKNOWN=$((UNKNOWN+1)); }
+skip() { printf '  SKIP  %s\n' "$1"; }
+
+MIHOMO_CONF=${GM_MIHOMO_CONFIG:-/etc/mihomo/config.yaml}
+HOSTS_FILE=${GM_HOSTS:-/etc/hosts}
+NET_DIR=${GM_NET_DIR:-/sys/class/net}
+PYTHON=${GM_PYTHON:-python3}
 
 echo "=== DNS safety check  $(date '+%F %T') ==="
 
 echo
 echo "--- 1) is the resolver actually alive ---"
-ANS=$(nslookup yandex.ru 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2; exit}')
-[ -n "$ANS" ] && ok "dnsmasq answers on 127.0.0.1:53 ($ANS)" \
-  || bad "dnsmasq does NOT answer on 127.0.0.1:53 - LAN clients cannot resolve anything"
-ANS2=$(nslookup yandex.ru 192.168.0.1 2>/dev/null | awk '/^Address: /{print $2; exit}')
-[ -n "$ANS2" ] && ok "answers on the LAN address too" || bad "does not answer on 192.168.0.1:53"
-pgrep -f dnsmasq >/dev/null 2>&1 || bad "no dnsmasq process at all"
+# The answer is a line AFTER `Name:`. The first `Address:` line of nslookup output is the
+# server that was asked; taking it made a SERVFAIL look like a working resolver (G01).
+resolver_answer() { # <server>; prints the answer address, empty when the exchange failed
+  _out=$(nslookup yandex.ru "$1" 2>/dev/null)
+  _rc=$?
+  [ "$_rc" -eq 0 ] || return 1
+  printf '%s\n' "$_out" | awk '
+    /^Name:/ { seen = 1; next }
+    seen && /^Address[ \t]*[0-9]*:/ {
+      sub(/^Address[ \t]*[0-9]*:[ \t]*/, "")
+      if ($1 != "") { print $1; exit }
+    }'
+}
+check_resolver() { # <server> <label>
+  _ans=$(resolver_answer "$1")
+  if [ -n "$_ans" ]; then
+    ok "dnsmasq answers on $2 ($_ans)"
+  else
+    bad "dnsmasq does NOT answer on $2 - LAN clients cannot resolve anything"
+  fi
+}
+if [ "$QUICK" = "--quick" ]; then
+  skip "resolver liveness probes (--quick makes no network calls)"
+else
+  if ! command -v nslookup >/dev/null 2>&1; then
+    unknown "nslookup is missing - the resolver cannot be probed"
+  else
+    check_resolver 127.0.0.1 "127.0.0.1:53"
+    LAN_DEV=$(uci get network.lan.device 2>/dev/null)
+    [ -n "$LAN_DEV" ] || LAN_DEV=$(uci get network.lan.ifname 2>/dev/null)
+    for _lan in $LAN_DEV; do LAN_DEV=$_lan; break; done
+    [ -n "$LAN_DEV" ] || LAN_DEV=br-lan
+    LAN_IP=''
+    if command -v ip >/dev/null 2>&1; then
+      LAN_IP=$(ip -4 addr show dev "$LAN_DEV" 2>/dev/null \
+        | awk '/^[[:space:]]*inet /{sub(/\/.*/, "", $2); print $2; exit}')
+    fi
+    if [ -n "$LAN_IP" ]; then
+      check_resolver "$LAN_IP" "$LAN_IP:53 (LAN $LAN_DEV)"
+    else
+      unknown "cannot determine the LAN address of $LAN_DEV via UCI/ip - the LAN probe did not run"
+    fi
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    if ! pgrep -f dnsmasq >/dev/null 2>&1; then bad "no dnsmasq process at all"; fi
+  else
+    unknown "pgrep is missing - cannot check that dnsmasq runs"
+  fi
+fi
 
 echo
 echo "--- 2) who owns port 53, and is anything redirected into a loop ---"
-LIST=$(netstat -lntu 2>/dev/null | grep -cE ':53[[:space:]]')
-[ "$LIST" -gt 0 ] && ok "port 53 has a listener ($LIST socket(s))" || bad "nothing listens on :53"
+if ! command -v netstat >/dev/null 2>&1; then
+  unknown "netstat is missing - cannot check who listens on :53"
+else
+  LIST=$(netstat -lntu 2>/dev/null | grep -cE ':53[[:space:]]')
+  [ -n "$LIST" ] || LIST=0
+  if [ "$LIST" -gt 0 ]; then ok "port 53 has a listener ($LIST socket(s))"
+  else bad "nothing listens on :53"; fi
+fi
 DOH_PORT=$(uci get https-dns-proxy.@https-dns-proxy[0].listen_port 2>/dev/null)
 [ -n "$DOH_PORT" ] && echo "  https-dns-proxy listens on :$DOH_PORT"
 # the loop shape: a redirect of :53 that lands on the DoH proxy, while the proxy resolves its
@@ -37048,9 +38271,17 @@ else
   ok "no package forces DNS redirection"
 fi
 if [ -n "$DOH_PORT" ]; then
-  REDIR=$(nft list ruleset 2>/dev/null | grep -E 'dport 53' | grep -c "redirect to :$DOH_PORT")
-  [ "$REDIR" -gt 0 ] && warn "port 53 is redirected to the DoH proxy :$DOH_PORT - if its bootstrap also uses :53, DNS dies" \
-    || ok "no :53 -> :$DOH_PORT redirect (proxy is not in the resolution path)"
+  if ! command -v nft >/dev/null 2>&1; then
+    unknown "nft is missing - cannot check the :53 redirect into https-dns-proxy"
+  else
+    REDIR=$(nft list ruleset 2>/dev/null | grep -E 'dport 53' | grep -c "redirect to :$DOH_PORT")
+    [ -n "$REDIR" ] || REDIR=0
+    if [ "$REDIR" -gt 0 ]; then
+      warn "port 53 is redirected to the DoH proxy :$DOH_PORT - if its bootstrap also uses :53, DNS dies"
+    else
+      ok "no :53 -> :$DOH_PORT redirect (proxy is not in the resolution path)"
+    fi
+  fi
 fi
 
 echo
@@ -37059,12 +38290,16 @@ BOOT=$(uci get https-dns-proxy.@https-dns-proxy[0].bootstrap_dns 2>/dev/null)
 if [ -n "$BOOT" ]; then
   echo "  bootstrap_dns = $BOOT"
   if [ "$QUICK" = "--quick" ]; then
-    echo "  skipped reachability probe (--quick)"
+    skip "bootstrap reachability probe (--quick)"
   else
     FIRST=$(echo "$BOOT" | cut -d, -f1 | tr -d ' ')
     case "$FIRST" in
       *[a-zA-Z]*) warn "bootstrap is a hostname ($FIRST) - it needs working DNS to get working DNS" ;;
-      *) R=$(python3 - "$FIRST" <<'PY'
+      *)
+        if ! command -v "$PYTHON" >/dev/null 2>&1; then
+          unknown "python3 is missing - the bootstrap UDP:53 probe did not run"
+        else
+          R=$("$PYTHON" - "$FIRST" <<'PY'
 import socket, sys
 ip=sys.argv[1]
 try:
@@ -37076,9 +38311,17 @@ except Exception:
     print('dead')
 PY
 )
-         [ "$R" = "ok" ] && ok "bootstrap $FIRST answers over UDP:53" \
-           || warn "bootstrap $FIRST does NOT answer over UDP:53 - if the proxy ever takes over DNS, clients will hang"
-         ;;
+          _py_rc=$?
+          R=$(printf '%s' "$R" | tr -d '\r')
+          if [ "$_py_rc" -ne 0 ]; then
+            unknown "the bootstrap probe did not return a verdict (python3 rc=$_py_rc)"
+          elif [ "$R" = "ok" ]; then
+            ok "bootstrap $FIRST answers over UDP:53"
+          else
+            warn "bootstrap $FIRST does NOT answer over UDP:53 - if the proxy ever takes over DNS, clients will hang"
+          fi
+        fi
+        ;;
     esac
   fi
 else
@@ -37093,20 +38336,29 @@ fi
 
 echo
 echo "--- 4) stale bypass pins in /etc/hosts (the Telegram case) ---"
-if [ "$QUICK" = "--quick" ]; then
-  grep -cE '^[0-9]' /etc/hosts | sed 's/^/  /' | sed 's/  /  pinned address lines: /'
-  echo "  skipped liveness probe (--quick)"
+if [ ! -r "$HOSTS_FILE" ]; then
+  unknown "$HOSTS_FILE is unreadable - the pinned-address check did not run"
+elif [ "$QUICK" = "--quick" ]; then
+  PINS=$(grep -cE '^[0-9]' "$HOSTS_FILE" 2>/dev/null)
+  [ -n "$PINS" ] || PINS=0
+  echo "  pinned address lines: $PINS"
+  skip "pin liveness probe (--quick)"
 else
-python3 - <<'PY'
-import socket, os, re, subprocess
+  if ! command -v "$PYTHON" >/dev/null 2>&1; then
+    unknown "python3 is missing - the /etc/hosts pin liveness check did not run"
+  else
+    PY_OUT=$("$PYTHON" - "$HOSTS_FILE" <<'PY'
+import socket, os, re, subprocess, sys
+hosts_file = sys.argv[1]
+ruleset_dir = os.environ.get('GM_RULESET_DIR', '/etc/mihomo/ruleset')
 # A pin whose names are routed through a subscription cannot be judged from the router: the
 # whole point of those addresses is that a foreign exit reaches them. Probing them directly
 # produced a false alarm for the AI pins (45.155.204.190), so tunneled names are now tested
 # through the local proxy chain instead, and only non-tunneled names are judged directly.
 tunneled=set()
-for f in os.listdir('/etc/mihomo/ruleset') if os.path.isdir('/etc/mihomo/ruleset') else []:
+for f in os.listdir(ruleset_dir) if os.path.isdir(ruleset_dir) else []:
     if not f.endswith('.yaml'): continue
-    try: txt=open('/etc/mihomo/ruleset/'+f, encoding='utf-8', errors='replace').read()
+    try: txt=open(os.path.join(ruleset_dir, f), encoding='utf-8', errors='replace').read()
     except Exception: continue
     for m in re.finditer(r'DOMAIN-SUFFIX,\s*([a-z0-9.\-]+)', txt):
         tunneled.add(m.group(1).lower())
@@ -37128,7 +38380,7 @@ def via_chain(host):
     return False
 dead_direct=[]; dead_chain=[]; alive=0; tun=0
 seen=set()
-for ln in open('/etc/hosts', encoding='utf-8', errors='replace'):
+for ln in open(hosts_file, encoding='utf-8', errors='replace'):
     ln=ln.strip()
     if not ln or ln.startswith('#'): continue
     p=ln.split()
@@ -37158,22 +38410,51 @@ for ip, host, n in dead_direct[:10]:
 if not dead_chain and not dead_direct:
     print('  all pins reachable (directly, or through the lane that serves them)')
 PY
+)
+    _py_rc=$?
+    PY_OUT=$(printf '%s\n' "$PY_OUT" | tr -d '\r')
+    if [ "$_py_rc" -ne 0 ]; then
+      unknown "the pin liveness check did not return a verdict (python3 rc=$_py_rc)"
+      printf '%s\n' "$PY_OUT"
+    else
+      printf '%s\n' "$PY_OUT"
+      _dead=$(printf '%s\n' "$PY_OUT" | grep -c '^  WARN')
+      case "$_dead" in ''|*[!0-9]*) _dead=0 ;; esac
+      WARN=$((WARN + _dead))
+    fi
+  fi
 fi
 
 echo
 echo "--- 5) the tunnels must not be asked to resolve themselves ---"
-grep -qE '^dns:' /etc/mihomo/config.yaml 2>/dev/null \
-  && warn "mihomo has its own dns: section - verify it does not point at the redirected port" \
-  || ok "mihomo uses the system resolver (no own dns section to loop through)"
+if [ ! -e "$MIHOMO_CONF" ]; then
+  unknown "no $MIHOMO_CONF - cannot verify which resolver mihomo uses"
+elif [ ! -r "$MIHOMO_CONF" ]; then
+  unknown "$MIHOMO_CONF is unreadable - cannot verify which resolver mihomo uses"
+elif grep -qE '^dns:' "$MIHOMO_CONF" 2>/dev/null; then
+  warn "mihomo has its own dns: section - verify it does not point at the redirected port"
+else
+  ok "mihomo uses the system resolver (no own dns section to loop through)"
+fi
 for t in Mihomo AI VPN-noP2P; do
-  [ -e "/sys/class/net/$t" ] && echo "  tunnel $t: present" || warn "tunnel $t missing"
+  if [ -e "$NET_DIR/$t" ]; then echo "  tunnel $t: present"; else warn "tunnel $t missing"; fi
 done
 
 echo
-if [ $FAIL -eq 0 ] && [ $WARN -eq 0 ]; then echo "=== RESULT: DNS looks healthy ==="
-elif [ $FAIL -eq 0 ]; then echo "=== RESULT: working, but $WARN warning(s) above are worth a look ==="
-else echo "=== RESULT: $FAIL problem(s) - DNS is likely broken for clients ==="; fi
-exit $FAIL
+if [ "$FAIL" -gt 0 ]; then
+  echo "=== RESULT: $FAIL problem(s) - DNS is likely broken for clients ==="
+  exit 1
+fi
+if [ "$UNKNOWN" -gt 0 ]; then
+  echo "=== RESULT: UNKNOWN - $UNKNOWN check(s) could not be performed (not a silent OK) ==="
+  exit 2
+fi
+if [ "$WARN" -gt 0 ]; then
+  echo "=== RESULT: working, but $WARN warning(s) above are worth a look ==="
+else
+  echo "=== RESULT: DNS looks healthy ==="
+fi
+exit 0
 ASSET_EOF
   # v1.21.0: extra tunnel lane - gives MagiTrickle's interface dropdown a real netdev that
   # always exits through the restricted subscription, so a list can be pointed at it directly.
@@ -37950,13 +39231,35 @@ ASSET_EOF
 # (C) Safety: table 101 must keep "default dev AI".
 # Logs actions only via logger -t geomask-guard (silent when healthy, cron
 # runs every 5 min - no syslog spam). Read: logread | grep geomask-guard
+#
+# R10a contract of the WHOLE entrypoint (not only the console block):
+#   0   healthy, or every needed repair succeeded
+#   1   degraded / unrepaired: a mutation failed, or the AI/console tun is down
+#   2   input or lock unknown: no readable device list, or no lock primitive
+#   75  the console lane lock is busy (another writer owns the lane; retry later)
+# A missing /etc/geo-devices.list is NOT an early exit any more: per-device state is
+# reported unknown and the independent blocks (drain, base rules, table 101, console)
+# still run. A list that exists but is not a readable regular file is fail-closed (2).
 GUARD_VERSION="1.31.0"
 
 log() { logger -t geomask-guard "$*"; }
 
-DEVS=/etc/geo-devices.list
+RC_DEGRADED=0
+RC_INPUT_UNKNOWN=0
+RC_CONSOLE_BUSY=0
+
+DEVS=${GM_DEVICES:-/etc/geo-devices.list}
 CHAIN="ip mangle PREROUTING"
-[ -f "$DEVS" ] || { log "SKIP: $DEVS missing"; exit 0; }
+DEV_STATE=ok
+if [ ! -e "$DEVS" ]; then
+  DEV_STATE=missing
+  RC_INPUT_UNKNOWN=1
+  log "UNKNOWN: $DEVS is missing - per-device state is unknown (dev_add or an empty list will fix it)"
+elif [ ! -f "$DEVS" ] || [ ! -r "$DEVS" ]; then
+  # Fail closed: without the list we cannot tell our exclusions from somebody else's.
+  log "FAIL: $DEVS is not a readable regular file - refusing to run without the device list"
+  exit 2
+fi
 
 # ---------- (0) R05 route queue drain ----------
 # The ifup hotplug only queues `pending-<table>`; its detached worker may find the route lock
@@ -37971,111 +39274,161 @@ if [ -r "$CROUTES" ]; then
     . "$CROUTES" && gm_route_drain ) >/dev/null 2>&1 || true
 fi
 
-IPS=$(awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && ($2=="ai" || $2=="bypass") {print $1}' "$DEVS" | tr '\n' ' ')
+IPS=''
+if [ "$DEV_STATE" = "ok" ]; then
+  IPS=$(awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && ($2=="ai" || $2=="bypass") {print $1}' "$DEVS" | tr '\n' ' ')
+fi
 NEED_FLUSH=""
 
 # ---------- (A) nft exclusion ----------
-OUT=$(nft -a list chain $CHAIN 2>/dev/null)
-if [ -z "$OUT" ]; then
-  log "FAIL: cannot list $CHAIN"
-else
-  FIRST_MT=$(printf '%s\n' "$OUT" | grep -n 'jump MT_' | head -1 | cut -d: -f1)
-  for ip in $IPS; do
-    OURS=$(printf '%s\n' "$OUT" | grep -n "ip saddr $ip return" | head -1)
-    if [ -z "$OURS" ]; then
-      if nft insert rule $CHAIN ip saddr "$ip" return comment "geomask-excl" 2>/dev/null; then
-        log "excl ADD $ip"
-        NEED_FLUSH="1"
-      else
-        log "FAIL excl add $ip"
-      fi
-    else
-      OUR_LINE=${OURS%%:*}
-      if [ -n "$FIRST_MT" ] && [ "$OUR_LINE" -gt "$FIRST_MT" ]; then
-        # our rule slid below the MT_ jumps (magitrickle re-seated) - rebuild at head
-        printf '%s\n' "$OUT" | grep "ip saddr $ip return" | sed -n 's/.*handle \([0-9][0-9]*\).*/\1/p' | while read -r H; do
-          nft delete rule $CHAIN handle "$H" 2>/dev/null
-        done
+# Per-device state needs the list: with a missing list nothing is added or deleted here, so an
+# empty IPS can never be mistaken for "no devices are excluded".
+if [ "$DEV_STATE" = "ok" ]; then
+  OUT=$(nft -a list chain $CHAIN 2>/dev/null)
+  if [ -z "$OUT" ]; then
+    RC_DEGRADED=1
+    log "FAIL: cannot list $CHAIN"
+  else
+    FIRST_MT=$(printf '%s\n' "$OUT" | grep -n 'jump MT_' | head -1 | cut -d: -f1)
+    for ip in $IPS; do
+      OURS=$(printf '%s\n' "$OUT" | grep -n "ip saddr $ip return" | head -1)
+      if [ -z "$OURS" ]; then
         if nft insert rule $CHAIN ip saddr "$ip" return comment "geomask-excl" 2>/dev/null; then
-          log "excl RESEAT $ip (was below MT_ jumps)"
+          log "excl ADD $ip"
           NEED_FLUSH="1"
         else
-          log "FAIL excl reseat $ip"
+          RC_DEGRADED=1
+          log "FAIL excl add $ip"
+        fi
+      else
+        OUR_LINE=${OURS%%:*}
+        if [ -n "$FIRST_MT" ] && [ "$OUR_LINE" -gt "$FIRST_MT" ]; then
+          # our rule slid below the MT_ jumps (magitrickle re-seated) - rebuild at head
+          for H in $(printf '%s\n' "$OUT" | grep "ip saddr $ip return" | sed -n 's/.*handle \([0-9][0-9]*\).*/\1/p'); do
+            nft delete rule $CHAIN handle "$H" 2>/dev/null \
+              || { RC_DEGRADED=1; log "FAIL excl delete handle $H"; }
+          done
+          if nft insert rule $CHAIN ip saddr "$ip" return comment "geomask-excl" 2>/dev/null; then
+            log "excl RESEAT $ip (was below MT_ jumps)"
+            NEED_FLUSH="1"
+          else
+            RC_DEGRADED=1
+            log "FAIL excl reseat $ip"
+          fi
         fi
       fi
-    fi
-  done
-  # drop exclusions for devices no longer in the list (mode changed / removed)
-  STALE=$(printf '%s\n' "$OUT" | grep 'geomask-excl')
-  if [ -n "$STALE" ]; then
-    OLDIFS2=$IFS
-    IFS='
-'
-    for line in $STALE; do
-      rip=$(printf '%s' "$line" | awk '{print $3}')
-      case " $IPS " in
-        *" $rip "*) ;;
-        *)
-          h=$(printf '%s' "$line" | sed -n 's/.*handle \([0-9][0-9]*\).*/\1/p')
-          if [ -n "$h" ] && nft delete rule $CHAIN handle "$h" 2>/dev/null; then
-            log "excl DEL stale $rip"
-            NEED_FLUSH="1"
-          fi
-          ;;
-      esac
     done
-    IFS=$OLDIFS2
+    # drop exclusions for devices no longer in the list (mode changed / removed)
+    STALE=$(printf '%s\n' "$OUT" | grep 'geomask-excl')
+    if [ -n "$STALE" ]; then
+      OLDIFS2=$IFS
+      IFS='
+'
+      for line in $STALE; do
+        rip=$(printf '%s' "$line" | awk '{print $3}')
+        case " $IPS " in
+          *" $rip "*) ;;
+          *)
+            h=$(printf '%s' "$line" | sed -n 's/.*handle \([0-9][0-9]*\).*/\1/p')
+            if [ -n "$h" ]; then
+              if nft delete rule $CHAIN handle "$h" 2>/dev/null; then
+                log "excl DEL stale $rip"
+                NEED_FLUSH="1"
+              else
+                RC_DEGRADED=1
+                log "FAIL excl del stale $rip"
+              fi
+            fi
+            ;;
+        esac
+      done
+      IFS=$OLDIFS2
+    fi
   fi
-fi
 
-# ---------- (A2) mark-clear table (survives PREROUTING rebuilds) ----------
-# Own table is invisible to magitrickle (ip mangle) and fw4 (inet fw4).
-# Hook at -149 = right after magitrickle's mangle (-150), before geomask
-# AI-DNS mark 0x64 (-110). Clears ONLY 0x4d61xxxx marks - zapret/aidns marks
-# are untouched.
-MC_T=geomask_excl
-nft list table ip "$MC_T" >/dev/null 2>&1 || nft add table ip "$MC_T" 2>/dev/null
-if ! nft list chain ip "$MC_T" prerouting >/dev/null 2>&1; then
-  nft add chain ip "$MC_T" prerouting '{ type filter hook prerouting priority -149; policy accept; }' 2>/dev/null \
-    || log "FAIL mclear chain add"
+  # ---------- (A2) mark-clear table (survives PREROUTING rebuilds) ----------
+  # Own table is invisible to magitrickle (ip mangle) and fw4 (inet fw4).
+  # Hook at -149 = right after magitrickle's mangle (-150), before geomask
+  # AI-DNS mark 0x64 (-110). Clears ONLY 0x4d61xxxx marks - zapret/aidns marks
+  # are untouched.
+  MC_T=geomask_excl
+  if ! nft list table ip "$MC_T" >/dev/null 2>&1; then
+    nft add table ip "$MC_T" 2>/dev/null \
+      || { RC_DEGRADED=1; log "FAIL mclear table add"; }
+  fi
+  if ! nft list chain ip "$MC_T" prerouting >/dev/null 2>&1; then
+    nft add chain ip "$MC_T" prerouting '{ type filter hook prerouting priority -149; policy accept; }' 2>/dev/null \
+      || { RC_DEGRADED=1; log "FAIL mclear chain add"; }
+  fi
+  if ! nft list set ip "$MC_T" excl_ips >/dev/null 2>&1; then
+    nft add set ip "$MC_T" excl_ips '{ type ipv4_addr; }' 2>/dev/null \
+      || { RC_DEGRADED=1; log "FAIL mclear set add"; }
+  fi
+  if ! nft list chain ip "$MC_T" prerouting 2>/dev/null | grep -q '@excl_ips'; then
+    if nft add rule ip "$MC_T" prerouting ip saddr @excl_ips \
+        meta mark and 0xffff0000 eq 0x4d610000 counter meta mark set 0 \
+        comment "geomask-mclear" 2>/dev/null; then
+      log "mclear rule installed"
+    else
+      RC_DEGRADED=1
+      log "FAIL mclear rule add"
+    fi
+  fi
+  MC_CUR=$(nft list set ip "$MC_T" excl_ips 2>/dev/null | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | tr '\n' ' ')
+  for ip in $IPS; do
+    case " $MC_CUR " in
+      *" $ip "*) ;;
+      *)
+        if nft add element ip "$MC_T" excl_ips "{ $ip }" 2>/dev/null; then
+          log "mclear ADD $ip"
+        else
+          RC_DEGRADED=1
+          log "FAIL mclear add $ip"
+        fi
+        ;;
+    esac
+  done
+  for rip in $MC_CUR; do
+    case " $IPS " in
+      *" $rip "*) ;;
+      *)
+        if nft delete element ip "$MC_T" excl_ips "{ $rip }" 2>/dev/null; then
+          log "mclear DEL $rip"
+        else
+          RC_DEGRADED=1
+          log "FAIL mclear del $rip"
+        fi
+        ;;
+    esac
+  done
+else
+  log "skip per-device exclusions: no device list to trust"
 fi
-if ! nft list set ip "$MC_T" excl_ips >/dev/null 2>&1; then
-  nft add set ip "$MC_T" excl_ips '{ type ipv4_addr; }' 2>/dev/null || log "FAIL mclear set add"
-fi
-if ! nft list chain ip "$MC_T" prerouting 2>/dev/null | grep -q '@excl_ips'; then
-  nft add rule ip "$MC_T" prerouting ip saddr @excl_ips \
-      meta mark and 0xffff0000 eq 0x4d610000 counter meta mark set 0 \
-      comment "geomask-mclear" 2>/dev/null || log "FAIL mclear rule add"
-  log "mclear rule installed"
-fi
-MC_CUR=$(nft list set ip "$MC_T" excl_ips 2>/dev/null | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | tr '\n' ' ')
-for ip in $IPS; do
-  case " $MC_CUR " in
-    *" $ip "*) ;;
-    *) nft add element ip "$MC_T" excl_ips "{ $ip }" 2>/dev/null && log "mclear ADD $ip" ;;
-  esac
-done
-for rip in $MC_CUR; do
-  case " $IPS " in
-    *" $rip "*) ;;
-    *) nft delete element ip "$MC_T" excl_ips "{ $rip }" 2>/dev/null && log "mclear DEL $rip" ;;
-  esac
-done
 
 # ---------- (B) ip-rule watchdog ----------
-MT_MIN=$(ip rule show 2>/dev/null | grep 'fwmark 0x4d61' | awk -F: '{print $1}' | sort -n | head -1)
+# The LAN input device comes from UCI (what netifd/hotplug actually named the bridge), not a
+# hardcoded br-lan: on a system with br-lan.1 the old check re-seated the rules every 5 minutes.
+LAN_DEV=$(uci get network.lan.device 2>/dev/null)
+[ -n "$LAN_DEV" ] || LAN_DEV=$(uci get network.lan.ifname 2>/dev/null)
+for _gm_lan in $LAN_DEV; do LAN_DEV=$_gm_lan; break; done
+[ -n "$LAN_DEV" ] || LAN_DEV=br-lan
 
-CHECKLIST="iif br-lan ipproto icmp lookup main
+RULES_NOW=$(ip rule show 2>/dev/null)
+MT_MIN=$(printf '%s\n' "$RULES_NOW" | grep 'fwmark 0x4d61' | awk -F: '{print $1}' | sort -n | head -1)
+
+CHECKLIST="iif $LAN_DEV ipproto icmp lookup main
 fwmark 0x64 lookup 101"
-for ip in $IPS; do
-  mode=$(awk -v i="$ip" '$1==i {print $2}' "$DEVS")
-  case "$mode" in
-    ai) CHECKLIST="$CHECKLIST
+if [ "$DEV_STATE" = "ok" ]; then
+  for ip in $IPS; do
+    mode=$(awk -v i="$ip" '$1==i {print $2; exit}' "$DEVS")
+    case "$mode" in
+      ai) CHECKLIST="$CHECKLIST
 from $ip lookup 101" ;;
-    bypass) CHECKLIST="$CHECKLIST
+      bypass) CHECKLIST="$CHECKLIST
 from $ip lookup main" ;;
-  esac
-done
+    esac
+  done
+fi
 
 RULES_OK=1
 OLDIFS=$IFS
@@ -38083,7 +39436,7 @@ IFS='
 '
 for pat in $CHECKLIST; do
   [ -z "$pat" ] && continue
-  LINE=$(ip rule show | grep -F "$pat" | head -1)
+  LINE=$(printf '%s\n' "$RULES_NOW" | grep -F "$pat" | head -1)
   if [ -z "$LINE" ]; then RULES_OK=0; break; fi
   PREF=${LINE%%:*}
   case "$PREF" in
@@ -38099,35 +39452,56 @@ if [ "$RULES_OK" = "0" ]; then
   else
     BASE=19900
   fi
+  RESEAT_OK=1
   for ip in $IPS; do
-    mode=$(awk -v i="$ip" '$1==i {print $2}' "$DEVS")
+    mode=$(awk -v i="$ip" '$1==i {print $2; exit}' "$DEVS")
     case "$mode" in
       ai)
         while ip rule del from "$ip" lookup 101 2>/dev/null; do :; done
         while ip rule del from "$ip" lookup main 2>/dev/null; do :; done
-        ip rule add priority "$BASE" from "$ip" lookup 101
+        ip rule add priority "$BASE" from "$ip" lookup 101 2>/dev/null \
+          || { RESEAT_OK=0; RC_DEGRADED=1; log "FAIL ip rule add from $ip lookup 101"; }
         ;;
       bypass)
         while ip rule del from "$ip" lookup main 2>/dev/null; do :; done
         while ip rule del from "$ip" lookup 101 2>/dev/null; do :; done
-        ip rule add priority "$BASE" from "$ip" lookup main
+        ip rule add priority "$BASE" from "$ip" lookup main 2>/dev/null \
+          || { RESEAT_OK=0; RC_DEGRADED=1; log "FAIL ip rule add from $ip lookup main"; }
         ;;
     esac
   done
-  while ip rule del iif br-lan ipproto icmp lookup main 2>/dev/null; do :; done
-  ip rule add priority $((BASE + 1)) iif br-lan ipproto icmp lookup main
+  while ip rule del iif "$LAN_DEV" ipproto icmp lookup main 2>/dev/null; do :; done
+  ip rule add priority $((BASE + 1)) iif "$LAN_DEV" ipproto icmp lookup main 2>/dev/null \
+    || { RESEAT_OK=0; RC_DEGRADED=1; log "FAIL ip rule add iif $LAN_DEV ipproto icmp lookup main"; }
   while ip rule del fwmark 0x64 table 101 2>/dev/null; do :; done
-  ip rule add priority $((BASE + 2)) fwmark 0x64 table 101
-  NEED_FLUSH="1"
-  log "ip rules re-seated at $BASE (magitrickle base: ${MT_MIN:-none})"
+  ip rule add priority $((BASE + 2)) fwmark 0x64 table 101 2>/dev/null \
+    || { RESEAT_OK=0; RC_DEGRADED=1; log "FAIL ip rule add fwmark 0x64 table 101"; }
+  if [ "$RESEAT_OK" = "1" ]; then
+    NEED_FLUSH="1"
+    log "ip rules re-seated at $BASE (magitrickle base: ${MT_MIN:-none})"
+  fi
 fi
 
 # ---------- (C) table 101 safety ----------
-if ! ip route show table 101 2>/dev/null | grep -q '^default'; then
+# `grep '^default'` accepted the WAN default netifd restores for every table: the AI lane was
+# silently bypassed while the guard reported success. The default must point at the AI tun.
+T101=$(ip route show table 101 2>/dev/null)
+if printf '%s\n' "$T101" | awk '
+    $1 == "default" { for (i = 2; i < NF; i++) if ($i == "dev" && $(i + 1) == "AI") ours = 1 }
+    END { exit(ours ? 0 : 1) }'; then
+  :
+else
   if ip route replace default dev AI table 101 2>/dev/null; then
     log "table 101 default restored (dev AI)"
   else
-    log "WARN: table 101 has no default route (AI tun down?)"
+    # The AI tun is absent. A foreign/WAN default here is worse than none: delete it and say
+    # that the lane is down instead of leaving traffic on the real address.
+    if ip route del default table 101 2>/dev/null; then
+      log "table 101 default removed (AI tun down) - AI-DNS runtime=down"
+    else
+      log "FAIL table 101 default could not be removed - AI-DNS runtime=down"
+    fi
+    RC_DEGRADED=1
   fi
 fi
 
@@ -38161,51 +39535,119 @@ CTBL=${GM_CONSOLE_TABLE:-102}
 # Kept here as well as at the drain above: the console block is exercised on its own by the
 # tests, and a missing variable must not turn a watchdog run into a crash.
 CROUTES=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
+# CONSOLE_LOCK_RC distinguishes the two refusals: 1 = another writer owns the lane (retry
+# later, 75), anything else = no usable primitive (fail closed, 2). It is never a green SKIP.
+CONSOLE_LOCK_RC=0
 console_lock() { # 0 only with the kernel lock held; busy or no primitive = skip, never forced
-  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  command -v gm_lock_acquire >/dev/null 2>&1 || { CONSOLE_LOCK_RC=2; return 1; }
   gm_lock_acquire console 0 "$CLOCK"
+  CONSOLE_LOCK_RC=$?
+  [ "$CONSOLE_LOCK_RC" = 0 ]
+}
+# Literal dotted quad only. An enabled lane with an empty or malformed ip= has no rule at
+# all: that is a degraded state, never silence.
+valid_ipv4() {
+  case "$1" in
+    ''|*[!0-9.]*) return 1 ;;
+  esac
+  _vi_o=$1
+  _vi_n=0
+  while [ -n "$_vi_o" ]; do
+    _vi_p=${_vi_o%%.*}
+    case "$_vi_p" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#_vi_p}" -le 3 ] && [ "$_vi_p" -le 255 ] || return 1
+    _vi_n=$((_vi_n + 1))
+    [ "$_vi_n" -le 4 ] || return 1
+    case "$_vi_o" in
+      *.*) _vi_o=${_vi_o#*.} ;;
+      *) _vi_o='' ;;
+    esac
+  done
+  [ "$_vi_n" = 4 ]
+}
+# Only OUR pref-19903 rule counts: a foreign rule with the same from/lookup must never be
+# reported as the console lane, and must never be deleted either.
+console_rule_present() { # console_rule_present <ip>
+  ip rule show 2>/dev/null | grep -q "^19903:.*from $1 lookup $CTBL"
 }
 if console_lock; then
-  if [ -f "$CS" ] && [ "$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)" = 1 ]; then
+  if [ -f "$CS" ]; then
+    CEN=$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)
     CIP=$(sed -n 's/^ip=//p' "$CS" 2>/dev/null | head -1)
-    if [ -n "$CIP" ]; then
-      # The table first: the rule below sends the console into it, and a table without the LAN
-      # prefixes hides the local network from the console. Sourced in a subshell so the shared
-      # helper cannot leak its variables into this script. The route lock is a TRY-LOCK here:
-      # this block already holds `console`, and waiting up to 20 s for `route-102` would make
-      # `console off` fail for that whole window. A busy table is skipped and reported; the next
-      # guard run (5 min) retries. No-wait in the subshell, without changing the default for
-      # every other caller.
-      if [ -r "$CROUTES" ]; then
-        ( GM_ROUTE_LOCK_WAIT=0; . "$CROUTES" && geomask_routes_sync "$CTBL" ) >/dev/null 2>&1 \
-          || log "WARN console table $CTBL not synced"
+    if [ "$CEN" = "1" ]; then
+      if [ -z "$CIP" ]; then
+        RC_DEGRADED=1
+        log "DEGRADED: console lane is enabled but ip= is empty - the lane has no rule"
+      elif ! valid_ipv4 "$CIP"; then
+        RC_DEGRADED=1
+        log "DEGRADED: console lane is enabled with an invalid ip '$CIP' - the lane has no rule"
       else
-        log "WARN console routes helper missing ($CROUTES)"
+        # The table first: the rule below sends the console into it, and a table without the LAN
+        # prefixes hides the local network from the console. Sourced in a subshell so the shared
+        # helper cannot leak its variables into this script. The route lock is a TRY-LOCK here:
+        # this block already holds `console`, and waiting up to 20 s for `route-102` would make
+        # `console off` fail for that whole window. A busy table is skipped and reported; the next
+        # guard run (5 min) retries. No-wait in the subshell, without changing the default for
+        # every other caller.
+        if [ -r "$CROUTES" ]; then
+          ( GM_ROUTE_LOCK_WAIT=0; . "$CROUTES" && geomask_routes_sync "$CTBL" ) >/dev/null 2>&1 \
+            || { RC_DEGRADED=1; log "WARN console table $CTBL not synced"; }
+        else
+          RC_DEGRADED=1
+          log "WARN console routes helper missing ($CROUTES)"
+        fi
+        if ! console_rule_present "$CIP"; then
+          while ip rule del from "$CIP" lookup "$CTBL" 2>/dev/null; do :; done
+          if ip rule add pref 19903 from "$CIP" lookup "$CTBL" 2>/dev/null; then
+            log "console rule re-seated for $CIP"
+            conntrack -D -s "$CIP" >/dev/null 2>&1
+            conntrack -D -d "$CIP" >/dev/null 2>&1
+          else
+            RC_DEGRADED=1
+            log "FAIL console rule add $CIP"
+          fi
+        fi
+        # A default through another device is not "a default": after a reboot netifd can leave
+        # one via the WAN in every table, and the console would use the real address.
+        if ! ip route show table "$CTBL" 2>/dev/null | grep -q "^default dev $CTUN"; then
+          if ip route replace table "$CTBL" default dev "$CTUN" 2>/dev/null; then
+            log "console table $CTBL default restored (dev $CTUN)"
+          else
+            RC_DEGRADED=1
+            log "WARN console table $CTBL has no default (tunnel down?)"
+          fi
+        fi
       fi
-      if ! ip rule show 2>/dev/null | grep -q "from $CIP lookup $CTBL"; then
-        while ip rule del from "$CIP" lookup "$CTBL" 2>/dev/null; do :; done
-        if ip rule add pref 19903 from "$CIP" lookup "$CTBL" 2>/dev/null; then
-          log "console rule re-seated for $CIP"
+    elif [ "$CEN" = "0" ]; then
+      # The lane was switched off. Remove only the rule this guard owns (pref 19903): a
+      # foreign rule with the same from/lookup is somebody else's and must survive.
+      if [ -n "$CIP" ] && console_rule_present "$CIP"; then
+        if ip rule del pref 19903 from "$CIP" lookup "$CTBL" 2>/dev/null; then
+          log "console rule removed for $CIP (lane off)"
           conntrack -D -s "$CIP" >/dev/null 2>&1
           conntrack -D -d "$CIP" >/dev/null 2>&1
         else
-          log "FAIL console rule add $CIP"
+          RC_DEGRADED=1
+          log "FAIL console rule removal $CIP"
         fi
       fi
-      # A default through another device is not "a default": after a reboot netifd can leave
-      # one via the WAN in every table, and the console would use the real address.
-      if ! ip route show table "$CTBL" 2>/dev/null | grep -q "^default dev $CTUN"; then
-        if ip route replace table "$CTBL" default dev "$CTUN" 2>/dev/null; then
-          log "console table $CTBL default restored (dev $CTUN)"
-        else
-          log "WARN console table $CTBL has no default (tunnel down?)"
-        fi
-      fi
+    else
+      RC_DEGRADED=1
+      log "DEGRADED: console state has an unknown enabled='$CEN' - not touching the lane"
     fi
   fi
   gm_lock_release console
 else
-  log "SKIP console watchdog: lane lock is busy or the lock primitive is unavailable"
+  case "$CONSOLE_LOCK_RC" in
+    1)
+      RC_CONSOLE_BUSY=1
+      log "SKIP console watchdog: lane lock is busy - another writer owns it" ;;
+    *)
+      RC_INPUT_UNKNOWN=1
+      log "UNKNOWN: the console lock primitive is unavailable - refusing to touch the console lane" ;;
+  esac
 fi
 
 # ---------- (D) AI-DNS self-heal ----------
@@ -38215,7 +39657,7 @@ fi
 [ -x /usr/bin/geo-backend.sh ] && ( /usr/bin/geo-backend.sh aidns >/dev/null 2>&1 & )
 
 # ---------- conntrack flush when something changed ----------
-if [ -n "$NEED_FLUSH" ]; then
+if [ -n "$NEED_FLUSH" ] && [ -n "$IPS" ]; then
   for ip in $IPS; do
     conntrack -D -s "$ip" >/dev/null 2>&1
     conntrack -D -d "$ip" >/dev/null 2>&1
@@ -38223,6 +39665,16 @@ if [ -n "$NEED_FLUSH" ]; then
   log "conntrack flushed for: $IPS"
 fi
 
+# Input/lock unknown is the most serious answer: nothing may be claimed healthy.
+if [ "$RC_INPUT_UNKNOWN" = "1" ]; then
+  exit 2
+fi
+if [ "$RC_CONSOLE_BUSY" = "1" ]; then
+  exit 75
+fi
+if [ "$RC_DEGRADED" = "1" ]; then
+  exit 1
+fi
 exit 0
 ASSET_EOF
   save_stream /etc/hotplug.d/iface/99-geomask-guard 755 <<'ASSET_EOF'

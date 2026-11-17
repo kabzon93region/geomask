@@ -64,6 +64,16 @@ def posix(path):
     return Path(path).as_posix()
 
 
+def msys(path):
+    """A path usable inside PATH under Git Bash: `Y:/x` must become `/y/x`.
+
+    A drive-letter form contains a colon, which PATH reads as a separator, so the stub would
+    silently not be on PATH and the fd test would fall back to the portable backend."""
+    p = posix(path)
+    matched = re.match(r'^([A-Za-z]):/(.*)$', p)
+    return '/%s/%s' % (matched.group(1).lower(), matched.group(2)) if matched else p
+
+
 @unittest.skipIf(BASH is None, 'bash is required')
 class LockHelperTests(unittest.TestCase):
     """Behaviour of the shipped helper in a throwaway lock directory."""
@@ -73,6 +83,26 @@ class LockHelperTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.case = Path(self.tmp.name)
         self.locks = self.case / 'locks'
+        # Hygiene: a test that leaks a relative path must not be able to write into the
+        # repository. Record the root listing and fail if the test adds anything to it.
+        self.root_before = set(os.listdir(str(ROOT)))
+        self.addCleanup(self.assert_repository_root_unchanged)
+
+    def assert_repository_root_unchanged(self):
+        new = sorted(set(os.listdir(str(ROOT))) - self.root_before)
+        self.assertEqual([], new,
+                         'the test left new paths in the repository root: %r' % new)
+
+    def stub_flock(self):
+        """Force the flock backend on the Windows test host.
+
+        Portable backend never opens a descriptor, so fd tests would pass without checking
+        anything. The stub satisfies `command -v flock`; it does not emulate exclusion."""
+        stub = self.case / 'bin'
+        stub.mkdir(exist_ok=True)
+        (stub / 'flock').write_text('#!/bin/sh\nexit 0\n', encoding='utf-8', newline='\n')
+        (stub / 'flock').chmod(0o755)
+        return 'PATH=%s:$PATH\nexport PATH\n' % sh_quote(msys(stub))
 
     def script(self, name, body):
         path = self.case / name
@@ -214,6 +244,111 @@ class LockHelperTests(unittest.TestCase):
             return
         self.assertIn('EXISTS_AFTER=1', result.stdout,
                       'the lock file was deleted on release - the inode must stay')
+
+    def test_a_path_with_shell_metacharacters_is_not_executed(self):
+        """The lock path is data: a quote, `$( )`, a backtick, `;`, `&` and a space are never
+        handed to a shell. The helper used to build `exec <fd>>"<path>"` as a string and run it,
+        so a crafted path executed commands (R04 follow-up, P0). The path must still work as a
+        file name - refusing it would be safe but would break a legitimate unusual path.
+
+        The payload is fully expanded (no literal `$CASE`) and the marker is a bare `pwn` in the
+        test's cwd, which is this test's temp dir: a leaking implementation can only touch that
+        temp dir, never the repository root."""
+        case_posix = posix(self.case)
+        hostile = (case_posix + "/locks/x' ; touch pwn ; '"
+                   '$( touch pwn )'
+                   '` touch pwn `'
+                   '& дорога')
+        result = self.run_script(
+            'path-injection.sh',
+            ('gm_lock_acquire console 0 %s\n'
+             'printf "RC=%%s\\n" "$?"\n'
+             'printf "PWN=%%s\\n" "$([ -e pwn ] && echo YES || echo NO)"\n'
+             'printf "EXISTS=%%s\\n" "$([ -f %s ] && echo YES || echo NO)"\n'
+             'gm_lock_release console\n') % (sh_quote(hostile), sh_quote(hostile)))
+        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
+        self.assertIn('PWN=NO', result.stdout, 'the lock path was executed as shell code')
+        self.assertIn('EXISTS=YES', result.stdout,
+                      'the path with metacharacters was not used as a plain file name')
+        self.assertFalse((ROOT / 'pwn').exists(), 'the test created a file in the repository root')
+
+    def test_a_name_with_metacharacters_is_refused(self):
+        """A name is not data: it selects the rank and the path. Anything outside the documented
+        alphabet is refused (rc=2) instead of being interpolated somewhere."""
+        for hostile in ('console; touch pwn',
+                        'console$( touch pwn )',
+                        'console` touch pwn `',
+                        'console x',
+                        'console=5'):
+            result = self.run_script('name-refusal.sh',
+                              'gm_lock_acquire %s 0 2>/dev/null\n' % sh_quote(hostile) +
+                              'printf "RC=%s\\n" "$?"\n'
+                              'printf "PWN=%s\\n" "$([ -e pwn ] && echo YES || echo NO)"\n')
+            self.assertIn('RC=2', result.stdout,
+                          'name %r was not refused: %s' % (hostile, result.stdout))
+            self.assertIn('PWN=NO', result.stdout, 'name %r was executed' % hostile)
+
+    def test_state_tracking_survives_release_and_reacquire(self):
+        """State is a token list, not variables named after the lock: forgetting an entry must
+        remove exactly that token, and the order rank must fall back with it (otherwise a
+        released lock keeps its rank and a later lawful acquisition is refused).
+
+        The flock backend is forced (stub `flock` in PATH) so the descriptor really is opened:
+        on the portable backend the test would only compare bookkeeping and would pass even if
+        acquire never opened fd 5."""
+        result = self.run_script('state.sh', self.stub_flock() +
+                          'gm_lock_acquire console 0; printf "A=%s\\n" "$?"\n'
+                          'printf "S1=%s\\n" "$GM_LOCK_STACK"\n'
+                          'printf "OPEN5=%s\\n" "$( { printf x >&5; } 2>/dev/null; echo $? )"\n'
+                          'gm_lock_release console\n'
+                          'printf "S2=[%s]\\n" "$GM_LOCK_STACK"\n'
+                          'printf "CLOSE5=%s\\n" "$( { printf x >&5; } 2>/dev/null; echo $? )"\n'
+                          'gm_lock_acquire config-tx 0; printf "B=%s\\n" "$?"\n'
+                          'gm_lock_acquire route-100 0; printf "C=%s\\n" "$?"\n'
+                          'gm_lock_release_all\n'
+                          'printf "S3=[%s] MAX=%s\\n" "$GM_LOCK_STACK" "$GM_LOCK_MAX_RANK"\n'
+                          'gm_lock_acquire console 0; printf "D=%s\\n" "$?"\n'
+                          'gm_lock_release console\n')
+        self.assertIn('A=0', result.stdout, result.stdout + result.stderr)
+        self.assertIn('S1=console=5', result.stdout,
+                      'the descriptor of the held lock is not tracked as a token')
+        self.assertIn('OPEN5=0', result.stdout,
+                      'the held descriptor is not open - the fd assertions are vacuous')
+        self.assertIn('S2=[]', result.stdout, 'release left a stale token in the stack')
+        self.assertIn('CLOSE5=1', result.stdout, 'release did not close the descriptor')
+        self.assertIn('B=0', result.stdout)
+        self.assertIn('C=0', result.stdout)
+        self.assertIn('S3=[] MAX=0', result.stdout,
+                      'release_all left state behind (stack or order rank)')
+        self.assertIn('D=0', result.stdout)
+
+    def test_close_inherited_closes_only_reserved_fds(self):
+        """A daemon started after the install must not inherit the lock descriptor, but the
+        updater runner's own descriptors (3, stdout) must survive: gm_lock_close_inherited is
+        the only place that closes descriptors and it is restricted to 5..9.
+
+        Forced flock backend: on the portable backend acquire opens no descriptor and this test
+        would assert nothing."""
+        result = self.run_script('inherited.sh', self.stub_flock() +
+                          'exec 3>"$CASE/caller.fd" || exit 8\n'
+                          'gm_lock_acquire console 0 || exit 9\n'
+                          'printf "HELD=%s\\n" "$GM_LOCK_STACK"\n'
+                          'printf "OPEN5=%s\\n" "$( { printf x >&5; } 2>/dev/null; echo $? )"\n'
+                          'gm_lock_close_inherited\n'
+                          'printf "STACK=[%s]\\n" "$GM_LOCK_STACK"\n'
+                          'printf ok >&3 2>/dev/null; printf "FD3=%s\\n" "$?"\n'
+                          'printf "FD5=%s\\n" "$( { printf x >&5; } 2>/dev/null; echo $? )"\n'
+                          'printf "FD1=%s\\n" "$([ -t 1 ] || echo open)"\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('HELD=console=5', result.stdout)
+        self.assertIn('OPEN5=0', result.stdout,
+                      'acquire opened no descriptor - the test would be vacuous')
+        self.assertIn('STACK=[]', result.stdout)
+        self.assertIn('FD3=0', result.stdout, 'a caller-owned descriptor was closed')
+        self.assertIn('FD5=1', result.stdout, 'the reserved descriptor 5 is still open')
+        self.assertIn('FD1=open', result.stdout)
+        self.assertEqual((self.case / 'caller.fd').read_text(encoding='utf-8'), 'ok',
+                         'the caller descriptor was redirected or truncated')
 
 
 @unittest.skipIf(BASH is None, 'bash is required')

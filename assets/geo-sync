@@ -64,6 +64,7 @@ list_methods() {
 	json_add_object "diag_run";                 json_add_string "check" "string"; json_close_object
 	json_add_object "diag_log";                 json_add_string "check" "string"; json_close_object
 	json_add_object "diag_domain";              json_add_string "domain" "string"; json_add_string "live" "string"; json_close_object
+	json_add_object "diag_bundle";              json_close_object
 	json_add_object "upd_check";                json_add_string "force" "string"; json_close_object
 	json_add_object "upd_status";               json_close_object
 	json_add_object "upd_apply";                json_close_object
@@ -148,6 +149,7 @@ call_method() {
 		diag_run)                 json_get_var check check; "$BACKEND" diag_run "$check" ;;
 		diag_log)                 json_get_var check check; "$BACKEND" diag_log "$check" ;;
 		diag_domain)              json_get_var domain domain; json_get_var live live; "$BACKEND" diag_domain "$domain" "$live" ;;
+		diag_bundle)              "$BACKEND" diag_bundle ;;
 		upd_check)                json_get_var force force; "$BACKEND" upd_check "$force" ;;
 		upd_status)               "$BACKEND" upd_status ;;
 		upd_apply)                "$BACKEND" upd_apply ;;

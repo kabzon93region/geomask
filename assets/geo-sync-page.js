@@ -60,6 +60,7 @@ var callDiagList              = rpc.declare({ object: 'geo-sync', method: 'diag_
 var callDiagRun               = rpc.declare({ object: 'geo-sync', method: 'diag_run', params: [ 'check' ], expect: {} });
 var callDiagLog               = rpc.declare({ object: 'geo-sync', method: 'diag_log', params: [ 'check' ], expect: {} });
 var callDiagDomain            = rpc.declare({ object: 'geo-sync', method: 'diag_domain', params: [ 'domain', 'live' ], expect: {} });
+var callDiagBundle            = rpc.declare({ object: 'geo-sync', method: 'diag_bundle', expect: {} });
 var callUpdCheck              = rpc.declare({ object: 'geo-sync', method: 'upd_check', params: { force: null }, expect: {} });
 var callUpdStatus             = rpc.declare({ object: 'geo-sync', method: 'upd_status', expect: {} });
 var callUpdApply              = rpc.declare({ object: 'geo-sync', method: 'upd_apply', expect: {} });
@@ -698,46 +699,28 @@ return view.extend({
 			// A router whose backend has no such method must still render the card.
 			conState.textContent = 'состояние консоли: нет данных';
 		});
-		// The bundle is built on the router and handed back through the same authenticated ubus
+		// The archive is built on the router and handed back through the same authenticated ubus
 		// call as the rest of the panel: the owner gets a file, not a path in /tmp to hunt for
-		// (review 15.11, #15).
-		function conSave(res) {
+		// (review 15.11, #15). The object URL is created from those bytes only - no network
+		// response is ever put into href, so a broken answer cannot navigate the panel away.
+		function saveBundle(res, statusEl) {
 			if (!res || !res.data) {
-				conState.textContent = 'архив не получен: ' + ((res && res.error) || 'нет данных');
-				return;
+				statusEl.textContent = 'архив не получен: ' + ((res && res.error) || 'нет данных');
+				return false;
 			}
 			var bin = atob(res.data);
 			var bytes = new Uint8Array(bin.length);
 			for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
 			var blob = new Blob([bytes], { type: 'application/gzip' });
 			var url = URL.createObjectURL(blob);
-			var a = E('a', { 'href': url, 'download': res.name || 'geomask-console-diag.tar.gz' });
+			var a = E('a', { 'href': url, 'download': res.name || 'geomask-diagnostics.tar.gz' });
 			document.body.appendChild(a);
 			a.click();
 			document.body.removeChild(a);
 			setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
-			conState.textContent = 'архив сохранён: ' + (res.name || '')
+			statusEl.textContent = 'архив сохранён: ' + (res.name || '')
 				+ ' (' + (res.bytes || 0) + ' байт)';
-		}
-		function conDiagBuild() {
-			conState.textContent = 'собираю архив…';
-			return callConsoleDiag({ what: 'all' }).then(function(res) {
-				res = res || {};
-				if (!res.ok) {
-					conState.textContent = 'архив не собран: ' + (res.error || 'нет ответа');
-					return;
-				}
-				return callConsoleDiagGet({ name: String(res.file || '').replace(/^.*\//, '') })
-					.then(conSave);
-			}).catch(function(e) {
-				conState.textContent = 'архив не собран: ' + e;
-			});
-		}
-		function conDiagSaveLast() {
-			conState.textContent = 'читаю последний архив…';
-			return callConsoleDiagGet({ name: '' }).then(conSave).catch(function(e) {
-				conState.textContent = 'архив не прочитан: ' + e;
-			});
+			return true;
 		}
 		var conCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Игровая консоль — отдельный выход'),
@@ -751,11 +734,9 @@ return view.extend({
 			conState,
 			E('div', { 'class': 'gs-row' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() { conAct('on'); } }, 'Включить путь консоли'),
-				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было'),
-				E('button', { 'class': 'gs-btn', 'click': function() { conDiagBuild(); } }, 'Собрать и скачать логи'),
-				E('button', { 'class': 'gs-btn', 'click': function() { conDiagSaveLast(); } }, 'Скачать прошлый архив')
+				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было')
 			]),
-			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. «Собрать и скачать логи» собирает архив на роутере и сохраняет его на этом компьютере; копия в папке бэкапов появляется только если шара включена.'),
+			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. Общий архив (состояние консоли и логи всех проверок) собирается одной кнопкой на вкладке «Диагностика».'),
 			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки (это и есть сброс фильтра). Указывайте коды через запятую: TR, DE, NL.'),
 			E('div', { 'class': 'gs-hint' }, 'Пустая подписка — «как у VPN»: провайдер консоли смотрит на подписку, которой пользуется группа VPN.')
 		]);
@@ -1129,6 +1110,7 @@ return view.extend({
 		/* ===================== ДИАГНОСТИКА (v1.29.1) ===================== */
 		var diagData = (diag.checks || []).slice();
 		var diagSummary = E('span', { 'class': 'gs-meta' }, '');
+		var diagBundleNote = E('span', { 'class': 'gs-meta' }, '');
 		var diagVerdict = E('div', { 'class': 'gs-hint', style: 'margin:6px 0' },
 			diag.verdict || 'Проверок ещё не было — нажмите «Проверить всё».');
 		if (diag.verdict_state) {
@@ -1234,6 +1216,39 @@ return view.extend({
 			});
 		}
 
+		// R09: ONE archive button. The backend builds the same safe bundle the console used
+		// (console state + every saved per-check log) without running a single check; the
+		// download then goes through `console_diag_get`, the same spool getter with the same
+		// ownership/NOFOLLOW checks. No path from the network answer is ever used as a link.
+		function diagBundleDownload(btn) {
+			if (btn) btn.disabled = true;
+			var localNotRun = diagData.filter(function(c) { return !c.last_state; }).length;
+			diagBundleNote.textContent = 'собираю архив…';
+			return callDiagBundle().then(function(res) {
+				res = res || {};
+				if (!res.ok) {
+					diagBundleNote.textContent = 'архив не собран: ' + (res.error || 'нет ответа');
+					return;
+				}
+				var name = String(res.name || '');
+				if (!name) {
+					diagBundleNote.textContent = 'архив не собран: сервер не вернул имя';
+					return;
+				}
+				return callConsoleDiagGet({ name: name }).then(function(got) {
+					if (!saveBundle(got, diagBundleNote)) return;
+					var total = (typeof res.checks === 'number') ? res.checks : diagData.length;
+					var skipped = (typeof res.not_run === 'number') ? res.not_run : localNotRun;
+					diagBundleNote.textContent += ' · в архиве: ' + total
+						+ ' проверок, ' + skipped + ' без запуска';
+				});
+			}).catch(function(e) {
+				diagBundleNote.textContent = 'архив не собран: ' + e;
+			}).then(function() {
+				if (btn) btn.disabled = false;
+			});
+		}
+
 		function domRun() {
 			var name = (domInput.value || '').trim();
 			if (!name) return;
@@ -1258,7 +1273,9 @@ return view.extend({
 			diagVerdict,
 			E('div', { 'class': 'gs-row', style: 'margin:8px 0;gap:10px;align-items:center' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function(ev) { diagRun('all', ev.target); } }, 'Проверить всё'),
-				diagSummary
+				E('button', { 'class': 'gs-btn', 'click': function(ev) { diagBundleDownload(ev.target); } }, 'Скачать архив диагностики'),
+				diagSummary,
+				diagBundleNote
 			]),
 			diagRowsBox,
 			diagLogBox

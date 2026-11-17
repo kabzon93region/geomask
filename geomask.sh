@@ -7796,10 +7796,16 @@ _diag_missing() {
   return 1
 }
 
+# The Diagnostics tab and the archive both need the same registry snapshot. It reads the cached
+# last results and the log paths; it never executes a check (R09: download must not probe).
+_diag_list_json() {
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  "$PYTHON_BIN" -B "$DOCTOR" list 2>&1
+}
+
 cmd_diag_list() {
   # Registry plus the results of the last run; never runs a check, so the tab paints fast.
-  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
-  python3 "$DOCTOR" list 2>&1
+  _diag_list_json
 }
 
 cmd_diag_run() { # $1 = check id or "all"
@@ -9070,10 +9076,213 @@ _diag_run() { # $1 = seconds, rest = command
   "$@"
 }
 
+# R09: `diagnostics/index.json` describes every check the Diagnostics tab knows about, including
+# the ones that were never run. The saved log blocks already carry a timestamp and a state, so
+# the description does not depend on the tab being open or on a live probe.
+_diag_index_json() { # $1 = doctor list json, $2 = staging dir, $3 = index file
+  "$PYTHON_BIN" -B - "$1" "$2" "$3" <<'DIAG_INDEX_PY'
+import json
+import os
+import re
+import sys
+from datetime import datetime
+
+list_path, stage, out = sys.argv[1], sys.argv[2], sys.argv[3]
+BLOCK = re.compile(r'(?m)^=== (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}) '
+                   r'(ok|warn|fail) ===')
+
+
+def last_block(path):
+    """Timestamp and state of the last saved block, read from the file's tail only."""
+    if not path:
+        return '', ''
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as handle:
+            # Doctor caps a log at 200 KiB, so the tail always reaches the last header.
+            handle.seek(max(0, size - 262144))
+            text = handle.read().decode('utf-8', 'replace')
+    except OSError:
+        return '', ''
+    matches = list(BLOCK.finditer(text))
+    if not matches:
+        return '', ''
+    return matches[-1].group(1), matches[-1].group(2)
+
+
+try:
+    with open(list_path, encoding='utf-8') as handle:
+        data = json.load(handle)
+except (OSError, ValueError):
+    sys.exit(1)
+checks = data.get('checks') if isinstance(data, dict) else None
+if not isinstance(checks, list):
+    checks = []
+
+entries = []
+included = 0
+not_run = 0
+for check in checks:
+    if not isinstance(check, dict):
+        continue
+    cid = check.get('id')
+    if not isinstance(cid, str) or not re.match(r'^[A-Za-z0-9_]+$', cid):
+        continue
+    source = check.get('log') if isinstance(check.get('log'), str) else ''
+    staged = os.path.join(stage, 'diagnostics', cid + '.log')
+    try:
+        staged_ok = os.path.isfile(staged)
+    except OSError:
+        staged_ok = False
+    try:
+        source_exists = (bool(source) and os.path.isfile(source)
+                         and not os.path.islink(source))
+        source_size = os.path.getsize(source) if source_exists else 0
+    except OSError:
+        source_exists, source_size = False, 0
+    if staged_ok:
+        log_state = 'included'
+    elif source_exists and source_size == 0:
+        log_state = 'empty'
+    else:
+        log_state = 'not_run'
+    stamp, logged_state = last_block(source) if source_exists else ('', '')
+    state = check.get('last_state') or logged_state or 'not_run'
+    if state not in ('ok', 'warn', 'fail'):
+        state = 'not_run'
+    last_at = stamp
+    if not last_at and state != 'not_run':
+        cached_at = check.get('last_at')
+        last_at = cached_at if isinstance(cached_at, str) else ''
+    if log_state == 'included':
+        included += 1
+    if state == 'not_run':
+        not_run += 1
+    entries.append({
+        'id': cid,
+        'title': str(check.get('title') or cid),
+        'area': str(check.get('area') or ''),
+        'state': state,
+        'last_state_at': last_at,
+        'log_state': log_state,
+    })
+
+document = {
+    'generated_at': datetime.now().astimezone().strftime('%Y-%m-%dT%H:%M:%S%z'),
+    'entries': entries,
+}
+try:
+    with open(out, 'w', encoding='utf-8', newline='\n') as handle:
+        json.dump(document, handle, ensure_ascii=False)
+        handle.write('\n')
+except OSError:
+    sys.exit(1)
+print('%d %d %d' % (len(entries), not_run, included))
+DIAG_INDEX_PY
+}
+
+# R09: the Diagnostics tab needs one archive with every saved per-check log, not a fresh run.
+# This copies only what `diag_list` reports and the files it points at, bounds each log to a
+# shared budget, and sends every copy through the same R02 redactor as the console producers.
+# It never calls `diag_run`; `physician, heal thyself` is not a diagnostic strategy.
+_diag_bundle_entries() {
+  [ -f "$DOCTOR" ] || {
+    rm -rf "$_dir" 2>/dev/null
+    _diag_missing
+    return 1
+  }
+  mkdir -p "$_dir/diagnostics" 2>/dev/null || {
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot create the diagnostics directory"}\n'
+    return 1
+  }
+  _diag_list=$(_diag_list_json)
+  _diag_list_rc=$?
+  if [ "$_diag_list_rc" != 0 ]; then
+    rm -rf "$_dir" 2>/dev/null
+    case "$_diag_list" in
+      '{"ok":false'*) printf '%s\n' "$_diag_list" ;;
+      *) printf '{"ok":false,"error":"cannot read the diagnostics list"}\n' ;;
+    esac
+    return 1
+  fi
+  _diag_list_file="$_tmpd/geomask-diag-list.$$"
+  _diag_pairs_file="$_tmpd/geomask-diag-pairs.$$"
+  printf '%s\n' "$_diag_list" > "$_diag_list_file" 2>/dev/null || {
+    rm -f "$_diag_list_file" 2>/dev/null
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot store the diagnostics list"}\n'
+    return 1
+  }
+  printf '%s\n' "$_diag_list" | "$PYTHON_BIN" -B -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+for check in data.get("checks") or []:
+    if isinstance(check, dict):
+        line = "%s|%s\n" % (check.get("id") or "", check.get("log") or "")
+        sys.stdout.buffer.write(line.encode("utf-8"))
+' > "$_diag_pairs_file" 2>/dev/null || {
+    rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot read the diagnostics list"}\n'
+    return 1
+  }
+  # The temporary list holds only ids, titles and log paths, but it lives in TMPDIR: keep it
+  # private like the archive it describes.
+  chmod 600 "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+  _diag_n=$(wc -l < "$_diag_pairs_file" 2>/dev/null | tr -d ' ')
+  case "$_diag_n" in ''|*[!0-9]*) _diag_n=0 ;; esac
+  # One shared byte budget for all logs, so the staging tree keeps the same bound as the
+  # console producers and a router with many checks cannot push the archive over its cap.
+  _diag_total=$(_diag_uint "${GM_DIAG_BUNDLE_LOG_TOTAL:-393216}" 393216 65536 1048576)
+  _diag_log_max=$(_diag_uint "${GM_DIAG_BUNDLE_LOG_MAX:-65536}" 65536 1024 262144)
+  _diag_log_min=$(_diag_uint "${GM_DIAG_BUNDLE_LOG_MIN:-8192}" 8192 1024 65536)
+  _diag_cap=$_diag_total
+  if [ "$_diag_n" -gt 0 ]; then
+    _diag_cap=$((_diag_total / _diag_n))
+  fi
+  [ "$_diag_cap" -gt "$_diag_log_max" ] && _diag_cap=$_diag_log_max
+  [ "$_diag_cap" -lt "$_diag_log_min" ] && _diag_cap=$_diag_log_min
+  while IFS='|' read -r _diag_id _diag_log; do
+    case "$_diag_id" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+    [ -n "$_diag_log" ] || continue
+    # Only the regular file the doctor itself named. A symlink is not followed: the log
+    # directory is root-owned, and a swap there must not turn into an arbitrary read.
+    [ -f "$_diag_log" ] || continue
+    [ -L "$_diag_log" ] && continue
+    [ -s "$_diag_log" ] || continue
+    # The tail is the part worth keeping; the block headers are at the start of each block.
+    if ! tail -c "$_diag_cap" "$_diag_log" 2>/dev/null \
+        | _console_diag_redact text "diag:$_diag_id" "$_dir/diagnostics/$_diag_id.log"; then
+      rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+      return 1
+    fi
+  done < "$_diag_pairs_file"
+  _diag_counts=$(_diag_index_json "$_diag_list_file" "$_dir" \
+    "$_dir/diagnostics/index.json")
+  _diag_index_rc=$?
+  rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+  if [ "$_diag_index_rc" != 0 ]; then
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot describe the saved checks"}\n'
+    return 1
+  fi
+  set -- $_diag_counts
+  _diag_checks=${1:-0}
+  _diag_not_run=${2:-0}
+  _diag_included=${3:-0}
+  return 0
+}
+
 # One archive with everything needed to diagnose the console path from a distance. The
 # masking is done by the shipped redactor, and `verify` is the last gate: an unmasked bundle
-# is never handed out (review 15.11, R02).
-cmd_console_diag() {
+# is never handed out (review 15.11, R02). R09 adds the saved per-check logs to the very same
+# tree through `_diag_bundle_entries`; there is one collector and one packer, not two.
+_console_diag_build() { # $1 = console|bundle
+  _diag_mode=${1:-console}
   # R07: the archive lives in a private spool, never in world-writable /tmp. `init` fails
   # closed (must be a real directory, ours, 0700) and its JSON refusal is the answer.
   [ -f "$DIAG_SPOOL_PY" ] || {
@@ -9171,6 +9380,11 @@ cmd_console_diag() {
       _console_diag_redact yaml yaml:mihomo "$_dir/config.masked.yaml" \
         < "$MIHOMO_CONF" || return 1
     fi
+  fi
+  # R09: the shared archive also carries every saved Doctor log. Collection is read-only:
+  # `diag_list` plus the files it names, no `diag_run`, no network probe on download.
+  if [ "$_diag_mode" = bundle ]; then
+    _diag_bundle_entries || return 1
   fi
   # Staging budget: 1.5 MiB of text already compresses into an archive the 2 MiB creation cap
   # accepts, so a bigger staging tree means a pathological state. Refuse before verify/tar
@@ -9271,9 +9485,22 @@ cmd_console_diag() {
   "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$BACKUP_DIR" --share \
     --keep-h "$_diag_keep" --quota "$_diag_share_quota" --files "$_diag_share_files" \
     >/dev/null 2>&1
-  printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s,"share_note":"%s"}\n' \
-    "$_tgz" "$_diag_bytes" "$_shared" "$_share_note"
+  if [ "$_diag_mode" = bundle ]; then
+    # R09: the tab downloads through `console_diag_get`, which needs a registered name, not a
+    # path. `checks`/`not_run` are counts from the index that was just packed.
+    printf '{"ok":true,"name":"%s","bytes":%s,"checks":%s,"not_run":%s}\n' \
+      "${_tgz##*/}" "$_diag_bytes" "${_diag_checks:-0}" "${_diag_not_run:-0}"
+  else
+    printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s,"share_note":"%s"}\n' \
+      "$_tgz" "$_diag_bytes" "$_shared" "$_share_note"
+  fi
 }
+
+# Both panel buttons share `_console_diag_build`: the console card keeps the console-only
+# answer for compatibility, while the Diagnostics tab asks for the full tree. No second
+# collector, packer or download path exists.
+cmd_console_diag() { _console_diag_build console; }
+cmd_diag_bundle() { _console_diag_build bundle; }
 
 # The panel used to get only a path on the router, so the owner had to find the archive by hand
 # over SMB or SSH - and the file sat in /tmp with no way back (review 15.11, #15). The bytes now
@@ -9353,6 +9580,7 @@ case "$1" in
   diag_run)                 cmd_diag_run "$2" ;;
   diag_log)                 cmd_diag_log "$2" ;;
   diag_domain)              cmd_diag_domain "$2" "$3" ;;
+  diag_bundle)              cmd_diag_bundle ;;
   upd_check)                cmd_upd_check "$2" ;;
   upd_status)               cmd_upd_status ;;
   upd_apply)                cmd_upd_apply ;;
@@ -16857,13 +17085,13 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "4a2822effcc93ac697c0725ff5a432177e9d64e68d291dc504335d9c24b9bb0a"
+          "sha256": "40cb1630004b038445e3b66705335ffab9967c71335eb8c7321d1d4822de0287"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
           "mode": "0755",
-          "sha256": "3b48a057c271df0eace0b5cc31b2b86dcd5e0159d534158ce5a3280b29c1db59"
+          "sha256": "eab8b7d531d54a0f075e95bf51cb2cce67cbf138635338eda23c14def0479de4"
         },
         {
           "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
@@ -16875,13 +17103,13 @@ ASSET_EOF
           "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
           "source": "assets/acl-geo-sync.json",
           "mode": "0644",
-          "sha256": "878998efb0b6abf2552388f72c8461f70ff3eb333240ffcd90cf3ff11a0cb14b"
+          "sha256": "69ad7a4b713de626576fd5c5888b07a715bfc456329f19088199d78ac4dc290c"
         },
         {
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "7660709f27ffe042498fb5a2696791942656482035eadfb62a84825ffc147bbc"
+          "sha256": "a20d6c792a5bf6f2f32b2a940d2b58e29a6cf4e64966391be7b106f5f4da4feb"
         }
       ]
     },
@@ -17058,6 +17286,7 @@ list_methods() {
 	json_add_object "diag_run";                 json_add_string "check" "string"; json_close_object
 	json_add_object "diag_log";                 json_add_string "check" "string"; json_close_object
 	json_add_object "diag_domain";              json_add_string "domain" "string"; json_add_string "live" "string"; json_close_object
+	json_add_object "diag_bundle";              json_close_object
 	json_add_object "upd_check";                json_add_string "force" "string"; json_close_object
 	json_add_object "upd_status";               json_close_object
 	json_add_object "upd_apply";                json_close_object
@@ -17142,6 +17371,7 @@ call_method() {
 		diag_run)                 json_get_var check check; "$BACKEND" diag_run "$check" ;;
 		diag_log)                 json_get_var check check; "$BACKEND" diag_log "$check" ;;
 		diag_domain)              json_get_var domain domain; json_get_var live live; "$BACKEND" diag_domain "$domain" "$live" ;;
+		diag_bundle)              "$BACKEND" diag_bundle ;;
 		upd_check)                json_get_var force force; "$BACKEND" upd_check "$force" ;;
 		upd_status)               "$BACKEND" upd_status ;;
 		upd_apply)                "$BACKEND" upd_apply ;;
@@ -17186,7 +17416,7 @@ ASSET_EOF
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "nodescan", "nodes_path_save", "nodes_path_check", "nodes_audit_cancel", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra", "sync_lists", "aidns", "google", "global", "ipv6", "dns_guard", "console", "console_diag", "dev_add", "dev_del", "ai_sub_set", "subs_seed", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "mod_check", "mod_update", "diag_run", "diag_domain", "upd_apply", "nodes_path_preview", "nodes_path_apply", "nodes_path_revoke", "mtrickle_sync", "backup", "nodes_audit_schedule_set" ]
+				"geo-sync": [ "nodescan", "nodes_path_save", "nodes_path_check", "nodes_audit_cancel", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra", "sync_lists", "aidns", "google", "global", "ipv6", "dns_guard", "console", "console_diag", "dev_add", "dev_del", "ai_sub_set", "subs_seed", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "mod_check", "mod_update", "diag_run", "diag_domain", "diag_bundle", "upd_apply", "nodes_path_preview", "nodes_path_apply", "nodes_path_revoke", "mtrickle_sync", "backup", "nodes_audit_schedule_set" ]
 			}
 		}
 	}
@@ -17282,6 +17512,7 @@ var callDiagList              = rpc.declare({ object: 'geo-sync', method: 'diag_
 var callDiagRun               = rpc.declare({ object: 'geo-sync', method: 'diag_run', params: [ 'check' ], expect: {} });
 var callDiagLog               = rpc.declare({ object: 'geo-sync', method: 'diag_log', params: [ 'check' ], expect: {} });
 var callDiagDomain            = rpc.declare({ object: 'geo-sync', method: 'diag_domain', params: [ 'domain', 'live' ], expect: {} });
+var callDiagBundle            = rpc.declare({ object: 'geo-sync', method: 'diag_bundle', expect: {} });
 var callUpdCheck              = rpc.declare({ object: 'geo-sync', method: 'upd_check', params: { force: null }, expect: {} });
 var callUpdStatus             = rpc.declare({ object: 'geo-sync', method: 'upd_status', expect: {} });
 var callUpdApply              = rpc.declare({ object: 'geo-sync', method: 'upd_apply', expect: {} });
@@ -17920,46 +18151,28 @@ return view.extend({
 			// A router whose backend has no such method must still render the card.
 			conState.textContent = 'состояние консоли: нет данных';
 		});
-		// The bundle is built on the router and handed back through the same authenticated ubus
+		// The archive is built on the router and handed back through the same authenticated ubus
 		// call as the rest of the panel: the owner gets a file, not a path in /tmp to hunt for
-		// (review 15.11, #15).
-		function conSave(res) {
+		// (review 15.11, #15). The object URL is created from those bytes only - no network
+		// response is ever put into href, so a broken answer cannot navigate the panel away.
+		function saveBundle(res, statusEl) {
 			if (!res || !res.data) {
-				conState.textContent = 'архив не получен: ' + ((res && res.error) || 'нет данных');
-				return;
+				statusEl.textContent = 'архив не получен: ' + ((res && res.error) || 'нет данных');
+				return false;
 			}
 			var bin = atob(res.data);
 			var bytes = new Uint8Array(bin.length);
 			for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
 			var blob = new Blob([bytes], { type: 'application/gzip' });
 			var url = URL.createObjectURL(blob);
-			var a = E('a', { 'href': url, 'download': res.name || 'geomask-console-diag.tar.gz' });
+			var a = E('a', { 'href': url, 'download': res.name || 'geomask-diagnostics.tar.gz' });
 			document.body.appendChild(a);
 			a.click();
 			document.body.removeChild(a);
 			setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
-			conState.textContent = 'архив сохранён: ' + (res.name || '')
+			statusEl.textContent = 'архив сохранён: ' + (res.name || '')
 				+ ' (' + (res.bytes || 0) + ' байт)';
-		}
-		function conDiagBuild() {
-			conState.textContent = 'собираю архив…';
-			return callConsoleDiag({ what: 'all' }).then(function(res) {
-				res = res || {};
-				if (!res.ok) {
-					conState.textContent = 'архив не собран: ' + (res.error || 'нет ответа');
-					return;
-				}
-				return callConsoleDiagGet({ name: String(res.file || '').replace(/^.*\//, '') })
-					.then(conSave);
-			}).catch(function(e) {
-				conState.textContent = 'архив не собран: ' + e;
-			});
-		}
-		function conDiagSaveLast() {
-			conState.textContent = 'читаю последний архив…';
-			return callConsoleDiagGet({ name: '' }).then(conSave).catch(function(e) {
-				conState.textContent = 'архив не прочитан: ' + e;
-			});
+			return true;
 		}
 		var conCard = E('div', { 'class': 'gs-card' }, [
 			E('h3', {}, 'Игровая консоль — отдельный выход'),
@@ -17973,11 +18186,9 @@ return view.extend({
 			conState,
 			E('div', { 'class': 'gs-row' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() { conAct('on'); } }, 'Включить путь консоли'),
-				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было'),
-				E('button', { 'class': 'gs-btn', 'click': function() { conDiagBuild(); } }, 'Собрать и скачать логи'),
-				E('button', { 'class': 'gs-btn', 'click': function() { conDiagSaveLast(); } }, 'Скачать прошлый архив')
+				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было')
 			]),
-			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. «Собрать и скачать логи» собирает архив на роутере и сохраняет его на этом компьютере; копия в папке бэкапов появляется только если шара включена.'),
+			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. Общий архив (состояние консоли и логи всех проверок) собирается одной кнопкой на вкладке «Диагностика».'),
 			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки (это и есть сброс фильтра). Указывайте коды через запятую: TR, DE, NL.'),
 			E('div', { 'class': 'gs-hint' }, 'Пустая подписка — «как у VPN»: провайдер консоли смотрит на подписку, которой пользуется группа VPN.')
 		]);
@@ -18351,6 +18562,7 @@ return view.extend({
 		/* ===================== ДИАГНОСТИКА (v1.29.1) ===================== */
 		var diagData = (diag.checks || []).slice();
 		var diagSummary = E('span', { 'class': 'gs-meta' }, '');
+		var diagBundleNote = E('span', { 'class': 'gs-meta' }, '');
 		var diagVerdict = E('div', { 'class': 'gs-hint', style: 'margin:6px 0' },
 			diag.verdict || 'Проверок ещё не было — нажмите «Проверить всё».');
 		if (diag.verdict_state) {
@@ -18456,6 +18668,39 @@ return view.extend({
 			});
 		}
 
+		// R09: ONE archive button. The backend builds the same safe bundle the console used
+		// (console state + every saved per-check log) without running a single check; the
+		// download then goes through `console_diag_get`, the same spool getter with the same
+		// ownership/NOFOLLOW checks. No path from the network answer is ever used as a link.
+		function diagBundleDownload(btn) {
+			if (btn) btn.disabled = true;
+			var localNotRun = diagData.filter(function(c) { return !c.last_state; }).length;
+			diagBundleNote.textContent = 'собираю архив…';
+			return callDiagBundle().then(function(res) {
+				res = res || {};
+				if (!res.ok) {
+					diagBundleNote.textContent = 'архив не собран: ' + (res.error || 'нет ответа');
+					return;
+				}
+				var name = String(res.name || '');
+				if (!name) {
+					diagBundleNote.textContent = 'архив не собран: сервер не вернул имя';
+					return;
+				}
+				return callConsoleDiagGet({ name: name }).then(function(got) {
+					if (!saveBundle(got, diagBundleNote)) return;
+					var total = (typeof res.checks === 'number') ? res.checks : diagData.length;
+					var skipped = (typeof res.not_run === 'number') ? res.not_run : localNotRun;
+					diagBundleNote.textContent += ' · в архиве: ' + total
+						+ ' проверок, ' + skipped + ' без запуска';
+				});
+			}).catch(function(e) {
+				diagBundleNote.textContent = 'архив не собран: ' + e;
+			}).then(function() {
+				if (btn) btn.disabled = false;
+			});
+		}
+
 		function domRun() {
 			var name = (domInput.value || '').trim();
 			if (!name) return;
@@ -18480,7 +18725,9 @@ return view.extend({
 			diagVerdict,
 			E('div', { 'class': 'gs-row', style: 'margin:8px 0;gap:10px;align-items:center' }, [
 				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function(ev) { diagRun('all', ev.target); } }, 'Проверить всё'),
-				diagSummary
+				E('button', { 'class': 'gs-btn', 'click': function(ev) { diagBundleDownload(ev.target); } }, 'Скачать архив диагностики'),
+				diagSummary,
+				diagBundleNote
 			]),
 			diagRowsBox,
 			diagLogBox

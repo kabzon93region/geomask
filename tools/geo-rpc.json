@@ -440,6 +440,12 @@
       "js_positional": true
     },
     {
+      "name": "diag_bundle",
+      "acl": "write",
+      "args": [],
+      "js": "callDiagBundle"
+    },
+    {
       "name": "upd_check",
       "acl": "read",
       "args": [

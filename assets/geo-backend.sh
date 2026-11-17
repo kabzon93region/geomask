@@ -1749,10 +1749,16 @@ _diag_missing() {
   return 1
 }
 
+# The Diagnostics tab and the archive both need the same registry snapshot. It reads the cached
+# last results and the log paths; it never executes a check (R09: download must not probe).
+_diag_list_json() {
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  "$PYTHON_BIN" -B "$DOCTOR" list 2>&1
+}
+
 cmd_diag_list() {
   # Registry plus the results of the last run; never runs a check, so the tab paints fast.
-  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
-  python3 "$DOCTOR" list 2>&1
+  _diag_list_json
 }
 
 cmd_diag_run() { # $1 = check id or "all"
@@ -3023,10 +3029,213 @@ _diag_run() { # $1 = seconds, rest = command
   "$@"
 }
 
+# R09: `diagnostics/index.json` describes every check the Diagnostics tab knows about, including
+# the ones that were never run. The saved log blocks already carry a timestamp and a state, so
+# the description does not depend on the tab being open or on a live probe.
+_diag_index_json() { # $1 = doctor list json, $2 = staging dir, $3 = index file
+  "$PYTHON_BIN" -B - "$1" "$2" "$3" <<'DIAG_INDEX_PY'
+import json
+import os
+import re
+import sys
+from datetime import datetime
+
+list_path, stage, out = sys.argv[1], sys.argv[2], sys.argv[3]
+BLOCK = re.compile(r'(?m)^=== (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}) '
+                   r'(ok|warn|fail) ===')
+
+
+def last_block(path):
+    """Timestamp and state of the last saved block, read from the file's tail only."""
+    if not path:
+        return '', ''
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as handle:
+            # Doctor caps a log at 200 KiB, so the tail always reaches the last header.
+            handle.seek(max(0, size - 262144))
+            text = handle.read().decode('utf-8', 'replace')
+    except OSError:
+        return '', ''
+    matches = list(BLOCK.finditer(text))
+    if not matches:
+        return '', ''
+    return matches[-1].group(1), matches[-1].group(2)
+
+
+try:
+    with open(list_path, encoding='utf-8') as handle:
+        data = json.load(handle)
+except (OSError, ValueError):
+    sys.exit(1)
+checks = data.get('checks') if isinstance(data, dict) else None
+if not isinstance(checks, list):
+    checks = []
+
+entries = []
+included = 0
+not_run = 0
+for check in checks:
+    if not isinstance(check, dict):
+        continue
+    cid = check.get('id')
+    if not isinstance(cid, str) or not re.match(r'^[A-Za-z0-9_]+$', cid):
+        continue
+    source = check.get('log') if isinstance(check.get('log'), str) else ''
+    staged = os.path.join(stage, 'diagnostics', cid + '.log')
+    try:
+        staged_ok = os.path.isfile(staged)
+    except OSError:
+        staged_ok = False
+    try:
+        source_exists = (bool(source) and os.path.isfile(source)
+                         and not os.path.islink(source))
+        source_size = os.path.getsize(source) if source_exists else 0
+    except OSError:
+        source_exists, source_size = False, 0
+    if staged_ok:
+        log_state = 'included'
+    elif source_exists and source_size == 0:
+        log_state = 'empty'
+    else:
+        log_state = 'not_run'
+    stamp, logged_state = last_block(source) if source_exists else ('', '')
+    state = check.get('last_state') or logged_state or 'not_run'
+    if state not in ('ok', 'warn', 'fail'):
+        state = 'not_run'
+    last_at = stamp
+    if not last_at and state != 'not_run':
+        cached_at = check.get('last_at')
+        last_at = cached_at if isinstance(cached_at, str) else ''
+    if log_state == 'included':
+        included += 1
+    if state == 'not_run':
+        not_run += 1
+    entries.append({
+        'id': cid,
+        'title': str(check.get('title') or cid),
+        'area': str(check.get('area') or ''),
+        'state': state,
+        'last_state_at': last_at,
+        'log_state': log_state,
+    })
+
+document = {
+    'generated_at': datetime.now().astimezone().strftime('%Y-%m-%dT%H:%M:%S%z'),
+    'entries': entries,
+}
+try:
+    with open(out, 'w', encoding='utf-8', newline='\n') as handle:
+        json.dump(document, handle, ensure_ascii=False)
+        handle.write('\n')
+except OSError:
+    sys.exit(1)
+print('%d %d %d' % (len(entries), not_run, included))
+DIAG_INDEX_PY
+}
+
+# R09: the Diagnostics tab needs one archive with every saved per-check log, not a fresh run.
+# This copies only what `diag_list` reports and the files it points at, bounds each log to a
+# shared budget, and sends every copy through the same R02 redactor as the console producers.
+# It never calls `diag_run`; `physician, heal thyself` is not a diagnostic strategy.
+_diag_bundle_entries() {
+  [ -f "$DOCTOR" ] || {
+    rm -rf "$_dir" 2>/dev/null
+    _diag_missing
+    return 1
+  }
+  mkdir -p "$_dir/diagnostics" 2>/dev/null || {
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot create the diagnostics directory"}\n'
+    return 1
+  }
+  _diag_list=$(_diag_list_json)
+  _diag_list_rc=$?
+  if [ "$_diag_list_rc" != 0 ]; then
+    rm -rf "$_dir" 2>/dev/null
+    case "$_diag_list" in
+      '{"ok":false'*) printf '%s\n' "$_diag_list" ;;
+      *) printf '{"ok":false,"error":"cannot read the diagnostics list"}\n' ;;
+    esac
+    return 1
+  fi
+  _diag_list_file="$_tmpd/geomask-diag-list.$$"
+  _diag_pairs_file="$_tmpd/geomask-diag-pairs.$$"
+  printf '%s\n' "$_diag_list" > "$_diag_list_file" 2>/dev/null || {
+    rm -f "$_diag_list_file" 2>/dev/null
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot store the diagnostics list"}\n'
+    return 1
+  }
+  printf '%s\n' "$_diag_list" | "$PYTHON_BIN" -B -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+for check in data.get("checks") or []:
+    if isinstance(check, dict):
+        line = "%s|%s\n" % (check.get("id") or "", check.get("log") or "")
+        sys.stdout.buffer.write(line.encode("utf-8"))
+' > "$_diag_pairs_file" 2>/dev/null || {
+    rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot read the diagnostics list"}\n'
+    return 1
+  }
+  # The temporary list holds only ids, titles and log paths, but it lives in TMPDIR: keep it
+  # private like the archive it describes.
+  chmod 600 "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+  _diag_n=$(wc -l < "$_diag_pairs_file" 2>/dev/null | tr -d ' ')
+  case "$_diag_n" in ''|*[!0-9]*) _diag_n=0 ;; esac
+  # One shared byte budget for all logs, so the staging tree keeps the same bound as the
+  # console producers and a router with many checks cannot push the archive over its cap.
+  _diag_total=$(_diag_uint "${GM_DIAG_BUNDLE_LOG_TOTAL:-393216}" 393216 65536 1048576)
+  _diag_log_max=$(_diag_uint "${GM_DIAG_BUNDLE_LOG_MAX:-65536}" 65536 1024 262144)
+  _diag_log_min=$(_diag_uint "${GM_DIAG_BUNDLE_LOG_MIN:-8192}" 8192 1024 65536)
+  _diag_cap=$_diag_total
+  if [ "$_diag_n" -gt 0 ]; then
+    _diag_cap=$((_diag_total / _diag_n))
+  fi
+  [ "$_diag_cap" -gt "$_diag_log_max" ] && _diag_cap=$_diag_log_max
+  [ "$_diag_cap" -lt "$_diag_log_min" ] && _diag_cap=$_diag_log_min
+  while IFS='|' read -r _diag_id _diag_log; do
+    case "$_diag_id" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+    [ -n "$_diag_log" ] || continue
+    # Only the regular file the doctor itself named. A symlink is not followed: the log
+    # directory is root-owned, and a swap there must not turn into an arbitrary read.
+    [ -f "$_diag_log" ] || continue
+    [ -L "$_diag_log" ] && continue
+    [ -s "$_diag_log" ] || continue
+    # The tail is the part worth keeping; the block headers are at the start of each block.
+    if ! tail -c "$_diag_cap" "$_diag_log" 2>/dev/null \
+        | _console_diag_redact text "diag:$_diag_id" "$_dir/diagnostics/$_diag_id.log"; then
+      rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+      return 1
+    fi
+  done < "$_diag_pairs_file"
+  _diag_counts=$(_diag_index_json "$_diag_list_file" "$_dir" \
+    "$_dir/diagnostics/index.json")
+  _diag_index_rc=$?
+  rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+  if [ "$_diag_index_rc" != 0 ]; then
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot describe the saved checks"}\n'
+    return 1
+  fi
+  set -- $_diag_counts
+  _diag_checks=${1:-0}
+  _diag_not_run=${2:-0}
+  _diag_included=${3:-0}
+  return 0
+}
+
 # One archive with everything needed to diagnose the console path from a distance. The
 # masking is done by the shipped redactor, and `verify` is the last gate: an unmasked bundle
-# is never handed out (review 15.11, R02).
-cmd_console_diag() {
+# is never handed out (review 15.11, R02). R09 adds the saved per-check logs to the very same
+# tree through `_diag_bundle_entries`; there is one collector and one packer, not two.
+_console_diag_build() { # $1 = console|bundle
+  _diag_mode=${1:-console}
   # R07: the archive lives in a private spool, never in world-writable /tmp. `init` fails
   # closed (must be a real directory, ours, 0700) and its JSON refusal is the answer.
   [ -f "$DIAG_SPOOL_PY" ] || {
@@ -3124,6 +3333,11 @@ cmd_console_diag() {
       _console_diag_redact yaml yaml:mihomo "$_dir/config.masked.yaml" \
         < "$MIHOMO_CONF" || return 1
     fi
+  fi
+  # R09: the shared archive also carries every saved Doctor log. Collection is read-only:
+  # `diag_list` plus the files it names, no `diag_run`, no network probe on download.
+  if [ "$_diag_mode" = bundle ]; then
+    _diag_bundle_entries || return 1
   fi
   # Staging budget: 1.5 MiB of text already compresses into an archive the 2 MiB creation cap
   # accepts, so a bigger staging tree means a pathological state. Refuse before verify/tar
@@ -3224,9 +3438,22 @@ cmd_console_diag() {
   "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$BACKUP_DIR" --share \
     --keep-h "$_diag_keep" --quota "$_diag_share_quota" --files "$_diag_share_files" \
     >/dev/null 2>&1
-  printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s,"share_note":"%s"}\n' \
-    "$_tgz" "$_diag_bytes" "$_shared" "$_share_note"
+  if [ "$_diag_mode" = bundle ]; then
+    # R09: the tab downloads through `console_diag_get`, which needs a registered name, not a
+    # path. `checks`/`not_run` are counts from the index that was just packed.
+    printf '{"ok":true,"name":"%s","bytes":%s,"checks":%s,"not_run":%s}\n' \
+      "${_tgz##*/}" "$_diag_bytes" "${_diag_checks:-0}" "${_diag_not_run:-0}"
+  else
+    printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s,"share_note":"%s"}\n' \
+      "$_tgz" "$_diag_bytes" "$_shared" "$_share_note"
+  fi
 }
+
+# Both panel buttons share `_console_diag_build`: the console card keeps the console-only
+# answer for compatibility, while the Diagnostics tab asks for the full tree. No second
+# collector, packer or download path exists.
+cmd_console_diag() { _console_diag_build console; }
+cmd_diag_bundle() { _console_diag_build bundle; }
 
 # The panel used to get only a path on the router, so the owner had to find the archive by hand
 # over SMB or SSH - and the file sat in /tmp with no way back (review 15.11, #15). The bytes now
@@ -3306,6 +3533,7 @@ case "$1" in
   diag_run)                 cmd_diag_run "$2" ;;
   diag_log)                 cmd_diag_log "$2" ;;
   diag_domain)              cmd_diag_domain "$2" "$3" ;;
+  diag_bundle)              cmd_diag_bundle ;;
   upd_check)                cmd_upd_check "$2" ;;
   upd_status)               cmd_upd_status ;;
   upd_apply)                cmd_upd_apply ;;

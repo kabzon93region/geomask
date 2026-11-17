@@ -118,7 +118,8 @@ class ConsoleDiagTests(unittest.TestCase):
         lines += [stubs]
         lines += [extract('_console_diag_fail'), extract('_console_diag_redact'),
                   extract('_console_diag_json'), extract('_diag_uint'), extract('_diag_run'),
-                  extract('_console_get'), extract('json_esc')]
+                  extract('_console_get'), extract('json_esc'),
+                  extract('_console_diag_build')]
         lines += [extract(name) for name in functions]
         lines += [body]
         path = self.case / 'run.sh'

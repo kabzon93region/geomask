@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"geo-sync": [ "nodescan", "nodes_path_save", "nodes_path_check", "nodes_audit_cancel", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra", "sync_lists", "aidns", "google", "global", "ipv6", "dns_guard", "console", "console_diag", "dev_add", "dev_del", "ai_sub_set", "subs_seed", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "mod_check", "mod_update", "diag_run", "diag_domain", "upd_apply", "nodes_path_preview", "nodes_path_apply", "nodes_path_revoke", "mtrickle_sync", "backup", "nodes_audit_schedule_set" ]
+				"geo-sync": [ "nodescan", "nodes_path_save", "nodes_path_check", "nodes_audit_cancel", "nodes_set", "sync_set", "syncd_set", "pin_set", "lists_seed", "yt_mode", "yt_reset", "torrent_refresh", "torrent_listener", "torrent_extra", "sync_lists", "aidns", "google", "global", "ipv6", "dns_guard", "console", "console_diag", "dev_add", "dev_del", "ai_sub_set", "subs_seed", "sub_add", "sub_del", "ai_sub_use", "vpn_sub_use", "vpnnp_sub_use", "mod_check", "mod_update", "diag_run", "diag_domain", "diag_bundle", "upd_apply", "nodes_path_preview", "nodes_path_apply", "nodes_path_revoke", "mtrickle_sync", "backup", "nodes_audit_schedule_set" ]
 			}
 		}
 	}

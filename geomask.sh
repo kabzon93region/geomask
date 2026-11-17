@@ -9057,7 +9057,7 @@ _diag_uint() { # $1 = value, $2 = default, $3 = minimum, $4 = maximum
   esac
   _diag_uint_v=$(printf '%s' "$_diag_uint_v" | sed 's/^0*//')
   [ -n "$_diag_uint_v" ] || _diag_uint_v=0
-  case "$_diag_uint_v" in ??????*) _diag_uint_v=$4 ;; esac
+  case "$_diag_uint_v" in ????????*) _diag_uint_v=$4 ;; esac
   _diag_uint_v=$((_diag_uint_v + 0))
   [ "$_diag_uint_v" -lt "$3" ] && _diag_uint_v=$3
   [ "$_diag_uint_v" -gt "$4" ] && _diag_uint_v=$4
@@ -9246,6 +9246,16 @@ for check in data.get("checks") or []:
   if [ "$_diag_n" -gt 0 ]; then
     _diag_cap=$((_diag_total / _diag_n))
   fi
+  # The shared budget is a hard ceiling. Clamping a too-small per-log share up to the
+  # minimum would make N * minimum exceed the total (48 logs at the old 8 KiB floor already
+  # fill 384 KiB exactly; 60 do not fit). Refuse instead of quietly exceeding the limit.
+  if [ "$_diag_n" -gt 0 ] && [ "$_diag_total" -lt "$((_diag_log_min * _diag_n))" ]; then
+    rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot fit %s saved check logs into the shared log budget (%s bytes minimum each, %s bytes total); raise GM_DIAG_BUNDLE_LOG_TOTAL or lower GM_DIAG_BUNDLE_LOG_MIN"}\n' \
+      "$_diag_n" "$_diag_log_min" "$_diag_total"
+    return 1
+  fi
   [ "$_diag_cap" -gt "$_diag_log_max" ] && _diag_cap=$_diag_log_max
   [ "$_diag_cap" -lt "$_diag_log_min" ] && _diag_cap=$_diag_log_min
   while IFS='|' read -r _diag_id _diag_log; do
@@ -9258,8 +9268,11 @@ for check in data.get("checks") or []:
     [ -s "$_diag_log" ] || continue
     # The tail is the part worth keeping; the block headers are at the start of each block.
     if ! tail -c "$_diag_cap" "$_diag_log" 2>/dev/null \
-        | _console_diag_redact text "diag:$_diag_id" "$_dir/diagnostics/$_diag_id.log"; then
+        | _console_diag_redact text "diag:$_diag_id" "$_dir/diagnostics/$_diag_id.log" >/dev/null; then
       rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+      rm -rf "$_dir" 2>/dev/null
+      printf '{"ok":false,"error":"cannot mask the saved check log %s - nothing was packed"}\n' \
+        "$_diag_id"
       return 1
     fi
   done < "$_diag_pairs_file"
@@ -17138,7 +17151,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "5f2effd7f92013c7bc9b63ba8b04b1b0d666496775962595ff02a59693c61ba6"
+          "sha256": "d370f8aa63e319f4d6af1b6e9934f3f086c14b2aba5d858d320a6e32bbd63188"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",

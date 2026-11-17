@@ -10,6 +10,8 @@ with its own HOME/TMPDIR, a hard timeout, and it records what actually happened:
   * a module that ran zero tests fails the run
   * a module that ran fewer tests than tests/expected-counts.json fails the run, and so
     does a whole run in which no test actually executed (every test was skipped)
+  * a module named in tests/expected-counts.json but absent from the run fails the run
+    (deleting or renaming a module must not look green)
 
 The allowlist is deliberately code, not a free-form log: each reason maps to the
 boundary ID documented in tests/BOUNDARIES.md. Adding a new skip reason is a review
@@ -59,7 +61,7 @@ def load_expected(path):
     if not path:
         return {}, 'expected-counts.json path is empty'
     try:
-        text = Path(path).read_text(encoding='utf-8')
+        text = Path(path).read_text(encoding='utf-8-sig')
     except OSError as exc:
         return {}, 'cannot read expected counts %s: %s' % (path, exc)
     try:
@@ -296,6 +298,8 @@ def summarize(results, tests_dir, log_dir, timeout, expected=None, expected_path
     totals['executed'] = totals['tests'] - totals['skip']
     below_manifest = []
     not_in_manifest = []
+    found_modules = {result['module'] for result in results}
+    missing_modules = sorted(set(expected) - found_modules)
     for result in results:
         minimum = expected.get(result['module'])
         if minimum is None:
@@ -308,11 +312,14 @@ def summarize(results, tests_dir, log_dir, timeout, expected=None, expected_path
                                   % (result['module'], result['tests'], minimum))
     totals['below_manifest'] = len(below_manifest)
     totals['not_in_manifest'] = len(not_in_manifest)
+    totals['missing_modules'] = len(missing_modules)
     failed_modules = [r['module'] for r in results
                       if r['status'] in ('fail', 'unknown-skip', 'timeout')]
     failed_modules.extend(item.split(' ', 1)[0] for item in below_manifest)
+    failed_modules.extend(missing_modules)
     failed_modules = sorted(set(failed_modules))
-    if problem or totals['modules'] == 0 or totals['tests'] == 0 or totals['executed'] == 0:
+    if (problem or totals['modules'] == 0 or totals['tests'] == 0
+            or totals['executed'] == 0 or missing_modules):
         rc = 1
     elif any(r['status'] == 'fail' or r['status'] == 'timeout' for r in results):
         rc = 1
@@ -351,6 +358,9 @@ def summarize(results, tests_dir, log_dir, timeout, expected=None, expected_path
         lines.append('error: no test actually executed (every test was skipped)')
     if below_manifest:
         lines.append('below manifest: %s' % '; '.join(below_manifest))
+    if missing_modules:
+        lines.append('missing modules: %s (in expected-counts.json, absent from the run)'
+                     % ', '.join(missing_modules))
     if not_in_manifest:
         lines.append('note: not listed in expected-counts.json (minimum 1 enforced): %s'
                      % ', '.join(not_in_manifest))
@@ -382,7 +392,8 @@ def summarize(results, tests_dir, log_dir, timeout, expected=None, expected_path
         'totals': totals, 'results': results, 'rc': rc,
         'allowed_skips': ALLOWED_SKIPS,
         'expected_counts': expected, 'expected_path': expected_path,
-        'below_manifest': below_manifest, 'manifest_problem': problem,
+        'below_manifest': below_manifest, 'missing_modules': missing_modules,
+        'manifest_problem': problem,
     }, ensure_ascii=False, indent=2), encoding='utf-8')
     print(text, end='')
     print('summary: %s' % Path(log_dir, 'summary.txt'))

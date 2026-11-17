@@ -120,12 +120,32 @@ if [ -n "${GM_TESTS_DIR:-}" ] && [ "${GM_RUN_SCENARIOS:-0}" != "1" ]; then
 fi
 
 pass=0; failn=0; skipped=0; skip_unknown=0; timeouts=0
+# R10a final review: the scenario helper had no bound at all, so `timeouts` was a constant
+# zero and a hung `t` could only be killed from outside (leaving no per-scenario record).
+# Each `t` command is bounded now; a timeout is its own outcome, not a pass and not a skip.
+GM_SCENARIO_TIMEOUT=${GM_SCENARIO_TIMEOUT:-600}
+case "$GM_SCENARIO_TIMEOUT" in
+  ''|*[!0-9]*) GM_SCENARIO_TIMEOUT=600 ;;
+esac
+[ "$GM_SCENARIO_TIMEOUT" -gt 0 ] 2>/dev/null || GM_SCENARIO_TIMEOUT=600
+GM_HAVE_TIMEOUT=0
+command -v timeout >/dev/null 2>&1 && GM_HAVE_TIMEOUT=1
 GM_SKIP_LOG="$GM_LOG_DIR/skips.txt"
 : > "$GM_SKIP_LOG"
 t() { # t <name> <expected_rc> <cmd...>
   _name="$1"; _want="$2"; shift 2
-  "$@" >"$HERE/last_out.txt" 2>&1
+  if [ "$GM_HAVE_TIMEOUT" = 1 ]; then
+    timeout "$GM_SCENARIO_TIMEOUT" "$@" >"$HERE/last_out.txt" 2>&1
+  else
+    "$@" >"$HERE/last_out.txt" 2>&1
+  fi
   _rc=$?
+  if [ "$_rc" = 124 ]; then
+    echo "TIMEOUT: $_name (> ${GM_SCENARIO_TIMEOUT}s)"
+    sed 's/^/    | /' "$HERE/last_out.txt" | tail -15
+    timeouts=$((timeouts+1))
+    return 0
+  fi
   if [ "$_rc" = "$_want" ]; then
     echo "PASS: $_name (rc=$_rc)"
     pass=$((pass+1))
@@ -171,7 +191,8 @@ write_summary() { # write_summary <rc>
   _rc=$1
   [ "${GM_SUMMARY_DONE:-0}" = 1 ] && return 0
   GM_SUMMARY_DONE=1
-  if [ "$_rc" = 0 ] && [ "$GM_ENV_FAIL" = 0 ]; then _verdict=PASS; else _verdict=FAIL; fi
+  if [ "$_rc" = 0 ] && [ "$GM_ENV_FAIL" = 0 ] && [ "$timeouts" = 0 ] \
+     && [ "$skip_unknown" = 0 ]; then _verdict=PASS; else _verdict=FAIL; fi
   {
     echo "== GEOMASK TEST RUNNER SUMMARY =="
     echo "date: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
@@ -277,6 +298,20 @@ scenario_s11() {
     tail -10 "$HERE/last_out.txt" | sed 's/^/    | /'; failn=$((failn+1))
   fi
 
+  _icmp_n=$(grep -c 'ipproto icmp' "$HERE/state/ip_rules")
+  # The ifup path is asynchronous: the inline drain above races the worker hotplug detached.
+  # Whoever takes `routes-worker` first applies the queue, so wait (bounded) for the effect
+  # instead of demanding that the synchronous call finished the work before the assertion.
+  _s11_wait=0
+  while [ "$_s11_wait" -lt 50 ]; do
+    _icmp_w=$(grep -c 'ipproto icmp' "$HERE/state/ip_rules" 2>/dev/null || echo 0)
+    if [ "$_icmp_w" = 1 ] && grep -q 'priority 32760' "$HERE/state/ip_rules" 2>/dev/null; then
+      _icmp_n=$_icmp_w
+      break
+    fi
+    sleep 0.1
+    _s11_wait=$((_s11_wait+1))
+  done
   _icmp_n=$(grep -c 'ipproto icmp' "$HERE/state/ip_rules")
   if [ "$_icmp_n" = 1 ]; then
     echo "PASS: S11 reseated ICMP rule not duplicated"; pass=$((pass+1))
@@ -2014,4 +2049,4 @@ if grep -qF 'restore_old' "$_BK" && ! grep -qF 'rm -f /tmp/router-backup-*.tar.g
 else echo "FAIL: S59 self-update still deletes backups before sysupgrade"; failn=$((failn+1)); fi
 
 echo "== SANDBOX RESULT: pass=$pass fail=$failn skip=$skipped timeout=$timeouts unknown_skip=$skip_unknown =="
-[ "$failn" -eq 0 ] && [ "$skip_unknown" -eq 0 ] && [ "$GM_ENV_FAIL" -eq 0 ]
+[ "$failn" -eq 0 ] && [ "$skip_unknown" -eq 0 ] && [ "$timeouts" -eq 0 ] && [ "$GM_ENV_FAIL" -eq 0 ]

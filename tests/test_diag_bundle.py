@@ -332,6 +332,60 @@ class DiagBundleTests(unittest.TestCase):
                      if entry.name.startswith('geomask-console-diag')]
         self.assertEqual(leftovers, [])
 
+    def test_a_redactor_failure_is_json_and_removes_the_staging_directory(self):
+        # Final review: this branch returned 1 with an empty stdout and left
+        # `$TMPDIR/geomask-console-diag.XXXXXX` behind, so ubus got no JSON.
+        wrapper = self.case / 'failing-redact.py'
+        wrapper.write_text(
+            'import subprocess, sys\n'
+            'REAL = %r\n'
+            'data = sys.stdin.buffer.read()\n'
+            'if len(sys.argv) > 1 and sys.argv[1] == "redact" '
+            'and b"FAIL-REDACTOR" in data:\n'
+            '    sys.exit(1)\n'
+            'proc = subprocess.run([sys.executable, REAL] + sys.argv[1:], input=data,\n'
+            '                      stdout=subprocess.PIPE)\n'
+            'sys.stdout.buffer.write(proc.stdout)\n'
+            'sys.exit(proc.returncode)\n' % native(REDACT), encoding='utf-8')
+        (self.logs / 'net_dns.log').write_text(
+            '=== 2026-11-17T10:00:00+0300 fail ===\nFAIL-REDACTOR\n',
+            encoding='utf-8', newline='\n')
+        answer = self.run_body(
+            # Simulate the historical failure shape: the redactor reports failure without
+            # emitting JSON or cleaning the staging tree; only _diag_bundle_entries can.
+            '_console_diag_fail() { return 1; }\n'
+            'GM_DIAG_PY="%s"; DIAG_PY="$GM_DIAG_PY"\n'
+            'cmd_diag_bundle; printf "\\nRC=%%s\\n" "$?"' % native(wrapper))
+        self.assertFalse(answer['ok'], answer)
+        self.assertIn('cannot mask the saved check log', answer['error'])
+        leftovers = [entry.name for entry in self.spool.iterdir()
+                     if entry.name.startswith(('geomask-console-diag',
+                                               'geomask-diag-list',
+                                               'geomask-diag-pairs'))]
+        self.assertEqual(leftovers, [])
+
+    def test_the_shared_log_budget_is_hard_at_sixty_checks(self):
+        # 60 * 8192-byte minimum is 480 KiB, over the 384 KiB shared budget. The old code
+        # clamped the per-log share up and packed more than the promised total.
+        self.checks = [{
+            'id': 'check_%02d' % index,
+            'area': 'test',
+            'title': 'check %d' % index,
+            'live': False,
+            'last_state': 'ok',
+            'last_summary': '',
+            'last_at': '',
+            'log': '',
+        } for index in range(60)]
+        self.write_doctor()
+        answer = self.run_bundle()
+        self.assertFalse(answer['ok'], answer)
+        self.assertIn('saved check logs', answer['error'])
+        self.assertIn('60', answer['error'])
+        leftovers = [entry.name for entry in self.spool.iterdir()
+                     if entry.name.startswith('geomask-console-diag')]
+        self.assertEqual(leftovers, [])
+
     # ---------------------------------------------------------------- spool registration
     def test_archive_is_registered_into_the_private_spool_with_the_shell_quota(self):
         calls = self.case / 'spool-calls'

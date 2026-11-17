@@ -90,6 +90,23 @@ class GateTests(unittest.TestCase):
         self.assertIn('verdict: PASS', summary)
         self.assertIn('tests actually executed: 2', summary)
 
+    def test_a_manifest_module_missing_from_the_run_is_a_failure(self):
+        rc, output, summary = self.run_gate({'test_one.py': PASSING},
+                                            {'test_one.py': 1, 'test_deleted.py': 5})
+        self.assertEqual(rc, 1)
+        self.assertIn('verdict: FAIL', summary)
+        self.assertIn('test_deleted.py', summary)
+        self.assertIn('missing modules', summary)
+
+    def test_a_utf8_bom_manifest_is_read(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        manifest = Path(tmp.name) / 'expected-counts.json'
+        manifest.write_bytes(b'\xef\xbb\xbf{"test_one.py": 1}\n')
+        expected, problem = testgate.load_expected(str(manifest))
+        self.assertEqual('', problem)
+        self.assertEqual({'test_one.py': 1}, expected)
+
     def test_missing_manifest_is_fail_closed(self):
         # run_gate always writes a manifest; point the gate at an absent one explicitly.
         tmp = tempfile.TemporaryDirectory()

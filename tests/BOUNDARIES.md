@@ -119,11 +119,11 @@ whose reason does not map to this list makes the run fail. The list lives in
 detail. Adding a skip with a new reason without updating this file is a bug.
 
 `tests/expected-counts.json` carries a **minimum** test count per module. The gate fails a
-module that ran fewer tests than its entry, a module that ran zero tests, and a whole run
-where no test actually executed (all skipped); running more tests than the entry is allowed.
-Update the entry when you add tests to a module. Final numbers are recomputed in R11 after
-the other R-tasks; this document describes the mechanism, not a promise about a particular
-count.
+module that ran fewer tests than its entry, a module that ran zero tests, a module named in
+the manifest but absent from the run, and a whole run where no test actually executed (all
+skipped); running more tests than the entry is allowed. Update the entry when you add tests
+to a module. Final numbers are recomputed in R11 after the other R-tasks; this document
+describes the mechanism, not a promise about a particular count.
 
 ## Running the gate
 

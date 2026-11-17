@@ -1012,6 +1012,20 @@
       "notes": "маркер uid dnsai"
     },
     {
+      "id": "/etc/geo-devices.list",
+      "path": "/etc/geo-devices.list",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "600",
+      "writers": [
+        "ensure_devices_list step2_apply (create only when absent)",
+        "cmd_dev_add/cmd_dev_del runtime (devices lock)"
+      ],
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "R10b: fresh install creates an empty list (600, root), so a missing file means damage rather than the norm; an existing list is owner data and is never truncated; rollback removes a file that did not exist before the run"
+    },
+    {
       "id": "/etc/passwd",
       "path": "/etc/passwd",
       "type": "regular",

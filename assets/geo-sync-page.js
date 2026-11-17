@@ -37,6 +37,7 @@ var callGoogle                = rpc.declare({ object: 'geo-sync', method: 'googl
 var callGlobal                = rpc.declare({ object: 'geo-sync', method: 'global', params: { mode: null }, expect: {} });
 var callIpv6                  = rpc.declare({ object: 'geo-sync', method: 'ipv6', params: { state: null }, expect: {} });
 var callDnsGuard              = rpc.declare({ object: 'geo-sync', method: 'dns_guard', params: { action: null }, expect: {} });
+var callDnsGuardStatus        = rpc.declare({ object: 'geo-sync', method: 'dns_guard_status', expect: {} });
 var callConsole               = rpc.declare({ object: 'geo-sync', method: 'console', params: { action: null, ip: null, sub: null, countries: null }, expect: {} });
 var callConsoleStatus         = rpc.declare({ object: 'geo-sync', method: 'console_status', expect: {} });
 var callConsoleDiag           = rpc.declare({ object: 'geo-sync', method: 'console_diag', params: { what: null }, expect: {} });
@@ -681,11 +682,18 @@ return view.extend({
 			conCc.value = cs.countries || '';
 			conSel.value = cs.sub ? String(cs.sub) : '';
 			var cc = cs.config || {};
+			// `state` distinguishes "on and matching" from "on but traffic goes elsewhere"
+			// and from "could not check"; enabled/rule/tun stay for older backends.
+			var csState = cs.state || '—';
+			var csUnknown = (cs.unknown && cs.unknown.length)
+				? ' · не проверено: ' + cs.unknown.join(', ') : '';
 			conState.textContent = 'состояние консоли: ' + (cs.enabled ? 'включена' : 'выключена')
+				+ ' · состояние: ' + csState
 				+ ' · правило: ' + (cs.rule ? 'есть' : 'нет')
 				+ ' · туннель Console: ' + (cs.tun ? 'поднят' : 'нет')
 				+ ' · группа CONSOLE: ' + (cc.group ? 'есть' : 'нет')
-				+ ' · провайдер console: ' + (cc.provider ? 'есть' : 'нет');
+				+ ' · провайдер console: ' + (cc.provider ? 'есть' : 'нет')
+				+ csUnknown;
 		}).catch(function() {
 			// A router whose backend has no such method must still render the card.
 			conState.textContent = 'состояние консоли: нет данных';

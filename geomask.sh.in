@@ -854,8 +854,34 @@ step2_check() {
   fi
   return $_need
 }
+# R10b: the guard now reports a missing /etc/geo-devices.list as "per-device state unknown"
+# (rc 2) instead of silently skipping the device blocks. The list used to appear only on the
+# first dev_add, so a fresh install had no file at all and "damaged" was indistinguishable
+# from "normal". Create an EMPTY list on install; an existing list is owner data and is never
+# truncated - install and reinstall both only fill the gap.
+ensure_devices_list() {
+  _edl=$(P /etc/geo-devices.list)
+  if [ -L "$_edl" ]; then
+    warn "$_edl is a symlink - refusing to create the device list through it"
+    return 1
+  fi
+  if [ -e "$_edl" ]; then
+    chmod 600 "$_edl" 2>/dev/null || true
+    return 0
+  fi
+  ( umask 077; : > "$_edl" ) 2>/dev/null || {
+    warn "cannot create the empty device list $_edl"
+    return 1
+  }
+  chmod 600 "$_edl" 2>/dev/null || true
+  chown root:root "$_edl" 2>/dev/null || true
+  return 0
+}
+
 step2_apply() {
   _save_before=${SAVE_FAIL:-0}
+  # Before the assets, so a failure here aborts before any service file is replaced.
+  ensure_devices_list || { bad "не удалось создать пустой список устройств"; return 1; }
   save_stream /usr/lib/geomask/geomask-node-audit.py 755 <<'ASSET_EOF'
 @@ASSET:geomask-node-audit.py@@
 ASSET_EOF
@@ -5427,6 +5453,7 @@ REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-o
 /etc/geomask/version|regular-or-absent
 /etc/geomask/modules.json|regular-or-absent
 /etc/geomask/modules-state.json|regular-or-absent
+/etc/geo-devices.list|regular-or-absent
 /root/sync_mtrickle_mihomo.sh|regular-or-absent
 /etc/mihomo/ruleset/ytdirect.yaml|regular-or-absent
 /etc/mihomo/ruleset/ytvpn.yaml|regular-or-absent

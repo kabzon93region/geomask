@@ -255,6 +255,12 @@
       "js": "callDnsGuard"
     },
     {
+      "name": "dns_guard_status",
+      "acl": "read",
+      "args": [],
+      "js": "callDnsGuardStatus"
+    },
+    {
       "name": "console",
       "acl": "write",
       "args": [

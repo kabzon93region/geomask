@@ -727,6 +727,31 @@ api_refresh_provider() { return 0; }
         self.assertIn('RC=1', result.stdout)
         self.assertIn('шаг 3 не завершён', result.stdout)
 
+    # ---------------------------------------------------------------- R10b device list
+    def test_a_fresh_install_creates_an_empty_device_list(self):
+        # The guard now treats a missing list as unknown (rc 2). The installer must create
+        # an EMPTY 600 list, so "missing" means damage rather than a normal fresh system.
+        result = self.run_script('ensure_devices_list; printf "RC=%s\\n" "$?"',
+                                 functions=['ensure_devices_list'])
+        self.assertIn('RC=0', result.stdout, result.stderr)
+        path = self.case / 'etc/geo-devices.list'
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.read_bytes(), b'')
+        self.assertIn('chmod 600 "$_edl"', SOURCE)
+        if os.name != 'nt':
+            import stat
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_an_existing_device_list_is_never_truncated(self):
+        path = self.case / 'etc/geo-devices.list'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        before = '10.0.0.5 ai phone\n192.168.1.50 bypass tv\n'
+        path.write_text(before, encoding='utf-8', newline='\n')
+        result = self.run_script('ensure_devices_list; printf "RC=%s\\n" "$?"',
+                                 functions=['ensure_devices_list'])
+        self.assertIn('RC=0', result.stdout, result.stderr)
+        self.assertEqual(path.read_text(encoding='utf-8'), before)
+
 
 if __name__ == '__main__':
     unittest.main()

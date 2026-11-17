@@ -181,13 +181,18 @@ class ConsoleStatusTests(unittest.TestCase):
             'set -u\n'
             'CONSOLE_STATE="%s"\nCONSOLE_TABLE=102\nCONSOLE_TUN_DEV=Console\n'
             'CONSOLE_RULE_PREF=19903\nCONSOLE_SOCKS_PORT=7893\nCONSOLE_TUN_IP=198.21.0.1\n'
+            'GM_ROUTES_LIB=/nonexistent/geomask-routes.sh\n'
             'CONSOLE_PY=/nonexistent/geomask-console.py\n'
             'PYTHON_BIN=/nonexistent/python3\n'
             'LOG="%s"\n'
             'ip() { return 0; }\n'
             % (posix(self.state), posix(self.case / 'geo-sync.log')))
         script = (header + '\n'.join(extract(name) for name in
-                                     ('_console_get', '_console_set', 'cmd_console'))
+                                     ('json_esc', '_ipv4_ok', '_console_get', '_console_set',
+                                      '_console_rule_exact', '_console_rule_any_table',
+                                      '_console_default_kind', '_console_lan_present',
+                                      '_console_status_unknown', '_console_status_state',
+                                      'cmd_console'))
                   + '\n' + body)
         path = self.case / 'run.sh'
         path.write_text(script, encoding='utf-8', newline='\n')

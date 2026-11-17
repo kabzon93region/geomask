@@ -1804,12 +1804,16 @@ def main(argv=None):
     if args.command == 'run':
         target = args.target or 'all'
         if target == 'all':
-            print(json.dumps(run_all(include_live=args.live), ensure_ascii=False))
-            return 0
+            payload = run_all(include_live=args.live)
+            print(json.dumps(payload, ensure_ascii=False))
+            # R10b (D17): the JSON already carried verdict_state='fail', but the process
+            # exited 0, so a shell caller could not fail a gate on a red check. `ok` still
+            # means "the request ran"; the exit code is the health answer.
+            return 1 if payload.get('verdict_state') == 'fail' else 0
         result = run_check(target)
         print(json.dumps({'ok': result['state'] != 'fail', 'checks': [result]},
                          ensure_ascii=False))
-        return 0 if result['state'] != 'fail' else 0
+        return 0 if result['state'] != 'fail' else 1
     if args.command == 'log':
         target = args.target or ''
         text = log_tail(target, args.tail)

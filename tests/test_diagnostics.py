@@ -308,5 +308,60 @@ class ProbeServiceTests(unittest.TestCase):
         self.assertEqual(proof.evidence['http'], 403)
 
 
+class DoctorRunExitCodeTests(unittest.TestCase):
+    """R10b (D17): a red Doctor check must fail the process, not only the JSON payload.
+
+    `ok` in the payload stays "the request ran" (the panel relies on it); the exit code is
+    the health answer a shell gate can use.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        source = ROOT / 'assets' / 'geomask-doctor.py'
+        spec = importlib.util.spec_from_file_location('geomask_doctor_rc', source)
+        cls.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.module)
+
+    def run_cli(self, argv, run_check=None, run_all=None):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            if run_check is not None:
+                with patch.object(self.module, 'run_check', return_value=run_check):
+                    rc = self.module.main(argv)
+            elif run_all is not None:
+                with patch.object(self.module, 'run_all', return_value=run_all):
+                    rc = self.module.main(argv)
+            else:
+                rc = self.module.main(argv)
+        return rc, out.getvalue()
+
+    def test_a_failing_check_exits_one(self):
+        rc, text = self.run_cli(['run', 'some_check'],
+                                run_check={'id': 'some_check', 'state': 'fail'})
+        self.assertEqual(rc, 1)
+        self.assertFalse(json.loads(text)['ok'])
+
+    def test_a_warning_check_still_exits_zero(self):
+        rc, text = self.run_cli(['run', 'some_check'],
+                                run_check={'id': 'some_check', 'state': 'warn'})
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(text)['ok'])
+
+    def test_run_all_exits_one_when_its_verdict_is_fail(self):
+        rc, text = self.run_cli(['run', 'all'],
+                                run_all={'ok': True, 'verdict_state': 'fail', 'checks': []})
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(text)['verdict_state'], 'fail')
+
+    def test_run_all_with_warnings_exits_zero(self):
+        rc, text = self.run_cli(['run', 'all'],
+                                run_all={'ok': True, 'verdict_state': 'warn', 'checks': []})
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(text)['verdict_state'], 'warn')
+
+
 if __name__ == '__main__':
     unittest.main()

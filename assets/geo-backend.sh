@@ -265,6 +265,179 @@ _url_of_provider() { # _url_of_provider <provider> -> its url line
   awk -v p="  $P:" '$0==p{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{exit}' "$MIHOMO_CONF" 2>/dev/null
 }
 
+# R10b: `status` is a READ. The old payload ended with `rules_ok` (a count of `lookup main`
+# rules) and the panel had nothing else to judge, so a router whose console/default went
+# through the WAN could still look healthy. These two sub-objects separate what the product
+# wants (desired) from what the kernel/UCI currently has (runtime), and name every check that
+# could not run (unknown). The top-level `ok` means "the request was served", never "healthy".
+_gm_unknown() { _GM_UNKNOWN="${_GM_UNKNOWN}${_GM_UNKNOWN:+,}\"$1\""; }
+
+_guard_status_json() { # the guard's base contract: device list + ip rules + table 101 default
+  _GM_UNKNOWN=''
+  _gs_state=ok
+  _gs_dev=ok
+  _gs_rules=0
+  _gs_t101=unknown
+  _gs_tun=unknown
+  _gs_lan=br-lan
+  if [ ! -e "$DEVICES" ]; then
+    _gs_dev=missing
+    _gs_state=unknown
+    _gm_unknown devices
+  elif [ ! -f "$DEVICES" ] || [ ! -r "$DEVICES" ]; then
+    _gs_dev=unreadable
+    _gs_state=unknown
+    _gm_unknown devices
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    _gs_lan=$(_gm_lan_iface 2>/dev/null)
+    [ -n "$_gs_lan" ] || _gs_lan=br-lan
+    if _gs_rules_now=$(ip rule show 2>/dev/null); then
+      _gs_rules=$(printf '%s\n' "$_gs_rules_now" | awk -v lan="$_gs_lan" '
+        {
+          line = $0
+          sub(/^[ \t]+/, "", line)
+          n = split(line, a, /[ \t]+/)
+          for (i = 1; i <= n; i++) {
+            if (a[i] == "iif" && a[i + 1] == lan && a[i + 2] == "ipproto" \
+                && a[i + 3] == "icmp" && a[i + 4] == "lookup" && a[i + 5] == "main") icmp = 1
+            if (a[i] == "fwmark" && a[i + 1] == "0x64" \
+                && (a[i + 2] == "lookup" || a[i + 2] == "table") && a[i + 3] == "101") fw = 1
+          }
+        }
+        END { print (icmp ? 1 : 0) + (fw ? 1 : 0) }
+      ')
+    else
+      _gs_state=unknown
+      _gm_unknown ip-rule
+    fi
+    if _gs_t101_now=$(ip route show table 101 2>/dev/null); then
+      _gs_t101=$(printf '%s\n' "$_gs_t101_now" | awk -v tun="$AI_TUN_DEV" '
+        $1 == "default" {
+          seen = 1
+          for (i = 2; i < NF; i++) if ($i == "dev" && $(i + 1) == tun) ours = 1
+        }
+        END {
+          if (ours) print "dev " tun
+          else if (seen) print "foreign"
+          else print "none"
+        }
+      ')
+    else
+      _gs_t101=unknown
+      _gs_state=unknown
+      _gm_unknown ip-route
+    fi
+    if ip link show "$AI_TUN_DEV" >/dev/null 2>&1; then _gs_tun=up; else _gs_tun=down; fi
+  else
+    _gs_state=unknown
+    _gm_unknown ip
+  fi
+  if [ "$_gs_state" != unknown ]; then
+    if [ "$_gs_tun" = down ]; then
+      _gs_state=down
+    elif [ "$_gs_rules" != 2 ] || [ "$_gs_t101" != "dev $AI_TUN_DEV" ]; then
+      _gs_state=drift
+    fi
+  fi
+  printf '{"scope":"base rules + table 101 (the console lane is its own object)","desired":{"devices":"regular","base_rules":2,"table101_default":"dev %s","tun":"%s"},"runtime":{"devices":"%s","base_rules":%s,"table101_default":"%s","tun":"%s"},"unknown":[%s],"state":"%s"}' \
+    "$AI_TUN_DEV" "$AI_TUN_DEV" "$_gs_dev" "$_gs_rules" "$_gs_t101" "$_gs_tun" "$_GM_UNKNOWN" "$_gs_state"
+}
+
+# Strict DNS policy recorded by geomask-dnsguard. This does NOT probe the resolver (the panel
+# calls status on every render): desired comes from the record, runtime from the live dnsmasq
+# section. A missing record means "off"; a record without the matching live list is drift.
+DNSGUARD_STATE=${GM_DNSGUARD_STATE:-/etc/geomask/dnsguard.state}
+DNSGUARD_DHCP=${GM_DNSGUARD_DHCP:-/etc/config/dhcp}
+
+_dns_section_values() { # <file> <option> -> values of the FIRST dnsmasq section, one per line
+  awk -v key="$2" '
+    /^[ \t]*config[ \t]+dnsmasq([ \t]|$)/ { if (started) exit; started = 1; next }
+    /^[ \t]*config[ \t]+/ { if (started) exit }
+    started {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line ~ ("^(option|list)[ \t]+" key "([ \t]|$)")) {
+        sub("^(option|list)[ \t]+" key "[ \t]+", "", line)
+        q = sprintf("%c", 39)
+        while (substr(line, 1, 1) == q || substr(line, 1, 1) == "\"") line = substr(line, 2)
+        while (substr(line, length(line), 1) == q || substr(line, length(line), 1) == "\"") \
+          line = substr(line, 1, length(line) - 1)
+        print line
+      }
+    }
+  ' "$1" 2>/dev/null
+}
+
+_dns_status_json() {
+  _GM_UNKNOWN=''
+  _ds_state=ok
+  _ds_desired=off
+  _ds_runtime=unknown
+  _ds_first=''
+  _ds_reserve=false
+  _ds_so=false
+  _ds_record=absent
+  if [ -f "$DNSGUARD_STATE" ]; then
+    _ds_record=present
+    if [ -r "$DNSGUARD_STATE" ]; then
+      _ds_saved=$(sed -n 's/^saved=//p' "$DNSGUARD_STATE" 2>/dev/null | head -1)
+      case "$_ds_saved" in
+        1) _ds_desired=strict ;;
+        0|'') ;;
+        *) _ds_desired=unknown; _ds_state=unknown; _gm_unknown state-record ;;
+      esac
+    else
+      _ds_desired=unknown
+      _ds_state=unknown
+      _gm_unknown state
+    fi
+  fi
+  if [ -r "$DNSGUARD_DHCP" ]; then
+    _ds_all=$(_dns_section_values "$DNSGUARD_DHCP" server)
+    _ds_first=$(printf '%s\n' "$_ds_all" | head -1)
+    _ds_so_value=$(_dns_section_values "$DNSGUARD_DHCP" strictorder | head -1)
+    [ "$_ds_so_value" = 1 ] && _ds_so=true
+    _ds_res=1
+    printf '%s\n' "$_ds_all" | grep -Fxq '1.1.1.1' || _ds_res=0
+    printf '%s\n' "$_ds_all" | grep -Fxq '8.8.8.8' || _ds_res=0
+    [ "$_ds_res" = 1 ] && _ds_reserve=true
+    _ds_doh=0
+    case "$_ds_first" in
+      127.0.0.1#*)
+        _ds_port=${_ds_first#*#}
+        case "$_ds_port" in ''|*[!0-9]*) ;; *) _ds_doh=1 ;; esac
+        ;;
+    esac
+    if [ "$_ds_doh" = 1 ] && [ "$_ds_res" = 1 ] && [ "$_ds_so" = true ]; then
+      _ds_runtime=strict
+    else
+      _ds_runtime=off
+    fi
+  else
+    _ds_state=unknown
+    _gm_unknown dhcp-config
+  fi
+  if [ "$_ds_state" != unknown ]; then
+    case "$_ds_desired:$_ds_runtime" in
+      strict:strict|off:off) _ds_state=ok ;;
+      *) _ds_state=drift ;;
+    esac
+  fi
+  printf '{"scope":"strict DNS policy recorded by geomask-dnsguard (no probe)","desired":{"mode":"%s","record":"%s"},"runtime":{"mode":"%s","first":"%s","reserve":%s,"strictorder":%s},"unknown":[%s],"state":"%s"}' \
+    "$_ds_desired" "$_ds_record" "$_ds_runtime" "$(json_esc "$_ds_first")" \
+    "$_ds_reserve" "$_ds_so" "$_GM_UNKNOWN" "$_ds_state"
+}
+
+_status_attach_health() { # <base JSON> -> base + request-level ok + guard/dns objects
+  _sah_guard=$(_guard_status_json)
+  _sah_dns=$(_dns_status_json)
+  case "$1" in
+    *'}' ) printf '%s,"ok":true,"guard":%s,"dns":%s}\n' "${1%?}" "$_sah_guard" "$_sah_dns" ;;
+    * ) printf '%s\n' "$1" ;;
+  esac
+}
+
 cmd_status() {
   _migrate
   VPN_NODE=$(_grp_node VPN)          # slot VPN: P2P-tolerant tunnel (may be absent)
@@ -340,6 +513,9 @@ cmd_status() {
       '{'*'}') _STATUS_JSON=$_MERGED ;;
     esac
   fi
+  # `rules_ok` above stays as a legacy counter. Health is these separate objects: `ok` only
+  # says the request was executed, so a caller must read guard.state / dns.state.
+  _STATUS_JSON=$(_status_attach_health "$_STATUS_JSON")
   printf '%s\n' "$_STATUS_JSON"
 }
 
@@ -637,8 +813,11 @@ cmd_aidns_apply() {
     return 0
   fi
   if [ ! -f "$AIDNS_UID_FILE" ]; then
-    printf '{"ok":false,"warn":"AI-DNS not installed - run the aidns step of geomask"}'
-    return 0
+    # "Not installed" was answered with rc 0, so a caller could not tell the no-op from a
+    # successful apply. The JSON keeps `warn` for the panel and names the state explicitly;
+    # the exit code is the honest one (R10b item 4).
+    printf '{"ok":false,"state":"not_installed","warn":"AI-DNS not installed - run the aidns step of geomask"}\n'
+    return 1
   fi
   _before=$(sha256sum "$AIDNS_NFT_DEST" 2>/dev/null | awk '{print $1}')
   _aidns_sync
@@ -2156,7 +2335,7 @@ cmd_policy_apply() {
 
 # Strict DNS with an emergency reserve (owner decision 14.11.2026). The policy itself lives in
 # one script so the panel, the installer and a shell call all do the same thing.
-DNSGUARD=/usr/lib/geomask/geomask-dnsguard.sh
+DNSGUARD=${GM_DNSGUARD:-/usr/lib/geomask/geomask-dnsguard.sh}
 cmd_dns_guard() { # cmd_dns_guard <status|apply|revert>
   case "${1:-status}" in
     status|apply|revert) ;;
@@ -2166,6 +2345,11 @@ cmd_dns_guard() { # cmd_dns_guard <status|apply|revert>
   [ -x "$DNSGUARD" ] || { printf '{"ok":false,"error":"dns guard not installed (/usr/lib/geomask/geomask-dnsguard.sh)"}\n'; return 1; }
   "$DNSGUARD" "$1"
 }
+
+# Read-only twin of `dns_guard status`: the panel needs the policy on every render, while
+# apply/revert must stay behind the write ACL. Keeping one method for both made `status`
+# unreachable for a read-only user (R10b item 3).
+cmd_dns_guard_status() { cmd_dns_guard status; }
 
 # ---------------------------------------------------------------- console lane (v1.31.0)
 # A console needs ONE egress for the whole session: auth, game and UDP must leave through the
@@ -2201,6 +2385,168 @@ CONSOLE_LOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-locks/console.lock}
 CONSOLE_ROUTE_WAIT=${GM_CONSOLE_ROUTE_WAIT:-2}
 
 _console_get() { sed -n "s/^$1=//p" "$CONSOLE_STATE" 2>/dev/null | head -1; }
+
+# R10b: the console status used to be three boolean substrings. `grep "from $ip lookup 102"`
+# matched a longer address and table 1020, and `grep '^default'` accepted a default through the
+# WAN. A match must be the exact rule (pref, address and table are separate tokens), the
+# default must name our tunnel without a gateway, and the LAN prefixes mirrored into table 102
+# must be there. "Cannot check" is a third answer, never folded into "healthy".
+_console_rule_exact() { # stdin: ip rule show; $1 = ip; 0 only for pref 19903 from <ip> lookup 102
+  awk -v ip="$1" -v pref="$CONSOLE_RULE_PREF" -v tbl="$CONSOLE_TABLE" '
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      n = split(line, f, /[ \t]+/)
+      p = f[1]
+      sub(/:$/, "", p)
+      if (n == 5 && p == pref && f[2] == "from" && f[3] == ip && f[4] == "lookup" && f[5] == tbl) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+_console_rule_any_table() { # stdin: ip rule show; 0 when any rule looks up the console table
+  awk -v tbl="$CONSOLE_TABLE" '
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      n = split(line, f, /[ \t]+/)
+      for (i = 1; i < n; i++) if (f[i] == "lookup" && f[i + 1] == tbl) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+_console_default_kind() { # stdin: ip route show table 102; prints "dev Console" | "foreign" | "none"
+  awk -v tun="$CONSOLE_TUN_DEV" '
+    $1 == "default" {
+      seen = 1
+      for (i = 2; i < NF; i++) {
+        if ($i == "via") via = 1
+        if ($i == "dev" && $(i + 1) == tun) dev = 1
+      }
+      if (dev && !via) ours = 1
+    }
+    END {
+      if (ours) print "dev " tun
+      else if (seen) print "foreign"
+      else print "none"
+    }
+  '
+}
+
+_console_lan_present() { # stdin: ip route show table 102; $1 = prefix, $2 = device
+  awk -v net="$1" -v dev="$2" '
+    $1 == net {
+      for (i = 2; i < NF; i++) if ($i == "dev" && $(i + 1) == dev) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+_console_status_unknown() { _cs_unknown="${_cs_unknown}${_cs_unknown:+,}\"$1\""; }
+
+# Sets the status fields without writing anything (the panel calls this on every render).
+# _cs_state is ok|drift|down|unknown; _cs_unknown is a JSON array body of checks that could
+# not run; _cs_rule/_cs_tun keep the old boolean fields, but only an exact match sets _cs_rule.
+_console_status_state() {
+  _cs_state=ok
+  _cs_unknown=''
+  _cs_rule=0
+  _cs_tun=0
+  _cs_default=unknown
+  _cs_lan_missing=''
+  _cs_enabled=$(_console_get enabled)
+  _cs_ip=$(_console_get ip)
+  _cs_ip_ok=0
+  if [ -n "$_cs_ip" ] && _ipv4_ok "$_cs_ip"; then _cs_ip_ok=1; fi
+  if [ ! -f "$CONSOLE_STATE" ]; then
+    _cs_state=unknown
+    _console_status_unknown state
+  else
+    case "$_cs_enabled" in
+      0|1) ;;
+      *) _cs_state=unknown; _console_status_unknown enabled ;;
+    esac
+  fi
+  if ! command -v ip >/dev/null 2>&1; then
+    _cs_state=unknown
+    _console_status_unknown ip
+    return 0
+  fi
+  if _cs_rules=$(ip rule show 2>/dev/null); then
+    :
+  else
+    _cs_rules=''
+    _cs_state=unknown
+    _console_status_unknown ip-rule
+  fi
+  ip link show "$CONSOLE_TUN_DEV" >/dev/null 2>&1 && _cs_tun=1
+  # A disabled lane has no desired table: only "no rule may point at 102" is checked.
+  if [ "$_cs_enabled" != 1 ]; then
+    _cs_default=not_checked
+    if printf '%s\n' "$_cs_rules" | _console_rule_any_table; then
+      [ "$_cs_state" = unknown ] || _cs_state=drift
+    fi
+    return 0
+  fi
+  if [ "$_cs_ip_ok" = 1 ]; then
+    printf '%s\n' "$_cs_rules" | _console_rule_exact "$_cs_ip" && _cs_rule=1
+  fi
+  _cs_routes=''
+  _cs_routes_ok=0
+  if _cs_routes=$(ip route show table "$CONSOLE_TABLE" 2>/dev/null); then
+    _cs_routes_ok=1
+    _cs_default=$(printf '%s\n' "$_cs_routes" | _console_default_kind)
+  else
+    _cs_default=unknown
+    _cs_state=unknown
+    _console_status_unknown ip-route
+  fi
+  if [ -r "$GM_ROUTES_LIB" ]; then
+    # The same helper the switch uses, so "desired" is what the sync really writes. A
+    # subshell: the helper defines a crowd of _gm_* functions and variables.
+    _cs_expected=$( ( . "$GM_ROUTES_LIB" && _gm_route_local_lines ) 2>/dev/null )
+    if [ "$_cs_routes_ok" = 1 ]; then
+      while IFS= read -r _cs_line; do
+        [ -n "$_cs_line" ] || continue
+        _cs_net=${_cs_line%% *}
+        _cs_dev=''
+        _cs_rest=" $_cs_line "
+        case "$_cs_rest" in
+          *" dev "*) _cs_tail=${_cs_rest#* dev }; _cs_dev=${_cs_tail%% *} ;;
+        esac
+        [ -n "$_cs_net" ] && [ -n "$_cs_dev" ] || continue
+        if printf '%s\n' "$_cs_routes" | _console_lan_present "$_cs_net" "$_cs_dev"; then
+          :
+        else
+          _cs_lan_missing="$_cs_lan_missing $_cs_net"
+        fi
+      done <<EOF
+$_cs_expected
+EOF
+    fi
+  else
+    _cs_state=unknown
+    _console_status_unknown routes-helper
+  fi
+  if [ "$_cs_state" = unknown ]; then
+    return 0
+  fi
+  if [ "$_cs_enabled" = 1 ]; then
+    if [ "$_cs_tun" != 1 ]; then
+      _cs_state=down
+    elif [ "$_cs_ip_ok" != 1 ] || [ "$_cs_rule" != 1 ] \
+      || [ "$_cs_default" != "dev $CONSOLE_TUN_DEV" ] || [ -n "$_cs_lan_missing" ]; then
+      _cs_state=drift
+    fi
+  else
+    if printf '%s\n' "$_cs_rules" | _console_rule_any_table; then
+      _cs_state=drift
+    fi
+  fi
+  return 0
+}
 
 _console_lock() {
   command -v gm_lock_acquire >/dev/null 2>&1 || {
@@ -2416,21 +2762,29 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   _countries="${4-}"
   _sub="${3-}"
   if [ "$_act" = status ]; then
-    # `status` reports what is stored instead of what the caller sent.
+    # `status` reports what is stored instead of what the caller sent. The old fields
+    # (`enabled`, `rule`, `tun`, `config`) stay for the panel, but `rule` is now set only by
+    # the exact pref/from/lookup match and the honest answer is `state`.
     _countries=$(_console_get countries)
     _sub=$(_console_get sub)
-    _rule=0
-    [ -n "$_ip" ] && ip rule show 2>/dev/null | grep -q "from $_ip lookup $CONSOLE_TABLE" && _rule=1
-    _tun=0
-    ip link show "$CONSOLE_TUN_DEV" >/dev/null 2>&1 && _tun=1
+    _console_status_state
+    _cs_lan_json=''
+    for _cs_p in $_cs_lan_missing; do
+      _cs_lan_json="${_cs_lan_json}${_cs_lan_json:+,}\"$_cs_p\""
+    done
     _cfg='{}'
     [ -x "$CONSOLE_PY" ] && [ -f "$MIHOMO_CONF" ] && \
       _cfg=$("$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" 2>/dev/null)
     [ -n "$_cfg" ] || _cfg='{}'
     # `sub` is the registry id the panel restores into its field; empty means "as the VPN".
-    printf '{"ok":true,"enabled":%s,"ip":"%s","sub":"%s","countries":"%s","rule":%s,"tun":%s,"config":%s}\n' \
-      "$([ "$(_console_get enabled)" = 1 ] && echo true || echo false)" \
-      "$_ip" "$_sub" "$_countries" "$_rule" "$_tun" "$_cfg"
+    printf '{"ok":true,"enabled":%s,"ip":"%s","sub":"%s","countries":"%s","rule":%s,"tun":%s,"config":%s,"state":"%s","unknown":[%s],"desired":{"enabled":%s,"ip":"%s","pref":%s,"table":%s,"default":"dev %s","tun":"%s"},"runtime":{"rule":%s,"tun":%s,"default":"%s","lan_missing":[%s]}}\n' \
+      "$([ "$_cs_enabled" = 1 ] && echo true || echo false)" \
+      "$(json_esc "$_ip")" "$(json_esc "$_sub")" "$(json_esc "$_countries")" \
+      "$_cs_rule" "$_cs_tun" "$_cfg" \
+      "$_cs_state" "$_cs_unknown" \
+      "$([ "$_cs_enabled" = 1 ] && echo true || echo false)" "$(json_esc "$_ip")" \
+      "$CONSOLE_RULE_PREF" "$CONSOLE_TABLE" "$CONSOLE_TUN_DEV" "$CONSOLE_TUN_DEV" \
+      "$_cs_rule" "$_cs_tun" "$_cs_default" "$_cs_lan_json"
     return 0
   fi
   # Serialise the lane before anything is changed: `off` must not interleave with a switch,
@@ -2928,6 +3282,7 @@ case "$1" in
   global)                   cmd_global "$2" ;;
   ipv6)                     cmd_ipv6 "$2" ;;
   dns_guard)                cmd_dns_guard "$2" ;;
+  dns_guard_status)         cmd_dns_guard_status ;;
   console)                  cmd_console "$2" "$3" "$4" "$5" ;;
   console_status)           cmd_console_status ;;
   console_diag)             cmd_console_diag "$2" ;;

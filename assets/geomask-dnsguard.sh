@@ -55,7 +55,11 @@ SCOPED_VALUES=
 
 say() { printf '%s\n' "$*"; }
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-fail() { say "{\"ok\":false,\"error\":\"$(json_escape "$1")\"}"; return 1; }
+# R10b (D14-D18): the DNS policy used to leave no trace in syslog, so "when was it applied
+# and did it fail" had no answer. Action and rc only - never upstream values, URLs or tokens.
+# The helper is a no-op where logger is absent (test hosts, minimal images).
+logmsg() { command -v logger >/dev/null 2>&1 && logger -t geomask-dnsguard "$*" >/dev/null 2>&1; return 0; }
+fail() { logmsg "FAIL ${_stage:-unknown}: $(printf '%s' "$1" | cut -c1-200)"; say "{\"ok\":false,\"error\":\"$(json_escape "$1")\"}"; return 1; }
 
 # The candidate and the value snapshots are private; a failed run must not leave a copy.
 cleanup_private() {
@@ -831,7 +835,17 @@ revert() {
 
 case "${1:-status}" in
   status) status ;;
-  apply) apply ;;
-  revert) revert "${2:-}" ;;
+  apply)
+    logmsg "apply start"
+    apply
+    _rc=$?
+    logmsg "apply rc=$_rc"
+    exit "$_rc" ;;
+  revert)
+    logmsg "revert start"
+    revert "${2:-}"
+    _rc=$?
+    logmsg "revert rc=$_rc"
+    exit "$_rc" ;;
   *) say '{"ok":false,"error":"usage: geomask-dnsguard.sh status|apply|revert [--force]"}'; exit 2 ;;
 esac

@@ -76,6 +76,10 @@ cat >/dev/null
 exit ${FAKE_DOH_RC:-0}
 '''
 
+LOGGER = r'''#!/bin/sh
+printf '%s\n' "$*" >> "$CASE/logger.log"
+'''
+
 
 @unittest.skipIf(BASH is None, 'bash is required')
 class DnsGuardTests(unittest.TestCase):
@@ -105,8 +109,10 @@ class DnsGuardTests(unittest.TestCase):
         uci.write_text(wrapper, encoding='utf-8', newline='\n')
         nslookup = self.bin / 'nslookup'
         nslookup.write_text(NSLOOKUP, encoding='utf-8', newline='\n')
+        logger = self.bin / 'logger'
+        logger.write_text(LOGGER, encoding='utf-8', newline='\n')
         self.probe.write_text(PROBE, encoding='utf-8', newline='\n')
-        for path in (uci, nslookup, self.probe):
+        for path in (uci, nslookup, logger, self.probe):
             os.chmod(path, 0o755)
 
     def write_dhcp(self, text):
@@ -668,6 +674,60 @@ class DnsGuardTests(unittest.TestCase):
         result = self.run_guard('status', dns='servfail')
         self.assertIn('"mode":"degraded"', result.stdout)
         self.assertIn('"resolution":false', result.stdout)
+
+    # ---------------------------------------------------------------- syslog (R10b)
+    def logger_text(self):
+        path = self.case / 'logger.log'
+        return path.read_text(encoding='utf-8') if path.exists() else ''
+
+    def test_apply_and_revert_leave_a_syslog_trace(self):
+        self.dhcp_list(['127.0.0.1#5053'])
+        self.assertEqual(self.run_guard('apply').returncode, 0)
+        self.assertEqual(self.run_guard('revert').returncode, 0)
+        log = self.logger_text()
+        for needle in ('-t geomask-dnsguard apply start', 'apply rc=0',
+                       '-t geomask-dnsguard revert start', 'revert rc=0'):
+            self.assertIn(needle, log)
+
+    def test_a_failed_apply_is_logged(self):
+        self.dhcp_list(['127.0.0.1#5053'])
+        result = self.run_guard('apply', fail_addlist='1.1.1.1')
+        self.assertNotEqual(result.returncode, 0, self.combined(result))
+        log = self.logger_text()
+        self.assertIn('FAIL', log)
+        self.assertIn('apply rc=1', log)
+
+    def test_a_healthy_status_does_not_log(self):
+        self.dhcp_list(['127.0.0.1#5053'])
+        self.assertEqual(self.run_guard('status').returncode, 0)
+        self.assertEqual(self.logger_text(), '')
+
+
+class DnsGuardAclTests(unittest.TestCase):
+    """R10b item 3: status for readers, apply/revert for writers only."""
+
+    def test_status_has_a_read_method_and_mutations_stay_write(self):
+        root = ROOT
+        manifest = json.loads((root / 'tools' / 'geo-rpc.json').read_text(encoding='utf-8'))
+        methods = {item['name']: item for item in manifest['methods']}
+        self.assertEqual(methods['dns_guard']['acl'], 'write')
+        self.assertEqual(methods['dns_guard_status']['acl'], 'read')
+        self.assertEqual(methods['dns_guard_status']['args'], [])
+        self.assertEqual(methods['dns_guard_status']['js'], 'callDnsGuardStatus')
+
+        acl = json.loads((root / 'assets' / 'acl-geo-sync.json')
+                         .read_text(encoding='utf-8'))['luci-app-geo-sync']
+        self.assertIn('dns_guard_status', acl['read']['ubus']['geo-sync'])
+        self.assertNotIn('dns_guard_status', acl['write']['ubus']['geo-sync'])
+        self.assertIn('dns_guard', acl['write']['ubus']['geo-sync'])
+        self.assertNotIn('dns_guard', acl['read']['ubus']['geo-sync'])
+
+        plugin = (root / 'assets' / 'geo-sync').read_text(encoding='utf-8')
+        self.assertIn('json_add_object "dns_guard_status"', plugin)
+        self.assertIn('dns_guard_status)', plugin)
+        backend = (root / 'assets' / 'geo-backend.sh').read_text(encoding='utf-8')
+        self.assertIn('cmd_dns_guard_status()', backend)
+        self.assertIn('dns_guard_status)', backend)
 
 
 if __name__ == '__main__':

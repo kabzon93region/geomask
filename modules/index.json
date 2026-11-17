@@ -176,7 +176,7 @@
           "path": "/usr/lib/geomask/geomask-dnsguard.sh",
           "source": "assets/geomask-dnsguard.sh",
           "mode": "0755",
-          "sha256": "e8a6d5742c57a26280e8f1bc7a8f8499bda8bf422931b5241748a7d1edaa64c6"
+          "sha256": "9164f5110130f8321b130a522dd02715f9a04981c9a5eae06f76339c2a5fb48b"
         },
         {
           "path": "/usr/lib/geomask/geomask-lane-torrent.py",
@@ -284,7 +284,7 @@
           "path": "/usr/lib/geomask/geomask-doctor.py",
           "source": "assets/geomask-doctor.py",
           "mode": "0755",
-          "sha256": "f3a54ecb139b7e9cc22ed189c6458b6045fe4ac835872f408e949e3eb6098ae3"
+          "sha256": "db88fba50e80317933de8c632e2bcbf80126827e5fb53cf77f83bb33eb487b28"
         }
       ]
     },
@@ -322,13 +322,13 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "52d0c2db2e0fe8a24241fee6772417cc363d3e59a1b002202523f8a5bee2b060"
+          "sha256": "4a2822effcc93ac697c0725ff5a432177e9d64e68d291dc504335d9c24b9bb0a"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
           "mode": "0755",
-          "sha256": "e6d19c4bec14606125443cb577306fb9a330ac97c7e23bd481ce450d28316dfb"
+          "sha256": "3b48a057c271df0eace0b5cc31b2b86dcd5e0159d534158ce5a3280b29c1db59"
         },
         {
           "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
@@ -340,13 +340,13 @@
           "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
           "source": "assets/acl-geo-sync.json",
           "mode": "0644",
-          "sha256": "6fa63af85272b1a0f330999cc00a8048175082c239ff77820d2241aa899ff5e7"
+          "sha256": "878998efb0b6abf2552388f72c8461f70ff3eb333240ffcd90cf3ff11a0cb14b"
         },
         {
           "path": "/www/luci-static/resources/view/geo-sync/main.js",
           "source": "assets/geo-sync-page.js",
           "mode": "0644",
-          "sha256": "97ac20b460b6df06bea7af2baefe38c9dcde7d65018bac2d775cf4a3bba93127"
+          "sha256": "7660709f27ffe042498fb5a2696791942656482035eadfb62a84825ffc147bbc"
         }
       ]
     },

@@ -1,15 +1,23 @@
 #!/bin/sh /etc/rc.common
 # geomask-syncd - procd service for the event sync watchdog (geomask v1.10.0+).
+# R10b (D18): a missing watchdog script used to be a silent `return 0`, so `start` looked
+# successful while nothing watched /etc/magitrickle/state. Say it in syslog and fail instead.
 START=98
 STOP=10
 USE_PROCD=1
 
+log() { command -v logger >/dev/null 2>&1 && logger -t geomask-syncd "$1" 2>/dev/null; }
+
 start_service() {
-	[ -x /usr/bin/geomask-syncd.sh ] || return 0
+	[ -x /usr/bin/geomask-syncd.sh ] || {
+		log "not started: /usr/bin/geomask-syncd.sh is missing or not executable"
+		return 1
+	}
 	procd_open_instance
 	procd_set_param command /bin/sh /usr/bin/geomask-syncd.sh
 	procd_set_param respawn 3600 5 0
 	procd_set_param term_timeout 5
+	procd_set_param stderr 1
 	procd_set_param pidfile /var/run/geomask-syncd.pid
 	procd_close_instance
 }

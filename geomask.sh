@@ -16559,13 +16559,13 @@ ASSET_EOF
           "path": "/etc/init.d/ai-doh",
           "source": "assets/ai-doh.init",
           "mode": "0755",
-          "sha256": "33ec8738fb82b8a0f5c78caed8ff3c32b79eb298e2680b1817967d865422a02a"
+          "sha256": "b27cc77ac845a577bb854ad20846b0691efecf6c731b438539f74269adfb9b99"
         },
         {
           "path": "/etc/init.d/dnsmasq-ai",
           "source": "assets/dnsmasq-ai.init",
           "mode": "0755",
-          "sha256": "7ffa1f7edd43f69509a26c3c0c8f8bf984f49ce3b623fbc14622f7fedd93cccc"
+          "sha256": "6a839b536809a277865baf42dce1dddd89dff3e66d613d4abb65e9b37b1c6690"
         }
       ]
     },
@@ -16621,7 +16621,7 @@ ASSET_EOF
           "path": "/etc/init.d/geomask-syncd",
           "source": "assets/geomask-syncd.init",
           "mode": "0755",
-          "sha256": "35ea7b468fd1fa11a3050fa1ce10233c94ecec7c415ac85f73ac98067784a8fa"
+          "sha256": "2b7ca4943d9a44bf449405880030a181aee91656869f8f576086fa855ccaa414"
         },
         {
           "path": "/root/sync_mtrickle_mihomo.sh",
@@ -16651,7 +16651,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-syncd.sh",
           "source": "assets/geomask-syncd.sh",
           "mode": "0755",
-          "sha256": "74632f8406412a18bdc9b63979d2f7efd2a6874269795d23f3fafa973ad0a882"
+          "sha256": "52744d7a73ccb535ae7f1391e67112876cf46f3c9b811f3fef8b6c08209756df"
         },
         {
           "path": "/usr/lib/geomask/99-default-vpn-route.dist",
@@ -20287,12 +20287,43 @@ ASSET_EOF
   save_stream /etc/init.d/ai-doh 755 <<'ASSET_EOF'
 #!/bin/sh /etc/rc.common
 # geomask: DNS-over-HTTPS worker for AI-mode devices (DoH via AI listener)
+# R10b (D18): the worker needs the AI TUN and mihomo's ai-devices listener at 127.0.0.1:7891.
+# They may come up later (boot order, reconnect), so the dependency is logged, not turned into
+# a hard refusal: procd respawns the worker and it reconnects by itself. stderr goes to syslog.
+#
+# Bootstrap values are deliberate and documented in docs/AIDNS.md ("Bootstrap-значения"):
+#   -b 8.8.8.8,1.1.1.1   plain-DNS bootstrap for the DoH endpoint (no DoH without it)
+#   -p 5055              loopback port the AI dnsmasq points at (installer AIDNS_PORT=5055)
+#   -t socks5h://127.0.0.1:7891  mihomo's ai-devices listener (AI proxy group)
 START=21
 USE_PROCD=1
+
+AI_TUN=AI
+AI_LISTEN=127.0.0.1:7891
+
+log() { command -v logger >/dev/null 2>&1 && logger -t ai-doh "$1" 2>/dev/null; }
+
+# netstat is not guaranteed: when it is absent the check is skipped instead of warning.
+listener_present() {
+  command -v netstat >/dev/null 2>&1 || return 0
+  netstat -ltn 2>/dev/null | grep -q "[[:space:]]${AI_LISTEN}[[:space:]]"
+}
+
+check_deps() {
+  if [ ! -e "/sys/class/net/$AI_TUN" ] && ! ip link show "$AI_TUN" >/dev/null 2>&1; then
+    log "dependency not up yet: AI TUN '$AI_TUN' is missing (mihomo/ai.yml not started?)"
+  fi
+  if ! listener_present; then
+    log "dependency not up yet: mihomo ai-devices listener ${AI_LISTEN} is not listening"
+  fi
+}
+
 start_service() {
+  check_deps
   procd_open_instance
   procd_set_param command /usr/sbin/https-dns-proxy -a 127.0.0.1 -p 5055 -r https://cloudflare-dns.com/dns-query -t socks5h://127.0.0.1:7891 -b 8.8.8.8,1.1.1.1 -u dnsai -g dnsai
   procd_set_param respawn
+  procd_set_param stderr 1
   procd_close_instance
 }
 ASSET_EOF
@@ -20313,12 +20344,26 @@ ASSET_EOF
   save_stream /etc/init.d/dnsmasq-ai 755 <<'ASSET_EOF'
 #!/bin/sh /etc/rc.common
 # geomask: dnsmasq for AI-mode devices (upstream = AI DoH worker in the AI tunnel)
+# R10b (D18): without /etc/dnsmasq-ai.conf dnsmasq exits at once and procd respawns it in
+# silence. Check the config first, say why in syslog and fail the start instead; track the
+# file so a rewritten config restarts the instance, and keep its stderr in syslog.
 START=61
 USE_PROCD=1
+
+CONF=/etc/dnsmasq-ai.conf
+
+log() { command -v logger >/dev/null 2>&1 && logger -t dnsmasq-ai "$1" 2>/dev/null; }
+
 start_service() {
+  [ -f "$CONF" ] || {
+    log "not started: $CONF is missing (the AI-DNS step did not run or was rolled back)"
+    return 1
+  }
   procd_open_instance
-  procd_set_param command /usr/sbin/dnsmasq -C /etc/dnsmasq-ai.conf -k
+  procd_set_param command /usr/sbin/dnsmasq -C "$CONF" -k
   procd_set_param respawn
+  procd_set_param file "$CONF"
+  procd_set_param stderr 1
   procd_close_instance
 }
 ASSET_EOF
@@ -41341,9 +41386,16 @@ PYEOF
 # after magitrickle touches /etc/magitrickle/state, so the panel button and the */5
 # cron become a backup, not the primary path.
 # Prefers inotifywait (package inotifywait); falls back to a 10s mtime poll.
+#
+# R10b (D18): the exit code of inotifywait used to be ignored. When the watch dies
+# (directory replaced, inotify limit, permission) the loop still slept DEB=4 s, ran the
+# sync and retried at once - a 4-second spin with no line in syslog. A failed watch now
+# is logged and backs off exponentially up to a minute, and a successful watch resets it.
 DIR=/etc/magitrickle/state
 SYNC=/root/sync_mtrickle_mihomo.sh
 DEB=4
+BACKOFF=15
+BACKOFF_MAX=60
 log() { logger -t geomask-syncd "$1" 2>/dev/null; }
 run() {
   [ -x "$SYNC" ] || return 0
@@ -41354,7 +41406,16 @@ log "watchdog started (dir=$DIR, inotify=$(command -v inotifywait >/dev/null 2>&
 while true; do
   if ! [ -d "$DIR" ]; then sleep 15; continue; fi
   if command -v inotifywait >/dev/null 2>&1; then
-    inotifywait -qq -e close_write,moved_to,create,delete "$DIR" 2>/dev/null
+    _iw_out=$(inotifywait -qq -e close_write,moved_to,create,delete "$DIR" 2>&1)
+    _iw_rc=$?
+    if [ "$_iw_rc" -ne 0 ]; then
+      log "inotifywait rc=$_iw_rc on $DIR ($(printf '%s' "$_iw_out" | tail -1)); backing off ${BACKOFF}s"
+      sleep "$BACKOFF"
+      BACKOFF=$((BACKOFF * 2))
+      [ "$BACKOFF" -le "$BACKOFF_MAX" ] || BACKOFF=$BACKOFF_MAX
+      continue
+    fi
+    BACKOFF=15
     sleep "$DEB"
     run
   else
@@ -41368,16 +41429,24 @@ ASSET_EOF
   save_stream /etc/init.d/geomask-syncd 755 <<'ASSET_EOF'
 #!/bin/sh /etc/rc.common
 # geomask-syncd - procd service for the event sync watchdog (geomask v1.10.0+).
+# R10b (D18): a missing watchdog script used to be a silent `return 0`, so `start` looked
+# successful while nothing watched /etc/magitrickle/state. Say it in syslog and fail instead.
 START=98
 STOP=10
 USE_PROCD=1
 
+log() { command -v logger >/dev/null 2>&1 && logger -t geomask-syncd "$1" 2>/dev/null; }
+
 start_service() {
-	[ -x /usr/bin/geomask-syncd.sh ] || return 0
+	[ -x /usr/bin/geomask-syncd.sh ] || {
+		log "not started: /usr/bin/geomask-syncd.sh is missing or not executable"
+		return 1
+	}
 	procd_open_instance
 	procd_set_param command /bin/sh /usr/bin/geomask-syncd.sh
 	procd_set_param respawn 3600 5 0
 	procd_set_param term_timeout 5
+	procd_set_param stderr 1
 	procd_set_param pidfile /var/run/geomask-syncd.pid
 	procd_close_instance
 }

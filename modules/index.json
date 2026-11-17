@@ -24,13 +24,13 @@
           "path": "/etc/init.d/ai-doh",
           "source": "assets/ai-doh.init",
           "mode": "0755",
-          "sha256": "33ec8738fb82b8a0f5c78caed8ff3c32b79eb298e2680b1817967d865422a02a"
+          "sha256": "b27cc77ac845a577bb854ad20846b0691efecf6c731b438539f74269adfb9b99"
         },
         {
           "path": "/etc/init.d/dnsmasq-ai",
           "source": "assets/dnsmasq-ai.init",
           "mode": "0755",
-          "sha256": "7ffa1f7edd43f69509a26c3c0c8f8bf984f49ce3b623fbc14622f7fedd93cccc"
+          "sha256": "6a839b536809a277865baf42dce1dddd89dff3e66d613d4abb65e9b37b1c6690"
         }
       ]
     },
@@ -86,7 +86,7 @@
           "path": "/etc/init.d/geomask-syncd",
           "source": "assets/geomask-syncd.init",
           "mode": "0755",
-          "sha256": "35ea7b468fd1fa11a3050fa1ce10233c94ecec7c415ac85f73ac98067784a8fa"
+          "sha256": "2b7ca4943d9a44bf449405880030a181aee91656869f8f576086fa855ccaa414"
         },
         {
           "path": "/root/sync_mtrickle_mihomo.sh",
@@ -116,7 +116,7 @@
           "path": "/usr/bin/geomask-syncd.sh",
           "source": "assets/geomask-syncd.sh",
           "mode": "0755",
-          "sha256": "74632f8406412a18bdc9b63979d2f7efd2a6874269795d23f3fafa973ad0a882"
+          "sha256": "52744d7a73ccb535ae7f1391e67112876cf46f3c9b811f3fef8b6c08209756df"
         },
         {
           "path": "/usr/lib/geomask/99-default-vpn-route.dist",

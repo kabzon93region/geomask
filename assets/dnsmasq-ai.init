@@ -1,10 +1,24 @@
 #!/bin/sh /etc/rc.common
 # geomask: dnsmasq for AI-mode devices (upstream = AI DoH worker in the AI tunnel)
+# R10b (D18): without /etc/dnsmasq-ai.conf dnsmasq exits at once and procd respawns it in
+# silence. Check the config first, say why in syslog and fail the start instead; track the
+# file so a rewritten config restarts the instance, and keep its stderr in syslog.
 START=61
 USE_PROCD=1
+
+CONF=/etc/dnsmasq-ai.conf
+
+log() { command -v logger >/dev/null 2>&1 && logger -t dnsmasq-ai "$1" 2>/dev/null; }
+
 start_service() {
+  [ -f "$CONF" ] || {
+    log "not started: $CONF is missing (the AI-DNS step did not run or was rolled back)"
+    return 1
+  }
   procd_open_instance
-  procd_set_param command /usr/sbin/dnsmasq -C /etc/dnsmasq-ai.conf -k
+  procd_set_param command /usr/sbin/dnsmasq -C "$CONF" -k
   procd_set_param respawn
+  procd_set_param file "$CONF"
+  procd_set_param stderr 1
   procd_close_instance
 }

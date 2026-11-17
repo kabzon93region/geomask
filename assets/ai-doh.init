@@ -1,10 +1,41 @@
 #!/bin/sh /etc/rc.common
 # geomask: DNS-over-HTTPS worker for AI-mode devices (DoH via AI listener)
+# R10b (D18): the worker needs the AI TUN and mihomo's ai-devices listener at 127.0.0.1:7891.
+# They may come up later (boot order, reconnect), so the dependency is logged, not turned into
+# a hard refusal: procd respawns the worker and it reconnects by itself. stderr goes to syslog.
+#
+# Bootstrap values are deliberate and documented in docs/AIDNS.md ("Bootstrap-значения"):
+#   -b 8.8.8.8,1.1.1.1   plain-DNS bootstrap for the DoH endpoint (no DoH without it)
+#   -p 5055              loopback port the AI dnsmasq points at (installer AIDNS_PORT=5055)
+#   -t socks5h://127.0.0.1:7891  mihomo's ai-devices listener (AI proxy group)
 START=21
 USE_PROCD=1
+
+AI_TUN=AI
+AI_LISTEN=127.0.0.1:7891
+
+log() { command -v logger >/dev/null 2>&1 && logger -t ai-doh "$1" 2>/dev/null; }
+
+# netstat is not guaranteed: when it is absent the check is skipped instead of warning.
+listener_present() {
+  command -v netstat >/dev/null 2>&1 || return 0
+  netstat -ltn 2>/dev/null | grep -q "[[:space:]]${AI_LISTEN}[[:space:]]"
+}
+
+check_deps() {
+  if [ ! -e "/sys/class/net/$AI_TUN" ] && ! ip link show "$AI_TUN" >/dev/null 2>&1; then
+    log "dependency not up yet: AI TUN '$AI_TUN' is missing (mihomo/ai.yml not started?)"
+  fi
+  if ! listener_present; then
+    log "dependency not up yet: mihomo ai-devices listener ${AI_LISTEN} is not listening"
+  fi
+}
+
 start_service() {
+  check_deps
   procd_open_instance
   procd_set_param command /usr/sbin/https-dns-proxy -a 127.0.0.1 -p 5055 -r https://cloudflare-dns.com/dns-query -t socks5h://127.0.0.1:7891 -b 8.8.8.8,1.1.1.1 -u dnsai -g dnsai
   procd_set_param respawn
+  procd_set_param stderr 1
   procd_close_instance
 }

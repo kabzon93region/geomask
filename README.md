@@ -1,5 +1,10 @@
 # geomask
 
+> **Статус master (18.11.2026): WIP, не для массовой установки и не для единственного рабочего роутера.**
+> Локальные исправления не прошли обязательную изолированную Linux/OpenWrt-приёмку;
+> полная и частичная установка, откат и взаимодействие модулей ещё проверяются.
+> Git push не является релизом или разрешением деплоя. См. [отчёт и незакрытые gates](docs/RECHECK-2026-11-17.md).
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/kabzon93region/geomask)](https://github.com/kabzon93region/geomask/releases/latest)
 [![CI](https://github.com/kabzon93region/geomask/actions/workflows/ci.yml/badge.svg)](https://github.com/kabzon93region/geomask/actions/workflows/ci.yml)

@@ -1,9 +1,9 @@
 # geomask
 
 > **Статус master (18.11.2026): WIP, не для массовой установки и не для единственного рабочего роутера.**
-> Локальные исправления не прошли обязательную изолированную Linux/OpenWrt-приёмку;
-> полная и частичная установка, откат и взаимодействие модулей ещё проверяются.
-> Git push не является релизом или разрешением деплоя. См. [отчёт и незакрытые gates](docs/RECHECK-2026-11-17.md).
+> Аудит выявил блокирующие дефекты установки, отката и взаимодействия модулей;
+> обязательная изолированная Linux/OpenWrt-приёмка также не завершена.
+> Git push не является релизом или разрешением деплоя. См. [план исправлений и критерии приёмки](docs/superpowers/plans/2026-11-18-mass-readiness.md) и [предыдущие незакрытые gates](docs/RECHECK-2026-11-17.md).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/kabzon93region/geomask)](https://github.com/kabzon93region/geomask/releases/latest)
@@ -31,7 +31,7 @@
 | Модули | **15** частей, у каждой своя версия и отдельное обновление ([MODULES](docs/MODULES.md)) |
 | Панель | LuCI, **9 вкладок**; RPC через `ubus` (`geo-sync`), ACL и меню в комплекте |
 | Зависимости | `mihomo`, `magitrickle` — до установки; `python3`, `curl`, `https-dns-proxy` — ставит сам |
-| Тесты | **534** unit-теста и **438** проверок песочницы, гоняются в CI на каждый push |
+| Тесты | Unit/fixture/static suites и shell-сценарии в CI; актуальные executed/skipped — в логе конкретного запуска. Это не OpenWrt E2E и не гарантия изоляции |
 | Обновления | релиз с GitHub, сверка `GM_VERSION` = тег и sha256 = digest ассета; бэкап перед установкой |
 | Лицензия | MIT |
 

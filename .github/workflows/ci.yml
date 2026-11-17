@@ -35,29 +35,34 @@ jobs:
       - name: Compile every shipped python module
         run: python -m py_compile assets/geomask-node-audit.py assets/geomask-audit-state.py assets/geomask-config-tx.py assets/geomask-config-owner.py assets/geomask-apply.py assets/geomask-lane-torrent.py assets/geomask-sync-youtube.py assets/geomask-seed-lists.py tools/gen-geo-rpc.py tools/node-audit-save.py
 
-      # One module per process with its own timeout: a hang used to freeze the whole job
-      # for as long as GitHub allowed, and the log never said which test it was.
-      # No sudo: a test that needs root is a test that writes into the host's /etc, /root or
-      # /tmp. Every module runs under its own HOME and TMPDIR (review 15.11, point 1); if one
-      # of them starts writing outside its sandbox, tests/test_sandbox_guard.py says which.
+      # One module per process with its own timeout and its own HOME/TMPDIR, via
+      # tests/testgate.py. This gate records testsRun/passed/failed/skipped (with the reason
+      # unittest reported), timeouts and rc per module; a module where every test was skipped
+      # is NOT "ok", and an unknown skip reason fails the run. It is still not isolation:
+      # tests/test_sandbox_guard.py is an after-the-fact detector for six modules, not a sandbox.
       - name: Unit tests
+        env:
+          PYTHONPATH: tests
         run: |
-          set -u
-          failed=0
-          for file in tests/test_*.py; do
-            module=$(basename "$file" .py)
-            start=$(date +%s)
-            if timeout --kill-after=10 180 env "PATH=$PATH" "HOME=$HOME" \
-                 python -m unittest discover -s tests -p "$module.py" \
-                 > "/tmp/$module.log" 2>&1; then
-              echo "ok   $module ($(( $(date +%s) - start ))s)"
-            else
-              echo "FAIL $module ($(( $(date +%s) - start ))s)"
-              tail -40 "/tmp/$module.log"
-              failed=1
-            fi
-          done
-          exit $failed
+          python -B tests/testgate.py run --tests-dir tests --log-dir test-logs --timeout 600
+
+      - name: Upload unit gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-gate-logs
+          path: test-logs/
+          if-no-files-found: warn
 
       - name: Sandbox tests
-        run: timeout --kill-after=10 600 bash tests/run_tests.sh
+        env:
+          GM_TEST_LOG_DIR: sandbox-logs
+        run: timeout --kill-after=10 900 bash tests/run_tests.sh
+
+      - name: Upload sandbox logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-logs
+          path: sandbox-logs/
+          if-no-files-found: warn

@@ -12,7 +12,113 @@ SCRIPT="${GM_SCRIPT:-$HERE/../geomask.sh}"
 STUB="$HERE/bin"
 export PATH="$STUB:$PATH"
 
-pass=0; failn=0
+# ---------- R06 M4: real environment, checked before anything runs ----------
+# The runner used to inherit whatever the operator had: no python, no PyYAML, no native
+# symlinks, and still a green summary because SKIP never reached the exit code. These
+# facts are recorded now, and every python/symlink gate below consumes them.
+GM_LOG_DIR=${GM_TEST_LOG_DIR:-$HERE/../audit-temp/run-logs}
+if ! mkdir -p "$GM_LOG_DIR" 2>/dev/null; then
+  echo "FAIL: cannot create log directory: $GM_LOG_DIR"
+  exit 1
+fi
+GM_PREFLIGHT="$GM_LOG_DIR/preflight.txt"
+: > "$GM_PREFLIGHT"
+pf() { printf '%s\n' "$*" >> "$GM_PREFLIGHT"; printf 'PREFLIGHT: %s\n' "$*"; }
+GM_ENV_FAIL=0
+GM_HAVE_BASH=0
+GM_NATIVE_SYMLINK=0
+GM_PY=''
+GM_PY_YAML=0
+GM_ON_WINDOWS=0
+GM_UNAME=$(uname -s 2>/dev/null || echo unknown)
+pf "platform: $GM_UNAME $(uname -m 2>/dev/null || echo unknown)"
+pf "cwd: $(pwd)"
+pf "date: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+case "$GM_UNAME" in
+  MINGW*|MSYS*|CYGWIN*) GM_ON_WINDOWS=1 ;;
+esac
+pf "windows/git-bash host: $GM_ON_WINDOWS"
+pf "msys: ${MSYS:-<unset>}"
+# A real interpreter: skip tests/bin/python3 (the stub) on purpose.
+for _c in python3 python; do
+  _p=$(command -v "$_c" 2>/dev/null) || continue
+  case "$_p" in "$STUB"|"$STUB"/*) continue ;; esac
+  if "$_p" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 7)' >/dev/null 2>&1; then
+    GM_PY=$_p
+    pf "real python: $_p ($("$_p" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)) via $_c"
+    break
+  fi
+done
+if [ -n "$GM_PY" ]; then
+  export GM_REAL_PYTHON="$GM_PY"
+  export GM_PYTHON="$GM_PY"
+  if "$GM_PY" -c 'import yaml' >/dev/null 2>&1; then
+    GM_PY_YAML=1
+    pf "pyyaml: $("$GM_PY" -c 'import yaml; print(yaml.__version__)' 2>/dev/null)"
+  else
+    pf "pyyaml: MISSING (python gates that need YAML will SKIP with reason=no-pyyaml)"
+  fi
+else
+  pf "real python: MISSING (tests/bin/python3 is a stub; python gates will SKIP with reason=no-python)"
+fi
+if command -v bash >/dev/null 2>&1; then
+  GM_HAVE_BASH=1
+  pf "bash: $(command -v bash) ($(bash -c 'echo $BASH_VERSION' 2>/dev/null))"
+else
+  pf "bash: MISSING"
+fi
+# Native symlink probe in a throwaway directory; MSYS copy-mode is not a symlink.
+_sym_dir=$(mktemp -d "${TMPDIR:-/tmp}/gm-symlink-probe.XXXXXX" 2>/dev/null) || _sym_dir=''
+if [ -n "$_sym_dir" ]; then
+  : > "$_sym_dir/target"
+  if ( cd "$_sym_dir" && MSYS=winsymlinks:nativestrict ln -s target link 2>/dev/null && [ -L link ] ); then
+    GM_NATIVE_SYMLINK=1
+  fi
+  rm -rf "$_sym_dir"
+fi
+if [ "$GM_NATIVE_SYMLINK" = 1 ]; then
+  pf "native symlinks: yes (ln -s + [ -L ] probe)"
+else
+  pf "native symlinks: NO (symlink-layout modules will SKIP with reason=no-native-symlink)"
+  _mods=$(grep -l 'NATIVE_SYMLINKS' "$HERE"/test_*.py 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')
+  pf "modules with native-symlink-gated classes: ${_mods:-unknown}"
+fi
+if [ "$GM_HAVE_BASH" = 0 ]; then
+  _mods=$(grep -l 'BASH is None' "$HERE"/test_*.py 2>/dev/null | sed 's|.*/||' | tr '\n' ' ')
+  pf "modules with bash-gated classes: ${_mods:-unknown}"
+fi
+if [ "${GM_REQUIRE_ENV:-0}" = 1 ]; then
+  [ -n "$GM_PY" ] || { pf "FAIL: GM_REQUIRE_ENV=1 and no real python"; GM_ENV_FAIL=1; }
+  [ "$GM_PY_YAML" = 1 ] || { pf "FAIL: GM_REQUIRE_ENV=1 and PyYAML is missing"; GM_ENV_FAIL=1; }
+  [ "$GM_HAVE_BASH" = 1 ] || { pf "FAIL: GM_REQUIRE_ENV=1 and bash is missing"; GM_ENV_FAIL=1; }
+  [ "$GM_NATIVE_SYMLINK" = 1 ] || { pf "FAIL: GM_REQUIRE_ENV=1 and native symlinks are unavailable"; GM_ENV_FAIL=1; }
+fi
+if [ "${GM_REQUIRE_NATIVE_SYMLINKS:-0}" = 1 ] && [ "$GM_NATIVE_SYMLINK" != 1 ]; then
+  pf "FAIL: GM_REQUIRE_NATIVE_SYMLINKS=1 but the native symlink probe failed"
+  GM_ENV_FAIL=1
+fi
+
+# ---------- R06 M1/M5: module gate mode ----------
+# GM_TESTS_DIR runs the honest per-module gate only (tests/testgate.py): every module
+# gets its own process, HOME/TMPDIR and timeout; skip counts and rc are recorded.
+# The scenario suite is skipped in this mode; set GM_RUN_SCENARIOS=1 to run both.
+if [ -n "${GM_TESTS_DIR:-}" ] && [ "${GM_RUN_SCENARIOS:-0}" != "1" ]; then
+  if [ -z "$GM_PY" ]; then
+    echo "FAIL: module gate needs a real python interpreter (see $GM_PREFLIGHT)"
+    echo "summary: $GM_PREFLIGHT"
+    exit 1
+  fi
+  GM_MODULE_TIMEOUT=${GM_MODULE_TIMEOUT:-600}
+  GM_PREFLIGHT_FILE="$GM_PREFLIGHT" "$GM_PY" -B "$HERE/testgate.py" run \
+    --tests-dir "$GM_TESTS_DIR" --log-dir "$GM_LOG_DIR" --timeout "$GM_MODULE_TIMEOUT"
+  _mrc=$?
+  echo "summary: $GM_LOG_DIR/summary.txt"
+  exit "$_mrc"
+fi
+
+pass=0; failn=0; skipped=0; skip_unknown=0; timeouts=0
+GM_SKIP_LOG="$GM_LOG_DIR/skips.txt"
+: > "$GM_SKIP_LOG"
 t() { # t <name> <expected_rc> <cmd...>
   _name="$1"; _want="$2"; shift 2
   "$@" >"$HERE/last_out.txt" 2>&1
@@ -35,6 +141,51 @@ lacks() { # lacks <file> <pattern> <name>
   if grep -q "$2" "$1" 2>/dev/null; then echo "FAIL: $3 (pattern '$2' unexpectedly present)"; tail -15 "$1" | sed 's/^/    | /'; failn=$((failn+1));
   else echo "PASS: $3"; pass=$((pass+1)); fi
 }
+
+# R06 M1: a skip is a named outcome with a reason from this list, not a comment.
+# An unknown reason is a FAIL: silence is how "green" stopped meaning "checked".
+GM_ALLOWED_SKIPS="no-bash no-native-symlink no-python no-pyyaml posix-only windows-acl docs-absent needs-root router-only linux-only"
+skip() { # skip <name> <reason>
+  _known=0
+  for _r in $GM_ALLOWED_SKIPS; do
+    if [ "$_r" = "$2" ]; then _known=1; break; fi
+  done
+  printf 'SKIP: %s (reason=%s)\n' "$1" "$2" | tee -a "$GM_SKIP_LOG"
+  skipped=$((skipped+1))
+  if [ "$_known" = 0 ]; then
+    echo "FAIL: unknown skip reason '$2' for $1 (allowed: $GM_ALLOWED_SKIPS)"
+    skip_unknown=$((skip_unknown+1))
+  fi
+}
+
+# Compile without writing __pycache__ into the checkout (py_compile writes by design).
+py_syntax_ok() { # py_syntax_ok <file>
+  [ -n "$GM_PY" ] && "$GM_PY" -B -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$1" >/dev/null 2>&1
+}
+
+# R06 M5: the summary is printed and saved even when the script exits early.
+write_summary() { # write_summary <rc>
+  _rc=$1
+  [ "${GM_SUMMARY_DONE:-0}" = 1 ] && return 0
+  GM_SUMMARY_DONE=1
+  if [ "$_rc" = 0 ] && [ "$GM_ENV_FAIL" = 0 ]; then _verdict=PASS; else _verdict=FAIL; fi
+  {
+    echo "== GEOMASK TEST RUNNER SUMMARY =="
+    echo "date: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+    echo "mode: scenario suite (S1-S59) + preflight"
+    echo "modules: not run in this mode; set GM_TESTS_DIR=<dir> for the per-module gate"
+    echo "scenarios: pass=$pass fail=$failn skip=$skipped timeout=$timeouts unknown_skip=$skip_unknown"
+    echo "environment:"
+    sed 's/^/  /' "$GM_PREFLIGHT" 2>/dev/null
+    echo "skips:"
+    if [ -s "$GM_SKIP_LOG" ]; then sed 's/^/  /' "$GM_SKIP_LOG"; else echo "  (none)"; fi
+    echo "verdict: $_verdict (rc=$_rc)"
+  } > "$GM_LOG_DIR/summary.txt" 2>/dev/null
+  echo "== SUMMARY: pass=$pass fail=$failn skip=$skipped timeout=$timeouts unknown_skip=$skip_unknown verdict=$_verdict =="
+  echo "summary file: $GM_LOG_DIR/summary.txt"
+  echo "preflight:    $GM_PREFLIGHT"
+}
+trap 'write_summary $?' EXIT
 
 rm -rf "$HERE/root_empty" "$HERE/root_healthy" "$HERE/root_apply" "$HERE/state"
 mkdir -p "$HERE/state" "$HERE/root_empty/tmp" "$HERE/root_healthy/tmp" "$HERE/root_apply/tmp"
@@ -551,14 +702,16 @@ else echo "FAIL: S19 lists_* not in ACL/wrapper"; failn=$((failn+1)); fi
 
 # ---------- scenario 48: generated glue stays in sync with tools/geo-rpc.json ----------
 echo "=== S48: gen-geo-rpc --check (single-source manifest) ==="
-if python3 -c 'pass' >/dev/null 2>&1; then
-  if python3 "$HERE/../tools/gen-geo-rpc.py" --check >/dev/null 2>&1; then
+if [ -n "$GM_PY" ] && [ "$GM_PY_YAML" = 1 ]; then
+  if "$GM_PY" -B "$HERE/../tools/gen-geo-rpc.py" --check >/dev/null 2>&1; then
     echo "PASS: S48 all four integration points match tools/geo-rpc.json"; pass=$((pass+1))
   else
     echo "FAIL: S48 generated regions drifted (run: python tools/gen-geo-rpc.py)"; failn=$((failn+1))
   fi
+elif [ -z "$GM_PY" ]; then
+  skip "S48 manifest check" no-python
 else
-  echo "SKIP: S48 manifest check (python3 not runnable)"
+  skip "S48 manifest check" no-pyyaml
 fi
 
 # ---------- scenario 20: youtube edges watchdog (v1.14.0) ----------
@@ -868,7 +1021,7 @@ grep -qF "name_filter_groups='VPN,VPN-noP2P'" "$HERE/../assets/geomask-nodes.con
 # v1.20.4: scan all subscriptions, zapret direction B, seconds-fast YouTube failover
 # behavioural test: run the REAL enumeration against the fixture config. A grep cannot catch a
 # missing re.M flag - that is exactly how "scanning all 0 providers" shipped once.
-if python3 -c 'pass' >/dev/null 2>&1; then
+if [ -n "$GM_PY" ] && [ "$GM_PY_YAML" = 1 ]; then
   cat > "$HERE/state/providers.yaml" <<'PROVEOF'
 proxy-providers:
   sub:
@@ -888,12 +1041,14 @@ PROVEOF
   _got=$(GM_NODES_CONF="$HERE/state/nodes.conf" GM_MIHOMO_CFG="$HERE/state/providers.yaml" \
          sh "$HERE/../assets/geomask-node-scan.sh" --list-providers 2>/dev/null | tail -1)
   case "$_got" in
-    '')     echo "SKIP: S27 provider enumeration (python not runnable in this sandbox)" ;;
+    '')     echo "FAIL: S27 provider enumeration produced no output although python and PyYAML are runnable"; failn=$((failn+1)) ;;
     sub,de5,sub2) echo "PASS: S27 provider enumeration finds all three (got: $_got)"; pass=$((pass+1)) ;;
     *)      echo "FAIL: S27 provider enumeration returned '$_got' (want sub,de5,sub2)"; failn=$((failn+1)) ;;
   esac
+elif [ -z "$GM_PY" ]; then
+  skip "S27 provider enumeration" no-python
 else
-  echo "SKIP: S27 provider enumeration (python3 not runnable)"
+  skip "S27 provider enumeration" no-pyyaml
 fi
 grep -qF "elif provider.strip()=='all'" "$HERE/../assets/geomask-node-scan.sh" \
   && grep -qF "'--provider'" "$HERE/../assets/geomask-node-scan.sh" \
@@ -1003,17 +1158,24 @@ grep -qF '*/1 * * * * /usr/bin/geomask-ytwatch.sh' "$HERE/../geomask.sh.in" \
 # v1.20.6: every embedded python block must parse. Two shipped bugs (the None sentinel and the
 # missing re.M) were invisible to grep-based tests and only surfaced on the router; this gate
 # catches syntax errors here instead.
-_PYC=''
-for c in python3 python; do if "$c" -c 'pass' >/dev/null 2>&1; then _PYC="$c"; break; fi; done
+_PYC="$GM_PY"
 if [ -n "$_PYC" ]; then
-  if "$_PYC" "$HERE/../tools/pycheck.py" "$HERE"/../assets/*.sh >"$HERE/state/pycheck.out" 2>&1; then
+  # tests/pyblocks.py is the shared extractor (also used by tools/pycheck.py): it ignores
+  # the rest of the opener line, supports PY/PYEOF and checks every block. tools/pycheck.py
+  # itself is covered by tests/test_pycheck.py; S29 stays on the shared implementation so a
+  # future change to the tool cannot silently change what this gate checked.
+  if "$_PYC" -B "$HERE/pyblocks.py" "$HERE"/../assets/*.sh >"$HERE/state/pycheck.out" 2>&1; then
     _n=$(grep -c 'parses OK' "$HERE/state/pycheck.out")
-    echo "PASS: S29 embedded python parses ($_n blocks checked)"; pass=$((pass+1))
+    if [ "$_n" -gt 0 ]; then
+      echo "PASS: S29 embedded python parses ($_n blocks checked)"; pass=$((pass+1))
+    else
+      echo "FAIL: S29 pycheck parsed 0 python blocks (the gate checked nothing)"; failn=$((failn+1))
+    fi
   else
     echo "FAIL: S29 embedded python has a syntax error"; sed 's/^/    | /' "$HERE/state/pycheck.out"; failn=$((failn+1))
   fi
 else
-  echo "SKIP: S29 python syntax gate (no runnable python)"
+  skip "S29 python syntax gate" no-python
 fi
 
 # v1.21.3: a provider health-check removes failing nodes from the group, which emptied the VPN
@@ -1205,7 +1367,7 @@ grep -qF 'geomask-slot-patch.py' "$HERE/../build.py" \
 # shape an apply produces. AI on a shared provider must get an isolated provider while VPN
 # keeps the shared one; a later VPN switch re-points only the shared provider; VPN-noP2P
 # (group absent) must create its own provider and group after the AI anchor.
-if [ -n "$_PYC" ]; then
+if [ -n "$_PYC" ] && [ "$GM_PY_YAML" = 1 ]; then
   _s49cfg="$HERE/state/slot_cfg.yaml"
   "$_PYC" - "$_s49cfg" <<'S49GEN'
 import sys, yaml
@@ -1290,7 +1452,11 @@ S49GEN
     && { echo "PASS: S49 the rewritten config is still valid YAML"; pass=$((pass+1)); } \
     || { echo "FAIL: S49 the rewritten config is not valid YAML"; failn=$((failn+1)); }
 else
-  echo "SKIP: S49 slot patcher functional run (no runnable python)"
+  if [ -z "$_PYC" ]; then
+    skip "S49 slot patcher functional run" no-python
+  else
+    skip "S49 slot patcher functional run" no-pyyaml
+  fi
 fi
 
 # ==================== S50: node-audit subsystem wiring (v1.28.0) ====================
@@ -1319,14 +1485,14 @@ if [ -n "$_PYC" ]; then
   for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
             geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
             geomask-sync-youtube.py geomask-audit-scheduler.py geomask-slot-patch.py; do
-    if "$_PYC" -m py_compile "$HERE/../assets/$_m" >/dev/null 2>&1; then
+    if py_syntax_ok "$HERE/../assets/$_m"; then
       echo "PASS: S50 compiles: $_m"; pass=$((pass+1))
     else
       echo "FAIL: S50 syntax error in: $_m"; failn=$((failn+1))
     fi
   done
 else
-  echo "SKIP: S50 module compile check (no runnable python)"
+  skip "S50 module compile check" no-python
 fi
 # the legacy scanner must no longer own the managed 'exclude-filter' write path unconditionally
 grep -qF 'apply_filter_all' "$HERE/../assets/geomask-node-scan.sh" \
@@ -1581,13 +1747,13 @@ for _m in callDiagList callDiagRun callDiagLog callDiagDomain; do
     || { echo "FAIL: S53 the panel lacks $_m"; failn=$((failn+1)); }
 done
 if [ -n "$_PYC" ]; then
-  if "$_PYC" -m py_compile "$HERE/../assets/geomask-doctor.py" >/dev/null 2>&1; then
+  if py_syntax_ok "$HERE/../assets/geomask-doctor.py"; then
     echo "PASS: S53 the doctor compiles"; pass=$((pass+1))
   else
     echo "FAIL: S53 the doctor has a syntax error"; failn=$((failn+1))
   fi
 else
-  echo "SKIP: S53 doctor compile check (no runnable python)"
+  skip "S53 doctor compile check" no-python
 fi
 
 echo ""
@@ -1753,5 +1919,5 @@ if grep -qF 'restore_old' "$_BK" && ! grep -qF 'rm -f /tmp/router-backup-*.tar.g
   echo "PASS: S59 self-update parks the old backup instead of deleting it"; pass=$((pass+1))
 else echo "FAIL: S59 self-update still deletes backups before sysupgrade"; failn=$((failn+1)); fi
 
-echo "== SANDBOX RESULT: pass=$pass fail=$failn =="
-[ "$failn" -eq 0 ]
+echo "== SANDBOX RESULT: pass=$pass fail=$failn skip=$skipped timeout=$timeouts unknown_skip=$skip_unknown =="
+[ "$failn" -eq 0 ] && [ "$skip_unknown" -eq 0 ] && [ "$GM_ENV_FAIL" -eq 0 ]

@@ -1,12 +1,43 @@
 #!/bin/sh
+# Test-only python3 bridge.
+#
+# It exists because a Windows host may expose only `python`, while the shipped scripts
+# call `python3`. It must NEVER fake success: a stub that exits 0 without running anything
+# turns every python gate into a false PASS (R06, S48/S29/S50/S53). If no real interpreter
+# can be reached, this bridge prints a marker and exits 127, so the caller fails or skips
+# explicitly instead of going green.
+#
+# run_tests.sh discovers a real interpreter before putting this directory on PATH and
+# exports GM_REAL_PYTHON, so delegation does not depend on the ambient PATH.
+_self=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
+_real=''
+if [ -n "${GM_REAL_PYTHON:-}" ] && [ -x "${GM_REAL_PYTHON}" ]; then
+  _real=${GM_REAL_PYTHON}
+else
+  for _c in python3 python; do
+    _p=$(command -v "$_c" 2>/dev/null) || continue
+    case "$_p" in
+      /*) ;;
+      *) _p=$(cd "$(dirname "$_p")" 2>/dev/null && pwd)/$(basename "$_p") ;;
+    esac
+    [ "$_p" = "$_self" ] && continue
+    if "$_p" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 6) else 7)' \
+         >/dev/null 2>&1; then
+      _real=$_p
+      break
+    fi
+  done
+fi
+if [ -z "$_real" ]; then
+  echo "GM-STUB-PYTHON3: no real python3/python interpreter found; refusing to fake success" >&2
+  exit 127
+fi
 # Windows Python cannot execute the shell curl stub directly via subprocess.
 # Keep this compatibility bridge test-only; Linux uses the normal interpreter.
 if [ "${1:-}" = '-' ] && command -v cygpath >/dev/null 2>&1; then
   GM_TEST_SHELL=$(cygpath -w "$(command -v sh)")
   export GM_TEST_SHELL
   shift
-  exec python "$(dirname "$0")/../python_stdin.py" "$@"
+  exec "$_real" "$(dirname "$0")/../python_stdin.py" "$@"
 fi
-# stub python3 -> delegate to real python if found, else exit 0
-if command -v python >/dev/null 2>&1; then exec python "$@"; fi
-exit 0
+exec "$_real" "$@"

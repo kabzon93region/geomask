@@ -17,6 +17,8 @@ import time
 import unittest
 from unittest import mock
 
+from win_symlink import NATIVE_SYMLINKS, SYMLINK_REASON
+
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / 'assets' / 'geomask-module-update.py'
 
@@ -40,11 +42,16 @@ def keep_writes_in(test, root):
 
     LOCK_PATH defaults to /tmp/geomask-module-update.lock and is opened by every
     state-changing command, so a test that only patches the state file would still write to
-    the host's /tmp on a POSIX run (review 15.11, points 1 and 25).
+    the host's /tmp on a POSIX run (review 15.11, points 1 and 25). CACHE_ROOT and
+    INSTALL_ROOTS are the trust boundary introduced for the 18.11 audit (U01): the cache
+    must live in the private root, and a destination must be inside the shipped roots - a
+    sandbox test declares its own temporary root as both.
     """
     for name, value in (('LOCK_PATH', str(root / 'install.lock')),
                         ('BACKUP_ROOT', str(root / 'backups')),
-                        ('CACHE', str(root / 'index-cache.json'))):
+                        ('CACHE_ROOT', str(root)),
+                        ('CACHE', str(root / 'index-cache.json')),
+                        ('INSTALL_ROOTS', (str(root) + os.sep,))):
         patcher = mock.patch.object(updater, name, value)
         patcher.start()
         test.addCleanup(patcher.stop)
@@ -57,6 +64,7 @@ class ModuleUpdaterSafetyTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        keep_writes_in(self, self.root)
 
     def test_modes_from_the_catalogue_are_octal(self):
         # JSON 755 as a decimal int is 0o1363 - a world-writable root script
@@ -162,7 +170,9 @@ class ModuleUpdateTests(unittest.TestCase):
         self.backup_root = self.root / 'backups'
         for name, value in (('BACKUP_ROOT', str(self.backup_root)),
                             ('LOCK_PATH', str(self.root / 'install.lock')),
-                            ('CACHE', str(self.root / 'index-cache.json'))):
+                            ('CACHE_ROOT', str(self.root)),
+                            ('CACHE', str(self.root / 'index-cache.json')),
+                            ('INSTALL_ROOTS', (str(self.root) + os.sep,))):
             patcher = mock.patch.object(updater, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -751,6 +761,200 @@ class OfflineIndexTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertTrue(self.cache.exists())
         self.assertEqual(json.loads(out.getvalue())['source'], 'network')
+
+
+class UpdaterTrustTests(unittest.TestCase):
+    """U01-U03 of the independent audit of 18.11.2026.
+
+    U01: the catalogue cache sat in a predictable world-writable directory and every
+    per-module destination came from the catalogue itself. A substituted cache plus a
+    matching download therefore authorised a root write outside the shipped tree.
+    U02: the original file was compared with the catalogue while staging the download, but
+    not again under the write lock, so an owner edit made between the two was overwritten.
+    U03: a symlink at a destination was dereferenced - the linked file was replaced and the
+    call still reported "originals restored".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.private = self.root / 'private'
+        self.private.mkdir()
+        self.cache = self.private / 'modules-index.json'
+        self.state_path = self.root / 'state.json'
+        self.config = {'repo': 'owner/repo', 'ref': 'master', 'ttl': 3600}
+        self.dest = self.root / 'bin' / 'tool.sh'
+        self.dest.parent.mkdir()
+        for name, value in (('BACKUP_ROOT', str(self.root / 'backups')),
+                            ('LOCK_PATH', str(self.root / 'install.lock')),
+                            ('CACHE_ROOT', str(self.private)),
+                            ('CACHE', str(self.cache)),
+                            ('INSTALL_ROOTS', (str(self.root) + os.sep,))):
+            patcher = mock.patch.object(updater, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    # --- fixtures ---------------------------------------------------------
+    def catalogue(self, path, payload, mode='0644'):
+        return {'schema': 1, 'core_version': '1.27.10', 'modules': {'core': {
+            'version': '2.0.0', 'type': 'core', 'name': 'Core', 'dependencies': [],
+            'files': [{'path': str(path), 'source': 'assets/tool.sh', 'mode': mode,
+                       'sha256': sha(payload)}]}}}
+
+    def fetch_body(self, payload):
+        def call(url):
+            if url.endswith('modules/index.json'):
+                raise AssertionError('the cache path must decide the source: ' + url)
+            return payload
+        return call
+
+    def state_with(self, payload):
+        """Baseline equal to what is on disk, so the local-edit guard is not the one firing."""
+        return {'modules': {'core': {'version': '1.0.0',
+                                     'files': {str(self.dest): sha(payload)}}}}
+
+    def no_network(self, url):
+        raise AssertionError('a network fetch was attempted: ' + url)
+
+    # --- U01: catalogue trust and destination policy ----------------------
+    def test_a_regular_cache_inside_the_private_root_is_used(self):
+        self.cache.write_text(json.dumps({'schema': 1, 'modules': {}}), encoding='utf-8')
+        index, source = updater.load_index(self.config, offline=True,
+                                           fetcher=self.no_network)
+        self.assertEqual(source, 'cache')
+        self.assertEqual(index, {'schema': 1, 'modules': {}})
+
+    def test_a_cache_outside_the_private_root_is_refused(self):
+        # /tmp was the old location: any local user could plant a catalogue there
+        planted = self.root / 'tmp-cache.json'
+        planted.write_text(json.dumps({'schema': 1, 'modules': {}}), encoding='utf-8')
+        with mock.patch.object(updater, 'CACHE', str(planted)):
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.load_index(self.config, offline=True, fetcher=self.no_network)
+        self.assertIn('not trusted', str(caught.exception))
+
+    def test_a_substituted_cache_is_never_used_and_never_overwritten(self):
+        planted = self.root / 'planted.json'
+        planted.write_text(json.dumps({'schema': 1, 'modules': {}}), encoding='utf-8')
+        with mock.patch.object(updater, 'CACHE', str(planted)), \
+                mock.patch.object(updater, 'CACHE_ROOT', str(self.root / 'other')):
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.load_index(self.config, force=True, fetcher=self.fetch_body(b'{}'))
+        self.assertIn('not trusted', str(caught.exception))
+        self.assertEqual(json.loads(planted.read_text(encoding='utf-8')),
+                         {'schema': 1, 'modules': {}})
+
+    @unittest.skipUnless(NATIVE_SYMLINKS, 'native symlinks unavailable: ' + SYMLINK_REASON)
+    def test_a_cache_symlink_is_refused(self):
+        decoy = self.root / 'decoy.json'
+        decoy.write_text(json.dumps({'schema': 1, 'modules': {}}), encoding='utf-8')
+        os.symlink(str(decoy), str(self.cache))
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.load_index(self.config, offline=True, fetcher=self.no_network)
+        self.assertIn('not trusted', str(caught.exception))
+
+    def test_a_cache_that_is_not_a_regular_file_is_refused(self):
+        self.cache.mkdir()
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.load_index(self.config, offline=True, fetcher=self.no_network)
+        self.assertIn('not trusted', str(caught.exception))
+
+    def test_a_planted_catalogue_cannot_authorise_a_destination_outside_the_policy(self):
+        outside = self.root / 'pwn.sh'
+        with mock.patch.object(updater, 'INSTALL_ROOTS', ('/usr/bin/',)):
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.download_module(self.catalogue(outside, b'x\n'), {'modules': {}},
+                                        'core', self.config,
+                                        fetcher=self.fetch_body(b'x\n'))
+        self.assertIn('install root', str(caught.exception))
+        self.assertFalse(outside.exists())
+
+    def test_a_traversing_destination_is_refused(self):
+        index = self.catalogue('/usr/bin/../tmp/pwn', b'x\n')
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.download_module(index, {'modules': {}}, 'core', self.config,
+                                    fetcher=self.fetch_body(b'x\n'))
+        self.assertIn('normalized', str(caught.exception))
+
+    def test_a_relative_destination_is_refused(self):
+        index = self.catalogue('bin/tool.sh', b'x\n')
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.download_module(index, {'modules': {}}, 'core', self.config,
+                                    fetcher=self.fetch_body(b'x\n'))
+        self.assertIn('absolute', str(caught.exception))
+
+    # --- U02: the commit re-validates what it overwrites ------------------
+    def test_owner_edit_between_stage_and_commit_is_not_lost(self):
+        self.dest.write_bytes(b'old\n')
+        index = self.catalogue(self.dest, b'new\n')
+        _module, staged, _changed = updater.download_module(
+            index, self.state_with(b'old\n'), 'core', self.config, fetcher=self.fetch_body(b'new\n'))
+        self.dest.write_bytes(b'owner edit\n')      # happens after staging, before commit
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.install_staged('core', staged, {'modules': {}}, '2.0.0',
+                                   str(self.state_path))
+        self.assertIn('changed while the update was staged', str(caught.exception))
+        self.assertEqual(self.dest.read_bytes(), b'owner edit\n')
+        self.assertFalse(self.state_path.exists(), 'a refused commit wrote state anyway')
+
+    def test_force_still_allows_the_confirmable_overwrite(self):
+        self.dest.write_bytes(b'old\n')
+        index = self.catalogue(self.dest, b'new\n')
+        _module, staged, _changed = updater.download_module(
+            index, self.state_with(b'old\n'), 'core', self.config, fetcher=self.fetch_body(b'new\n'))
+        self.dest.write_bytes(b'owner edit\n')
+        updater.install_staged('core', staged, {'modules': {}}, '2.0.0',
+                               str(self.state_path), force=True)
+        self.assertEqual(self.dest.read_bytes(), b'new\n')
+
+    def test_a_deleted_original_blocks_the_commit(self):
+        self.dest.write_bytes(b'old\n')
+        index = self.catalogue(self.dest, b'new\n')
+        _module, staged, _changed = updater.download_module(
+            index, self.state_with(b'old\n'), 'core', self.config, fetcher=self.fetch_body(b'new\n'))
+        self.dest.unlink()
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.install_staged('core', staged, {'modules': {}}, '2.0.0',
+                                   str(self.state_path))
+        self.assertIn('changed while the update was staged', str(caught.exception))
+        self.assertFalse(self.dest.exists(), 'a refused commit recreated the file')
+
+    # --- U03: symlink identity -------------------------------------------
+    @unittest.skipUnless(NATIVE_SYMLINKS, 'native symlinks unavailable: ' + SYMLINK_REASON)
+    def test_a_symlinked_destination_is_refused_before_any_write(self):
+        real = self.root / 'real-target'
+        real.write_bytes(b'keep\n')
+        os.symlink(str(real), str(self.dest))
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.download_module(self.catalogue(self.dest, b'new\n'), {'modules': {}},
+                                    'core', self.config, fetcher=self.fetch_body(b'new\n'))
+        self.assertIn('symlink', str(caught.exception))
+        self.assertTrue(self.dest.is_symlink(), 'the link was replaced by a regular file')
+        self.assertEqual(real.read_bytes(), b'keep\n')
+
+    @unittest.skipUnless(NATIVE_SYMLINKS, 'native symlinks unavailable: ' + SYMLINK_REASON)
+    def test_a_symlinked_parent_is_refused_before_any_write(self):
+        real = self.root / 'real-dir'
+        real.mkdir()
+        link = self.root / 'linked-dir'
+        os.symlink(str(real), str(link))
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.install_staged(
+                'core', [{'path': str(link / 'tool.sh'), 'mode': 0o644, 'data': b'new\n',
+                          'sha256': sha(b'new\n')}], {'modules': {}}, '2.0.0',
+                str(self.state_path))
+        self.assertIn('symlink', str(caught.exception))
+        self.assertEqual(list(real.iterdir()), [], 'a file was written through the link')
+
+    def test_a_destination_that_is_a_directory_is_refused(self):
+        self.dest.mkdir()
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.install_staged(
+                'core', [{'path': str(self.dest), 'mode': 0o644, 'data': b'new\n',
+                          'sha256': sha(b'new\n')}], {'modules': {}}, '2.0.0',
+                str(self.state_path))
+        self.assertIn('regular file', str(caught.exception))
 
 
 if __name__ == '__main__':

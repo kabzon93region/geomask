@@ -1513,12 +1513,27 @@
       "owner": "ours",
       "mode": "644",
       "writers": [
-        "rm step2_apply",
-        "callee geomask-module-update.py (cache write)"
+        "rm step2_apply"
       ],
       "snapshot": "NONE",
       "restore": "NR",
-      "notes": "/tmp-кэш каталога модулей; transient, удаляется в обоих направлениях"
+      "notes": "/tmp-путь прежнего кеша каталога; установщик удаляет его как legacy, кеш живёт в /etc/geomask/cache (U01)"
+    },
+    {
+      "id": "/etc/geomask/cache",
+      "path": "/etc/geomask/cache",
+      "type": "dir",
+      "owner": "ours",
+      "mode": "700",
+      "writers": [
+        "callee geomask-module-update.py (catalogue cache)"
+      ],
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "приватный кеш каталога модулей (аудит U01): /tmp был доступен на запись любому локальному пользователю",
+      "evidence": {
+        "kind": "callee"
+      }
     },
     {
       "id": "/tmp/geomask-ytwatch.conf.new",
@@ -2415,6 +2430,58 @@
       "snapshot": "NONE",
       "restore": "NR",
       "notes": "package DB/пост-скрипты не откатываются snapshot-ом - любая автоустановка ломает контракт полного отката"
+    }
+  ],
+  "callee_path_policy": [
+    {
+      "id": "policy.etc-geomask",
+      "path": "/etc/geomask/",
+      "reason": "Каталог состояния geomask: политика назначений апдейтера, а не запись этого callee."
+    },
+    {
+      "id": "policy.cache-root",
+      "path": "/etc/geomask/cache",
+      "reason": "Приватный каталог каталога модулей (0700) — сам каталог создаёт и проверяет updater."
+    },
+    {
+      "id": "policy.hotplug",
+      "path": "/etc/hotplug.d/",
+      "reason": "Разрешённый корень поставки: hotplug-скрипты geomask."
+    },
+    {
+      "id": "policy.initd",
+      "path": "/etc/init.d/",
+      "reason": "Разрешённый корень поставки: init-скрипты geomask."
+    },
+    {
+      "id": "policy.mihomo",
+      "path": "/etc/mihomo/",
+      "reason": "Разрешённый корень поставки: ruleset, синхронизируемые geomask."
+    },
+    {
+      "id": "policy.usr-bin",
+      "path": "/usr/bin/",
+      "reason": "Разрешённый корень поставки: утилиты geomask."
+    },
+    {
+      "id": "policy.usr-lib",
+      "path": "/usr/lib/",
+      "reason": "Разрешённый корень поставки: скрипты geomask."
+    },
+    {
+      "id": "policy.usr-libexec",
+      "path": "/usr/libexec/",
+      "reason": "Разрешённый корень поставки: rpcd-плагин geo-sync."
+    },
+    {
+      "id": "policy.usr-share",
+      "path": "/usr/share/",
+      "reason": "Разрешённый корень поставки: ACL, меню и прочие данные."
+    },
+    {
+      "id": "policy.www",
+      "path": "/www/luci-static/",
+      "reason": "Разрешённый корень поставки: страница панели LuCI."
     }
   ],
   "callees": [

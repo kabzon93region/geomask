@@ -496,6 +496,9 @@ def _covered_by_files(manifest: dict, path: str) -> bool:
     for entry in manifest.get('read_only') or []:
         if entry.get('path') == path:
             return True
+    for entry in manifest.get('callee_path_policy') or []:
+        if entry.get('path') == path:
+            return True
     return _covered_by_dynamic(manifest, path)
 
 
@@ -695,6 +698,20 @@ def check(manifest: dict) -> list[str]:
                 problems.append('uncovered %s effect in callee %s (key=%s) in %s:%d: %s'
                                 % (site.kind, label, site.detail or '-', site.function,
                                    site.line_no, site.raw.strip()[:100]))
+
+    # 4d. An allow-list of install roots is a policy statement, not a writer, so each
+    #     entry is declared with a reason and must still name a real literal. A stale
+    #     entry would silently widen the reviewed set.
+    callee_literals = set()
+    for body in callee_texts(manifest).values():
+        callee_literals |= path_literals(body)
+    for entry in manifest.get('callee_path_policy') or []:
+        path = entry.get('path') or ''
+        if not entry.get('reason'):
+            problems.append('callee path policy without a reason: %s'
+                            % (entry.get('id') or path))
+        if path and path not in callee_literals:
+            problems.append('callee path policy entry without any literal: %s' % path)
 
     # 5. forbidden package effects are declared with the reinstall guard
     package_sites = [s for s in sites if s.kind == 'package']

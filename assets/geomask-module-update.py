@@ -31,6 +31,7 @@ import copy
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import sys
@@ -48,7 +49,27 @@ DEFAULT_REF = 'master'
 DEFAULT_CONFIG = '/etc/geomask/module-update.json'
 DEFAULT_STATE = '/etc/geomask/modules-state.json'
 DEFAULT_SELECTION = '/etc/geomask/modules.json'
-CACHE = '/tmp/geomask-modules-index.json'
+# The cached catalogue decides which paths a root-owned update writes. In /tmp any local
+# user could plant one (audit U01), so it lives in a private root-owned directory and is
+# rejected when a link, a foreign owner or a writable mode shows it may have been replaced.
+CACHE_ROOT = '/etc/geomask/cache'
+CACHE = os.path.join(CACHE_ROOT, 'modules-index.json')
+# Destinations the release is allowed to own. A catalogue - even a substituted one - cannot
+# authorise a write anywhere else, so a compromised cache cannot reach an arbitrary path.
+INSTALL_ROOTS = (
+    '/etc/geomask/',
+    '/etc/geomask-nodes.conf',
+    '/etc/geomask-ytwatch.conf',
+    '/etc/hotplug.d/',
+    '/etc/init.d/',
+    '/etc/mihomo/',
+    '/root/sync_mtrickle_mihomo.sh',
+    '/usr/bin/',
+    '/usr/lib/',
+    '/usr/libexec/',
+    '/usr/share/',
+    '/www/luci-static/',
+)
 # The catalogue stores modes as zero-padded octal strings ("0755"). A JSON integer 755
 # passed to os.chmod is 0o1363 - a world-writable executable - and 644 is 0o1204.
 SAFE_MODES = {0o755, 0o750, 0o700, 0o644, 0o640, 0o600}
@@ -149,6 +170,122 @@ def digest_file(path):
         return None
 
 
+def _normalized(path):
+    """The canonical form of a catalogue destination, on the host's own rules."""
+    if path.startswith('/'):
+        return posixpath.normpath(path)
+    return os.path.normpath(path)
+
+
+def destination_problem(path):
+    """Why a catalogue destination is outside what the release may own, or ''.
+
+    The catalogue is the only source of destination paths, so it also decides where root
+    writes land: a cache that names `/tmp/x` used to be executed as-is. The shipped policy
+    is a fixed list of roots; anything else, a relative path or a `..` detour is refused
+    before the first write.
+    """
+    if not isinstance(path, str) or not path:
+        return 'it is not a path'
+    absolute = path.startswith('/') or (os.name == 'nt' and len(path) > 2 and path[1] == ':')
+    if not absolute:
+        return 'it is not an absolute path'
+    if _normalized(path) != path:
+        return 'the path is not normalized'
+    for root in INSTALL_ROOTS:
+        if root.endswith(('/', os.sep)):
+            if path.startswith(root) and len(path) > len(root):
+                return ''
+        elif path == root:
+            return ''
+    return 'it is outside the shipped install roots'
+
+
+def _first_symlink(path):
+    """The first existing component of `path` that is a symlink, or ''.
+
+    Writing through a symlink replaces the linked file and keeps the link, so the previous
+    rollback "restored originals" while a foreign file had been overwritten (audit U03).
+    """
+    current = os.path.abspath(path)
+    chain = []
+    while True:
+        chain.append(current)
+        head, tail = os.path.split(current)
+        if not tail or head == current:
+            break
+        current = head
+    for candidate in reversed(chain):
+        try:
+            if os.path.islink(candidate):
+                return candidate
+        except OSError:
+            continue
+    return ''
+
+
+def _unsafe_owner_or_mode(st, what):
+    """POSIX ownership problems; Windows has no comparable model and is skipped."""
+    if os.name != 'posix' or not hasattr(os, 'geteuid'):
+        return ''
+    euid = os.geteuid()
+    if st.st_uid != euid:
+        return '%s is owned by uid %d, not %d' % (what, st.st_uid, euid)
+    if st.st_mode & 0o022:
+        return '%s is writable by group or others' % what
+    return ''
+
+
+def cache_problem(path=None):
+    """Why the catalogue cache may not be trusted, or '' when it may be read and written."""
+    path = path or CACHE
+    root = os.path.abspath(CACHE_ROOT)
+    target = os.path.abspath(path)
+    if not (target == root or target.startswith(root + os.sep)):
+        return 'it is outside the private cache directory %s' % root
+    if os.path.islink(target):
+        return 'it is a symlink'
+    if os.path.exists(target):
+        if not os.path.isfile(target):
+            return 'it is not a regular file'
+        reason = _unsafe_owner_or_mode(os.stat(target), 'the cache file')
+        if reason:
+            return reason
+    directory = os.path.dirname(target) or '.'
+    while directory and directory != root:
+        if os.path.islink(directory):
+            return 'the cache directory %s is a symlink' % directory
+        if os.path.isdir(directory):
+            reason = _unsafe_owner_or_mode(os.stat(directory),
+                                           'the cache directory %s' % directory)
+            if reason:
+                return reason
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    return ''
+
+
+def write_cache(index):
+    """Publish the catalogue under an unpredictable name in the private directory."""
+    os.makedirs(CACHE_ROOT, mode=0o700, exist_ok=True)
+    directory = os.path.dirname(CACHE) or '.'
+    fd, tmp = tempfile.mkstemp(prefix='.modules-index-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(index, handle, ensure_ascii=False, sort_keys=True)
+            handle.write('\n')
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CACHE)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def read_json(path, default=None):
     try:
         with open(path, encoding='utf-8') as handle:
@@ -209,17 +346,25 @@ def load_index(config, force=False, fetcher=None, offline=False):
     used to turn every poll into a fresh download attempt.
     """
     fetcher = fetcher or fetch
-    cached = read_json(CACHE)
+    problem = cache_problem(CACHE)
+    cached = None if problem else read_json(CACHE)
     usable = isinstance(cached, dict) and cached.get('schema') == 1
     age = None
-    if os.path.exists(CACHE):
+    if usable and os.path.exists(CACHE):
         age = time.time() - os.path.getmtime(CACHE)
     if usable and not force and age is not None and age < config['ttl']:
         return cached, 'cache'
     if offline:
+        if problem:
+            raise UpdateError('index cache is not trusted (%s)' % problem)
         if usable:
             return cached, 'stale-cache'
         raise UpdateError('index cache is empty')
+    if problem:
+        # Refuse instead of overwriting: an untrusted cache is evidence of interference,
+        # and writing over it would destroy the very object a review needs.
+        raise UpdateError('index cache is not trusted (%s); remove it or fix its owner and mode'
+                          % problem)
     try:
         raw = fetcher(index_url(config))
         index = json.loads(raw.decode('utf-8'))
@@ -230,9 +375,7 @@ def load_index(config, force=False, fetcher=None, offline=False):
     if not isinstance(index, dict) or index.get('schema') != 1:
         raise UpdateError('index has an unexpected schema')
     try:
-        with open(CACHE + '.tmp', 'w', encoding='utf-8', newline='\n') as handle:
-            json.dump(index, handle, ensure_ascii=False, sort_keys=True)
-        os.replace(CACHE + '.tmp', CACHE)
+        write_cache(index)
     except OSError:
         pass
     return index, 'network'
@@ -382,6 +525,15 @@ def download_module(index, state, module_id, config, force=False, fetcher=None,
     changed = False
     for entry in module.get('files') or []:
         path = entry['path']
+        problem = destination_problem(path)
+        if problem:
+            raise UpdateError('%s: %s' % (path, problem))
+        link = _first_symlink(path)
+        if link:
+            raise UpdateError('%s: a symlink is on the install path (%s); '
+                              'refusing to write through it' % (path, link))
+        if os.path.exists(path) and not os.path.isfile(path):
+            raise UpdateError('%s: the destination is not a regular file' % path)
         current = digest_file(path)
         if current is not None and current != entry['sha256']:
             known = recorded['files'].get(path)
@@ -403,7 +555,7 @@ def download_module(index, state, module_id, config, force=False, fetcher=None,
         if current != actual:
             changed = True
         staged.append({'path': path, 'mode': parse_mode(entry.get('mode', '0644'), path),
-                       'data': data, 'sha256': actual})
+                       'data': data, 'sha256': actual, 'before': current})
     return module, staged, changed
 
 
@@ -488,7 +640,42 @@ def install_lock(path=None):
             handle.close()
 
 
-def install_staged(module_id, staged, state, version, state_path=DEFAULT_STATE):
+def preflight_staged(staged, force=False):
+    """Refuse a commit whose world changed after staging, before the first write.
+
+    The download step compares the file with the catalogue, but the catalogue was fetched
+    over the network and the owner may edit the file in between: the commit then overwrote
+    bytes the catalogue never saw (audit U02). Everything is re-checked under the write
+    lock, and a symlink or a non-regular destination is refused rather than dereferenced.
+    """
+    seen = set()
+    for item in staged:
+        path = item['path']
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            raise UpdateError('duplicate destination path in the index: %s' % path)
+        seen.add(key)
+        problem = destination_problem(path)
+        if problem:
+            raise UpdateError('%s: %s' % (path, problem))
+        link = _first_symlink(path)
+        if link:
+            raise UpdateError('%s: a symlink is on the install path (%s); '
+                              'refusing to write through it' % (path, link))
+        if os.path.exists(path) and not os.path.isfile(path):
+            raise UpdateError('%s: the destination is not a regular file' % path)
+        before = item.get('before')
+        if before is not None and not force:
+            now = digest_file(path)
+            # Re-committing bytes that are already installed is harmless; anything else
+            # means the file moved under us after staging (an owner edit, a deletion or
+            # another writer) and must not be overwritten from a stale snapshot.
+            if now != before and now != item['sha256']:
+                raise UpdateError('%s changed while the update was staged; '
+                                  're-run the update' % path)
+
+
+def install_staged(module_id, staged, state, version, state_path=DEFAULT_STATE, force=False):
     """Write staged files atomically, restoring originals if any write fails.
 
     The state file is part of the same transaction: writing it outside the rollback block
@@ -496,17 +683,11 @@ def install_staged(module_id, staged, state, version, state_path=DEFAULT_STATE):
     and blocked every later update. The caller's dict is a copy until the state file has
     been written, so a failed install leaves memory and disk agreeing.
     """
-    seen = set()
-    for item in staged:
-        key = os.path.normcase(os.path.abspath(item['path']))
-        if key in seen:
-            raise UpdateError('duplicate destination path in the index: %s' % item['path'])
-        seen.add(key)
-
     # Mutate a copy: the caller must not learn about an install that never committed.
     updated = copy.deepcopy(state)
     stamp = time.strftime('%Y%m%d-%H%M%S')
     with install_lock():
+        preflight_staged(staged, force=force)
         backup = ''
         written = []
         temps = []
@@ -662,7 +843,8 @@ def run_command(args):
             # used to stay at the old value and the panel offered the same update forever.
             recorded = module_state(state, args.module)['version']
             if version_tuple(module.get('version')) > version_tuple(recorded):
-                install_staged(args.module, [], state, module.get('version', ''), args.state)
+                install_staged(args.module, [], state, module.get('version', ''), args.state,
+                               force=args.force)
                 print(json.dumps({'ok': True, 'module': args.module, 'changed': False,
                                   'version': module.get('version'), 'source': source,
                                   'metadata': True}, ensure_ascii=False))
@@ -672,7 +854,7 @@ def run_command(args):
                               'skipped': skipped}, ensure_ascii=False))
             return 0
         backup = install_staged(args.module, staged, state, module.get('version', ''),
-                                args.state)
+                                args.state, force=args.force)
         print(json.dumps({'ok': True, 'module': args.module, 'changed': True,
                           'version': module.get('version'), 'files': len(staged),
                           'backup': backup, 'source': source,

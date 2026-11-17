@@ -92,11 +92,14 @@ class SlotPatcherTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / 'config.yaml'
 
     def run_patcher(self, text, group='AI', url=SUB_OLD):
+        # C11: the patcher only produces candidate bytes. The document comes back on stdout and
+        # the machine-readable action on stderr; the config file must stay exactly as it was.
         self.path.write_text(text, encoding='utf-8')
         result = subprocess.run([sys.executable, '-B', str(PATCHER), str(self.path), group, url],
                                 capture_output=True, text=True, timeout=60)
-        body = self.path.read_text(encoding='utf-8')
-        return result, body
+        self.assertEqual(self.path.read_text(encoding='utf-8'), text,
+                         'the patcher wrote the live config - only the transaction may')
+        return result, result.stdout
 
     def group(self, body, name):
         doc = yaml.safe_load(body)
@@ -107,7 +110,7 @@ class SlotPatcherTests(unittest.TestCase):
         self.assertIn('\n- name: AI', text)  # the shape that used to break every switch
         result, body = self.run_patcher(text, 'AI', SUB_OLD)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('updated:slot', result.stdout)
+        self.assertIn('updated:slot', result.stderr)
         self.assertEqual(self.group(body, 'AI')['use'], ['slot'])
         doc = yaml.safe_load(body)
         self.assertEqual(doc['proxy-providers']['slot']['url'], SUB_OLD)
@@ -135,7 +138,7 @@ class SlotPatcherTests(unittest.TestCase):
             yaml.safe_dump(doc, sort_keys=False), 'AI', SUB_NEW)
         self.assertEqual(result.returncode, 0, result.stderr)
         # base_config already defines "slot", so the isolated provider takes the next name.
-        self.assertTrue(result.stdout.startswith('created:slot2'))
+        self.assertTrue(result.stderr.startswith('created:slot2'))
         parsed = yaml.safe_load(body)
         self.assertEqual(self.group(body, 'AI')['use'], ['slot2'])
         self.assertEqual(self.group(body, 'VPN')['use'], ['sub2'])
@@ -154,11 +157,11 @@ class SlotPatcherTests(unittest.TestCase):
         ]
         result, body = self.run_patcher(yaml.safe_dump(doc, sort_keys=False), 'AI', SUB_NEW)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.startswith('created:'))
+        self.assertTrue(result.stderr.startswith('created:'))
         parsed = yaml.safe_load(body)
         self.assertEqual(parsed['proxy-providers']['audit-ai-g3'],
                          {'type': 'file', 'path': '/etc/mihomo/geomask-pools/ai-g3.yaml'})
-        self.assertEqual(self.group(body, 'AI')['use'], [result.stdout.strip().split(':', 1)[1]])
+        self.assertEqual(self.group(body, 'AI')['use'], [result.stderr.strip().split(':', 1)[1]])
 
     def test_absent_group_is_created_after_the_ai_anchor(self):
         doc = base_config()
@@ -169,7 +172,7 @@ class SlotPatcherTests(unittest.TestCase):
         names = [g['name'] for g in parsed['proxy-groups']]
         self.assertEqual(names, ['VPN-noP2P', 'AI', 'VPN'])
         vpn = self.group(body, 'VPN')
-        self.assertEqual(vpn['use'], [result.stdout.strip().split(':', 1)[1]])
+        self.assertEqual(vpn['use'], [result.stderr.strip().split(':', 1)[1]])
         self.assertIn('RULE-SET,mtrickle_bulk,VPN', parsed['rules'])
         self.assertIn('MATCH,VPN', parsed['rules'])
         self.assertNotIn('MATCH,RESERVE', parsed['rules'])
@@ -181,7 +184,8 @@ class SlotPatcherTests(unittest.TestCase):
         result, body = self.run_patcher(before, 'AI', SUB_NEW)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('inline proxies', result.stderr)
-        self.assertEqual(body, before, 'a refused switch must not touch the config')
+        self.assertEqual(body, '', 'a refusal must not emit candidate bytes')
+        self.assertEqual(self.path.read_text(encoding='utf-8'), before)
 
     def test_missing_provider_is_refused_without_writing(self):
         doc = base_config()
@@ -190,7 +194,8 @@ class SlotPatcherTests(unittest.TestCase):
         result, body = self.run_patcher(before, 'AI', SUB_NEW)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('missing', result.stderr)
-        self.assertEqual(body, before)
+        self.assertEqual(body, '')
+        self.assertEqual(self.path.read_text(encoding='utf-8'), before)
 
     def test_sibling_groups_keep_their_sources(self):
         doc = base_config()
@@ -201,6 +206,42 @@ class SlotPatcherTests(unittest.TestCase):
         self.assertEqual(self.group(body, 'VPN-noP2P')['use'], ['sub2'])
         self.assertEqual(parsed['proxy-providers']['sub2']['url'], SUB_OLD)
 
+
+
+
+BACKEND = HERE / 'geo-backend.sh'
+BACKEND_TEXT = BACKEND.read_text(encoding='utf-8')
+
+
+class SlotWriterBoundaryTests(unittest.TestCase):
+    """C11 of the 18.11.2026 audit: the slot lane must not be a second writer.
+
+    It used to open the live config for writing inside the patcher and keep an unchecked
+    `.bak_slot` copy beside it. Now the patcher only emits candidate bytes and the backend
+    commits them through the transaction CLI with a CAS base.
+    """
+
+    def test_the_patcher_never_writes_the_config(self):
+        text = PATCHER.read_text(encoding='utf-8')
+        self.assertNotIn("open(config_path, 'w'", text)
+        self.assertNotIn("open(config_path, 'wb'", text)
+        self.assertIn('sys.stdout.write(body)', text)
+
+    def test_the_backend_commits_the_slot_through_the_transaction(self):
+        start = BACKEND_TEXT.index('_slot_apply() {')
+        end = BACKEND_TEXT.index('\ncmd_ai_sub_set()', start)
+        section = BACKEND_TEXT[start:end]
+        self.assertIn('--commit "$MIHOMO_CONF" --expect-sha256 "$_slot_base"', section)
+        self.assertNotIn('bak_slot', section)
+        self.assertNotIn('mv -f', section)
+        self.assertIn('_sha_file "$MIHOMO_CONF"', section)
+
+    def test_a_reload_that_the_controller_refused_is_an_error(self):
+        start = BACKEND_TEXT.index('_mihomo_reload() {')
+        end = BACKEND_TEXT.index('\n}', start)
+        section = BACKEND_TEXT[start:end]
+        self.assertIn('%{http_code}', section)
+        self.assertIn('return 1', section)
 
 if __name__ == '__main__':
     unittest.main()

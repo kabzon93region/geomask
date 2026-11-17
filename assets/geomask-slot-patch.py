@@ -7,8 +7,14 @@ writes `- name:` at column 0 and bare scalars, so every rewrite failed - switchi
 slot answered "no AI group anchor" although the group was right there.
 
 Read and write the YAML structure instead, with YAML 1.2 boolean semantics so a round trip
-cannot turn `off` into `false`. Prints one machine-readable line: updated:<provider> or
-created:<provider>.
+cannot turn `off` into `false`.
+
+The patcher does not write any config file (audit 18.11.2026, C11). Its job is to produce
+candidate bytes; the caller stages them and commits through `geomask-config-tx.py`, so the
+live config still has exactly one writer, with a CAS base, a trial and a rollback. The
+patched document is printed to stdout, the machine-readable action line
+(updated:<provider> or created:<provider>) to stderr, and a refusal is rc 2 with the reason
+on stderr and nothing on stdout.
 """
 import copy
 import re
@@ -105,8 +111,7 @@ def main(argv):
     if len(argv) != 4:
         sys.stderr.write('usage: slot patcher <config> <group> <url|->\n')
         return 2
-    config_path, group, url = argv[1], argv[2], argv[3]
-    # `-` reads the URL from stdin: a subscription URL carries its access token, and argv is
+    config_path, group, url = argv[1], argv[2], argv[3]    # `-` reads the URL from stdin: a subscription URL carries its access token, and argv is
     # world-readable in /proc for as long as the process runs (audit 14.11.2026, F23).
     if url == '-':
         url = sys.stdin.readline().strip()
@@ -169,9 +174,9 @@ def main(argv):
         action = 'created:' + created
 
     body = yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
-    with open(config_path, 'w', encoding='utf-8', newline='') as handle:
-        handle.write(body)
-    print(action)
+    # Candidate bytes only: the live config is written by the transaction CLI the caller runs.
+    sys.stdout.write(body)
+    sys.stderr.write(action + '\n')
     return 0
 
 

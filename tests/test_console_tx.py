@@ -214,7 +214,8 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
     def run_backend(self, body, env=None):
         script = (self.header()
                   + '\n'.join(extract(name) for name in
-                              ('_console_get', '_console_set', '_ipv4_ok', '_console_cfg_restore',
+                              ('_sha_file', '_console_get', '_console_set', '_ipv4_ok',
+                               '_console_file_sha', '_console_cfg_restore',
                                '_console_on_fail', '_console_lock', '_console_unlock',
                                'cmd_console'))
                   + '\n' + body)
@@ -258,13 +259,16 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, calls)
         for call in calls:
             self.assertEqual(call['argv'][:2], ['--commit', win(self.config)])
-        # CAS: the forward commit carries the digest of the pre-patch live bytes (R06); the
-        # rollback restores the private preimage and has no base to compare.
-        self.assertEqual(len(calls[0]['argv']), 4, calls[0]['argv'])
-        self.assertEqual(calls[0]['argv'][2], '--expect-sha256')
-        self.assertEqual(len(calls[1]['argv']), 2, calls[1]['argv'])
+        # CAS on both directions (C01): the forward commit carries the digest of the live
+        # bytes it was built from, and the rollback carries the digest of OUR post-image -
+        # not "whatever is there now", which may be another writer's commit.
+        for call in calls:
+            self.assertEqual(len(call['argv']), 4, call['argv'])
+            self.assertEqual(call['argv'][2], '--expect-sha256')
         self.assertNotEqual(calls[0]['sha256'], sha(original))   # the patched candidate went in
         self.assertEqual(calls[1]['sha256'], sha(original))      # the original bytes came back
+        self.assertEqual(calls[1]['argv'][3], calls[0]['sha256'],
+                         'the rollback is not tied to the bytes this switch installed')
 
     def test_a_second_on_keeps_the_same_bytes(self):
         # The acceptance criterion for the transaction: a repeated `on` is idempotent, so a
@@ -299,6 +303,50 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), original)
         self.assertFalse((self.case / 'config.yaml.bak_console').exists())
 
+    def test_a_late_foreign_commit_survives_the_rollback(self):
+        # C01 of the 18.11 audit: our switch had already installed its candidate, then a panel
+        # commit wrote new bytes, and only then the reload failed. The rollback used to write
+        # the pre-switch copy unconditionally, destroying the newer commit.
+        original = self.config.read_bytes()
+        foreign = b'# committed by the panel after the console switch\n' + original
+        foreign_path = self.case / 'foreign.yaml'
+        foreign_path.write_bytes(foreign)
+        body = (
+            'controller_curl() {\n'
+            '  case "$*" in\n'
+            '    *"-X PUT"*) cp -p "%s" "$MIHOMO_CONF"; printf 500 ;;\n'
+            '    *) printf 200 ;;\n'
+            '  esac\n'
+            '}\n'
+            'cmd_console on 192.168.1.177 "" ""; printf "\\nRC=%%s\\n" "$?"'
+            % win(foreign_path))
+        result = self.run_backend(body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RC=1', result.stdout)
+        self.assertEqual(self.config.read_bytes(), foreign,
+                         'the rollback overwrote a commit made by another writer')
+        self.assertIn('"restored":false', result.stdout)
+        self.assertIn('"conflict":true', result.stdout)
+        self.assertEqual(len(list(self.case.glob('geomask-console-orig.*'))), 1,
+                         'the only working copy was deleted after a refused restore')
+
+    def test_the_restore_refuses_a_live_file_it_did_not_write(self):
+        # No-mutation case: the transaction refused on its own, the live bytes belong to
+        # somebody else. There is nothing of ours to undo, so nothing may be written.
+        pre = self.case / 'pre.yaml'
+        pre.write_bytes(b'pre: 1\n')
+        cand = self.case / 'cand.yaml'
+        cand.write_bytes(b'cand: 2\n')
+        foreign = b'foreign: 3\n'
+        self.config.write_bytes(foreign)
+        body = ('_orig="%s"; _cand="%s"; _console_cfg_restore "$_orig"; '
+                'printf "\\nRC=%%s\\n" "$?"' % (win(pre), win(cand)))
+        result = self.run_backend(body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RC=2', result.stdout)
+        self.assertEqual(self.config.read_bytes(), foreign)
+        self.assertEqual(self.recorded(), [], 'the restore committed bytes anyway')
+
     def test_the_switch_writes_only_through_the_transaction_cli(self):
         # Static: no `cp` of the live config into a backup, no `mv` of the candidate over it.
         # `assertFalse(x in text)` keeps the failure message readable (the text is 2000 lines).
@@ -308,14 +356,21 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
                          'the candidate is still moved over the live config by hand')
         self.assertFalse('cp -p "$MIHOMO_CONF" "$MIHOMO_CONF' in CONSOLE_SECTION,
                          'the live config is still copied by hand before the switch')
-        self.assertTrue('TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}' in CONSOLE_SECTION,
+        self.assertTrue('TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}' in BACKEND_TEXT,
                         'the transaction CLI is not wired into the backend')
         self.assertTrue('--commit "$MIHOMO_CONF" --expect-sha256 "$_base_sha" < "$_cand"'
                         in CONSOLE_SECTION,
                         'the candidate is not installed through the transaction CLI with its CAS base')
-        # The rollback is the same CLI, fed with the private preimage the switch kept.
-        self.assertTrue('--commit "$MIHOMO_CONF" < "$_pre"' in CONSOLE_SECTION,
-                        'the rollback does not go through the same CLI')
+        # The rollback is the same CLI, fed with the private preimage the switch kept, and it
+        # is bound to the bytes this lane installed (C01): a live file that changed elsewhere
+        # is refused instead of overwritten.
+        self.assertTrue('--commit "$MIHOMO_CONF" --expect-sha256 "$_live_sha" \\' in CONSOLE_SECTION
+                        or '--commit "$MIHOMO_CONF" --expect-sha256 "$_live_sha"' in CONSOLE_SECTION,
+                        'the rollback does not go through the same CLI with a CAS base')
+        self.assertTrue('_console_file_sha' in CONSOLE_SECTION,
+                        'the restore does not compare the live bytes with its own post-image')
+        self.assertTrue('return 2' in CONSOLE_SECTION,
+                        'a foreign commit is not distinguished from a failed restore')
         self.assertTrue('_console_cfg_restore "$_orig"' in CONSOLE_SECTION,
                         'a failed step does not restore the preimage it kept')
         # The preimage is private (0600) and named the way the plan asks for.

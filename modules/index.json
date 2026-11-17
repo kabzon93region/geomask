@@ -212,7 +212,7 @@
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
           "source": "assets/geomask-slot-patch.py",
           "mode": "0755",
-          "sha256": "261f0a2af10086988c17f7f49711b3813ab739116f31af4b5cd5dd40574e8e98"
+          "sha256": "1110469f15923962f722a89c5e80d4e59739df596304f9c08d1c7d999793c17c"
         },
         {
           "path": "/usr/lib/geomask/geomask-subscription-status.py",
@@ -322,7 +322,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "d370f8aa63e319f4d6af1b6e9934f3f086c14b2aba5d858d320a6e32bbd63188"
+          "sha256": "9263db220a2e24e72a21b5ee0ca1084bb385672be732e33915d229b688e09a4f"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",

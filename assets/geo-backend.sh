@@ -133,6 +133,18 @@ SUB_STATUS_PY=/usr/lib/geomask/geomask-subscription-status.py
 # Interpreter for the python helpers; GM_PYTHON only lets tests point at their own python.
 PYTHON_BIN=${GM_PYTHON:-python3}
 SUB_STATUS_PYTHON=$PYTHON_BIN
+# The one writer of the mihomo config: preimage, `mihomo -t`, isolated trial, atomic write,
+# reload and rollback all live in this CLI. Every lane that changes the file stages bytes and
+# commits them here with a CAS base - never `cp`/`mv` over the live file.
+TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}
+
+# Digest of a file's bytes, or rc 1 when it cannot be read. Used as a CAS base before a
+# config write and to prove that a rollback really put the expected bytes back.
+_sha_file() {
+  [ -n "${1:-}" ] && [ -f "$1" ] || return 1
+  "$PYTHON_BIN" -B -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
+    "$1" 2>/dev/null | tr -d '\r\n'
+}
 UPD_CHECK=$UPD_DIR/check.json
 UPD_STATUS=$UPD_DIR/status.json
 UPD_PIDF=$UPD_DIR/pid              # legacy, read-only: the lock replaced it
@@ -1375,20 +1387,41 @@ _slot_apply() { # _slot_apply <group> <url> -> patch config so <group> is fed by
     printf '{"error":"slot patcher not installed"}'; return 1
   fi
   _require_backup || return 1
-  cp -p "$MIHOMO_CONF" "$MIHOMO_CONF.bak_slot" 2>/dev/null
+  # C11 (audit 18.11.2026): this lane used to open the live config for writing inside the
+  # patcher and keep an unchecked backup copy around it. It now stages candidate bytes and
+  # commits them through the same transaction as every other writer: preimage, CAS on the bytes
+  # it read, trial, atomic write and rollback owned by one component.
+  _slot_base=$(_sha_file "$MIHOMO_CONF") || {
+    printf '{"ok":false,"error":"cannot fingerprint the mihomo config - live config untouched"}'; return 1; }
+  _slot_cand="${TMPDIR:-/tmp}/geomask-slot-candidate.$$.yaml"
+  _slot_err="${TMPDIR:-/tmp}/geomask-slot-error.$$"
   # The URL goes through stdin, never argv: /proc/<pid>/cmdline is world-readable.
-  _res=$(printf '%s\n' "$URL" | "$PYTHON_BIN" -B "$SLOT_PATCH_PY" "$MIHOMO_CONF" "$_g" - 2>&1)
+  ( umask 077; printf '%s\n' "$URL" | "$PYTHON_BIN" -B "$SLOT_PATCH_PY" "$MIHOMO_CONF" "$_g" - \
+      > "$_slot_cand" 2> "$_slot_err" )
   _rc=$?
   if [ "$_rc" -ne 0 ]; then
-    mv -f "$MIHOMO_CONF.bak_slot" "$MIHOMO_CONF" 2>/dev/null
+    _res=$(head -1 "$_slot_err" 2>/dev/null | tr -d '\r')
+    rm -f "$_slot_cand" "$_slot_err" 2>/dev/null
     printf '{"ok":false,"error":"%s"}' "$(json_esc "$_res")"; return 1
   fi
-  if ! /usr/bin/mihomo -t -d "$(dirname "$MIHOMO_CONF")" >/dev/null 2>&1; then
-    mv -f "$MIHOMO_CONF.bak_slot" "$MIHOMO_CONF" 2>/dev/null
-    printf '{"ok":false,"error":"mihomo config test failed - old config kept"}'; return 1
+  _res=$(head -1 "$_slot_err" 2>/dev/null | tr -d '\r')
+  rm -f "$_slot_err" 2>/dev/null
+  _slot_out=$("$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" --expect-sha256 "$_slot_base" \
+    < "$_slot_cand" 2>&1)
+  _slot_rc=$?
+  rm -f "$_slot_cand" 2>/dev/null
+  if [ "$_slot_rc" != 0 ]; then
+    _detail=$(printf '%s' "$_slot_out" | tail -1 | sed 's/["\\]//g' | cut -c1-300)
+    printf '{"ok":false,"error":"switch not applied: %s - live config untouched"}' \
+      "$(json_esc "${_detail:-transaction refused}")"
+    return 1
   fi
-  rm -f "$MIHOMO_CONF.bak_slot"
-  _mihomo_reload
+  if ! _mihomo_reload; then
+    # The bytes are the new ones, but the running core did not confirm them: say so instead of
+    # reporting a switch that did not take effect.
+    printf '{"ok":false,"error":"config saved, but mihomo did not confirm the reload - check the controller"}'
+    return 1
+  fi
   echo "$(date +%FT%T) SLOT $_g <- $(_mask_url "$URL") ($_res)" >> "$LOG"
   printf '{"ok":true,"slot":"%s","change":"%s","url":"%s","node":"%s"}' \
     "$_g" "$(json_esc "$_res")" "$(json_esc "$(_mask_url "$URL")")" "$(json_esc "$(_grp_node "$_g")")"
@@ -1512,9 +1545,14 @@ cmd_sub_del() {
 }
 
 _mihomo_reload() { # re-read the config in the running core (no service restart)
-  controller_curl -s -m15 -f -X PUT "$MIHOMO_API/configs" \
-    -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" >/dev/null 2>&1
-  sleep 2
+  # The status code decides, not the exit of `sleep`: a reload that the controller refused used
+  # to be reported as a successful switch (audit C11).
+  _mr=$(controller_curl -s -m15 -o /dev/null -w '%{http_code}' -X PUT "$MIHOMO_API/configs" \
+    -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" 2>/dev/null)
+  case "$_mr" in
+    200|204) sleep 2; return 0 ;;
+  esac
+  return 1
 }
 
 cmd_ai_sub_use() {
@@ -2378,9 +2416,8 @@ CONSOLE_YML=${GM_CONSOLE_YML:-/etc/hev-socks5-tunnel/console.yml}
 CONSOLE_INITD=${GM_CONSOLE_INITD:-/etc/init.d/hev-console}
 CONSOLE_NFT=${GM_CONSOLE_NFT:-/usr/share/nftables.d/ruleset-post/99-console-accept.nft}
 CONSOLE_PY=/usr/lib/geomask/geomask-console.py
-# The switch writes the live config through a transaction (preimage, mihomo -t, isolated
-# trial, atomic write, reload, rollback), never through a hand-written `cp`/`mv` pair.
-TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}
+# The switch writes the live config through the transaction CLI declared at the top of this
+# file (preimage, mihomo -t, isolated trial, atomic write, reload, rollback).
 # One lock for `on`, `off` and the guard's console block: a rule must not come back after the
 # kill switch removed it. `status` never takes it - the panel calls it on every render.
 # The primitive is the shared kernel lock (geomask-lock.sh, console rank): a killed switch is
@@ -2711,18 +2748,35 @@ _console_rule_off() { # remove only OUR rules: `from <ipv4> lookup 102`, never a
   return 0
 }
 
+# Digest of a file's bytes, or rc 1 when it cannot be read. Used to decide whether the live
+# config is still the one this lane wrote before any rollback is allowed to touch it.
+_console_file_sha() {
+  _sha_file "${1:-}"
+}
+
 # Undo the console patch: put the pre-switch bytes back through the SAME transaction the switch
 # used, then prove the live file is usable again. A restore that leaves mihomo unable to load
 # the file, or the controller not answering, is not a restore.
-#   _console_cfg_restore [preimage] -> rc 0 only when the live config is byte-identical to the
+#   _console_cfg_restore [preimage] -> 0 only when the live config is byte-identical to the
 #   preimage, `mihomo -t` accepts it and the controller answers /version.
+#   -> 2 when the live file is neither our preimage nor the candidate we installed: another
+#   writer committed after us, and undoing "our" change would destroy their bytes (C01).
 _console_cfg_restore() {
   _pre="${1:-${_orig:-}}"
   [ -n "$_pre" ] && [ -f "$_pre" ] || return 1
-  # The CLI can refuse (lane busy, disk full, trial failed): its own rollback may already have
-  # put the bytes back, so the byte comparison below decides, not its exit code.
-  "$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" < "$_pre" >/dev/null 2>&1 || :
-  cmp -s "$MIHOMO_CONF" "$_pre" || return 1
+  _pre_sha=$(_console_file_sha "$_pre") || return 1
+  _live_sha=$(_console_file_sha "$MIHOMO_CONF")
+  if [ -n "$_live_sha" ] && [ "$_live_sha" != "$_pre_sha" ]; then
+    # Only undo OUR OWN write. The candidate we installed is the one other state this lane is
+    # allowed to replace; a live file that is neither is a concurrent commit, so refuse instead
+    # of restoring "the original" over it. The CAS below also closes the read-to-write window.
+    _post_sha=''
+    [ -n "${_cand:-}" ] && [ -f "$_cand" ] && _post_sha=$(_console_file_sha "$_cand")
+    [ -n "$_post_sha" ] && [ "$_live_sha" = "$_post_sha" ] || return 2
+    "$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" --expect-sha256 "$_live_sha" \
+      < "$_pre" >/dev/null 2>&1 || :
+    cmp -s "$MIHOMO_CONF" "$_pre" || return 1
+  fi
   if command -v mihomo >/dev/null 2>&1; then
     mihomo -d /etc/mihomo -f "$MIHOMO_CONF" -t >/dev/null 2>&1 || return 1
   fi
@@ -2738,15 +2792,22 @@ _console_on_fail() { # _console_on_fail <step> <message> [retryable]
   _cof_retry=""
   [ "${3:-}" = retryable ] && _cof_retry=',"retryable":true'
   _restored=false
-  if _console_cfg_restore "$_orig"; then
-    _restored=true
-    rm -f "$_orig" 2>/dev/null
-  fi
+  _cof_conflict=false
+  _cof_rc=0
+  _console_cfg_restore "$_orig" || _cof_rc=$?
+  case "$_cof_rc" in
+    0) _restored=true; rm -f "$_orig" 2>/dev/null ;;
+    2) _cof_conflict=true ;;
+  esac
   rm -f "$_cand" 2>/dev/null
   # Every failure path ends here; none of them may return with the lane lock still held.
   _console_unlock
   if [ "$_restored" = true ]; then
     printf '{"ok":false%s,"step":"%s","restored":true,"error":"%s - previous config restored"}\n' "$_cof_retry" "$1" "$2"
+  elif [ "$_cof_conflict" = true ]; then
+    # The honest answer for C01: our change is gone, but the live bytes belong to somebody
+    # else's commit. Nothing was overwritten, and the preimage is kept as the working copy.
+    printf '{"ok":false%s,"step":"%s","restored":false,"conflict":true,"error":"%s - the live config was changed by another writer after this switch; it was NOT overwritten, the pre-switch copy is kept at %s"}\n' "$_cof_retry" "$1" "$2" "$_orig"
   else
     # Not verified is not the same as "left patched": the transaction rolls back on its own, so
     # the bytes may already be the old ones while mihomo or the controller still refuses to
@@ -2859,8 +2920,7 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   # still find live at commit time. Without it a concurrent mtrickle_sync/apply commit would
   # be silently erased by a candidate built before it (report R06): the transaction refuses
   # with "changed since read" instead.
-  _base_sha=$("$PYTHON_BIN" -B -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
-    "$_cand" 2>/dev/null)
+  _base_sha=$(_sha_file "$_cand")
   [ -n "$_base_sha" ] || {
     rm -f "$_cand"; _console_unlock
     printf '{"ok":false,"error":"cannot fingerprint the mihomo config - live config untouched"}\n'; return 1

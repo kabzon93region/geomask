@@ -80,7 +80,7 @@
           "path": "/etc/hotplug.d/iface/99-default-vpn-route",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "32bf28c40935e80271a76eb9c0424ee470fdf37e3b9eb40174dacd0b8f5f5f3e"
+          "sha256": "2268c1fcdf91ddedb964cf9ddbf2c6a1e47c0da993987764e24813afa93f0f64"
         },
         {
           "path": "/etc/init.d/geomask-syncd",
@@ -92,19 +92,19 @@
           "path": "/root/sync_mtrickle_mihomo.sh",
           "source": "assets/sync_mtrickle_mihomo.sh",
           "mode": "0755",
-          "sha256": "5ac6ec58fd32ed3b24b8949e16b577eedb2e48ab2cc54ea0d5f34695f356cb0b"
+          "sha256": "45c5715a89e9b3b598adc1378df87a4ac1c818b61971d754224d2426bf21ff4a"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
           "source": "assets/geomask-lane.sh",
           "mode": "0755",
-          "sha256": "4dfd552076ec30dfbb6c54fd45134401fd1a1a3e52dfe701ff02a71df8cdb471"
+          "sha256": "a7167abe51aa161e335d3e0520cf8217320fc6b8a6788a931901301a0e4053e0"
         },
         {
           "path": "/usr/bin/geomask-node-scan.sh",
           "source": "assets/geomask-node-scan.sh",
           "mode": "0755",
-          "sha256": "6e15ca7d85f9e4ff1c844c866ad08ae2a4d21874d2bc09c52a97839842f2a5b6"
+          "sha256": "082b368c808d18082e40b57723c25fd3c02a995cb55cdb467084fe3bc89f9ec2"
         },
         {
           "path": "/usr/bin/geomask-seed-lists.py",
@@ -122,13 +122,13 @@
           "path": "/usr/lib/geomask/99-default-vpn-route.dist",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "32bf28c40935e80271a76eb9c0424ee470fdf37e3b9eb40174dacd0b8f5f5f3e"
+          "sha256": "2268c1fcdf91ddedb964cf9ddbf2c6a1e47c0da993987764e24813afa93f0f64"
         },
         {
           "path": "/usr/lib/geomask/geomask-apply.py",
           "source": "assets/geomask-apply.py",
           "mode": "0755",
-          "sha256": "532d02d66727b682ab35471e02bbbe56239f3e277c95da016a4cc2698a4bdec9"
+          "sha256": "1acad6d02e67af871ebf5061ae8ba22b1c1e2dc28e7dafc220b258fbdbaa12d1"
         },
         {
           "path": "/usr/lib/geomask/geomask-audit-scheduler.py",
@@ -152,7 +152,7 @@
           "path": "/usr/lib/geomask/geomask-config-tx.py",
           "source": "assets/geomask-config-tx.py",
           "mode": "0755",
-          "sha256": "53e77fe83b65a9c824a66d239ddc4bb4213aef1427a384d650ea2ea820be6fcb"
+          "sha256": "d578ca354aed2adcc058a8b64f959fef5b88a4c3bc66422b71849810eeafcf9e"
         },
         {
           "path": "/usr/lib/geomask/geomask-console.py",
@@ -182,13 +182,19 @@
           "path": "/usr/lib/geomask/geomask-lane-torrent.py",
           "source": "assets/geomask-lane-torrent.py",
           "mode": "0755",
-          "sha256": "f7ba7bfc412ae929a7a464b085ac405c62fb4e44043adf0a80a04354a6ee484a"
+          "sha256": "21a7b5ddb49fcc132c4d010e855d57160f3fe4867da2262fbdef202ff5c2fe7e"
         },
         {
           "path": "/usr/lib/geomask/geomask-lists-edit.py",
           "source": "assets/geomask-lists-edit.py",
           "mode": "0755",
           "sha256": "058aec0a08d350d590f09bc01379a0f6f87a2e8855ba7d1cafb8334f31696a62"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-lock.sh",
+          "source": "assets/geomask-lock.sh",
+          "mode": "0644",
+          "sha256": "eb72c61b78258c9cbedfe5e1992d04089310d86570e560bcaf7f2153508c3883"
         },
         {
           "path": "/usr/lib/geomask/geomask-node-audit.py",
@@ -200,7 +206,7 @@
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "0963e09bb0a27476e3c055c8210202aaf0db47f1cb86e55d7b8aba27faf34b2d"
+          "sha256": "bba9e027b22ba2498342fa03352abb323c8545d606f7a63a971f9f3cebbbfb89"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
@@ -218,7 +224,7 @@
           "path": "/usr/lib/geomask/geomask-sync-youtube.py",
           "source": "assets/geomask-sync-youtube.py",
           "mode": "0755",
-          "sha256": "22b4a2e34ed05045e5304c11fb0e1a98f2c5346cbd58122f5fea1e4c040db6b2"
+          "sha256": "40bb9c6488640d09b453707c23b08370611585aa79538e45e6b3fded9d852467"
         }
       ]
     },
@@ -300,7 +306,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "4532108d7667e323103ba05d5ae00549a1ec50afd8957c4ebdb051c4f2a45df7"
+          "sha256": "ce81c3f3cf076a514c6e2e9a0328f1cdb7a27cf042821a59cad86984f1ea02ff"
         }
       ]
     },
@@ -316,7 +322,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "4c35df37d2f3558e87fcb83872802ae63a842d1434fa0b2f38febe56adad7610"
+          "sha256": "6caabd31b60918c86cbc8b4464e221504a981348d44f8f70b9fec9a9c7071b09"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -403,7 +409,7 @@
           "path": "/usr/bin/geomask-torrent.sh",
           "source": "assets/geomask-torrent.sh",
           "mode": "0755",
-          "sha256": "e9dab1c3d8d58896fcedfe4b54d0e73ee3e55bdf38a74943a4b019068cbf7d5f"
+          "sha256": "fdba7ae65803ff52d6f63e03115769dbc91cc915a29b2b5f26464aa868e73387"
         }
       ]
     },

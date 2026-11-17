@@ -261,7 +261,11 @@ ip() { case "$*" in "link show "*) return 0 ;; esac; return 0; }
                 '  "-q get network.lan.device") printf "br-lan" ;;\n'
                 '  *) return 1 ;;\n'
                 'esac; }\n'
-                'GM_ROUTE_STATE_DIR=' + posix(state) + '\n')
+                'GM_ROUTE_STATE_DIR=' + posix(state) + '\n'
+                # R04: the route table is now serialised by the shared kernel lock helper.
+                'GM_LOCK_DIR=' + posix(self.case / 'locks') + '\n'
+                'GM_LOCK_LIB=' + posix(ROOT / 'assets' / 'geomask-lock.sh') + '\n'
+                '. "$GM_LOCK_LIB"\n')
         if source is None:
             return self.run_script('geomask_routes_sync 100; printf "\\nRC=%s\\n" "$?"',
                                    functions=['_gm_route_owned', '_gm_route_networks',

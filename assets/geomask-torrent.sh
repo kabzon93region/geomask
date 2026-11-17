@@ -9,7 +9,42 @@
 # Everything it writes is validated with `mihomo -t` and rolled back on failure; reload goes
 # through the local controller API with the bearer token, never via argv.
 exec python3 - "$@" <<'PYEOF'
-import json, os, re, subprocess, sys, time, urllib.request
+import contextlib, json, os, re, subprocess, sys, time, urllib.request
+
+# The config transaction (geomask-config-tx.py) and this script write the same file. The lock
+# is the transaction's own lock file - the same kernel flock(2) the Python transaction and the
+# shell helper (geomask-lock.sh, rank config-tx) use, so no writer can interleave a commit
+# between our read and our write. The file is never deleted or recreated.
+TXLOCK=os.environ.get('GM_CONFIG_TX_LOCK','/etc/geomask/node-audit/state/.config-tx.lock')
+
+@contextlib.contextmanager
+def tx_lock():
+    try:
+        import fcntl
+    except ImportError:
+        if sys.platform.startswith('linux'):
+            sys.exit('geomask-torrent: the fcntl/flock primitive is missing - refusing to write the live config')
+        yield
+        return
+    os.makedirs(os.path.dirname(TXLOCK), exist_ok=True)
+    fd=os.open(TXLOCK, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        # Bounded wait like the Python transaction (30s) and the lane helper (15s): a blocking
+        # LOCK_EX could hang the panel call forever on a stuck/malicious holder (review round 2).
+        deadline=time.monotonic()+30.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic()>=deadline:
+                    sys.exit('geomask-torrent: the config transaction lock is busy for 30s - retry later')
+                time.sleep(0.1)
+        yield
+    finally:
+        try: fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError: pass
+        os.close(fd)
 
 CFG='/etc/mihomo/config.yaml'
 RS='/etc/mihomo/ruleset/torrentdirect.yaml'
@@ -228,13 +263,28 @@ def set_listener(on):
         lines=out
     return _commit_listener(t, ''.join(lines), 'enabled' if on else 'disabled')
 
+def _put(data):
+    """Atomic replace of the live config (a crash cannot leave a truncated file)."""
+    tmp=CFG+'.tmp.torrent.%d' % os.getpid()
+    open(tmp,'w',encoding='utf-8',newline='').write(data)
+    os.replace(tmp,CFG)
+
 def _commit_listener(old, new, why):
     if new==old: return False
-    bak=CFG+'.bak_torrent'; open(bak,'w',encoding='utf-8',newline='').write(old)
-    open(CFG,'w',encoding='utf-8',newline='').write(new)
-    if not validate():
-        open(CFG,'w',encoding='utf-8',newline='').write(old)
-        log('listener change rejected by mihomo -t, config restored'); return False
+    # Read-modify-write under the transaction lock, with a compare-and-swap: `old` is what the
+    # patch was derived from. A concurrent console/panel commit is refused, never overwritten.
+    with tx_lock():
+        if read(CFG)!=old:
+            log('listener change refused: config changed since it was read (another writer won)')
+            return False
+        bak=CFG+'.bak_torrent.%d' % os.getpid()
+        open(bak,'w',encoding='utf-8',newline='').write(old)
+        _put(new)
+        if not validate():
+            _put(old)
+            log('listener change rejected by mihomo -t, config restored'); return False
+        try: os.remove(bak)
+        except OSError: pass
     api('PUT','/configs?force=true', {'path': CFG})
     log('listener %s' % why)
     return True

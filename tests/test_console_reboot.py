@@ -126,10 +126,14 @@ class ConsoleRebootTests(unittest.TestCase):
             'GM_CONSOLE_LOCK="%s/console.lock"\n'
             'GM_ROUTES_LIB="%s"\n'
             'GM_CONSOLE_TUN="Console"\n'
-            'export CASE GM_CONSOLE_STATE GM_CONSOLE_LOCK GM_ROUTES_LIB GM_CONSOLE_TUN\n'
+            'GM_LOCK_DIR="%s/locks"\n'
+            'GM_LOCK_LIB="%s"\n'
+            'export CASE GM_CONSOLE_STATE GM_CONSOLE_LOCK GM_ROUTES_LIB GM_CONSOLE_TUN GM_LOCK_DIR GM_LOCK_LIB\n'
+            '. "$GM_LOCK_LIB"\n'
             'logger() { printf "%%s\n" "$*" >> "$CASE/logger.log"; }\n'
             'conntrack() { return 0; }\n'
-            % (win(self.case), win(self.state), win(self.case), win(self.lib)))
+            % (win(self.case), win(self.state), win(self.case), win(self.lib),
+               win(self.case), win(ROOT / 'assets' / 'geomask-lock.sh')))
 
     def run_script(self, body, prefix=''):
         script = self.write('run.sh', 'set -u\n' + self.environment() + IP_STUB

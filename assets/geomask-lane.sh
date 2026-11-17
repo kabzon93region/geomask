@@ -29,6 +29,23 @@ LAN_DEV=$(uci -q get network.lan.device 2>/dev/null)
 
 die() { echo "lane: $*" >&2; exit 1; }
 
+# The mihomo config is written here by hand only after validation, but it is the same file the
+# config transaction owns. The lock is the transaction's own lock file (geomask-lock.sh rank
+# config-tx, the same kernel flock(2)), so a panel commit cannot interleave between our read and
+# our write. A killed lane run releases the lock in the kernel; nothing is deleted.
+GM_LOCK_LIB=${GM_LOCK_LIB:-/usr/lib/geomask/geomask-lock.sh}
+if ! command -v gm_lock_acquire >/dev/null 2>&1 && [ -r "$GM_LOCK_LIB" ]; then
+  . "$GM_LOCK_LIB"
+fi
+_cfg_lock() {
+  command -v gm_lock_acquire >/dev/null 2>&1 || die "lock helper missing ($GM_LOCK_LIB)"
+  gm_lock_acquire config-tx 15 || die "mihomo config is busy (another transaction holds the lock) - retry"
+}
+_cfg_unlock() {
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release config-tx
+  return 0
+}
+
 # _provision_netfw - give the tun a uci interface + firewall zone + lan forwarding.
 # Without this, fw4 treats the tun as "no zone" and REJECTs (tcp-reset) every MagiTrickle
 # flow routed to it, so every group assigned to this lane silently fails. This is exactly
@@ -159,6 +176,7 @@ INITend
   if grep -q "name: $LNAME" "$CFG"; then
     echo "  listener already present"
   else
+    _cfg_lock
     cp -p "$CFG" "$CFG.bak_lane"
     python3 - "$CFG" "$LNAME" "$LANE_PORT" "$LANE_GROUP" <<'PY'
 import re, sys
@@ -178,8 +196,9 @@ open(p, 'w', encoding='utf-8', newline='').write(new)
 print('  listener %s:%s -> proxy %s added' % (name, port, grp))
 PY
     if ! /usr/bin/mihomo -t -d /etc/mihomo >/dev/null 2>&1; then
-      cp -p "$CFG.bak_lane" "$CFG"; die "mihomo -t failed after adding the listener - config restored"
+      cp -p "$CFG.bak_lane" "$CFG"; _cfg_unlock; die "mihomo -t failed after adding the listener - config restored"
     fi
+    _cfg_unlock
     SECRET=$(grep -m1 -oE '^secret:[[:space:]]*["'\'']?[^"'\''[:space:]]+' "$CFG" | sed -E 's/^secret:[[:space:]]*["'\'']?//')
     curl -s -o /dev/null -X PUT "http://127.0.0.1:9090/configs?force=true" \
       -H "Authorization: Bearer $SECRET" -H 'Content-Type: application/json' \
@@ -196,6 +215,7 @@ remove() {
   "$INITD" stop >/dev/null 2>&1; "$INITD" disable >/dev/null 2>&1
   rm -f "$INITD" "$YML"
   if grep -q "name: $LNAME" "$CFG" 2>/dev/null; then
+    _cfg_lock
     cp -p "$CFG" "$CFG.bak_lane"
     python3 - "$CFG" "$LNAME" <<'PY'
 import re, sys
@@ -205,7 +225,8 @@ new = re.sub(r'(?m)^  - name: %s\n(?:[ ]{4}.*\n)+' % re.escape(name), '', t)
 open(p, 'w', encoding='utf-8', newline='').write(new)
 print('  listener removed' if new != t else '  nothing to remove')
 PY
-    /usr/bin/mihomo -t -d /etc/mihomo >/dev/null 2>&1 || { cp -p "$CFG.bak_lane" "$CFG"; die "config invalid after removing the listener - restored"; }
+    /usr/bin/mihomo -t -d /etc/mihomo >/dev/null 2>&1 || { cp -p "$CFG.bak_lane" "$CFG"; _cfg_unlock; die "config invalid after removing the listener - restored"; }
+    _cfg_unlock
     SECRET=$(grep -m1 -oE '^secret:[[:space:]]*["'\'']?[^"'\''[:space:]]+' "$CFG" | sed -E 's/^secret:[[:space:]]*["'\'']?//')
     curl -s -o /dev/null -X PUT "http://127.0.0.1:9090/configs?force=true" \
       -H "Authorization: Bearer $SECRET" -H 'Content-Type: application/json' -d "{\"path\":\"$CFG\"}"

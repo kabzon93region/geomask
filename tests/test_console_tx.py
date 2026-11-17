@@ -150,6 +150,12 @@ TX_PY="@TX_PY@"
 PYTHON_BIN="@PYTHON@"
 CONSOLE_LOCK="@LOCK@"
 CONSOLE_LOCK_TRIES=3
+# R04: the backend holds the shared kernel lock through the shipped helper. The test host has
+# no flock(2), so the helper selects its documented portable (O_EXCL) backend; the lock dir is
+# inside the case tree like every other path here.
+GM_LOCK_DIR="@CASE@/locks"
+GM_LOCK_LIB="@LOCKLIB@"
+. "$GM_LOCK_LIB"
 LOG="@LOG@"
 DEVICES="@CASE@/geo-devices.list"
 TMPDIR="@CASE@"
@@ -197,6 +203,7 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
             'TX_PY': win(self.tx_stub),
             'PYTHON': win(sys.executable),
             'LOCK': win(self.case / 'console.lock'),
+            'LOCKLIB': win(ROOT / 'assets' / 'geomask-lock.sh'),
             'LOG': win(self.case / 'geo-sync.log'),
         }
         text = HEADER
@@ -250,7 +257,12 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
         calls = self.recorded()
         self.assertEqual(len(calls), 2, calls)
         for call in calls:
-            self.assertEqual(call['argv'], ['--commit', win(self.config)])
+            self.assertEqual(call['argv'][:2], ['--commit', win(self.config)])
+        # CAS: the forward commit carries the digest of the pre-patch live bytes (R06); the
+        # rollback restores the private preimage and has no base to compare.
+        self.assertEqual(len(calls[0]['argv']), 4, calls[0]['argv'])
+        self.assertEqual(calls[0]['argv'][2], '--expect-sha256')
+        self.assertEqual(len(calls[1]['argv']), 2, calls[1]['argv'])
         self.assertNotEqual(calls[0]['sha256'], sha(original))   # the patched candidate went in
         self.assertEqual(calls[1]['sha256'], sha(original))      # the original bytes came back
 
@@ -298,8 +310,9 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
                          'the live config is still copied by hand before the switch')
         self.assertTrue('TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}' in CONSOLE_SECTION,
                         'the transaction CLI is not wired into the backend')
-        self.assertTrue('--commit "$MIHOMO_CONF" < "$_cand"' in CONSOLE_SECTION,
-                        'the candidate is not installed through the transaction CLI')
+        self.assertTrue('--commit "$MIHOMO_CONF" --expect-sha256 "$_base_sha" < "$_cand"'
+                        in CONSOLE_SECTION,
+                        'the candidate is not installed through the transaction CLI with its CAS base')
         # The rollback is the same CLI, fed with the private preimage the switch kept.
         self.assertTrue('--commit "$MIHOMO_CONF" < "$_pre"' in CONSOLE_SECTION,
                         'the rollback does not go through the same CLI')

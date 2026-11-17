@@ -168,6 +168,11 @@ class _RoutesCase(unittest.TestCase):
             '. "$CASE/stubs.sh"',
             'GM_ROUTE_STATE_DIR="$CASE/state"',
             'export GM_ROUTE_STATE_DIR',
+            'GM_LOCK_DIR="$CASE/locks"',
+            'export GM_LOCK_DIR',
+            'GM_LOCK_LIB="%s"' % (ROOT / 'assets' / 'geomask-lock.sh').as_posix(),
+            'export GM_LOCK_LIB',
+            '. "$GM_LOCK_LIB"',
         ]
         if lock_wait is not None:
             lines.append('GM_ROUTE_LOCK_WAIT=%s; export GM_ROUTE_LOCK_WAIT' % lock_wait)
@@ -197,29 +202,47 @@ class _RoutesCase(unittest.TestCase):
         self.assertIn('RC=', result.stdout, result.stdout + result.stderr)
         return int(result.stdout.rsplit('RC=', 1)[1].split()[0])
 
-    def plant_lock(self, pid):
-        lock = self.state_dir() / 'lock-102'
-        lock.mkdir()
-        (lock / 'pid').write_text('%s\n' % pid, encoding='utf-8')
+    def lock_file(self):
+        return self.case / 'locks' / 'route-102.lock'
 
     def hold_lock(self):
-        """A real second process owns the table lock, the way a running sync would.
+        """A real second process owns the table lock through the shipped helper.
 
-        The pid has to be the one bash reports as `$$`: a Windows pid from Popen is not what
-        `kill -0` resolves inside Git-Bash, and the helper would rightly call that lock stale.
+        R04: the lock is the persistent kernel lock of geomask-lock.sh; nothing is written into
+        the state directory and no pid is involved. On the Windows test host the helper selects
+        its documented portable (O_EXCL) backend, where the file itself is the lock.
         """
-        lock = self.state_dir() / 'lock-102'
-        lock.mkdir()
-        holder = subprocess.Popen([BASH, '-c', 'printf "%s\\n" "$$" > "$1"; sleep 30',
-                                   'sh', (lock / 'pid').as_posix()], cwd=str(self.case))
+        self.case.joinpath('locks').mkdir(exist_ok=True)
+        script = self.case / 'hold.sh'
+        script.write_text(
+            'GM_LOCK_DIR=%s\nGM_LOCK_LIB=%s\n. "$GM_LOCK_LIB"\n'
+            'gm_lock_acquire route-102 0 || exit 9\n'
+            'printf held > %s\nsleep 30\n'
+            % (self.case.joinpath('locks').as_posix(),
+               (ROOT / 'assets' / 'geomask-lock.sh').as_posix(),
+               (self.case / 'held').as_posix()),
+            encoding='utf-8', newline='\n')
+        holder = subprocess.Popen([BASH, script.as_posix()], cwd=str(self.case))
         self.addCleanup(holder.kill)
-        pidfile = lock / 'pid'
         for _ in range(200):
-            if pidfile.exists() and pidfile.stat().st_size:
+            if (self.case / 'held').exists():
                 break
             time.sleep(0.05)
-        self.assertGreater(pidfile.stat().st_size, 0, 'the lock holder never wrote its pid')
+        self.assertTrue((self.case / 'held').exists(), 'the lock holder never started')
         return holder
+
+    def lock_is_free(self):
+        script = self.case / 'probe.sh'
+        script.write_text(
+            'GM_LOCK_DIR=%s\nGM_LOCK_LIB=%s\n. "$GM_LOCK_LIB"\n'
+            'gm_lock_acquire route-102 0; printf "RC=%%s\\n" "$?"\n'
+            'gm_lock_release_all\n'
+            % (self.case.joinpath('locks').as_posix(),
+               (ROOT / 'assets' / 'geomask-lock.sh').as_posix()),
+            encoding='utf-8', newline='\n')
+        result = subprocess.run([BASH, script.as_posix()], cwd=str(self.case),
+                                capture_output=True, text=True, encoding='utf-8', timeout=60)
+        return 'RC=0' in result.stdout
 
 
 class RoutesOwnershipTests(_RoutesCase):
@@ -278,24 +301,25 @@ class RoutesLockTests(_RoutesCase):
         self.assertEqual(self.owned(), [LAN_CONNECTED], 'the owned file was overwritten')
         self.assertFalse([call for call in self.calls() if call.startswith('route replace')],
                          self.calls())
-        self.assertTrue((self.case / 'state' / 'lock-102').exists(),
+        self.assertTrue(self.lock_file().exists(),
                         'the lock of the other process was removed')
 
-    def test_a_lock_left_by_a_dead_process_is_broken(self):
+    def test_a_legacy_directory_lock_no_longer_blocks_the_table(self):
+        """Migration: the old mkdir lock is a different path and is neither used nor deleted."""
         dead = subprocess.Popen([BASH, '-c', 'exit 0'], cwd=str(self.case))
         dead.wait()
-        self.install([LAN_CONNECTED], [], None)
-        self.plant_lock(dead.pid)
+        legacy = self.state_dir() / 'lock-102'
+        legacy.mkdir()
+        (legacy / 'pid').write_text('%s\n' % dead.pid, encoding='utf-8')
         result = self.run_sync(main=[LAN_CONNECTED], installed=[], owned=None, lock_wait=3)
         self.assertEqual(self.rc(result), 0, result.stdout + result.stderr)
         self.assertIn(LAN_CONNECTED, self.table())
-        self.assertFalse((self.case / 'state' / 'lock-102').exists(),
-                         'the stale lock was not cleaned up')
+        self.assertTrue(legacy.exists(), 'the new code deleted a legacy lock it does not own')
 
     def test_the_lock_is_released_after_a_successful_run(self):
         result = self.run_sync(main=[LAN_CONNECTED], installed=[], owned=None)
         self.assertEqual(self.rc(result), 0, result.stdout + result.stderr)
-        self.assertFalse((self.case / 'state' / 'lock-102').exists())
+        self.assertTrue(self.lock_is_free(), 'the table lock is still held after a successful run')
 
     def test_the_lock_is_released_after_a_failed_run(self):
         """Every early exit gives the lock back; otherwise the table stays blocked for good."""
@@ -303,8 +327,7 @@ class RoutesLockTests(_RoutesCase):
         (self.case / 'no-main').write_text('', encoding='utf-8')
         result = self.run_sync(main=[], installed=[], owned=None)
         self.assertEqual(self.rc(result), 1)
-        self.assertFalse((self.case / 'state' / 'lock-102').exists(),
-                         'a failed sync kept the table lock')
+        self.assertTrue(self.lock_is_free(), 'a failed sync kept the table lock')
 
     def test_two_syncs_do_not_lose_each_other_prefixes(self):
         """Two writers, one table: the owned file must end up describing the real table.

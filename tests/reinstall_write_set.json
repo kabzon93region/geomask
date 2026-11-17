@@ -315,6 +315,20 @@
       "notes": "общий helper hotplug+backend; uninstall не удаляет"
     },
     {
+      "id": "/usr/lib/geomask/geomask-lock.sh",
+      "path": "/usr/lib/geomask/geomask-lock.sh",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "644",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall keeps"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "R04: единственный helper блокировки (kernel flock на постоянном inode); его же функции инжектируются в установщик из assets/geomask-lock.sh"
+    },
+    {
       "id": "/usr/lib/geomask/geomask-module-update.py",
       "path": "/usr/lib/geomask/geomask-module-update.py",
       "type": "regular",
@@ -1537,8 +1551,8 @@
       "notes": "состояние последнего sync; transient"
     },
     {
-      "id": "/tmp/geomask-sync.state.tmp",
-      "path": "/tmp/geomask-sync.state.tmp",
+      "id": "/tmp/geomask-sync.state.tmp.",
+      "path": "/tmp/geomask-sync.state.tmp.",
       "type": "regular",
       "owner": "ours",
       "mode": "644",
@@ -1627,6 +1641,7 @@
       "id": "dyn.mihomo-temps",
       "functions": [
         "write_mihomo_config",
+        "_write_mihomo_config_unlocked",
         "safe_mihomo_restart"
       ],
       "effects": [
@@ -1636,8 +1651,8 @@
         "cp",
         "chmod"
       ],
-      "site_regex": "\\.de5rm|\\.urlnew|\\.tdnew|\\.ecnew|pre-run-|\\$_pre\\b",
-      "path_regex": ".*\\.(de5rm|urlnew|tdnew|ecnew|pre-run-[^/]*)$",
+      "site_regex": "\\.de5rm|\\.urlnew|\\.tdnew|\\.ecnew|\\.zmnew|pre-run-|\\$_pre\\b|\\$_wpid\\b|\\$_tmpconf\\b",
+      "path_regex": ".*\\.(de5rm|urlnew|tdnew|ecnew|zmnew|pre-run-[^/]*)(\\.[0-9]+|\\.\\*)?$",
       "type": "dynamic",
       "owner": "ours",
       "snapshot": "SBA",
@@ -1645,9 +1660,25 @@
       "notes": "временные файлы точечного патча конфига + pre-run-копия GM_PRE_CONFIG"
     },
     {
+      "id": "dyn.mihomo-preimage-restore",
+      "functions": [
+        "_mihomo_restore_preimage"
+      ],
+      "effects": [
+        "cp"
+      ],
+      "site_regex": "cp -p \"\\$1\" \"\\$2\"",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "R04 round 4: safe_mihomo_restart возвращает preimage конфига под config-tx; цель — живой config.yaml (покрыт files-объектом), аргументы не резолвятся статически"
+    },
+    {
       "id": "dyn.ruleset-stub-loop",
       "functions": [
-        "write_mihomo_config"
+        "write_mihomo_config",
+        "_write_mihomo_config_unlocked"
       ],
       "effects": [
         "redirect",
@@ -1738,6 +1769,7 @@
         "_rs_snap_net",
         "_rs_stop_new_services",
         "_rs_restore_files",
+        "_rs_restore_files_unlocked",
         "_rs_prune_temps",
         "_rs_restore_shared",
         "_rs_restore_uci",

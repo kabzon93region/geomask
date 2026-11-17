@@ -7,7 +7,9 @@ Fixtures are written as bytes so the comparison is exact on every platform.
 """
 import os
 from pathlib import Path
+import sys
 import tempfile
+import time
 import unittest
 
 HERE = Path(__file__).resolve().parents[1] / 'assets'
@@ -28,9 +30,11 @@ def helper_source():
 
 def load_helper(config_path):
     env = {'GM_CONFIG_TX_LOCK': str(config_path.parent / '.config-tx.lock')}
-    namespace = {'os': os, '_E': env, '__name__': 'scanner_helpers'}
+    # CFG/time must exist while the extracted module-level code runs: the scanner defines
+    # per-process temp names (TMP_CFG) from CFG, and the lock loop uses time.
+    namespace = {'os': os, 'time': time, 'sys': sys, '_E': env, '__name__': 'scanner_helpers',
+                 'CFG': str(config_path)}
     exec(compile(helper_source(), '<scanner-helpers>', 'exec'), namespace)
-    namespace['CFG'] = str(config_path)
     return namespace
 
 

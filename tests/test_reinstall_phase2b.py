@@ -46,6 +46,15 @@ FUNCTIONS = [
     '_reinstall_save', '_reinstall_snapshot', '_reinstall_restore',
 ]
 
+# The extracted restore functions call the one-line product helpers _cron_begin/_cron_end,
+# which the discover-by-name rule (`_rs_*`) does not pick up. The harness emulates the installed
+# system: the same semantics, using the same kernel helper. Without them the restore printed
+# "command not found" and its `&&`-guarded release masked the failure.
+HARNESS_STUBS = '''
+_cron_begin() { command -v gm_lock_acquire >/dev/null 2>&1 || return 1; gm_lock_acquire cron 20; }
+_cron_end() { command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release cron; return 0; }
+'''
+
 
 def reinstall_functions():
     """Every real snapshot/restore helper the template defines, in file order.
@@ -703,7 +712,13 @@ class Phase2bTest(unittest.TestCase):
                    .replace('@STATE@', posix(self.fixture.state))
                    .replace('@LOGS@', posix(self.fixture.logs))
                    .replace('@MODULES@', ''))
-        text = (support + template_tables() + '\n' + '\n'.join(parts) + '\n'
+        # R04: the shipped rollback takes the kernel config-tx lock (and cron lock) through the
+        # installed helper; the fixture root injects it exactly like the installed file.
+        support += ('\nGM_LOCK_DIR="%s/locks"\nGM_CONFIG_TX_LOCK="%s/tx.lock"\n'
+                    'GM_LOCK_LIB="%s"\n. "$GM_LOCK_LIB"\n'
+                    % (posix(self.case), posix(self.case),
+                       posix(ROOT / 'assets' / 'geomask-lock.sh')))
+        text = (support + template_tables() + HARNESS_STUBS + '\n' + '\n'.join(parts) + '\n'
                 + extra + '\n' + body)
         path = self.case / 'run.sh'
         path.write_text(text, encoding='utf-8', newline='\n')

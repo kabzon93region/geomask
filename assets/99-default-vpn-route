@@ -22,6 +22,10 @@ sync_table() { # sync_table <table> - mirror LAN connected routes, drop only our
     command -v logger >/dev/null 2>&1 && logger -t geomask "route sync skipped: $_rl missing"
     return 1
   fi
+  # R05: this runs inside netifd's ifup. The route lock is try-lock only here: a table that
+  # is busy (panel apply, another ifup) is left to its owner and reported, never waited for.
+  GM_ROUTE_LOCK_WAIT=0
+  export GM_ROUTE_LOCK_WAIT
   . "$_rl"
   geomask_routes_sync "$1"
 }

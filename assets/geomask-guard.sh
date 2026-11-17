@@ -189,11 +189,19 @@ fi
 # The kill switch and this block must not interleave: `off` writes enabled=0 and removes the
 # rule, so a watchdog that had read the state BEFORE that would put the rule straight back
 # after the owner switched the lane off. The state is therefore re-read INSIDE the same lock
-# that `on`/`off` hold for their whole operation. BusyBox has no flock everywhere, so the lock
-# is a directory with the owner pid inside; a stale lock (owner gone) is broken once, and a
-# lock that stays busy means "skip this run", never "work without it".
+# that `on`/`off` hold for their whole operation. The lock is the kernel flock of
+# geomask-lock.sh: a killed holder is released by the kernel, the file is never deleted and
+# there is no PID to guess. A busy lane means "skip this run", never "work without it".
 CS=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
-CLOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
+CLOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-locks/console.lock}
+# The kill switch and this block hold the same kernel lock (geomask-lock.sh, console rank).
+# The watchdog is a cron/hotplug background run: it takes the lock with a single non-blocking
+# attempt and skips the run when the lane is busy - it never waits, never reclaims a lock and
+# never deletes the lock file (a killed holder is released by the kernel).
+GM_LOCK_LIB=${GM_LOCK_LIB:-/usr/lib/geomask/geomask-lock.sh}
+if ! command -v gm_lock_acquire >/dev/null 2>&1 && [ -r "$GM_LOCK_LIB" ]; then
+  . "$GM_LOCK_LIB"
+fi
 # Table 102 is the only path the console device has, so both halves of it are watched: the LAN
 # prefixes (mirrored through the same helper as table 101) and a default that really points at
 # our tunnel. `grep '^default'` accepted the WAN default netifd restores for every table, so a
@@ -201,29 +209,9 @@ CLOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
 CTUN=${GM_CONSOLE_TUN:-Console}
 CTBL=${GM_CONSOLE_TABLE:-102}
 CROUTES=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
-console_lock() {
-  _ct=0
-  while [ "$_ct" -lt 10 ]; do
-    if mkdir "$CLOCK" 2>/dev/null; then
-      if printf '%s\n' "$$" > "$CLOCK/pid" 2>/dev/null; then
-        return 0
-      fi
-      rm -rf "$CLOCK" 2>/dev/null
-      return 1
-    fi
-    _ct=$((_ct+1))
-    _cop=''
-    [ -f "$CLOCK/pid" ] && _cop=$(cat "$CLOCK/pid" 2>/dev/null)
-    if [ -z "$_cop" ] && [ "$_ct" -eq 1 ]; then
-      # The owner may be between `mkdir` and writing its pid: look again before breaking it.
-      sleep 1
-    elif [ -n "$_cop" ] && kill -0 "$_cop" 2>/dev/null; then
-      sleep 1
-    else
-      rm -rf "$CLOCK" 2>/dev/null
-    fi
-  done
-  return 1
+console_lock() { # 0 only with the kernel lock held; busy or no primitive = skip, never forced
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire console 0 "$CLOCK"
 }
 if console_lock; then
   if [ -f "$CS" ] && [ "$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)" = 1 ]; then
@@ -231,9 +219,13 @@ if console_lock; then
     if [ -n "$CIP" ]; then
       # The table first: the rule below sends the console into it, and a table without the LAN
       # prefixes hides the local network from the console. Sourced in a subshell so the shared
-      # helper cannot leak its variables into this script.
+      # helper cannot leak its variables into this script. The route lock is a TRY-LOCK here:
+      # this block already holds `console`, and waiting up to 20 s for `route-102` would make
+      # `console off` fail for that whole window. A busy table is skipped and reported; the next
+      # guard run (5 min) retries. No-wait in the subshell, without changing the default for
+      # every other caller.
       if [ -r "$CROUTES" ]; then
-        ( . "$CROUTES" && geomask_routes_sync "$CTBL" ) >/dev/null 2>&1 \
+        ( GM_ROUTE_LOCK_WAIT=0; . "$CROUTES" && geomask_routes_sync "$CTBL" ) >/dev/null 2>&1 \
           || log "WARN console table $CTBL not synced"
       else
         log "WARN console routes helper missing ($CROUTES)"
@@ -259,12 +251,9 @@ if console_lock; then
       fi
     fi
   fi
-  _cup=$(cat "$CLOCK/pid" 2>/dev/null)
-  if [ -z "$_cup" ] || [ "$_cup" = "$$" ]; then
-    rm -rf "$CLOCK" 2>/dev/null
-  fi
+  gm_lock_release console
 else
-  log "SKIP console watchdog: lane lock is busy"
+  log "SKIP console watchdog: lane lock is busy or the lock primitive is unavailable"
 fi
 
 # ---------- (D) AI-DNS self-heal ----------

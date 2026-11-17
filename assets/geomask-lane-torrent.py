@@ -46,9 +46,17 @@ def _lan_ip():
 
 
 def _read_config():
-    """Read and parse mihomo config."""
-    with open(CFG, encoding='utf-8') as f:
-        return f.read()
+    """Read and parse mihomo config, remembering the digest the candidate is built from.
+
+    The transaction compares this digest with the live file under its lock and refuses a
+    stale write, so a concurrent panel commit cannot be silently overwritten (R06).
+    """
+    global _READ_DIGEST
+    raw = CFG.read_bytes()
+    _READ_DIGEST = _tx.digest(raw)
+    return raw.decode('utf-8')
+
+_READ_DIGEST = None
 
 def _validate_config(text=None):
     """Validate mihomo config."""
@@ -145,7 +153,8 @@ def lane_install(lane_name='VPN-noP2P', lane_ip='198.20.0.1', lane_port=7892, la
     if not changes:
         return {'ok': True, 'message': 'Lane already installed'}
 
-    return _tx.start_transaction(_tx_files(changes['config.yaml']))
+    return _tx.start_transaction(_tx_files(changes['config.yaml']),
+                                 expect_sha256=_READ_DIGEST)
 
 def lane_remove(lane_name='VPN-noP2P'):
     """Remove a lane using transaction."""
@@ -163,7 +172,8 @@ def lane_remove(lane_name='VPN-noP2P'):
     if new_config == config:
         return {'ok': True, 'message': 'Lane not found in config'}
     
-    return _tx.start_transaction(_tx_files(new_config.encode('utf-8')))
+    return _tx.start_transaction(_tx_files(new_config.encode('utf-8')),
+                                 expect_sha256=_READ_DIGEST)
 
 def lane_status(lane_name='VPN-noP2P'):
     """Get lane status."""
@@ -269,7 +279,8 @@ def torrent_set_listener(enable):
     if not changes:
         return {'ok': True, 'message': 'No change needed'}
     
-    return _tx.start_transaction(_tx_files(changes['config.yaml']))
+    return _tx.start_transaction(_tx_files(changes['config.yaml']),
+                                 expect_sha256=_READ_DIGEST)
 
 def torrent_refresh():
     """Refresh torrent ruleset."""

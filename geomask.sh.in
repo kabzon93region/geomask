@@ -440,6 +440,23 @@ module_skip_path() { # true when the path belongs to a module the owner did not 
   return 0
 }
 
+# ---- the one lock helper (R04) ----------------------------------------------
+# Single source of truth: assets/geomask-lock.sh. Injected here so the installer locks with
+# exactly the same code it installs to /usr/lib/geomask/geomask-lock.sh, and installed by the
+# save_stream below. Kernel flock(2) on a persistent inode: no PID, no reclaim, no unlink.
+# The config-transaction lock path and the lock directory are prefixed exactly like every other
+# path the installer touches. On the router P is the identity, so these are the real
+# /etc/geomask/node-audit/state/.config-tx.lock and /tmp/geomask-locks the runtime writers use;
+# a test root can never make the installer lock (or write) the host /etc or host /tmp. Both are
+# set BEFORE the helper is sourced: the helper captures the canonical path and keeps a
+# non-empty GM_LOCK_DIR provided by the caller. They are exported because the installer starts
+# child writers (uninstall calls geomask-lane.sh), which must inherit the injected paths
+# instead of falling back to the host ones.
+GM_CONFIG_TX_LOCK=${GM_CONFIG_TX_LOCK:-$(P /etc/geomask/node-audit/state/.config-tx.lock)}
+GM_LOCK_DIR=${GM_LOCK_DIR:-$(P /tmp/geomask-locks)}
+export GM_CONFIG_TX_LOCK GM_LOCK_DIR
+@@ASSET:geomask-lock.sh@@
+
 save_stream() { # save_stream <target-path> <mode>  (content on stdin)
   if module_skip_path "$1"; then
     cat >/dev/null 2>&1 || true
@@ -479,11 +496,20 @@ mod_skipped() { # mod_skipped <module> -> 0 (and a note) when the module is not 
   return 0
 }
 
+# Every rewrite of /etc/crontabs/root is a read-modify-write: the panel (nodes_set,
+# sync_set), the installer and uninstall must take the same kernel `cron` lock or one writer
+# silently drops the other's line (report R09). cron_ensure is used by step5 many times.
+_cron_begin() { command -v gm_lock_acquire >/dev/null 2>&1 || return 1; gm_lock_acquire cron 20; }
+_cron_end() { command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release cron; return 0; }
+
 cron_ensure() { # cron_ensure <module> <marker-ere> <cron-line>
   mod_skipped "$1" && return 0
   if crontab -l 2>/dev/null | grep -qE -- "$2"; then info "cron: уже есть ($2)"; return 0; fi
+  if ! _cron_begin; then warn "cron: блокировка недоступна ($2)"; return 0; fi
   ( crontab -l 2>/dev/null; printf '%s\n' "$3" ) | crontab - 2>/dev/null \
     && info "cron: добавлен ($2)" || warn "cron: не удалось записать ($2)"
+  _cron_end
+  return 0
 }
 
 cron_verify() { # cron_verify <module> <marker-ere> <label> [soft]
@@ -624,10 +650,29 @@ initd() { # initd <svc> <action>  - respects GM_PREFIX for tests
       return 1
     fi
   fi
-  "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+  # Run the init script without the lock descriptors: a service that daemonizes directly (or a
+  # procd fallback) must not inherit the maintenance lock and hold it until reboot.
+  if command -v gm_lock_safe_exec >/dev/null 2>&1; then
+    gm_lock_safe_exec "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+  else
+    "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+  fi
 }
 
 # ============================================================ PREFLIGHT
+# R04: the lock primitive is a mandatory dependency of every writer, on the normal install as
+# well as on the reinstall preflight. Echoes the missing piece (Linux only); rc=1 when usable.
+# Without flock every writer refuses to mutate, and the copied helper file must not exist.
+lock_primitive_missing() {
+  [ "$(uname -s 2>/dev/null)" = Linux ] || return 0
+  have flock || { printf 'flock applet (BusyBox; upstream OpenWrt 24.10 ships it)'; return 0; }
+  if have python3 && ! python3 -c 'import fcntl' >/dev/null 2>&1; then
+    printf 'python3 fcntl (the config transaction lock is fail-closed without it)'
+    return 0
+  fi
+  return 1
+}
+
 # Everything that can only fail later is checked here, before the first byte is written:
 # a reset router must not end up with a panel and no working mihomo config.
 preflight() {
@@ -654,6 +699,8 @@ preflight() {
   if have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
     have apk || have opkg || { bad "preflight: нет apk/opkg - python3-yaml не поставить"; _need=1; }
   fi
+  _lpm=$(lock_primitive_missing)
+  [ -z "$_lpm" ] || { bad "preflight: нет примитива блокировки: $_lpm"; info "  Без него писатели отказываются изменять конфиг (fail-closed), а не работают без lock."; _need=1; }
   [ -n "$(lan_ip)" ] || { bad "preflight: не определён адрес LAN ($(lan_iface)) - слушатели некуда привязать"; _need=1; }
   return $_need
 }
@@ -661,6 +708,8 @@ preflight() {
 # ============================================================ STEP 1: env
 step1_check() {
   _need=0
+  # Reset first: the flag is a property of THIS check, not a sticky state from an earlier run.
+  GM_STEP1_FATAL=0
   [ -f "$(P /etc/openwrt_release)" ] && info "OpenWrt: $(grep '^DISTRIB_RELEASE=' "$(P /etc/openwrt_release)" 2>/dev/null | cut -d"'" -f2)" || { bad "not OpenWrt (/etc/openwrt_release missing)"; _need=1; }
   if have apk; then info "pkg manager: apk"; elif have opkg; then info "pkg manager: opkg"; else bad "no apk/opkg"; _need=1; fi
   # v1.30.5: geomask is an overlay over mihomo, not a standalone product. Saying so here
@@ -679,6 +728,11 @@ step1_check() {
     if python3 -c 'import yaml' >/dev/null 2>&1; then info "python3-yaml: present"
     else warn "python3-yaml: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
   fi
+  # R04: a fresh install must fail before step 2 if the lock primitive is missing, otherwise
+  # every writer installed by the run would refuse to mutate. This is a hard refusal: the
+  # interactive wizard must not go on applying steps 2-7 after it (see run_step).
+  _lpm=$(lock_primitive_missing)
+  [ -z "$_lpm" ] || { GM_STEP1_FATAL=1; bad "flock: MISSING ($_lpm) - geomask writers are fail-closed without it"; _need=1; }
   # the AI lane is a second hev-socks5-tunnel instance; without the binary it cannot exist
   if module_selected path_ai || module_selected ai_dns; then
     if have hev-socks5-tunnel || [ -x "$(P /usr/bin/hev-socks5-tunnel)" ]; then info "hev-socks5-tunnel: present"
@@ -839,6 +893,11 @@ ASSET_EOF
   # two copies of the mirroring logic can never drift apart (audit 14.11.2026, F01/F02).
   save_stream /usr/lib/geomask/geomask-routes.sh 644 <<'ASSET_EOF'
 @@ASSET:geomask-routes.sh@@
+ASSET_EOF
+  # R04: the one lock helper (kernel flock on a persistent inode). Every writer sources it;
+  # the installer itself runs the very same functions from this script (injected below).
+  save_stream /usr/lib/geomask/geomask-lock.sh 644 <<'ASSET_EOF'
+@@ASSET:geomask-lock.sh@@
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-module-update.py 755 <<'ASSET_EOF'
 @@ASSET:geomask-module-update.py@@
@@ -1089,7 +1148,27 @@ step3_verify() { step3_check; }
 
 # write a fresh 2-provider mihomo config: write_mihomo_config <vpn_url> <ai_url>
 # validates with `mihomo -t`, keeps backup of the previous config; no restart here.
-write_mihomo_config() {
+write_mihomo_config() { # <vpn-url> <ai-url> - public entry: serialised live-config rewrite (R04)
+  # rpcd is reloaded in step2 and the panel can already commit through geomask-config-tx.py
+  # when step3 calls this: without the SAME kernel lock the installer's mv could land on top
+  # of a panel commit (lost update / mixed file) and the transaction CAS would be worthless.
+  # Rank config-tx(30) is above the installer's maintenance(10), so the fixed order holds.
+  if ! command -v gm_lock_acquire >/dev/null 2>&1; then
+    bad "lock helper missing - refusing to rewrite the mihomo config"
+    return 1
+  fi
+  if ! gm_lock_acquire config-tx 30; then
+    bad "mihomo config is busy (config transaction lock) - reinstall aborted, nothing changed"
+    return 1
+  fi
+  _wmc_rc=0
+  _write_mihomo_config_unlocked "$@" || _wmc_rc=$?
+  gm_lock_release config-tx
+  return $_wmc_rc
+}
+
+_write_mihomo_config_unlocked() { # the actual writer; called only under config-tx
+  _wpid=$$
   _c="$(P $MIHOMO_CONF)"
   _vpnu="$1"; _aiu="$2"
   # The rollback source must be the file as it was BEFORE this run touched it. The old code
@@ -1131,9 +1210,9 @@ write_mihomo_config() {
         sect=="proxy-providers" && /^  de5:[[:space:]]*$/ {d=1; next}
         d && /^  [A-Za-z0-9_-]+:/ {d=0}
         d && /^[A-Za-z]/ {d=0}
-        !d {print}' "$_c" > "$_c.de5rm" \
-        && mihomo_validate "$_c.de5rm" && mv -f "$_c.de5rm" "$_c" && rm -f "$_c.de5rm" \
-        && info "retired de5 provider removed from config" || { rm -f "$_c.de5rm"; warn "de5 removal skipped (validation)"; }
+        !d {print}' "$_c" > "$_c.de5rm.$_wpid" \
+        && mihomo_validate "$_c.de5rm.$_wpid" && mv -f "$_c.de5rm.$_wpid" "$_c" && rm -f "$_c.de5rm.$_wpid" \
+        && info "retired de5 provider removed from config" || { rm -f "$_c.de5rm.$_wpid"; warn "de5 removal skipped (validation)"; }
     fi
     _curv=$(_prov_url "$_c" sub)
     if [ -n "${_vpnu:-}" ] && [ "$_vpnu" != "$_curv" ]; then
@@ -1148,21 +1227,21 @@ write_mihomo_config() {
         }
         f && /^    url:/ {print "    url: \"" nu "\""; done=1; f=0; next}
         {print}
-        END{exit done?0:1}' "$_c" > "$_c.urlnew"; then
-        rm -f "$_c.urlnew"; bad "provider url patch failed - точечное обновление невозможно, нужен --replace-config"; return 1
+        END{exit done?0:1}' "$_c" > "$_c.urlnew.$_wpid"; then
+        rm -f "$_c.urlnew.$_wpid"; bad "provider url patch failed - точечное обновление невозможно, нужен --replace-config"; return 1
       fi
-      mihomo_validate "$_c.urlnew" && mv -f "$_c.urlnew" "$_c" || { rm -f "$_c.urlnew"; bad "mihomo -t failed - config kept"; return 1; }
+      mihomo_validate "$_c.urlnew.$_wpid" && mv -f "$_c.urlnew.$_wpid" "$_c" || { rm -f "$_c.urlnew.$_wpid"; bad "mihomo -t failed - config kept"; return 1; }
       info "provider url updated in place (sub)"
     fi
     if ! grep -q 'ai-devices' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
       awk -v L="$_lanip" 'BEGIN{d=0}
         /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: " L;print "";d=1}
-        {print}' "$_c" > "$_c.zmnew" || return 1
-      if mihomo_validate "$_c.zmnew"; then
-        mv -f "$_c.zmnew" "$_c"; info "listeners block added to existing config (custom rules preserved)"
+        {print}' "$_c" > "$_c.zmnew.$_wpid" || return 1
+      if mihomo_validate "$_c.zmnew.$_wpid"; then
+        mv -f "$_c.zmnew.$_wpid" "$_c"; info "listeners block added to existing config (custom rules preserved)"
       else
-        rm -f "$_c.zmnew"; bad "mihomo -t failed after adding listeners - config kept"; return 1
+        rm -f "$_c.zmnew.$_wpid"; bad "mihomo -t failed after adding listeners - config kept"; return 1
       fi
     else
       # v1.14.4: config already had listeners - make sure the torrent DIRECT one exists
@@ -1170,11 +1249,11 @@ write_mihomo_config() {
         cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
         awk -v L="$_lanip" 'BEGIN{d=0} {print} (!d && $0 ~ /^    proxy: AI$/) {
               print "  - name: torrent-direct"; print "    type: mixed"; print "    port: 7894";
-              print "    listen: " L; d=1 }' "$_c" > "$_c.tdnew" || return 1
-        if mihomo_validate "$_c.tdnew"; then
-          mv -f "$_c.tdnew" "$_c"; info "torrent-direct listener added (listeners already present)"
+              print "    listen: " L; d=1 }' "$_c" > "$_c.tdnew.$_wpid" || return 1
+        if mihomo_validate "$_c.tdnew.$_wpid"; then
+          mv -f "$_c.tdnew.$_wpid" "$_c"; info "torrent-direct listener added (listeners already present)"
         else
-          rm -f "$_c.tdnew"; bad "mihomo -t failed after adding torrent-direct - config kept"; return 1
+          rm -f "$_c.tdnew.$_wpid"; bad "mihomo -t failed after adding torrent-direct - config kept"; return 1
         fi
       else
         info "existing 2-subscription config kept as-is (ai-devices + torrent-direct present)"
@@ -1188,11 +1267,11 @@ write_mihomo_config() {
       ''|*127.0.0.1*|*localhost*) ;;
       *)
         cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
-        if sed 's|^external-controller:.*|external-controller: 127.0.0.1:9090|' "$_c" > "$_c.ecnew" \
-           && mihomo_validate "$_c.ecnew" && mv -f "$_c.ecnew" "$_c"; then
+        if sed 's|^external-controller:.*|external-controller: 127.0.0.1:9090|' "$_c" > "$_c.ecnew.$_wpid" \
+           && mihomo_validate "$_c.ecnew.$_wpid" && mv -f "$_c.ecnew.$_wpid" "$_c"; then
           info "external-controller moved to 127.0.0.1:9090 (LAN devices could switch nodes)"
         else
-          rm -f "$_c.ecnew"; warn "external-controller not changed (validation) - check it manually"
+          rm -f "$_c.ecnew.$_wpid"; warn "external-controller not changed (validation) - check it manually"
         fi
         ;;
     esac
@@ -1210,7 +1289,7 @@ write_mihomo_config() {
   fi
   if [ -s "$_c" ]; then warn "полная замена конфига mihomo по --replace-config (прежний файл в бэкапе)"; fi
   _hwid=$(grep -A1 'x-hwid' "$_c" 2>/dev/null | sed -n 's/^[[:space:]]*-[[:space:]]*"\(.*\)"/\1/p' | head -1)
-  _tmpconf="$_c.zmnew"
+  _tmpconf="$_c.zmnew.$_wpid"
   {
     printf '%s\n' '# geomask-managed: 1'
     printf '%s\n' 'mixed-port: 7890'
@@ -1736,6 +1815,25 @@ mihomo_restart_verified() {
   return 0
 }
 
+# Restore the pre-run config bytes under the transaction lock. safe_mihomo_restart runs in
+# step3 AFTER write_mihomo_config released the lock and rpcd is live, so a bare `cp` could land
+# on a newer panel commit. Fail closed when the lock cannot be taken: a refused rollback is
+# reported, not silently written unlocked.
+_mihomo_restore_preimage() { # <preimage> <live>
+  if ! command -v gm_lock_acquire >/dev/null 2>&1; then
+    bad "lock helper missing - refusing to restore the mihomo preimage"
+    return 1
+  fi
+  if ! gm_lock_acquire config-tx 30; then
+    bad "config transaction lock is busy - refusing to restore the mihomo preimage unlocked"
+    return 1
+  fi
+  _mrp_rc=0
+  cp -p "$1" "$2" 2>/dev/null || _mrp_rc=1
+  gm_lock_release config-tx
+  return $_mrp_rc
+}
+
 # full safe mihomo restart: backup -> trial -> restart -> verify -> rollback on failure
 safe_mihomo_restart() {
   _c="$(P $MIHOMO_CONF)"
@@ -1754,7 +1852,11 @@ safe_mihomo_restart() {
     # the candidate is already on disk at this point: leaving it there means the next
     # restart picks up a config that does not start. Put the pre-run file back.
     if [ -n "$_pre" ] && [ -s "$_pre" ]; then
-      cp -p "$_pre" "$_c" && info "прежний конфиг возвращён ($_pre)"
+      if _mihomo_restore_preimage "$_pre" "$_c"; then
+        info "прежний конфиг возвращён ($_pre)"
+      else
+        warn "прежний конфиг НЕ возвращён (lock/копия) - проверьте $_c вручную"
+      fi
     else
       warn "копии прежнего конфига нет - проверьте $_c вручную"
     fi
@@ -1767,7 +1869,10 @@ safe_mihomo_restart() {
   fi
   bad "restart FAILED - rolling back config and re-starting"
   if [ -n "$_pre" ] && [ -s "$_pre" ]; then
-    cp -p "$_pre" "$_c"
+    if ! _mihomo_restore_preimage "$_pre" "$_c"; then
+      bad "config rollback could not be serialised (busy lock or copy failure) - mihomo NOT restarted on a possibly failed candidate; RESTORE FROM BACKUP: $_bk"
+      return 1
+    fi
     /etc/init.d/mihomo restart >/dev/null 2>&1
     sleep 3
     if svc_alive mihomo && controller_curl -s -m3 "http://127.0.0.1:9090/version" 2>/dev/null | grep -qi 'mihomo\|meta'; then
@@ -2339,7 +2444,9 @@ ASSET_EOF
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     info "cron already present"
   else
+    _cron_begin
     ( crontab -l 2>/dev/null; echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' ) | crontab - 2>/dev/null && info "cron added: */5 sync" || warn "cannot set crontab"
+    _cron_end
   fi
   # v1.11.0: nightly node audit (registry check of every subscription server)
   save_stream /usr/bin/geomask-node-scan.sh 755 <<'ASSET_EOF'
@@ -2397,7 +2504,9 @@ PYEOF
   elif [ "$(nodescan_schedule_active)" = "1" ]; then
     info "per-path scheduler is active: not adding the legacy nodescan cron"
   else
+    _cron_begin
     ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
+    _cron_end
   fi
   # v1.14.0: YouTube edge watchdog - failing *.googlevideo.com edges get pinned to VPN,
   # released back to zapret nightly. Source of truth stays in MagiTrickle (group feeds ytvpn.yaml).
@@ -2438,8 +2547,10 @@ PYEOF
   # v1.29.0: the migration only runs for a selected module, and cron_ensure owns creation.
   if module_selected youtube \
      && crontab -l 2>/dev/null | grep -qE '^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch\.sh.*# geomask-ytwatch$'; then
+    _cron_begin
     ( crontab -l 2>/dev/null | sed 's|^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch.sh|*/1 * * * * /usr/bin/geomask-ytwatch.sh|' ) | crontab - 2>/dev/null \
       && info "ytwatch cron migrated */5 -> */1" || warn "cannot migrate the ytwatch cron"
+    _cron_end
   fi
   cron_ensure youtube '# geomask-ytwatch$' '*/1 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch'
   cron_ensure youtube '# geomask-ytwatch-reset$' '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset'
@@ -2722,6 +2833,20 @@ run_step() { # run_step N  (interactive/auto common logic)
     return 0
   fi
   info "check: issues found - apply needed"
+  # A missing lock primitive (step 1 sets GM_STEP1_FATAL) is not something "apply" can fix:
+  # refuse to apply ANY step, in the interactive wizard as well as in --auto. Without this the
+  # wizard printed the step-1 error and still installed steps 2-7 into a system whose writers
+  # are all fail-closed.
+  # `--step N` and menu item 3 run a step in a fresh process where step1_check never ran, so
+  # the sticky flag alone is not enough: probe the primitive directly for every other step.
+  if [ "$_n" != 1 ] && [ "${GM_STEP1_FATAL:-0}" != 1 ]; then
+    _rs_lpm=$(lock_primitive_missing)
+    [ -z "$_rs_lpm" ] || GM_STEP1_FATAL=1
+  fi
+  if [ "${GM_STEP1_FATAL:-0}" = 1 ] && [ "$GM_CHECK_ONLY" != 1 ]; then
+    bad "step $_n: step 1 did not pass its mandatory lock-primitive check - refusing to apply"
+    return 1
+  fi
   if [ "$GM_CHECK_ONLY" = 1 ]; then
     info "(check-only mode: not applying)"
     return 1
@@ -2899,6 +3024,12 @@ prompt_url() { # prompt_url <label> <current> <flag-value>  -> prints url, rc=1 
 # remove geomask parts (geo overlay, sync script, cron); keeps mihomo config
 # $1 = noreload: skip the rpcd reload (caller re-registers right after install)
 geomask_uninstall() {
+  # Every crontab rewrite below is a read-modify-write. Hold the shared `cron` lock for the
+  # whole removal so a panel nodes_set/sync_set cannot re-add a line from a stale read while
+  # the uninstall removes it (report R09). --reinstall calls this with the maintenance lock
+  # already held; the fixed order allows maintenance(10) -> cron(50).
+  _un_cron=0
+  _cron_begin && _un_cron=1
   for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
            /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
            /usr/share/luci/menu.d/luci-app-geo-sync.json; do
@@ -2968,6 +3099,7 @@ geomask_uninstall() {
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi
   [ "$1" = "noreload" ] || initd rpcd reload 2>/dev/null || true
+  [ "$_un_cron" = 1 ] && _cron_end
   return 0
 }
 
@@ -3012,6 +3144,13 @@ REINSTALL_LIST_DIRS="/usr/bin /usr/lib/geomask /usr/libexec/rpcd /usr/share/rpcd
 # patcher, the lane). Only names that did NOT exist at snapshot time are removed: a backup
 # or temp file another writer had before the transaction is never deleted.
 REINSTALL_TEMP_SUFFIXES=".zmnew .de5rm .urlnew .tdnew .ecnew .gm.tmp"
+# R04: the installer and the scanner now name their temps per process (two writers must not
+# share one file), so a crash leaves <object>.zmnew.<pid> instead of <object>.zmnew. These
+# globs are pruned only for objects the transaction snapshotted and only for names created
+# after the snapshot; a file that was already there is in the listing and is left alone.
+# Deliberately no generic `.tmp.*`: `<object>.tmp.<pid>` may be another writer's LIVE temporary
+# (node-scan writes config.yaml.tmp.<pid> while the installer runs).
+REINSTALL_TEMP_GLOBS=".zmnew.* .de5rm.* .urlnew.* .tdnew.* .ecnew.* .bak_nodescan.* .bak_aiguard.*"
 # Objects the manifest marks restore=NR even though a byte preimage exists: the owner
 # (a daemon) rewrites them, so a rollback must NOT write stale bytes over live state.
 # They are recorded by identity+hash and the restore reports "incomplete" when they
@@ -3872,7 +4011,33 @@ _rs_stop_new_services() { # _rs_stop_new_services <dir> - stop what the run star
   return 0
 }
 
-_rs_restore_files() { # _rs_restore_files <dir> - bytes/absence/mode of the byte objects
+_rs_restore_files() { # <dir> - byte objects, serialised with the config transaction (R04 round 3)
+  # rpcd is reloaded in step2, so by the time a failed reinstall rolls back the panel is live
+  # and can commit config.yaml through geomask-config-tx.py. This restore writes that very
+  # file (cp) and then proves it: without the SAME kernel lock a live commit can land between
+  # the copy and the verification (or be overwritten by an older snapshot), and the rollback
+  # would report a state that no longer exists. Fail closed when the lock cannot be taken.
+  if ! command -v gm_lock_acquire >/dev/null 2>&1; then
+    bad "rollback: lock helper missing - refusing to restore config.yaml without serialisation"
+    _rr=1
+    return 1
+  fi
+  if ! gm_lock_acquire config-tx 30; then
+    bad "rollback: config transaction lock is busy - refusing to restore config.yaml unlocked (retry after the live commit finishes)"
+    _rr=1
+    return 1
+  fi
+  _rs_rf_rc=0
+  _rs_restore_files_unlocked "$@" || _rs_rf_rc=1
+  # Verify the bytes while the lock is still held: no live commit can slip between the copy and
+  # this check. The later _rs_restore_verify repeats it outside the lock on purpose - if a
+  # writer changed the file after our restore, that verify must fail loudly.
+  _rs_verify_files "$@" || { bad "rollback: byte objects do not match the snapshot while the transaction lock is held"; _rs_rf_rc=1; }
+  gm_lock_release config-tx
+  return $_rs_rf_rc
+}
+
+_rs_restore_files_unlocked() { # the byte restore itself; called only under config-tx
   [ -f "$_rs_snap/objects" ] || { bad "rollback: snapshot objects list missing"; return 1; }
   while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
     [ -n "${_rs_op:-}" ] || continue
@@ -3988,6 +4153,16 @@ _rs_prune_temps() { # _rs_prune_temps <dir> - only temp/backup names this transa
           _rs_in_list "$_rs_snap" "$_rs_cand" && continue
           rm -f "$(P "$_rs_cand")" 2>/dev/null \
             || { bad "rollback: cannot remove our temporary $_rs_cand"; _rr=1; }
+        done
+        # Per-PID names: same rule, matched as a glob instead of an exact suffix.
+        for _rs_glob in ${REINSTALL_TEMP_GLOBS:-}; do
+          for _rs_cand in "$(P "$_rs_op")"$_rs_glob; do
+            [ -e "$_rs_cand" ] || continue
+            _rs_rel=${_rs_cand#"$GM_PREFIX"}
+            _rs_in_list "$_rs_snap" "$_rs_rel" && continue
+            rm -f "$_rs_cand" 2>/dev/null \
+              || { bad "rollback: cannot remove our temporary $_rs_rel"; _rr=1; }
+          done
         done
         for _rs_cand in "$(P "$_rs_op")".bak_geomask_* "$(P "$_rs_op")".pre-run-*; do
           [ -e "$_rs_cand" ] || continue
@@ -4460,8 +4635,12 @@ _rs_restore_cron() { # _rs_restore_cron <dir> - exact crontab, foreign lines are
     _rr=1
     return 1
   fi
+  # Same kernel `cron` lock as every other crontab writer: a panel nodes_set/sync_set must not
+  # interleave with this exact restore (report R09).
+  _cron_begin
   crontab "$_rs_snap/cron" 2>/dev/null \
-    || { bad "rollback: crontab write failed"; _rr=1; return 1; }
+    || { _cron_end; bad "rollback: crontab write failed"; _rr=1; return 1; }
+  _cron_end
   _rs_after=$(crontab -l 2>/dev/null)
   if [ "$_rs_after" != "$_rs_want" ]; then
     bad "rollback: crontab did not verify (silent write failure?)"
@@ -4472,6 +4651,9 @@ _rs_restore_cron() { # _rs_restore_cron <dir> - exact crontab, foreign lines are
 }
 
 _rs_verify_files() { # _rs_verify_files <dir>
+  # Honour the argument every caller already passes: relying on a global _rs_snap silently
+  # verified "whatever snapshot was set last" when a test or a future caller pointed elsewhere.
+  _rs_snap=${1:-$_rs_snap}
   [ -f "$_rs_snap/objects" ] || return 1
   _rs_vr=0
   while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
@@ -5033,7 +5215,11 @@ _rs_nr_notes() { # _rs_nr_notes <dir> - honest NR list (they are not restored by
 
 _rs_restore_verify() { # _rs_restore_verify <dir> - the rollback is not trusted, it is verified
   _rs_vok=0
-  _rs_verify_files || { _rs_vok=1; bad "rollback verification failed: file objects"; }
+  # R04: the byte objects were written and proven under config-tx already. This second check
+  # runs after that lock was released, so a live panel commit may legitimately (or not) change
+  # config.yaml in between. A mismatch here is reported as a concurrent writer, not silently
+  # accepted as "restored": the snapshot no longer describes the live file.
+  _rs_verify_files || { _rs_vok=1; bad "rollback verification failed: file objects (a concurrent writer - e.g. a live config transaction - changed them after the serialised restore)"; }
   _rs_verify_shared || { _rs_vok=1; bad "rollback verification failed: shared files"; }
   _rs_verify_uci || { _rs_vok=1; bad "rollback verification failed: uci keys"; }
   _rs_verify_sysctl || { _rs_vok=1; bad "rollback verification failed: sysctl"; }
@@ -5203,6 +5389,7 @@ REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-o
 /usr/lib/geomask/geomask-diag-spool.py|regular-or-absent
 /usr/lib/geomask/geomask-diag-redact.py|regular-or-absent
 /usr/lib/geomask/geomask-routes.sh|regular-or-absent
+/usr/lib/geomask/geomask-lock.sh|regular-or-absent
 /usr/lib/geomask/geomask-module-update.py|regular-or-absent
 /usr/lib/geomask/geomask-lists-edit.py|regular-or-absent
 /usr/lib/geomask/geomask-doctor.py|regular-or-absent
@@ -5350,6 +5537,15 @@ reinstall_preflight() {
   done
   if have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
     _pf_reason "dependency missing: python3-yaml (python3 -c 'import yaml' fails; auto-install is forbidden during reinstall)"
+  fi
+  # R04: lock primitive is mandatory on the target. Without it every writer (route, console,
+  # config transaction, cron) refuses to mutate; the installer must refuse first instead of
+  # installing a system whose writers all fail closed. No mkdir fallback exists on purpose.
+  if [ "$(uname -s 2>/dev/null)" = Linux ]; then
+    have flock || _pf_reason "dependency missing: flock (BusyBox applet; auto-install is forbidden during reinstall - use an image that ships it)"
+    if have python3 && ! python3 -c 'import fcntl' >/dev/null 2>&1; then
+      _pf_reason "dependency missing: python3 fcntl (the config transaction lock is fail-closed without it)"
+    fi
   fi
   _pf_scope_ai=0
   module_selected ai_dns && [ ! -f "$(P /etc/geomask-aidns.off)" ] && _pf_scope_ai=1
@@ -5570,13 +5766,22 @@ menu_reinstall() {
     info "  Ничего не изменено. Установите недостающие зависимости вручную и повторите."
     return 1
   fi
-  backup_gate || return 1
-  _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
+  # R04: single instance. The preflight above is read-only; from here on the run mutates
+  # save_stream targets, uci, services and crontab, so two reinstallers must not interleave.
+  # The kernel lock is a try-lock: the second run refuses immediately and nothing is
+  # unlocked on the way out (the kernel releases a killed run).
+  if ! gm_lock_acquire maintenance 0; then
+    bad "переустановка уже выполняется: второй экземпляр не запущен (блокировка maintenance)"
+    info "  Дождитесь завершения текущей переустановки или перезагрузки; ничего не изменено."
+    return 1
+  fi
+  backup_gate || { gm_lock_release maintenance; return 1; }
+  _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; gm_lock_release maintenance; return 1; }
   # A snapshot from an earlier failed attempt may still hold the only copy of the old
   # components: never delete a fixed name here (same rule as the backup park, F03).
   _snap=$(mktemp -d "$(P /tmp)/geomask-reinstall-XXXXXX" 2>/dev/null) \
-    || { bad "не удалось создать каталог снимка в /tmp"; return 1; }
-  _reinstall_snapshot "$_snap" || { bad "не удалось сохранить текущие компоненты - переустановка отменена"; rm -rf "$_snap"; return 1; }
+    || { bad "не удалось создать каталог снимка в /tmp"; gm_lock_release maintenance; return 1; }
+  _reinstall_snapshot "$_snap" || { bad "не удалось сохранить текущие компоненты - переустановка отменена"; rm -rf "$_snap"; gm_lock_release maintenance; return 1; }
   if ! _reinstall_steps "$_vpn"; then
     bad "переустановка не завершена - возвращаю прежние компоненты"
     if ! _reinstall_restore "$_snap"; then
@@ -5584,9 +5789,11 @@ menu_reinstall() {
     else
       info "откат проверен: прежние компоненты и runtime восстановлены"
     fi
+    gm_lock_release maintenance
     return 1
   fi
   rm -rf "$_snap"
+  gm_lock_release maintenance
   log "Пересстановка geomask завершена."
   return 0
 }
@@ -5683,6 +5890,10 @@ if [ "$GM_RESTART" = 1 ] && [ -f "$(P /root/.geomask-norestart)" ]; then
 fi
 
 RC=0
+# The self-update runner holds the `updater` lock and passes its descriptor to this installer.
+# Close it here: the runner still holds that lock, and no service we start below may inherit
+# the descriptor and keep the updater lock alive after the update has finished.
+if command -v gm_lock_close_inherited >/dev/null 2>&1; then gm_lock_close_inherited; fi
 if [ "$GM_BACKUP" = 1 ]; then
   _b=$(ensure_backup full) && { info "полный бэкап: $_b"; info "SMB (свежая копия): \\\\$(lan_ip)\\geomask-backups ; история на ПК: geomask\\fetch_backup.ps1"; RC=0; } || { bad "полный бэкап не создан"; RC=1; }
 elif [ "$GM_REINSTALL" = 1 ]; then

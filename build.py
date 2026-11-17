@@ -31,6 +31,7 @@ MAP = {
     "ytvpn.yaml":            "ytvpn.yaml",
     "99-default-vpn-route":  "99-default-vpn-route",
     "geomask-routes.sh":     "geomask-routes.sh",
+    "geomask-lock.sh":       "geomask-lock.sh",
     "geomask-guard.sh":      "geomask-guard.sh",
     "geomask-syncd.sh":      "geomask-syncd.sh",
     "geomask-syncd.init":    "geomask-syncd.init",

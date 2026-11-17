@@ -98,6 +98,8 @@ class BackendSafetyTests(unittest.TestCase):
             'MIHOMO_CONF="%s"\nGM_ROUTES_LIB=/nonexistent\n'
             'AIDNS_UID_FILE="%s"\nAIDNS_OFF_FILE="%s"\nAIDNS_STATE="%s"\nNODES_LOCK="%s"\n'
             'BACKUP_OK="%s"\n'
+            'GM_LOCK_DIR="%s"\nGM_LOCK_LIB="%s"\nDEVICES_LOCK="%s"\n'
+            '. "$GM_LOCK_LIB"\n'
             'warn() { printf "WARN %%s\\n" "$*" >&2; }\n'
             % (posix(self.devices), posix(self.log), posix(self.case / 'subs.list'),
                posix(self.owned), posix(self.backups), posix(self.nodes),
@@ -105,7 +107,9 @@ class BackendSafetyTests(unittest.TestCase):
                posix(self.case / 'geomask-aidns.off'),
                posix(self.case / 'geomask-aidns.state'),
                posix(self.case / 'nodes.lock'),
-               posix(self.case / 'backup-ok')))
+               posix(self.case / 'backup-ok'),
+               posix(self.case / 'locks'), posix(ROOT / 'assets' / 'geomask-lock.sh'),
+               posix(self.case / 'devices.lock')))
         script = (header + extra + '\n'
                   + '\n'.join(extract(name) for name in functions) + '\n' + body)
         path = self.case / 'run.sh'
@@ -174,7 +178,8 @@ uci() {
 '''
         result = self.run_backend('cmd_dev_del 192.168.1.2; printf "RC=%s\\n" "$?"',
                                   functions=['cmd_dev_del', '_ipv4_ok', '_require_backup',
-                                             '_write_gate'],
+                                             '_write_gate', '_devices_lock', '_devices_unlock',
+                                             '_dhcp_owned_add'],
                                   extra=extra + '_apply_routing() { :; }\ncmd_status() { :; }\n'
                                                  'ip() { :; }\n')
         self.assertNotIn('DELETED', result.stdout)
@@ -183,7 +188,8 @@ uci() {
     def test_an_impossible_address_is_refused(self):
         result = self.run_backend('cmd_dev_add 999.1.1.1 ai "" test; printf "RC=%s\\n" "$?"',
                                   functions=['cmd_dev_add', '_ipv4_ok', '_require_backup',
-                                             '_write_gate'],
+                                             '_write_gate', '_devices_lock', '_devices_unlock',
+                                             '_dhcp_owned_add'],
                                   extra='_apply_routing() { :; }\ncmd_status() { :; }\n')
         self.assertIn('RC=1', result.stdout)
         self.assertIn('bad ip', result.stdout)

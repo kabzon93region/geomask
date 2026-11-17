@@ -34,7 +34,11 @@ DEFAULT_POOLS_DIR = _state.DEFAULT_POOLS_DIR
 
 # Transaction journal
 TX_JOURNAL = DEFAULT_STATE_DIR / 'config-tx-journal.jsonl'
-TX_LOCK = DEFAULT_STATE_DIR / '.config-tx.lock'
+# Canonical lock path: the SAME env name the shell helper (gm_lock_acquire config-tx) and the
+# embedded Python writers (node-scan, torrent) read. The default is derived from the state dir,
+# so a test root that only moves GM_AUDIT_STATE keeps working; GM_CONFIG_TX_LOCK is the one
+# documented override (review round 2, defect 11 - three names used to describe one inode).
+TX_LOCK = Path(os.environ.get('GM_CONFIG_TX_LOCK') or (DEFAULT_STATE_DIR / '.config-tx.lock'))
 TX_STATE_DIR = DEFAULT_STATE_DIR / 'tx-work'
 TX_PREIMAGES_DIR = DEFAULT_STATE_DIR / 'tx-preimages'
 # how long a second transaction waits for the lock before reporting that it is busy
@@ -74,17 +78,24 @@ def strict_json(data: bytes):
 
 @contextlib.contextmanager
 def tx_lock(timeout=None):
-    """Process-wide transaction lock using flock (Unix) or file-based lock (Windows).
+    """Transaction lock: kernel flock(2) on a persistent lock file.
 
-    The Unix path used a blocking flock: a second transaction (or a test that leaked the
-    descriptor) waited forever instead of reporting anything. It now polls with LOCK_NB and
-    gives up after TX_LOCK_TIMEOUT, so a stuck transaction fails loudly.
+    The file is created once and never deleted or recreated: the same inode is locked by every
+    writer, so a release cannot hand the lock to two processes (the R04 reclaim race). A holder
+    that dies is released by the kernel. BusyBox `flock` on the very same path is the same
+    primitive, so a shell writer (geomask-lock.sh, rank config-tx) and this module exclude each
+    other. On Linux the primitive is mandatory: without fcntl the transaction refuses to run
+    (fail closed) instead of mutating the live config unlocked.
     """
     TX_LOCK.parent.mkdir(parents=True, exist_ok=True)
     timeout = TX_LOCK_TIMEOUT if timeout is None else timeout
 
-    if hasattr(os, 'O_NOFOLLOW'):  # Unix
-        import fcntl
+    if hasattr(os, 'O_NOFOLLOW'):  # Unix - the supported runtime
+        try:
+            import fcntl
+        except ImportError:
+            raise TxError('the fcntl/flock primitive is missing on this system: '
+                          'refusing to run an unlocked config transaction') from None
         fd = None
         try:
             fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -105,7 +116,7 @@ def tx_lock(timeout=None):
                 except Exception:
                     pass
                 os.close(fd)
-    else:  # Windows - use file-based lock
+    else:  # Windows - the test host only; never a deployment target (no flock(2) there)
         lock_acquired = False
         try:
             # Try to create lock file exclusively
@@ -714,7 +725,7 @@ class ConfigTransaction:
             shutil.rmtree(work_dir, ignore_errors=True)
 
 def start_transaction(files: dict, trial_paths: list = None, require_nonempty=None,
-                      require_exactly=None):
+                      require_exactly=None, expect_sha256: str = None):
     """Commit one whole file atomically.
 
     ``files`` maps an absolute path (str or Path) to the exact bytes that must land
@@ -724,6 +735,11 @@ def start_transaction(files: dict, trial_paths: list = None, require_nonempty=No
 
     ``trial_paths`` lists which of those files are mihomo configs to validate and
     trial-run; it defaults to the primary mihomo config.
+
+    ``expect_sha256`` is the digest of the live bytes the caller built its candidate from.
+    The check runs INSIDE the transaction lock, after recovery and before the first mutation:
+    a concurrent commit between the caller's read and this lock is refused as STALE instead
+    of being silently overwritten (report R06, lost update).
     """
     if not isinstance(files, dict) or not files:
         raise TxError('start_transaction requires a non-empty {path: bytes} mapping')
@@ -733,14 +749,10 @@ def start_transaction(files: dict, trial_paths: list = None, require_nonempty=No
         # a guarantee this code does not provide. Every current caller writes one file.
         raise TxError('start_transaction commits one file at a time; '
                       'multi-file atomic commit is not implemented')
-    # Repair a previous run that died mid-commit before stacking another mutation on top of
-    # it. Nothing used to call the recovery routine, so an interrupted transaction stayed
-    # interrupted until a human noticed.
-    try:
-        recover_interrupted_transactions()
-    except Exception as exc:
-        raise TxError('an earlier interrupted transaction could not be recovered: %s'
-                      % str(exc)[:160]) from None
+    if expect_sha256 is not None:
+        expect_sha256 = str(expect_sha256).strip().lower()
+        if not re.fullmatch(r'[0-9a-f]{64}', expect_sha256):
+            raise TxError('expect_sha256 must be a hex sha256 digest')
 
     normalised = {}
     for path, content in files.items():
@@ -762,33 +774,51 @@ def start_transaction(files: dict, trial_paths: list = None, require_nonempty=No
 
     tx_id = secrets.token_hex(12)
 
-    with tx_lock(), job_budget(300), ConfigTransaction(tx_id) as tx:
-        for path in normalised:
-            tx.capture_preimage(path)
-        for path, content in normalised.items():
-            tx.stage_file(path, content)
+    with tx_lock(), job_budget(300):
+        # Recovery belongs INSIDE the lock: running it before meant a second writer could
+        # restore the preimage of a transaction that was still live (report R05). It also runs
+        # before the transaction context, so a failed recovery is reported as such instead of
+        # being replaced by that context's own rollback error.
+        try:
+            recover_interrupted_transactions()
+        except Exception as exc:
+            raise TxError('an earlier interrupted transaction could not be recovered: %s'
+                          % str(exc)[:160]) from None
 
-        for path in trials:
-            tx.validate_candidate(path)
-            tx.run_isolated_trial(path)
+        if expect_sha256 is not None:
+            for path in normalised:
+                live = path.read_bytes() if path.exists() else b''
+                if digest(live) != expect_sha256:
+                    raise TxError('config changed since it was read (STALE): %s - refusing to '
+                                  'overwrite a newer commit; re-read and retry' % path)
 
-        # Record the intent (including preimage locations) before the first mutation,
-        # so a crash between commit and the caller's own bookkeeping stays recoverable.
-        with open(TX_JOURNAL, 'ab') as f:
-            f.write((json.dumps({
-                'tx_id': tx.tx_id,
-                'stage': 'prepare',
-                'files': [str(p) for p in normalised],
-                'preimages': {str(p): (digest(b) if b is not None else None)
-                              for p, b in tx.preimages.items()},
-                'timestamp': stamp(),
-            }, ensure_ascii=False) + '\n').encode('utf-8'))
-            f.flush()
-            os.fsync(f.fileno())
+        with ConfigTransaction(tx_id) as tx:
+            for path in normalised:
+                tx.capture_preimage(path)
+            for path, content in normalised.items():
+                tx.stage_file(path, content)
 
-        tx.commit(next(iter(trials), None), require_nonempty, require_exactly)
-        return {'ok': True, 'tx_id': tx.tx_id, 'config_digest': tx.config_digest_after,
-                'files': [str(p) for p in normalised]}
+            for path in trials:
+                tx.validate_candidate(path)
+                tx.run_isolated_trial(path)
+
+            # Record the intent (including preimage locations) before the first mutation,
+            # so a crash between commit and the caller's own bookkeeping stays recoverable.
+            with open(TX_JOURNAL, 'ab') as f:
+                f.write((json.dumps({
+                    'tx_id': tx.tx_id,
+                    'stage': 'prepare',
+                    'files': [str(p) for p in normalised],
+                    'preimages': {str(p): (digest(b) if b is not None else None)
+                                  for p, b in tx.preimages.items()},
+                    'timestamp': stamp(),
+                }, ensure_ascii=False) + '\n').encode('utf-8'))
+                f.flush()
+                os.fsync(f.fileno())
+
+            tx.commit(next(iter(trials), None), require_nonempty, require_exactly)
+            return {'ok': True, 'tx_id': tx.tx_id, 'config_digest': tx.config_digest_after,
+                    'files': [str(p) for p in normalised]}
 
 def recover_interrupted_transactions():
     """Scan for incomplete transactions and rollback/recover."""
@@ -879,16 +909,26 @@ def main(argv=None):
         return 0
     try:
         if args[0] == '--commit':
+            expect = None
+            if '--expect-sha256' in args:
+                _i = args.index('--expect-sha256')
+                if _i + 1 >= len(args):
+                    raise TxError('--expect-sha256 needs a digest')
+                expect = args[_i + 1]
+                del args[_i:_i + 2]
             if len(args) != 2:
                 raise TxError('--commit takes exactly one target path')
             data = sys.stdin.buffer.read()
             if not data:
                 # Replacing the live config with nothing is never a switch: refuse it.
                 raise TxError('refusing to commit an empty payload')
-            result = start_transaction({args[1]: data})
+            result = start_transaction({args[1]: data}, expect_sha256=expect)
             answer = {'ok': True, 'tx_id': result.get('tx_id')}
         elif args[0] == '--recover':
-            recover_interrupted_transactions()
+            # Recovery mutates the live config: it runs under the very same lock as a commit,
+            # never beside it (report R05).
+            with tx_lock():
+                recover_interrupted_transactions()
             answer = {'ok': True, 'recovered': True}
         else:
             raise TxError('unknown argument: %s' % args[0])

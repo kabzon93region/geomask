@@ -157,9 +157,20 @@ class InstallerSafetyTests(unittest.TestCase):
                 '0\n', encoding='utf-8', newline='\n')
 
     def run_script(self, body, functions=(), extra=''):
+        names = list(functions)
+        if 'write_mihomo_config' in names and '_write_mihomo_config_unlocked' not in names:
+            # R04: the public writer is a thin config-tx lock wrapper around the old body.
+            names.append('_write_mihomo_config_unlocked')
+        if 'safe_mihomo_restart' in names and '_mihomo_restore_preimage' not in names:
+            # R04 round 4: the preimage rollback is serialised through its own lock helper.
+            names.append('_mihomo_restore_preimage')
         script = (SUPPORT.replace('@PREFIX@', posix(self.case))
-                  .replace('@PY@', posix(sys.executable)) + extra + '\n'
-                  + '\n'.join(extract(name) for name in functions) + '\n' + body)
+                  .replace('@PY@', posix(sys.executable))
+                  + '\nGM_LOCK_DIR="%s/locks"\nGM_CONFIG_TX_LOCK="%s/tx.lock"\n'
+                    'GM_LOCK_LIB="%s"\n. "$GM_LOCK_LIB"\n'
+                    % (posix(self.case), posix(self.case), posix(ROOT / 'assets' / 'geomask-lock.sh'))
+                  + extra + '\n'
+                  + '\n'.join(extract(name) for name in names) + '\n' + body)
         path = self.case / 'run.sh'
         path.write_text(script, encoding='utf-8', newline='\n')
         return subprocess.run([BASH, posix(path)], cwd=str(self.case),
@@ -169,7 +180,7 @@ class InstallerSafetyTests(unittest.TestCase):
     # ---------------------------------------------------------------- B1
     def test_the_fresh_template_is_valid_yaml(self):
         """The template used to emit `listen: %s` and a separate line with the IP."""
-        block = re.search(r'  _tmpconf="\$_c\.zmnew"\n(.*?)\n  \} > "\$_tmpconf"',
+        block = re.search(r'  _tmpconf="\$_c\.zmnew\.\$_wpid"\n(.*?)\n  \} > "\$_tmpconf"',
                           SOURCE, re.DOTALL)
         self.assertIsNotNone(block, 'template block not found')
         body = ('_lanip=192.168.1.1\n_vpnu="https://example.invalid/sub"\n_hwid=""\n'

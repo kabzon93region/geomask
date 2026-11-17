@@ -25,9 +25,19 @@ class SyncYoutubeError(Exception):
     pass
 
 def _read_config():
-    """Read and parse mihomo config."""
-    with open(CFG, encoding='utf-8') as f:
-        return f.read()
+    """Read and parse mihomo config.
+
+    Also remembers the digest of the exact bytes the candidate is built from: the transaction
+    compares it with the live file under its lock and refuses a stale write (R06). Comparing
+    text re-encoded to bytes would hide a non-UTF-8 or newline difference, so the raw bytes are
+    hashed here.
+    """
+    global _READ_DIGEST
+    raw = CFG.read_bytes()
+    _READ_DIGEST = _tx.digest(raw)
+    return raw.decode('utf-8')
+
+_READ_DIGEST = None
 
 def _validate_config(text=None):
     """Validate mihomo config."""
@@ -50,7 +60,7 @@ def _validate_config(text=None):
 
 def _reload_mihomo():
     """Reload mihomo via controller API."""
-    text = open(CFG, encoding='utf-8').read()
+    text = _read_config()
     secret = ''
     for line in text.splitlines():
         m = re.match(r'^secret:\s*["\']?([^"\'\s]+)', line)
@@ -78,7 +88,7 @@ def _reload_mihomo():
 
 def yt_status():
     """Get youtube watch status."""
-    config = open(CFG, encoding='utf-8').read()
+    config = _read_config()
     
     # Check for ytwatch mode
     mode = 'off'
@@ -94,7 +104,7 @@ def yt_status():
 
 def yt_mode_changes(mode):
     """Build config changes for ytwatch mode."""
-    config = open(CFG, encoding='utf-8').read()
+    config = _read_config()
     
     if mode == 'off':
         # Remove ytwatch section
@@ -135,8 +145,10 @@ def yt_mode(mode):
     if not changes:
         return {'ok': True, 'message': f'ytwatch already set to {mode}'}
 
-    # Absolute key: the transaction refuses relative targets.
-    return _tx.start_transaction({str(CFG): changes['config.yaml']})
+    # Absolute key: the transaction refuses relative targets. The digest of the bytes the
+    # candidate was built from is checked under the transaction lock (no silent lost update).
+    return _tx.start_transaction({str(CFG): changes['config.yaml']},
+                                 expect_sha256=_READ_DIGEST)
 
 def yt_reset():
     """Reset ytwatch to off."""

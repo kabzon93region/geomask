@@ -454,6 +454,7 @@ module_owns_path() { # echoes the module id that owns an install path, if any
     "/usr/lib/geomask/geomask-dnsguard.sh") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-lane-torrent.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-lists-edit.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-lock.sh") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-node-audit.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-routes.sh") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-slot-patch.py") GM_PATH_MODULE="core" ;;
@@ -485,6 +486,293 @@ module_skip_path() { # true when the path belongs to a module the owner did not 
   [ -n "$_m" ] || return 1
   module_selected "$_m" && return 1
   return 0
+}
+
+# ---- the one lock helper (R04) ----------------------------------------------
+# Single source of truth: assets/geomask-lock.sh. Injected here so the installer locks with
+# exactly the same code it installs to /usr/lib/geomask/geomask-lock.sh, and installed by the
+# save_stream below. Kernel flock(2) on a persistent inode: no PID, no reclaim, no unlink.
+# The config-transaction lock path and the lock directory are prefixed exactly like every other
+# path the installer touches. On the router P is the identity, so these are the real
+# /etc/geomask/node-audit/state/.config-tx.lock and /tmp/geomask-locks the runtime writers use;
+# a test root can never make the installer lock (or write) the host /etc or host /tmp. Both are
+# set BEFORE the helper is sourced: the helper captures the canonical path and keeps a
+# non-empty GM_LOCK_DIR provided by the caller. They are exported because the installer starts
+# child writers (uninstall calls geomask-lane.sh), which must inherit the injected paths
+# instead of falling back to the host ones.
+GM_CONFIG_TX_LOCK=${GM_CONFIG_TX_LOCK:-$(P /etc/geomask/node-audit/state/.config-tx.lock)}
+GM_LOCK_DIR=${GM_LOCK_DIR:-$(P /tmp/geomask-locks)}
+export GM_CONFIG_TX_LOCK GM_LOCK_DIR
+# geomask-lock.sh - the ONE inter-process lock helper of geomask (R04).
+#
+# Contract
+#   * One persistent lock file per name. The file is opened, never deleted and never
+#     recreated while a lock is in use: the same inode is locked every time, so a lock
+#     released by one process is exactly the lock the next process takes.
+#   * The lock itself is kernel flock(2) on that file: BusyBox `flock` (the applet is part of
+#     the upstream OpenWrt 24.10 busybox config) and Python `fcntl.flock` on the same path
+#     (geomask-config-tx.py) are the same primitive, so shell and Python exclude each other.
+#   * No PID is stored, no owner is guessed, no stale lock is reclaimed. A holder that dies -
+#     including SIGKILL - has its lock released by the kernel when the last descriptor of
+#     that open file description is closed. There is therefore no ownerless window (nothing
+#     is created before the lock is held) and no unlock-after-takeover (the file is never
+#     removed, so a slow release cannot hand the lock to two writers).
+#   * Fixed lock order, enforced at run time: a process may only take locks with a strictly
+#     higher rank than every lock it already holds (gm_lock_rank). Downward nesting is
+#     refused with rc=4 instead of deadlocking. The order is:
+#       maintenance(10) -> console(20) -> cron(25) -> config-tx(30) -> route-<table>(40)
+#       -> sync(45) -> devices(60) -> subs(65)
+#   cron sits before config-tx because the uninstall (under maintenance) removes crontab lines
+#   and then asks the lane helper to rewrite the mihomo config; the reverse nesting never
+#   happens (the transaction and the lane manager never touch cron).
+#   * Waiting is bounded and explicit: `gm_lock_acquire <name> [seconds] [path]`. 0 means a
+#     single non-blocking attempt (hotplug, guard watchdog, single-instance entrypoints).
+#     BusyBox flock has no -w, so a bounded wait is `flock -n` plus sleep 1 up to the budget.
+#   * Critical sections stay short and contain no long-running external call. Commands that
+#     may leave a daemon behind (init scripts, services) MUST be run through
+#     gm_lock_safe_exec, which closes the reserved descriptors in the child: otherwise the
+#     daemon inherits the descriptor and keeps the lock after the writer has exited.
+#   * Fail-closed on the target: if `flock` cannot be found on Linux, every acquisition
+#     returns rc=2 and the caller must refuse to mutate. There is NO mkdir/O_EXCL fallback on
+#     Linux - that would bring back the reclaim race R04 is about.
+#
+# Non-Linux hosts (the Windows-hosted test suite) have neither flock(2) nor /proc. There the
+# helper uses an atomic O_EXCL file (noclobber) created once and removed only by its owner.
+# This backend exists so that caller logic can be exercised off-router; it is never selected
+# on Linux, it does not release on SIGKILL (documented Linux-only test gap) and it is not a
+# supported runtime.
+#
+# Environment (overridable for injected test roots only, never for skipping the lock):
+#   GM_LOCK_DIR      directory of the lock files (default /tmp/geomask-locks, mode 0700)
+#   GM_CONFIG_TX_LOCK  CANONICAL path of the config-transaction lock, shared with
+#                      geomask-config-tx.py, geomask-node-scan.sh and geomask-torrent.sh
+#   GM_LOCK_TX_FILE    legacy alias of GM_CONFIG_TX_LOCK (test roots only)
+#   GM_LOCK_FDS      reserved descriptors, highest first (default "9 8 7 6 5")
+
+GM_LOCK_DIR=${GM_LOCK_DIR:-/tmp/geomask-locks}
+GM_LOCK_TX_FILE=${GM_CONFIG_TX_LOCK:-${GM_LOCK_TX_FILE:-/etc/geomask/node-audit/state/.config-tx.lock}}
+GM_LOCK_FDS=${GM_LOCK_FDS:-9 8 7 6 5}
+GM_LOCK_MAX_RANK=${GM_LOCK_MAX_RANK:-0}
+GM_LOCK_STACK=${GM_LOCK_STACK:-}
+GM_LOCK_FDS_USED=${GM_LOCK_FDS_USED:-}
+
+# The rank table is the lock order. Unknown names get 90 so a new writer is the outermost -
+# an earlier rank could otherwise turn a lawful sequence into a refused one silently.
+gm_lock_rank() {
+  case "$1" in
+    maintenance) printf '10' ;;
+    console)     printf '20' ;;
+    config-tx)   printf '30' ;;
+    route-*)     printf '40' ;;
+    sync)        printf '45' ;;
+    cron)        printf '25' ;;
+    devices)     printf '60' ;;
+    subs)        printf '65' ;;
+    *)           printf '90' ;;
+  esac
+}
+
+# Echo the file a lock name uses. An explicit path wins (callers keep their historical
+# env-overridable path, e.g. GM_CONSOLE_LOCK, so an injected test root never touches /tmp).
+gm_lock_path() { # gm_lock_path <name> [explicit-path]
+  if [ -n "${2:-}" ]; then
+    printf '%s' "$2"
+  elif [ "$1" = config-tx ]; then
+    printf '%s' "$GM_LOCK_TX_FILE"
+  else
+    printf '%s/%s.lock' "$GM_LOCK_DIR" "$1"
+  fi
+}
+
+# flock | portable | missing. "missing" is a refusal on Linux (the caller must fail closed).
+gm_lock_backend() {
+  if command -v flock >/dev/null 2>&1; then
+    printf 'flock'
+    return 0
+  fi
+  case "$(uname -s 2>/dev/null)" in
+    Linux) printf 'missing' ;;
+    '')    printf 'missing' ;;
+    *)     printf 'portable' ;;
+  esac
+}
+
+_gm_lock_var() { # _gm_lock_var <prefix> <name> -> variable name, '-' and '/' become '_'
+  printf '%s_%s' "$1" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9' '_')"
+}
+
+_gm_lock_fd_of() { # echoes the descriptor held for <name>, empty when not held here
+  _gm_v=$(_gm_lock_var _GM_LOCK_FD "$1")
+  eval "printf '%s' \"\${$_gm_v:-}\""
+}
+
+_gm_lock_held() { # 0 when this shell holds <name>
+  [ -n "$(_gm_lock_fd_of "$1")" ]
+}
+
+_gm_lock_track() { # _gm_lock_track <name> <fd> <path>
+  eval "$(_gm_lock_var _GM_LOCK_FD "$1")='$2'"
+  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")='$3'"
+  GM_LOCK_FDS_USED="$GM_LOCK_FDS_USED $2"
+  GM_LOCK_STACK="$GM_LOCK_STACK $1"
+  _gm_r=$(gm_lock_rank "$1")
+  [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
+  return 0
+}
+
+_gm_lock_forget() { # _gm_lock_forget <name> <fd>
+  eval "$(_gm_lock_var _GM_LOCK_FD "$1")=''"
+  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")=''"
+  _gm_used=''
+  for _gm_u in $GM_LOCK_FDS_USED; do
+    [ "$_gm_u" = "$2" ] || _gm_used="$_gm_used $_gm_u"
+  done
+  GM_LOCK_FDS_USED=$_gm_used
+  _gm_new=''
+  for _gm_s in $GM_LOCK_STACK; do
+    [ "$_gm_s" = "$1" ] || _gm_new="$_gm_new $_gm_s"
+  done
+  GM_LOCK_STACK=$_gm_new
+  GM_LOCK_MAX_RANK=0
+  for _gm_s in $GM_LOCK_STACK; do
+    _gm_r=$(gm_lock_rank "$_gm_s")
+    [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
+  done
+  return 0
+}
+
+_gm_lock_free_fd() { # echoes the first reserved descriptor not used by this shell
+  for _gm_c in $GM_LOCK_FDS; do
+    case " $GM_LOCK_FDS_USED " in
+      *" $_gm_c "*) continue ;;
+    esac
+    printf '%s' "$_gm_c"
+    return 0
+  done
+  return 1
+}
+
+# Acquire <name>. rc: 0 held, 1 busy/timeout, 2 primitive unavailable (fail closed),
+# 3 already held by this shell, 4 lock order violated. On 1/2/4 nothing is held.
+gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
+  _gm_name=$1
+  _gm_wait=${2:-0}
+  # A non-numeric budget is a caller bug, not "wait forever": refuse it before the deadline
+  # comparison, otherwise `[ N -ge abc ]` errors and the retry loop never terminates.
+  case "$_gm_wait" in
+    ''|*[!0-9]*)
+      echo "geomask-lock: wait budget for '$_gm_name' must be a non-negative integer, got '$_gm_wait'" >&2
+      return 2 ;;
+  esac
+  [ "$_gm_wait" -gt 3600 ] && _gm_wait=3600
+  _gm_path=$(gm_lock_path "$_gm_name" "${3:-}")
+  _gm_rank=$(gm_lock_rank "$_gm_name")
+
+  if _gm_lock_held "$_gm_name"; then
+    echo "geomask-lock: '$GM_LOCK_STACK' already holds '$_gm_name' (re-entrant acquire refused)" >&2
+    return 3
+  fi
+  if [ "$GM_LOCK_MAX_RANK" -ge "$_gm_rank" ]; then
+    echo "geomask-lock: lock order violation: '$_gm_name' (rank $_gm_rank) requested while holding '$GM_LOCK_STACK' (max rank $GM_LOCK_MAX_RANK)" >&2
+    return 4
+  fi
+
+  _gm_backend=$(gm_lock_backend)
+  case "$_gm_backend" in
+    missing)
+      echo "geomask-lock: the flock primitive is missing on Linux ($_gm_name): refusing to mutate without a lock" >&2
+      return 2 ;;
+  esac
+
+  _gm_dir=$(dirname "$_gm_path")
+  ( umask 077; mkdir -p "$_gm_dir" ) 2>/dev/null || {
+    echo "geomask-lock: cannot create the lock directory $_gm_dir - refusing to lock $_gm_name" >&2
+    return 2
+  }
+  _gm_fd=$(_gm_lock_free_fd) || {
+    echo "geomask-lock: no free reserved descriptor for '$_gm_name' (GM_LOCK_FDS='$GM_LOCK_FDS')" >&2
+    return 2
+  }
+
+  _gm_try=0
+  while :; do
+    if [ "$_gm_backend" = portable ]; then
+      # noclobber create: the file appears exactly once, atomically. Never reclaimed.
+      if ( set -C; : > "$_gm_path" ) 2>/dev/null; then
+        _gm_lock_track "$_gm_name" "$_gm_fd" "$_gm_path"
+        return 0
+      fi
+    else
+      if eval "exec $_gm_fd>>\"\$_gm_path\"" 2>/dev/null; then
+        if flock -n "$_gm_fd" 2>/dev/null; then
+          _gm_lock_track "$_gm_name" "$_gm_fd" "$_gm_path"
+          return 0
+        fi
+        eval "exec $_gm_fd>&-"
+      else
+        echo "geomask-lock: cannot open the lock file $_gm_path - refusing to lock $_gm_name" >&2
+        return 2
+      fi
+    fi
+    if [ "$_gm_try" -ge "$_gm_wait" ]; then
+      return 1
+    fi
+    _gm_try=$((_gm_try+1))
+    sleep 1
+  done
+}
+
+gm_lock_release() { # gm_lock_release <name>
+  _gm_name=$1
+  _gm_fd=$(_gm_lock_fd_of "$_gm_name")
+  [ -n "$_gm_fd" ] || return 0
+  _gm_pv=$(_gm_lock_var _GM_LOCK_PATH "$_gm_name")
+  eval "_gm_path=\${$_gm_pv:-}"
+  if [ "$(gm_lock_backend)" = portable ]; then
+    [ -f "$_gm_path" ] && rm -f "$_gm_path" 2>/dev/null
+  else
+    flock -u "$_gm_fd" 2>/dev/null
+    eval "exec $_gm_fd>&-"
+  fi
+  _gm_lock_forget "$_gm_name" "$_gm_fd"
+  return 0
+}
+
+gm_lock_release_all() {
+  for _gm_name in $GM_LOCK_STACK; do
+    gm_lock_release "$_gm_name"
+  done
+}
+
+# Report whether another process holds <name>: 0 busy, 1 free, 2 primitive unavailable.
+gm_lock_busy() { # gm_lock_busy <name> [path]
+  _gm_name=$1
+  if gm_lock_acquire "$_gm_name" 0 "${2:-}"; then
+    gm_lock_release "$_gm_name"
+    return 1
+  else
+    _gm_rc=$?
+    [ "$_gm_rc" = 1 ] && return 0
+    return 2
+  fi
+}
+
+# Close the reserved descriptors in this process WITHOUT unlocking: flock lives on the open
+# file description, so another process (the updater runner) still holds the lock.
+gm_lock_close_inherited() {
+  for _gm_c in $GM_LOCK_FDS; do
+    eval "exec $_gm_c>&-" 2>/dev/null
+  done
+  GM_LOCK_FDS_USED=''
+  GM_LOCK_STACK=''
+  GM_LOCK_MAX_RANK=0
+  return 0
+}
+
+# Run a command (init script, service) so it does not inherit the lock descriptors. A daemon
+# spawned with them would keep the lock after the writer exits and block every later writer.
+gm_lock_safe_exec() {
+  ( gm_lock_close_inherited; "$@" )
 }
 
 save_stream() { # save_stream <target-path> <mode>  (content on stdin)
@@ -526,11 +814,20 @@ mod_skipped() { # mod_skipped <module> -> 0 (and a note) when the module is not 
   return 0
 }
 
+# Every rewrite of /etc/crontabs/root is a read-modify-write: the panel (nodes_set,
+# sync_set), the installer and uninstall must take the same kernel `cron` lock or one writer
+# silently drops the other's line (report R09). cron_ensure is used by step5 many times.
+_cron_begin() { command -v gm_lock_acquire >/dev/null 2>&1 || return 1; gm_lock_acquire cron 20; }
+_cron_end() { command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release cron; return 0; }
+
 cron_ensure() { # cron_ensure <module> <marker-ere> <cron-line>
   mod_skipped "$1" && return 0
   if crontab -l 2>/dev/null | grep -qE -- "$2"; then info "cron: уже есть ($2)"; return 0; fi
+  if ! _cron_begin; then warn "cron: блокировка недоступна ($2)"; return 0; fi
   ( crontab -l 2>/dev/null; printf '%s\n' "$3" ) | crontab - 2>/dev/null \
     && info "cron: добавлен ($2)" || warn "cron: не удалось записать ($2)"
+  _cron_end
+  return 0
 }
 
 cron_verify() { # cron_verify <module> <marker-ere> <label> [soft]
@@ -671,10 +968,29 @@ initd() { # initd <svc> <action>  - respects GM_PREFIX for tests
       return 1
     fi
   fi
-  "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+  # Run the init script without the lock descriptors: a service that daemonizes directly (or a
+  # procd fallback) must not inherit the maintenance lock and hold it until reboot.
+  if command -v gm_lock_safe_exec >/dev/null 2>&1; then
+    gm_lock_safe_exec "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+  else
+    "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+  fi
 }
 
 # ============================================================ PREFLIGHT
+# R04: the lock primitive is a mandatory dependency of every writer, on the normal install as
+# well as on the reinstall preflight. Echoes the missing piece (Linux only); rc=1 when usable.
+# Without flock every writer refuses to mutate, and the copied helper file must not exist.
+lock_primitive_missing() {
+  [ "$(uname -s 2>/dev/null)" = Linux ] || return 0
+  have flock || { printf 'flock applet (BusyBox; upstream OpenWrt 24.10 ships it)'; return 0; }
+  if have python3 && ! python3 -c 'import fcntl' >/dev/null 2>&1; then
+    printf 'python3 fcntl (the config transaction lock is fail-closed without it)'
+    return 0
+  fi
+  return 1
+}
+
 # Everything that can only fail later is checked here, before the first byte is written:
 # a reset router must not end up with a panel and no working mihomo config.
 preflight() {
@@ -701,6 +1017,8 @@ preflight() {
   if have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
     have apk || have opkg || { bad "preflight: нет apk/opkg - python3-yaml не поставить"; _need=1; }
   fi
+  _lpm=$(lock_primitive_missing)
+  [ -z "$_lpm" ] || { bad "preflight: нет примитива блокировки: $_lpm"; info "  Без него писатели отказываются изменять конфиг (fail-closed), а не работают без lock."; _need=1; }
   [ -n "$(lan_ip)" ] || { bad "preflight: не определён адрес LAN ($(lan_iface)) - слушатели некуда привязать"; _need=1; }
   return $_need
 }
@@ -708,6 +1026,8 @@ preflight() {
 # ============================================================ STEP 1: env
 step1_check() {
   _need=0
+  # Reset first: the flag is a property of THIS check, not a sticky state from an earlier run.
+  GM_STEP1_FATAL=0
   [ -f "$(P /etc/openwrt_release)" ] && info "OpenWrt: $(grep '^DISTRIB_RELEASE=' "$(P /etc/openwrt_release)" 2>/dev/null | cut -d"'" -f2)" || { bad "not OpenWrt (/etc/openwrt_release missing)"; _need=1; }
   if have apk; then info "pkg manager: apk"; elif have opkg; then info "pkg manager: opkg"; else bad "no apk/opkg"; _need=1; fi
   # v1.30.5: geomask is an overlay over mihomo, not a standalone product. Saying so here
@@ -726,6 +1046,11 @@ step1_check() {
     if python3 -c 'import yaml' >/dev/null 2>&1; then info "python3-yaml: present"
     else warn "python3-yaml: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
   fi
+  # R04: a fresh install must fail before step 2 if the lock primitive is missing, otherwise
+  # every writer installed by the run would refuse to mutate. This is a hard refusal: the
+  # interactive wizard must not go on applying steps 2-7 after it (see run_step).
+  _lpm=$(lock_primitive_missing)
+  [ -z "$_lpm" ] || { GM_STEP1_FATAL=1; bad "flock: MISSING ($_lpm) - geomask writers are fail-closed without it"; _need=1; }
   # the AI lane is a second hev-socks5-tunnel instance; without the binary it cannot exist
   if module_selected path_ai || module_selected ai_dns; then
     if have hev-socks5-tunnel || [ -x "$(P /usr/bin/hev-socks5-tunnel)" ]; then info "hev-socks5-tunnel: present"
@@ -2458,7 +2783,11 @@ DEFAULT_POOLS_DIR = _state.DEFAULT_POOLS_DIR
 
 # Transaction journal
 TX_JOURNAL = DEFAULT_STATE_DIR / 'config-tx-journal.jsonl'
-TX_LOCK = DEFAULT_STATE_DIR / '.config-tx.lock'
+# Canonical lock path: the SAME env name the shell helper (gm_lock_acquire config-tx) and the
+# embedded Python writers (node-scan, torrent) read. The default is derived from the state dir,
+# so a test root that only moves GM_AUDIT_STATE keeps working; GM_CONFIG_TX_LOCK is the one
+# documented override (review round 2, defect 11 - three names used to describe one inode).
+TX_LOCK = Path(os.environ.get('GM_CONFIG_TX_LOCK') or (DEFAULT_STATE_DIR / '.config-tx.lock'))
 TX_STATE_DIR = DEFAULT_STATE_DIR / 'tx-work'
 TX_PREIMAGES_DIR = DEFAULT_STATE_DIR / 'tx-preimages'
 # how long a second transaction waits for the lock before reporting that it is busy
@@ -2498,17 +2827,24 @@ def strict_json(data: bytes):
 
 @contextlib.contextmanager
 def tx_lock(timeout=None):
-    """Process-wide transaction lock using flock (Unix) or file-based lock (Windows).
+    """Transaction lock: kernel flock(2) on a persistent lock file.
 
-    The Unix path used a blocking flock: a second transaction (or a test that leaked the
-    descriptor) waited forever instead of reporting anything. It now polls with LOCK_NB and
-    gives up after TX_LOCK_TIMEOUT, so a stuck transaction fails loudly.
+    The file is created once and never deleted or recreated: the same inode is locked by every
+    writer, so a release cannot hand the lock to two processes (the R04 reclaim race). A holder
+    that dies is released by the kernel. BusyBox `flock` on the very same path is the same
+    primitive, so a shell writer (geomask-lock.sh, rank config-tx) and this module exclude each
+    other. On Linux the primitive is mandatory: without fcntl the transaction refuses to run
+    (fail closed) instead of mutating the live config unlocked.
     """
     TX_LOCK.parent.mkdir(parents=True, exist_ok=True)
     timeout = TX_LOCK_TIMEOUT if timeout is None else timeout
 
-    if hasattr(os, 'O_NOFOLLOW'):  # Unix
-        import fcntl
+    if hasattr(os, 'O_NOFOLLOW'):  # Unix - the supported runtime
+        try:
+            import fcntl
+        except ImportError:
+            raise TxError('the fcntl/flock primitive is missing on this system: '
+                          'refusing to run an unlocked config transaction') from None
         fd = None
         try:
             fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -2529,7 +2865,7 @@ def tx_lock(timeout=None):
                 except Exception:
                     pass
                 os.close(fd)
-    else:  # Windows - use file-based lock
+    else:  # Windows - the test host only; never a deployment target (no flock(2) there)
         lock_acquired = False
         try:
             # Try to create lock file exclusively
@@ -3138,7 +3474,7 @@ class ConfigTransaction:
             shutil.rmtree(work_dir, ignore_errors=True)
 
 def start_transaction(files: dict, trial_paths: list = None, require_nonempty=None,
-                      require_exactly=None):
+                      require_exactly=None, expect_sha256: str = None):
     """Commit one whole file atomically.
 
     ``files`` maps an absolute path (str or Path) to the exact bytes that must land
@@ -3148,6 +3484,11 @@ def start_transaction(files: dict, trial_paths: list = None, require_nonempty=No
 
     ``trial_paths`` lists which of those files are mihomo configs to validate and
     trial-run; it defaults to the primary mihomo config.
+
+    ``expect_sha256`` is the digest of the live bytes the caller built its candidate from.
+    The check runs INSIDE the transaction lock, after recovery and before the first mutation:
+    a concurrent commit between the caller's read and this lock is refused as STALE instead
+    of being silently overwritten (report R06, lost update).
     """
     if not isinstance(files, dict) or not files:
         raise TxError('start_transaction requires a non-empty {path: bytes} mapping')
@@ -3157,14 +3498,10 @@ def start_transaction(files: dict, trial_paths: list = None, require_nonempty=No
         # a guarantee this code does not provide. Every current caller writes one file.
         raise TxError('start_transaction commits one file at a time; '
                       'multi-file atomic commit is not implemented')
-    # Repair a previous run that died mid-commit before stacking another mutation on top of
-    # it. Nothing used to call the recovery routine, so an interrupted transaction stayed
-    # interrupted until a human noticed.
-    try:
-        recover_interrupted_transactions()
-    except Exception as exc:
-        raise TxError('an earlier interrupted transaction could not be recovered: %s'
-                      % str(exc)[:160]) from None
+    if expect_sha256 is not None:
+        expect_sha256 = str(expect_sha256).strip().lower()
+        if not re.fullmatch(r'[0-9a-f]{64}', expect_sha256):
+            raise TxError('expect_sha256 must be a hex sha256 digest')
 
     normalised = {}
     for path, content in files.items():
@@ -3186,33 +3523,51 @@ def start_transaction(files: dict, trial_paths: list = None, require_nonempty=No
 
     tx_id = secrets.token_hex(12)
 
-    with tx_lock(), job_budget(300), ConfigTransaction(tx_id) as tx:
-        for path in normalised:
-            tx.capture_preimage(path)
-        for path, content in normalised.items():
-            tx.stage_file(path, content)
+    with tx_lock(), job_budget(300):
+        # Recovery belongs INSIDE the lock: running it before meant a second writer could
+        # restore the preimage of a transaction that was still live (report R05). It also runs
+        # before the transaction context, so a failed recovery is reported as such instead of
+        # being replaced by that context's own rollback error.
+        try:
+            recover_interrupted_transactions()
+        except Exception as exc:
+            raise TxError('an earlier interrupted transaction could not be recovered: %s'
+                          % str(exc)[:160]) from None
 
-        for path in trials:
-            tx.validate_candidate(path)
-            tx.run_isolated_trial(path)
+        if expect_sha256 is not None:
+            for path in normalised:
+                live = path.read_bytes() if path.exists() else b''
+                if digest(live) != expect_sha256:
+                    raise TxError('config changed since it was read (STALE): %s - refusing to '
+                                  'overwrite a newer commit; re-read and retry' % path)
 
-        # Record the intent (including preimage locations) before the first mutation,
-        # so a crash between commit and the caller's own bookkeeping stays recoverable.
-        with open(TX_JOURNAL, 'ab') as f:
-            f.write((json.dumps({
-                'tx_id': tx.tx_id,
-                'stage': 'prepare',
-                'files': [str(p) for p in normalised],
-                'preimages': {str(p): (digest(b) if b is not None else None)
-                              for p, b in tx.preimages.items()},
-                'timestamp': stamp(),
-            }, ensure_ascii=False) + '\n').encode('utf-8'))
-            f.flush()
-            os.fsync(f.fileno())
+        with ConfigTransaction(tx_id) as tx:
+            for path in normalised:
+                tx.capture_preimage(path)
+            for path, content in normalised.items():
+                tx.stage_file(path, content)
 
-        tx.commit(next(iter(trials), None), require_nonempty, require_exactly)
-        return {'ok': True, 'tx_id': tx.tx_id, 'config_digest': tx.config_digest_after,
-                'files': [str(p) for p in normalised]}
+            for path in trials:
+                tx.validate_candidate(path)
+                tx.run_isolated_trial(path)
+
+            # Record the intent (including preimage locations) before the first mutation,
+            # so a crash between commit and the caller's own bookkeeping stays recoverable.
+            with open(TX_JOURNAL, 'ab') as f:
+                f.write((json.dumps({
+                    'tx_id': tx.tx_id,
+                    'stage': 'prepare',
+                    'files': [str(p) for p in normalised],
+                    'preimages': {str(p): (digest(b) if b is not None else None)
+                                  for p, b in tx.preimages.items()},
+                    'timestamp': stamp(),
+                }, ensure_ascii=False) + '\n').encode('utf-8'))
+                f.flush()
+                os.fsync(f.fileno())
+
+            tx.commit(next(iter(trials), None), require_nonempty, require_exactly)
+            return {'ok': True, 'tx_id': tx.tx_id, 'config_digest': tx.config_digest_after,
+                    'files': [str(p) for p in normalised]}
 
 def recover_interrupted_transactions():
     """Scan for incomplete transactions and rollback/recover."""
@@ -3303,16 +3658,26 @@ def main(argv=None):
         return 0
     try:
         if args[0] == '--commit':
+            expect = None
+            if '--expect-sha256' in args:
+                _i = args.index('--expect-sha256')
+                if _i + 1 >= len(args):
+                    raise TxError('--expect-sha256 needs a digest')
+                expect = args[_i + 1]
+                del args[_i:_i + 2]
             if len(args) != 2:
                 raise TxError('--commit takes exactly one target path')
             data = sys.stdin.buffer.read()
             if not data:
                 # Replacing the live config with nothing is never a switch: refuse it.
                 raise TxError('refusing to commit an empty payload')
-            result = start_transaction({args[1]: data})
+            result = start_transaction({args[1]: data}, expect_sha256=expect)
             answer = {'ok': True, 'tx_id': result.get('tx_id')}
         elif args[0] == '--recover':
-            recover_interrupted_transactions()
+            # Recovery mutates the live config: it runs under the very same lock as a commit,
+            # never beside it (report R05).
+            with tx_lock():
+                recover_interrupted_transactions()
             answer = {'ok': True, 'recovered': True}
         else:
             raise TxError('unknown argument: %s' % args[0])
@@ -4104,7 +4469,8 @@ def apply_preview(path_id, preview_id, expected_path_revision):
         result = start_transaction(
             {str(DEFAULT_CONFIG): yaml.safe_dump(config, allow_unicode=True,
                                                  sort_keys=False).encode('utf-8')},
-            require_exactly={group_name: eligible_names})
+            require_exactly={group_name: eligible_names},
+            expect_sha256=digest(live_raw))
     except Exception:
         _restore_applied_record(path_id, previous_applied)
         try:
@@ -4205,7 +4571,12 @@ def revoke_applied_pool(path_id):
     if applied.get('status') not in ('applied', 'expired'):
         return {'ok': True, 'revoked': False, 'message': 'No applied pool to revoke'}
 
-    config = yaml_load(open(DEFAULT_CONFIG, encoding='utf-8').read())
+    # ONE read: the candidate is built from these bytes and the CAS base is their digest.
+    # Two reads (open() then read_bytes()) could see two different files and hand the
+    # transaction a base newer than the candidate it protects (review round 2, defect 4).
+    _revoke_raw = DEFAULT_CONFIG.read_bytes()
+    config = yaml_load(_revoke_raw.decode('utf-8'))
+    _revoke_base = _tx.digest(_revoke_raw)
     group_name = PATHS[path_id][0]
     target = None
     for g in config.get('proxy-groups', []):
@@ -4240,7 +4611,8 @@ def revoke_applied_pool(path_id):
     # Widening is the point of a revoke, so an empty result here is not a failure mode
     # to guard against: the previous source and filter are restored as recorded.
     result = start_transaction({str(DEFAULT_CONFIG): yaml.safe_dump(
-        config, allow_unicode=True, sort_keys=False).encode('utf-8')})
+        config, allow_unicode=True, sort_keys=False).encode('utf-8')},
+        expect_sha256=_revoke_base)
     if not result.get('ok'):
         raise ApplyError('transaction rejected the candidate; group left as it was')
 
@@ -4392,9 +4764,17 @@ def _lan_ip():
 
 
 def _read_config():
-    """Read and parse mihomo config."""
-    with open(CFG, encoding='utf-8') as f:
-        return f.read()
+    """Read and parse mihomo config, remembering the digest the candidate is built from.
+
+    The transaction compares this digest with the live file under its lock and refuses a
+    stale write, so a concurrent panel commit cannot be silently overwritten (R06).
+    """
+    global _READ_DIGEST
+    raw = CFG.read_bytes()
+    _READ_DIGEST = _tx.digest(raw)
+    return raw.decode('utf-8')
+
+_READ_DIGEST = None
 
 def _validate_config(text=None):
     """Validate mihomo config."""
@@ -4491,7 +4871,8 @@ def lane_install(lane_name='VPN-noP2P', lane_ip='198.20.0.1', lane_port=7892, la
     if not changes:
         return {'ok': True, 'message': 'Lane already installed'}
 
-    return _tx.start_transaction(_tx_files(changes['config.yaml']))
+    return _tx.start_transaction(_tx_files(changes['config.yaml']),
+                                 expect_sha256=_READ_DIGEST)
 
 def lane_remove(lane_name='VPN-noP2P'):
     """Remove a lane using transaction."""
@@ -4509,7 +4890,8 @@ def lane_remove(lane_name='VPN-noP2P'):
     if new_config == config:
         return {'ok': True, 'message': 'Lane not found in config'}
     
-    return _tx.start_transaction(_tx_files(new_config.encode('utf-8')))
+    return _tx.start_transaction(_tx_files(new_config.encode('utf-8')),
+                                 expect_sha256=_READ_DIGEST)
 
 def lane_status(lane_name='VPN-noP2P'):
     """Get lane status."""
@@ -4615,7 +4997,8 @@ def torrent_set_listener(enable):
     if not changes:
         return {'ok': True, 'message': 'No change needed'}
     
-    return _tx.start_transaction(_tx_files(changes['config.yaml']))
+    return _tx.start_transaction(_tx_files(changes['config.yaml']),
+                                 expect_sha256=_READ_DIGEST)
 
 def torrent_refresh():
     """Refresh torrent ruleset."""
@@ -4710,9 +5093,19 @@ class SyncYoutubeError(Exception):
     pass
 
 def _read_config():
-    """Read and parse mihomo config."""
-    with open(CFG, encoding='utf-8') as f:
-        return f.read()
+    """Read and parse mihomo config.
+
+    Also remembers the digest of the exact bytes the candidate is built from: the transaction
+    compares it with the live file under its lock and refuses a stale write (R06). Comparing
+    text re-encoded to bytes would hide a non-UTF-8 or newline difference, so the raw bytes are
+    hashed here.
+    """
+    global _READ_DIGEST
+    raw = CFG.read_bytes()
+    _READ_DIGEST = _tx.digest(raw)
+    return raw.decode('utf-8')
+
+_READ_DIGEST = None
 
 def _validate_config(text=None):
     """Validate mihomo config."""
@@ -4735,7 +5128,7 @@ def _validate_config(text=None):
 
 def _reload_mihomo():
     """Reload mihomo via controller API."""
-    text = open(CFG, encoding='utf-8').read()
+    text = _read_config()
     secret = ''
     for line in text.splitlines():
         m = re.match(r'^secret:\s*["\']?([^"\'\s]+)', line)
@@ -4763,7 +5156,7 @@ def _reload_mihomo():
 
 def yt_status():
     """Get youtube watch status."""
-    config = open(CFG, encoding='utf-8').read()
+    config = _read_config()
     
     # Check for ytwatch mode
     mode = 'off'
@@ -4779,7 +5172,7 @@ def yt_status():
 
 def yt_mode_changes(mode):
     """Build config changes for ytwatch mode."""
-    config = open(CFG, encoding='utf-8').read()
+    config = _read_config()
     
     if mode == 'off':
         # Remove ytwatch section
@@ -4820,8 +5213,10 @@ def yt_mode(mode):
     if not changes:
         return {'ok': True, 'message': f'ytwatch already set to {mode}'}
 
-    # Absolute key: the transaction refuses relative targets.
-    return _tx.start_transaction({str(CFG): changes['config.yaml']})
+    # Absolute key: the transaction refuses relative targets. The digest of the bytes the
+    # candidate was built from is checked under the transaction lock (no silent lost update).
+    return _tx.start_transaction({str(CFG): changes['config.yaml']},
+                                 expect_sha256=_READ_DIGEST)
 
 def yt_reset():
     """Reset ytwatch to off."""
@@ -5553,6 +5948,10 @@ SMB_SHARE_ENABLE=${GM_SMB_SHARE_ENABLE:-/etc/geomask/backup-share.enable}
 # How long a bundle may sit in the temporary directory before it is removed (hours).
 CONSOLE_DIAG_KEEP_H=${GM_CONSOLE_DIAG_KEEP:-24}
 DHCP_OWNED=/etc/geomask/dhcp-hosts   # id|ip|mac of host sections geomask created
+# Device/subscription lists are read-modify-written by the panel and the guard. The RMW is
+# serialised by the shared kernel `devices` lock and the temporary file is per-process, so two
+# writers cannot install a half-rewritten list or overwrite each other's temp (report R08).
+DEVICES_LOCK=${GM_DEVICES_LOCK:-/tmp/geomask-locks/devices.lock}
 AI_TUN_DEV=AI
 AI_TUN_IP=198.19.0.1
 AI_SOCKS_PORT=7891
@@ -5570,6 +5969,13 @@ UPD_DIR=/tmp/geomask-upd
 SAFE_WRITE_PY=/usr/bin/safe_write.py
 # Shared route-table helper (also sourced by /etc/hotplug.d/iface/99-default-vpn-route).
 GM_ROUTES_LIB=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
+# The one lock helper (R04): kernel flock on a persistent inode - route tables, the console
+# lane, crontab/devices read-modify-write, the updater and the config transaction share the
+# same primitive and the same rank order. No PID heuristics, no stale-lock reclaim.
+GM_LOCK_LIB=${GM_LOCK_LIB:-/usr/lib/geomask/geomask-lock.sh}
+if ! command -v gm_lock_acquire >/dev/null 2>&1 && [ -r "$GM_LOCK_LIB" ]; then
+  . "$GM_LOCK_LIB"
+fi
 
 # ---- write gate ------------------------------------------------------------
 # The project rule is "a full settings backup before ANY change on the router". The panel
@@ -5640,7 +6046,8 @@ PYTHON_BIN=${GM_PYTHON:-python3}
 SUB_STATUS_PYTHON=$PYTHON_BIN
 UPD_CHECK=$UPD_DIR/check.json
 UPD_STATUS=$UPD_DIR/status.json
-UPD_PIDF=$UPD_DIR/pid
+UPD_PIDF=$UPD_DIR/pid              # legacy, read-only: the lock replaced it
+UPD_LOCK=${GM_UPD_LOCK:-/tmp/geomask-locks/updater.lock}
 UPD_TTL=3600
 
 # safe_write shell wrapper
@@ -6170,11 +6577,27 @@ _ipv4_ok() {
   }'
 }
 
+_devices_lock() {
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire devices 20 "$DEVICES_LOCK"
+}
+
+_devices_unlock() {
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release devices
+}
+
 _dhcp_owned_add() { # _dhcp_owned_add <section> <ip> <mac>
   mkdir -p "$(dirname "$DHCP_OWNED")" 2>/dev/null
-  [ -f "$DHCP_OWNED" ] && awk -F'|' -v id="$1" '$1!=id' "$DHCP_OWNED" > "$DHCP_OWNED.tmp" 2>/dev/null && mv -f "$DHCP_OWNED.tmp" "$DHCP_OWNED"
+  _do_tmp="$DHCP_OWNED.tmp.$$"
+  _devices_lock || return 1
+  if [ -f "$DHCP_OWNED" ]; then
+    awk -F'|' -v id="$1" '$1!=id' "$DHCP_OWNED" > "$_do_tmp" 2>/dev/null || { rm -f "$_do_tmp"; _devices_unlock; return 1; }
+    mv -f "$_do_tmp" "$DHCP_OWNED" 2>/dev/null || { rm -f "$_do_tmp"; _devices_unlock; return 1; }
+  fi
   printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$DHCP_OWNED"
   chmod 600 "$DHCP_OWNED" 2>/dev/null
+  _devices_unlock
 }
 
 # add/update a device geo-policy: dev_add <ip> <mode> [mac] [name]
@@ -6188,17 +6611,22 @@ cmd_dev_add() {
   # replace existing entry for this ip (exact first field, not a regex: a dotted address used
   # as a regex matches unrelated lines). A failed awk (ENOSPC) must NOT leave an empty file
   # behind: the old `|| : > tmp` truncated the list and dropped every device policy.
-  if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$DEVICES.tmp" 2>/dev/null; then
-    rm -f "$DEVICES.tmp"
+  # The rewrite runs under the shared `devices` lock and through a per-process temp, so two
+  # panel calls cannot install a list built from the same stale baseline (report R08).
+  _devices_lock || { printf '{"ok":false,"error":"device list is busy: another writer holds the lock"}\n'; return 1; }
+  _dv_tmp="$DEVICES.tmp.$$"
+  if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$_dv_tmp" 2>/dev/null; then
+    rm -f "$_dv_tmp"; _devices_unlock
     printf '{"ok":false,"error":"cannot rewrite %s (disk full?) - nothing changed"}\n' "$DEVICES"
     return 1
   fi
-  if ! mv -f "$DEVICES.tmp" "$DEVICES"; then
-    rm -f "$DEVICES.tmp"
+  if ! mv -f "$_dv_tmp" "$DEVICES"; then
+    rm -f "$_dv_tmp"; _devices_unlock
     printf '{"ok":false,"error":"cannot replace %s - nothing changed"}\n' "$DEVICES"
     return 1
   fi
   echo "$IP $MODE $NAME" >> "$DEVICES"
+  _devices_unlock
   # stable lease if mac given (strict MAC format only)
   if [ -n "$MAC" ] && echo "$MAC" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'; then
     if ! uci show dhcp 2>/dev/null | grep -q "\.mac='$MAC'"; then
@@ -6225,12 +6653,15 @@ cmd_dev_del() {
   _ipv4_ok "$IP" || { printf '{"error":"bad ip"}'; return 1; }
   _require_backup || return 1
   if [ -f "$DEVICES" ]; then
-    if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$DEVICES.tmp" 2>/dev/null; then
-      rm -f "$DEVICES.tmp"
+    _devices_lock || { printf '{"ok":false,"error":"device list is busy: another writer holds the lock"}\n'; return 1; }
+    _dv_tmp="$DEVICES.tmp.$$"
+    if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$_dv_tmp" 2>/dev/null; then
+      rm -f "$_dv_tmp"; _devices_unlock
       printf '{"ok":false,"error":"cannot rewrite %s (disk full?) - nothing changed"}\n' "$DEVICES"
       return 1
     fi
-    mv -f "$DEVICES.tmp" "$DEVICES" || { rm -f "$DEVICES.tmp"; printf '{"ok":false,"error":"cannot replace %s"}\n' "$DEVICES"; return 1; }
+    mv -f "$_dv_tmp" "$DEVICES" || { rm -f "$_dv_tmp"; _devices_unlock; printf '{"ok":false,"error":"cannot replace %s"}\n' "$DEVICES"; return 1; }
+    _devices_unlock
   fi
   # remove rules for this ip explicitly per table (bypass -> main, ai -> 101).
   # NEVER delete by pref alone: all per-device rules share priority 19900, so
@@ -6246,7 +6677,13 @@ cmd_dev_del() {
     _smac=$(uci -q get "$_sec.mac" 2>/dev/null)
     if [ "$_sip" = "$IP" ] && [ -n "$_smac" ]; then
       if uci -q delete "$_sec" 2>/dev/null && uci commit dhcp 2>/dev/null; then
-        awk -F'|' -v id="$_sec" '$1!=id' "$DHCP_OWNED" > "$DHCP_OWNED.tmp" 2>/dev/null && mv -f "$DHCP_OWNED.tmp" "$DHCP_OWNED"
+        _do_tmp="$DHCP_OWNED.tmp.$$"
+        if _devices_lock; then
+          awk -F'|' -v id="$_sec" '$1!=id' "$DHCP_OWNED" > "$_do_tmp" 2>/dev/null \
+            && mv -f "$_do_tmp" "$DHCP_OWNED" 2>/dev/null
+          rm -f "$_do_tmp"
+          _devices_unlock
+        fi
       else
         warn "cannot remove dhcp host $_sec - section left in place"
       fi
@@ -6734,11 +7171,17 @@ cmd_sub_add() {
   [ "$_internal" = internal ] || _require_backup || return 1
   [ -n "$NAME" ] || NAME=$(printf '%s' "$URL" | sed 's|^https\?://||; s|/.*||')
   NAME=$(printf '%s' "$NAME" | tr -d '|' | head -c 48)
+  # The registry is read-modify-written (id allocation + append / delete): the shared `subs`
+  # kernel lock makes the id unique and keeps a concurrent delete from dropping this append.
+  command -v gm_lock_acquire >/dev/null 2>&1 && gm_lock_acquire subs 20 || {
+    printf '{"ok":false,"error":"subscription registry is busy"}\n'; return 1; }
   ID=$(date +%s | tail -c 9)
-  while grep -q "^$ID|" "$SUBS_FILE" 2>/dev/null; do ID=$((ID+1)); done
+  _sa_i=0
+  while grep -q "^$ID|" "$SUBS_FILE" 2>/dev/null && [ "$_sa_i" -lt 100 ]; do ID=$((ID+1)); _sa_i=$((_sa_i+1)); done
   echo "$ID|$NAME|$URL" >> "$SUBS_FILE"
   # The registry holds subscription tokens: root-only, like the mihomo config itself.
   chmod 600 "$SUBS_FILE" 2>/dev/null
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
   echo "$(date +%FT%T) SUB add $ID $NAME" >> "$LOG"
   printf '{"ok":true,"subs":%s}' "$(_subs_json)"
 }
@@ -6759,8 +7202,18 @@ cmd_sub_del() {
         return 1 ;;
     esac
   fi
-  grep -v "^$ID|" "$SUBS_FILE" > "$SUBS_FILE.tmp" || true
-  mv -f "$SUBS_FILE.tmp" "$SUBS_FILE"
+  command -v gm_lock_acquire >/dev/null 2>&1 && gm_lock_acquire subs 20 || {
+    printf '{"ok":false,"error":"subscription registry is busy"}\n'; return 1; }
+  _sd_tmp="$SUBS_FILE.tmp.$$"
+  if ! grep -v "^$ID|" "$SUBS_FILE" > "$_sd_tmp"; then
+    rm -f "$_sd_tmp"; command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
+    printf '{"ok":false,"error":"cannot rewrite the subscription registry"}\n'; return 1
+  fi
+  if ! mv -f "$_sd_tmp" "$SUBS_FILE"; then
+    rm -f "$_sd_tmp"; command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
+    printf '{"ok":false,"error":"cannot replace the subscription registry"}\n'; return 1
+  fi
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
   echo "$(date +%FT%T) SUB del $ID" >> "$LOG"
   printf '{"ok":true,"subs":%s}' "$(_subs_json)"
 }
@@ -6930,9 +7383,11 @@ _upd_check_now() { # $1 = "force" bypasses the TTL cache
 }
 
 _upd_running() {
-  [ -f "$UPD_PIDF" ] || return 1
-  _p=$(cat "$UPD_PIDF" 2>/dev/null)
-  [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null
+  # The runner holds the shared kernel `updater` lock from the moment it is spawned until it
+  # exits; a pid file was check-then-write and a killed runner left a pid that could be
+  # reused, so the lock is the truth here (R10).
+  command -v gm_lock_busy >/dev/null 2>&1 || return 1
+  gm_lock_busy updater "$UPD_LOCK"
 }
 
 cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
@@ -7088,6 +7543,13 @@ cmd_upd_apply() {
   # verify the download against, and a hash from the same source proves nothing (F22).
   _dig=$(sed -n 's/.*"digest":"\(sha256:[0-9a-f]*\)".*/\1/p' "$UPD_CHECK" | head -1)
   [ -n "$_dig" ] || { printf '{"ok":false,"err":"release digest unavailable - refusing to run an unverified installer"}\n'; return 1; }
+  # Single instance: the kernel lock is acquired BEFORE the runner script is written, and the
+  # detached runner inherits the descriptor, so the lock lives exactly as long as the update.
+  # The old check-then-write pid let two callers both pass the check (R10).
+  command -v gm_lock_acquire >/dev/null 2>&1 || {
+    printf '{"ok":false,"err":"lock helper missing - refusing to start an update"}\n'; return 1; }
+  gm_lock_acquire updater 0 "$UPD_LOCK" || {
+    printf '{"ok":false,"err":"already running"}\n'; return 1; }
   cat > "$UPD_DIR/run.sh" <<'RUNEOF'
 #!/bin/sh
 # geomask self-update runner (detached): backup -> download -> validate -> reinstall
@@ -7098,7 +7560,7 @@ ST=$D/status.json
 SL=$D/steps.log
 LOGF=/root/geo-sync.log
 say() { _t=$(date '+%F %T'); _j=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g'); printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$_j" "$_t" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; printf '%s [%s] %s\n' "$_t" "$1" "$2" >> "$SL"; printf '%s GEOMASK-UPD [%s] %s\n' "$_t" "$1" "$2" >> "$LOGF"; }
-trap 'rm -f "$D/pid"' EXIT
+trap ':' EXIT
 TAG="$1"
 say queued "update to $TAG started"
 say backup "creating full router backup (sysupgrade -b)..."
@@ -7199,7 +7661,9 @@ say done "updated to $NEWV - refresh the panel page (Ctrl+F5)"
 RUNEOF
   printf '{"phase":"queued","msg":"starting update to %s","ts":"%s"}\n' "$_tag" "$(date '+%F %T')" > "$UPD_STATUS"
   sh "$UPD_DIR/run.sh" "$_tag" >/dev/null 2>&1 &
-  echo $! > "$UPD_PIDF"
+  # The runner inherited the `updater` descriptor: the lock is released by the kernel when it
+  # (and every copy of that open file description) exits. Do NOT unlock here - that would
+  # release the lock of the running update.
   printf '{"ok":true,"to":"%s"}\n' "$_tag"
 }
 
@@ -7239,24 +7703,19 @@ cmd_nodes_get() {
 # file and the cron line are one transaction. The old version rewrote the whole file with a
 # four-line template (dropping ai_*, name_filter_groups, ...) and accepted a newline inside
 # base_filter, which appended an arbitrary key such as ai_guard=0 (audit 14.11.2026, F07).
-NODES_LOCK=/tmp/geomask-nodes.lock
+# The lock is the shared kernel `cron` lock: it serialises this file together with every
+# other read-modify-write of /etc/crontabs/root (cmd_sync_set, the installer, uninstall).
+NODES_LOCK=${GM_NODES_LOCK:-/tmp/geomask-locks/cron.lock}
 
 _nodes_lock() {
-  _nl_i=0
-  while [ "$_nl_i" -lt 20 ]; do
-    mkdir "$NODES_LOCK" 2>/dev/null && return 0
-    # a writer that crashed must not lock the panel forever
-    _nl_m=$(stat -c %Y "$NODES_LOCK" 2>/dev/null || echo 0)
-    case "$_nl_m" in ''|*[!0-9]*) _nl_m=0 ;; esac
-    if [ "$_nl_m" -gt 0 ] && [ $(( $(date +%s) - _nl_m )) -gt 60 ]; then
-      rmdir "$NODES_LOCK" 2>/dev/null
-    fi
-    _nl_i=$((_nl_i+1)); sleep 0.2
-  done
-  return 1
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire cron 20 "$NODES_LOCK"
 }
 
-_nodes_unlock() { rmdir "$NODES_LOCK" 2>/dev/null; }
+_nodes_unlock() {
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release cron
+}
 
 _nodes_candidate() { # stdin: live conf -> stdout: candidate with the four keys replaced
   awk -v cc="$1" -v as="$2" -v bf="$3" -v pv="$4" '
@@ -7347,10 +7806,14 @@ cmd_nodes_set() {
 # sync insurance cron interval: */N minutes (N: 1,2,3,5,10,15,30)
 cmd_sync_set() {
   case "$1" in 1|2|3|5|10|15|30) : ;; *) printf '{"ok":false,"error":"bad interval"}\n'; return 1;; esac
+  # The crontab is shared with nodes_set, the installer and uninstall: same kernel lock, so a
+  # concurrent read-modify-write can no longer drop the other writer's line.
+  _nodes_lock || { printf '{"ok":false,"error":"crontab is busy: another writer holds the lock"}\n'; return 1; }
   _tmp=/tmp/gm-cron.$$
   crontab -l 2>/dev/null | grep -vF "/root/sync_mtrickle_mihomo.sh" > "$_tmp" || true
   printf '*/%s * * * * %s # %s\n' "$1" "$SYNCLISTS" "$SYNC_TAG" >> "$_tmp"
-  crontab "$_tmp" && rm -f "$_tmp" || { printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
+  crontab "$_tmp" && rm -f "$_tmp" || { rm -f "$_tmp"; _nodes_unlock; printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
+  _nodes_unlock
   printf '%s SYNC cron set to */%s\n' "$(date '+%F %T')" "$1" >> "$LOG"
   printf '{"ok":true,"interval":"*/%s"}\n' "$1"
 }
@@ -7616,58 +8079,40 @@ CONSOLE_PY=/usr/lib/geomask/geomask-console.py
 TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}
 # One lock for `on`, `off` and the guard's console block: a rule must not come back after the
 # kill switch removed it. `status` never takes it - the panel calls it on every render.
-CONSOLE_LOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
+# The primitive is the shared kernel lock (geomask-lock.sh, console rank): a killed switch is
+# released by the kernel, the lock file is never deleted and there is no PID to guess. The
+# emergency path waits a bounded number of seconds and then fails; it never works unserialised.
+CONSOLE_LOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-locks/console.lock}
 
 _console_get() { sed -n "s/^$1=//p" "$CONSOLE_STATE" 2>/dev/null | head -1; }
 
-# BusyBox on OpenWrt does not ship flock everywhere, so the lane lock is a directory with the
-# owner pid inside. A lock whose owner is gone (a killed switch) is broken once and retried; if
-# the lane is still busy after the wait, the caller fails instead of working unserialised.
 _console_lock() {
-  _lt=0
-  while [ "$_lt" -lt "${CONSOLE_LOCK_TRIES:-10}" ]; do
-    if mkdir "$CONSOLE_LOCK" 2>/dev/null; then
-      if printf '%s\n' "$$" > "$CONSOLE_LOCK/pid" 2>/dev/null; then
-        return 0
-      fi
-      rm -rf "$CONSOLE_LOCK" 2>/dev/null     # cannot name the owner: do not keep a half lock
-      return 1
-    fi
-    _lt=$((_lt+1))
-    _owner=''
-    [ -f "$CONSOLE_LOCK/pid" ] && _owner=$(cat "$CONSOLE_LOCK/pid" 2>/dev/null)
-    if [ -z "$_owner" ] && [ "$_lt" -eq 1 ]; then
-      # The owner may be between `mkdir` and writing its pid: look again before breaking it.
-      sleep 1
-    elif [ -n "$_owner" ] && kill -0 "$_owner" 2>/dev/null; then
-      sleep 1
-    else
-      rm -rf "$CONSOLE_LOCK" 2>/dev/null     # ownerless or dead owner: a killed switch
-    fi
-  done
-  return 1
+  command -v gm_lock_acquire >/dev/null 2>&1 || {
+    echo "console: lock helper missing ($GM_LOCK_LIB) - refusing to switch the lane" >&2
+    return 1
+  }
+  gm_lock_acquire console "${CONSOLE_LOCK_TRIES:-10}" "$CONSOLE_LOCK"
 }
 
-# Never release a lock this process does not own: a slow switch whose lock was taken over
-# must not delete the new owner's lock on the way out.
+# Releases only the lock this process holds. The lock file stays: deleting or recreating it
+# would give two writers two different inodes (the historical reclaim bug, R04).
 _console_unlock() {
-  [ -n "${CONSOLE_LOCK:-}" ] || return 0
-  _uo=$(cat "$CONSOLE_LOCK/pid" 2>/dev/null)
-  [ -z "$_uo" ] || [ "$_uo" = "$$" ] || return 0
-  rm -rf "$CONSOLE_LOCK" 2>/dev/null
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release console
   return 0
 }
 
 _console_set() { # _console_set <key> <value>
   mkdir -p "$(dirname "$CONSOLE_STATE")" 2>/dev/null || return 1
+  _ct_tmp="$CONSOLE_STATE.tmp.$$"
   if [ -f "$CONSOLE_STATE" ]; then
-    grep -v "^$1=" "$CONSOLE_STATE" > "$CONSOLE_STATE.tmp" 2>/dev/null || : > "$CONSOLE_STATE.tmp"
+    grep -v "^$1=" "$CONSOLE_STATE" > "$_ct_tmp" 2>/dev/null || : > "$_ct_tmp"
   else
-    : > "$CONSOLE_STATE.tmp"
+    : > "$_ct_tmp"
   fi
-  printf '%s=%s\n' "$1" "$2" >> "$CONSOLE_STATE.tmp" 2>/dev/null || { rm -f "$CONSOLE_STATE.tmp"; return 1; }
-  chmod 600 "$CONSOLE_STATE.tmp" 2>/dev/null
-  mv -f "$CONSOLE_STATE.tmp" "$CONSOLE_STATE" 2>/dev/null
+  printf '%s=%s\n' "$1" "$2" >> "$_ct_tmp" 2>/dev/null || { rm -f "$_ct_tmp"; return 1; }
+  chmod 600 "$_ct_tmp" 2>/dev/null
+  mv -f "$_ct_tmp" "$CONSOLE_STATE" 2>/dev/null
 }
 
 _console_tun_ensure() {
@@ -7697,7 +8142,13 @@ _console_tun_ensure() {
     chmod 755 "$CONSOLE_INITD" 2>/dev/null
   fi
   "$CONSOLE_INITD" enable >/dev/null 2>&1
-  "$CONSOLE_INITD" start >/dev/null 2>&1
+  # The tunnel is a procd service: run the init script without the lock descriptor, or the
+  # daemon inherits it and holds the console lock until reboot.
+  if command -v gm_lock_safe_exec >/dev/null 2>&1; then
+    gm_lock_safe_exec "$CONSOLE_INITD" start >/dev/null 2>&1
+  else
+    "$CONSOLE_INITD" start >/dev/null 2>&1
+  fi
   _i=0
   while [ "$_i" -lt 10 ] && ! ip link show "$CONSOLE_TUN_DEV" >/dev/null 2>&1; do
     sleep 1; _i=$((_i+1))
@@ -7808,6 +8259,8 @@ _console_on_fail() { # _console_on_fail <step> <message>
     rm -f "$_orig" 2>/dev/null
   fi
   rm -f "$_cand" 2>/dev/null
+  # Every failure path ends here; none of them may return with the lane lock still held.
+  _console_unlock
   if [ "$_restored" = true ]; then
     printf '{"ok":false,"step":"%s","restored":true,"error":"%s - previous config restored"}\n' "$1" "$2"
   else
@@ -7910,6 +8363,16 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     _console_unlock
     printf '{"ok":false,"error":"cannot read the mihomo config"}\n'; return 1
   }
+  # The candidate is patched from THIS copy, so its digest is the base the transaction must
+  # still find live at commit time. Without it a concurrent mtrickle_sync/apply commit would
+  # be silently erased by a candidate built before it (report R06): the transaction refuses
+  # with "changed since read" instead.
+  _base_sha=$("$PYTHON_BIN" -B -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
+    "$_cand" 2>/dev/null)
+  [ -n "$_base_sha" ] || {
+    rm -f "$_cand"; _console_unlock
+    printf '{"ok":false,"error":"cannot fingerprint the mihomo config - live config untouched"}\n'; return 1
+  }
   if [ -n "$_url" ]; then
     _res=$(printf '%s\n' "$_url" | "$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --url - --countries "$_countries" 2>&1)
   else
@@ -7944,7 +8407,7 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   chmod 600 "$_orig" 2>/dev/null
   # The switch itself: preimage, mihomo -t, isolated trial, atomic write, reload and a rollback
   # if any of it fails. Nothing here changes the live file by hand.
-  _txout=$("$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" < "$_cand" 2>&1)
+  _txout=$("$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" --expect-sha256 "$_base_sha" < "$_cand" 2>&1)
   _txrc=$?
   if [ "$_txrc" != 0 ]; then
     _detail=$(printf '%s' "$_txout" | tail -1 | sed 's/["\\]//g' | cut -c1-300)
@@ -8319,42 +8782,28 @@ _gm_route_cleanup() { rm -f "$@" 2>/dev/null; }
 # One writer per table. The hotplug path and the panel can fire together (a reconnect while the
 # owner presses "apply"), and both read the owned file and then rewrite it: the slower one
 # erased the faster one's prefixes, and a prefix left in the table without an owner can never be
-# cleaned up again (review 15.11, #22). BusyBox has no flock everywhere, so the lock is a
-# directory with the owner pid inside. Waiting is bounded: a lock that stays busy means "do not
-# touch this table now", never "work without it".
+# cleaned up again (review 15.11, #22). The lock is the kernel lock of geomask-lock.sh - one
+# persistent inode, no PID, no reclaim; a killed sync is released by the kernel. Waiting is
+# bounded and hotplug sets GM_ROUTE_LOCK_WAIT=0: a busy table means "do not touch this table
+# now", never "work without it" and never a stalled ifup.
+GM_LOCK_LIB=${GM_LOCK_LIB:-/usr/lib/geomask/geomask-lock.sh}
+if ! command -v gm_lock_acquire >/dev/null 2>&1 && [ -r "$GM_LOCK_LIB" ]; then
+  . "$GM_LOCK_LIB"
+fi
 GM_ROUTE_LOCK_WAIT=${GM_ROUTE_LOCK_WAIT:-20}
 
 _gm_route_lock() { # _gm_route_lock <table> -> 0 only when this process owns the table
-  _gl="$GM_ROUTE_STATE_DIR/lock-$1"
-  _gt=0
-  while [ "$_gt" -lt "$GM_ROUTE_LOCK_WAIT" ]; do
-    if mkdir "$_gl" 2>/dev/null; then
-      if printf '%s\n' "$$" > "$_gl/pid" 2>/dev/null; then
-        return 0
-      fi
-      rm -rf "$_gl" 2>/dev/null     # cannot name the owner: do not keep a half lock
-      return 1
-    fi
-    _gt=$((_gt+1))
-    _go=''
-    [ -f "$_gl/pid" ] && _go=$(cat "$_gl/pid" 2>/dev/null)
-    if [ -z "$_go" ] && [ "$_gt" -eq 1 ]; then
-      # The owner may be between `mkdir` and writing its pid: look again before breaking it.
-      sleep 1
-    elif [ -n "$_go" ] && kill -0 "$_go" 2>/dev/null; then
-      sleep 1
-    else
-      rm -rf "$_gl" 2>/dev/null     # ownerless or dead owner: a killed sync
-    fi
-  done
-  return 1
+  command -v gm_lock_acquire >/dev/null 2>&1 || {
+    echo "geomask-routes: lock helper missing ($GM_LOCK_LIB) - refusing to touch table $1" >&2
+    return 1
+  }
+  gm_lock_acquire "route-$1" "$GM_ROUTE_LOCK_WAIT" || return 1
+  return 0
 }
 
-_gm_route_unlock() { # never release a lock another process owns
-  _gu="$GM_ROUTE_STATE_DIR/lock-$1"
-  _gp=$(cat "$_gu/pid" 2>/dev/null)
-  [ -z "$_gp" ] || [ "$_gp" = "$$" ] || return 0
-  rm -rf "$_gu" 2>/dev/null
+_gm_route_unlock() { # releases only our own kernel lock; nothing is deleted
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release "route-$1"
   return 0
 }
 
@@ -8467,6 +8916,281 @@ geomask_routes_sync() { # geomask_routes_sync <table> -> 0 only when the table i
   _gm_route_cleanup "$_main" "$_want" "$_new" "$_cur" "$_occ"
   _gm_route_unlock "$_rt"
   return "$_fail"
+}
+ASSET_EOF
+  # R04: the one lock helper (kernel flock on a persistent inode). Every writer sources it;
+  # the installer itself runs the very same functions from this script (injected below).
+  save_stream /usr/lib/geomask/geomask-lock.sh 644 <<'ASSET_EOF'
+# geomask-lock.sh - the ONE inter-process lock helper of geomask (R04).
+#
+# Contract
+#   * One persistent lock file per name. The file is opened, never deleted and never
+#     recreated while a lock is in use: the same inode is locked every time, so a lock
+#     released by one process is exactly the lock the next process takes.
+#   * The lock itself is kernel flock(2) on that file: BusyBox `flock` (the applet is part of
+#     the upstream OpenWrt 24.10 busybox config) and Python `fcntl.flock` on the same path
+#     (geomask-config-tx.py) are the same primitive, so shell and Python exclude each other.
+#   * No PID is stored, no owner is guessed, no stale lock is reclaimed. A holder that dies -
+#     including SIGKILL - has its lock released by the kernel when the last descriptor of
+#     that open file description is closed. There is therefore no ownerless window (nothing
+#     is created before the lock is held) and no unlock-after-takeover (the file is never
+#     removed, so a slow release cannot hand the lock to two writers).
+#   * Fixed lock order, enforced at run time: a process may only take locks with a strictly
+#     higher rank than every lock it already holds (gm_lock_rank). Downward nesting is
+#     refused with rc=4 instead of deadlocking. The order is:
+#       maintenance(10) -> console(20) -> cron(25) -> config-tx(30) -> route-<table>(40)
+#       -> sync(45) -> devices(60) -> subs(65)
+#   cron sits before config-tx because the uninstall (under maintenance) removes crontab lines
+#   and then asks the lane helper to rewrite the mihomo config; the reverse nesting never
+#   happens (the transaction and the lane manager never touch cron).
+#   * Waiting is bounded and explicit: `gm_lock_acquire <name> [seconds] [path]`. 0 means a
+#     single non-blocking attempt (hotplug, guard watchdog, single-instance entrypoints).
+#     BusyBox flock has no -w, so a bounded wait is `flock -n` plus sleep 1 up to the budget.
+#   * Critical sections stay short and contain no long-running external call. Commands that
+#     may leave a daemon behind (init scripts, services) MUST be run through
+#     gm_lock_safe_exec, which closes the reserved descriptors in the child: otherwise the
+#     daemon inherits the descriptor and keeps the lock after the writer has exited.
+#   * Fail-closed on the target: if `flock` cannot be found on Linux, every acquisition
+#     returns rc=2 and the caller must refuse to mutate. There is NO mkdir/O_EXCL fallback on
+#     Linux - that would bring back the reclaim race R04 is about.
+#
+# Non-Linux hosts (the Windows-hosted test suite) have neither flock(2) nor /proc. There the
+# helper uses an atomic O_EXCL file (noclobber) created once and removed only by its owner.
+# This backend exists so that caller logic can be exercised off-router; it is never selected
+# on Linux, it does not release on SIGKILL (documented Linux-only test gap) and it is not a
+# supported runtime.
+#
+# Environment (overridable for injected test roots only, never for skipping the lock):
+#   GM_LOCK_DIR      directory of the lock files (default /tmp/geomask-locks, mode 0700)
+#   GM_CONFIG_TX_LOCK  CANONICAL path of the config-transaction lock, shared with
+#                      geomask-config-tx.py, geomask-node-scan.sh and geomask-torrent.sh
+#   GM_LOCK_TX_FILE    legacy alias of GM_CONFIG_TX_LOCK (test roots only)
+#   GM_LOCK_FDS      reserved descriptors, highest first (default "9 8 7 6 5")
+
+GM_LOCK_DIR=${GM_LOCK_DIR:-/tmp/geomask-locks}
+GM_LOCK_TX_FILE=${GM_CONFIG_TX_LOCK:-${GM_LOCK_TX_FILE:-/etc/geomask/node-audit/state/.config-tx.lock}}
+GM_LOCK_FDS=${GM_LOCK_FDS:-9 8 7 6 5}
+GM_LOCK_MAX_RANK=${GM_LOCK_MAX_RANK:-0}
+GM_LOCK_STACK=${GM_LOCK_STACK:-}
+GM_LOCK_FDS_USED=${GM_LOCK_FDS_USED:-}
+
+# The rank table is the lock order. Unknown names get 90 so a new writer is the outermost -
+# an earlier rank could otherwise turn a lawful sequence into a refused one silently.
+gm_lock_rank() {
+  case "$1" in
+    maintenance) printf '10' ;;
+    console)     printf '20' ;;
+    config-tx)   printf '30' ;;
+    route-*)     printf '40' ;;
+    sync)        printf '45' ;;
+    cron)        printf '25' ;;
+    devices)     printf '60' ;;
+    subs)        printf '65' ;;
+    *)           printf '90' ;;
+  esac
+}
+
+# Echo the file a lock name uses. An explicit path wins (callers keep their historical
+# env-overridable path, e.g. GM_CONSOLE_LOCK, so an injected test root never touches /tmp).
+gm_lock_path() { # gm_lock_path <name> [explicit-path]
+  if [ -n "${2:-}" ]; then
+    printf '%s' "$2"
+  elif [ "$1" = config-tx ]; then
+    printf '%s' "$GM_LOCK_TX_FILE"
+  else
+    printf '%s/%s.lock' "$GM_LOCK_DIR" "$1"
+  fi
+}
+
+# flock | portable | missing. "missing" is a refusal on Linux (the caller must fail closed).
+gm_lock_backend() {
+  if command -v flock >/dev/null 2>&1; then
+    printf 'flock'
+    return 0
+  fi
+  case "$(uname -s 2>/dev/null)" in
+    Linux) printf 'missing' ;;
+    '')    printf 'missing' ;;
+    *)     printf 'portable' ;;
+  esac
+}
+
+_gm_lock_var() { # _gm_lock_var <prefix> <name> -> variable name, '-' and '/' become '_'
+  printf '%s_%s' "$1" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9' '_')"
+}
+
+_gm_lock_fd_of() { # echoes the descriptor held for <name>, empty when not held here
+  _gm_v=$(_gm_lock_var _GM_LOCK_FD "$1")
+  eval "printf '%s' \"\${$_gm_v:-}\""
+}
+
+_gm_lock_held() { # 0 when this shell holds <name>
+  [ -n "$(_gm_lock_fd_of "$1")" ]
+}
+
+_gm_lock_track() { # _gm_lock_track <name> <fd> <path>
+  eval "$(_gm_lock_var _GM_LOCK_FD "$1")='$2'"
+  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")='$3'"
+  GM_LOCK_FDS_USED="$GM_LOCK_FDS_USED $2"
+  GM_LOCK_STACK="$GM_LOCK_STACK $1"
+  _gm_r=$(gm_lock_rank "$1")
+  [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
+  return 0
+}
+
+_gm_lock_forget() { # _gm_lock_forget <name> <fd>
+  eval "$(_gm_lock_var _GM_LOCK_FD "$1")=''"
+  eval "$(_gm_lock_var _GM_LOCK_PATH "$1")=''"
+  _gm_used=''
+  for _gm_u in $GM_LOCK_FDS_USED; do
+    [ "$_gm_u" = "$2" ] || _gm_used="$_gm_used $_gm_u"
+  done
+  GM_LOCK_FDS_USED=$_gm_used
+  _gm_new=''
+  for _gm_s in $GM_LOCK_STACK; do
+    [ "$_gm_s" = "$1" ] || _gm_new="$_gm_new $_gm_s"
+  done
+  GM_LOCK_STACK=$_gm_new
+  GM_LOCK_MAX_RANK=0
+  for _gm_s in $GM_LOCK_STACK; do
+    _gm_r=$(gm_lock_rank "$_gm_s")
+    [ "$_gm_r" -gt "$GM_LOCK_MAX_RANK" ] && GM_LOCK_MAX_RANK=$_gm_r
+  done
+  return 0
+}
+
+_gm_lock_free_fd() { # echoes the first reserved descriptor not used by this shell
+  for _gm_c in $GM_LOCK_FDS; do
+    case " $GM_LOCK_FDS_USED " in
+      *" $_gm_c "*) continue ;;
+    esac
+    printf '%s' "$_gm_c"
+    return 0
+  done
+  return 1
+}
+
+# Acquire <name>. rc: 0 held, 1 busy/timeout, 2 primitive unavailable (fail closed),
+# 3 already held by this shell, 4 lock order violated. On 1/2/4 nothing is held.
+gm_lock_acquire() { # gm_lock_acquire <name> [wait-seconds] [path]
+  _gm_name=$1
+  _gm_wait=${2:-0}
+  # A non-numeric budget is a caller bug, not "wait forever": refuse it before the deadline
+  # comparison, otherwise `[ N -ge abc ]` errors and the retry loop never terminates.
+  case "$_gm_wait" in
+    ''|*[!0-9]*)
+      echo "geomask-lock: wait budget for '$_gm_name' must be a non-negative integer, got '$_gm_wait'" >&2
+      return 2 ;;
+  esac
+  [ "$_gm_wait" -gt 3600 ] && _gm_wait=3600
+  _gm_path=$(gm_lock_path "$_gm_name" "${3:-}")
+  _gm_rank=$(gm_lock_rank "$_gm_name")
+
+  if _gm_lock_held "$_gm_name"; then
+    echo "geomask-lock: '$GM_LOCK_STACK' already holds '$_gm_name' (re-entrant acquire refused)" >&2
+    return 3
+  fi
+  if [ "$GM_LOCK_MAX_RANK" -ge "$_gm_rank" ]; then
+    echo "geomask-lock: lock order violation: '$_gm_name' (rank $_gm_rank) requested while holding '$GM_LOCK_STACK' (max rank $GM_LOCK_MAX_RANK)" >&2
+    return 4
+  fi
+
+  _gm_backend=$(gm_lock_backend)
+  case "$_gm_backend" in
+    missing)
+      echo "geomask-lock: the flock primitive is missing on Linux ($_gm_name): refusing to mutate without a lock" >&2
+      return 2 ;;
+  esac
+
+  _gm_dir=$(dirname "$_gm_path")
+  ( umask 077; mkdir -p "$_gm_dir" ) 2>/dev/null || {
+    echo "geomask-lock: cannot create the lock directory $_gm_dir - refusing to lock $_gm_name" >&2
+    return 2
+  }
+  _gm_fd=$(_gm_lock_free_fd) || {
+    echo "geomask-lock: no free reserved descriptor for '$_gm_name' (GM_LOCK_FDS='$GM_LOCK_FDS')" >&2
+    return 2
+  }
+
+  _gm_try=0
+  while :; do
+    if [ "$_gm_backend" = portable ]; then
+      # noclobber create: the file appears exactly once, atomically. Never reclaimed.
+      if ( set -C; : > "$_gm_path" ) 2>/dev/null; then
+        _gm_lock_track "$_gm_name" "$_gm_fd" "$_gm_path"
+        return 0
+      fi
+    else
+      if eval "exec $_gm_fd>>\"\$_gm_path\"" 2>/dev/null; then
+        if flock -n "$_gm_fd" 2>/dev/null; then
+          _gm_lock_track "$_gm_name" "$_gm_fd" "$_gm_path"
+          return 0
+        fi
+        eval "exec $_gm_fd>&-"
+      else
+        echo "geomask-lock: cannot open the lock file $_gm_path - refusing to lock $_gm_name" >&2
+        return 2
+      fi
+    fi
+    if [ "$_gm_try" -ge "$_gm_wait" ]; then
+      return 1
+    fi
+    _gm_try=$((_gm_try+1))
+    sleep 1
+  done
+}
+
+gm_lock_release() { # gm_lock_release <name>
+  _gm_name=$1
+  _gm_fd=$(_gm_lock_fd_of "$_gm_name")
+  [ -n "$_gm_fd" ] || return 0
+  _gm_pv=$(_gm_lock_var _GM_LOCK_PATH "$_gm_name")
+  eval "_gm_path=\${$_gm_pv:-}"
+  if [ "$(gm_lock_backend)" = portable ]; then
+    [ -f "$_gm_path" ] && rm -f "$_gm_path" 2>/dev/null
+  else
+    flock -u "$_gm_fd" 2>/dev/null
+    eval "exec $_gm_fd>&-"
+  fi
+  _gm_lock_forget "$_gm_name" "$_gm_fd"
+  return 0
+}
+
+gm_lock_release_all() {
+  for _gm_name in $GM_LOCK_STACK; do
+    gm_lock_release "$_gm_name"
+  done
+}
+
+# Report whether another process holds <name>: 0 busy, 1 free, 2 primitive unavailable.
+gm_lock_busy() { # gm_lock_busy <name> [path]
+  _gm_name=$1
+  if gm_lock_acquire "$_gm_name" 0 "${2:-}"; then
+    gm_lock_release "$_gm_name"
+    return 1
+  else
+    _gm_rc=$?
+    [ "$_gm_rc" = 1 ] && return 0
+    return 2
+  fi
+}
+
+# Close the reserved descriptors in this process WITHOUT unlocking: flock lives on the open
+# file description, so another process (the updater runner) still holds the lock.
+gm_lock_close_inherited() {
+  for _gm_c in $GM_LOCK_FDS; do
+    eval "exec $_gm_c>&-" 2>/dev/null
+  done
+  GM_LOCK_FDS_USED=''
+  GM_LOCK_STACK=''
+  GM_LOCK_MAX_RANK=0
+  return 0
+}
+
+# Run a command (init script, service) so it does not inherit the lock descriptors. A daemon
+# spawned with them would keep the lock after the writer exits and block every later writer.
+gm_lock_safe_exec() {
+  ( gm_lock_close_inherited; "$@" )
 }
 ASSET_EOF
   save_stream /usr/lib/geomask/geomask-module-update.py 755 <<'ASSET_EOF'
@@ -13829,7 +14553,7 @@ ASSET_EOF
           "path": "/etc/hotplug.d/iface/99-default-vpn-route",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "32bf28c40935e80271a76eb9c0424ee470fdf37e3b9eb40174dacd0b8f5f5f3e"
+          "sha256": "2268c1fcdf91ddedb964cf9ddbf2c6a1e47c0da993987764e24813afa93f0f64"
         },
         {
           "path": "/etc/init.d/geomask-syncd",
@@ -13841,19 +14565,19 @@ ASSET_EOF
           "path": "/root/sync_mtrickle_mihomo.sh",
           "source": "assets/sync_mtrickle_mihomo.sh",
           "mode": "0755",
-          "sha256": "5ac6ec58fd32ed3b24b8949e16b577eedb2e48ab2cc54ea0d5f34695f356cb0b"
+          "sha256": "45c5715a89e9b3b598adc1378df87a4ac1c818b61971d754224d2426bf21ff4a"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
           "source": "assets/geomask-lane.sh",
           "mode": "0755",
-          "sha256": "4dfd552076ec30dfbb6c54fd45134401fd1a1a3e52dfe701ff02a71df8cdb471"
+          "sha256": "a7167abe51aa161e335d3e0520cf8217320fc6b8a6788a931901301a0e4053e0"
         },
         {
           "path": "/usr/bin/geomask-node-scan.sh",
           "source": "assets/geomask-node-scan.sh",
           "mode": "0755",
-          "sha256": "6e15ca7d85f9e4ff1c844c866ad08ae2a4d21874d2bc09c52a97839842f2a5b6"
+          "sha256": "082b368c808d18082e40b57723c25fd3c02a995cb55cdb467084fe3bc89f9ec2"
         },
         {
           "path": "/usr/bin/geomask-seed-lists.py",
@@ -13871,13 +14595,13 @@ ASSET_EOF
           "path": "/usr/lib/geomask/99-default-vpn-route.dist",
           "source": "assets/99-default-vpn-route",
           "mode": "0755",
-          "sha256": "32bf28c40935e80271a76eb9c0424ee470fdf37e3b9eb40174dacd0b8f5f5f3e"
+          "sha256": "2268c1fcdf91ddedb964cf9ddbf2c6a1e47c0da993987764e24813afa93f0f64"
         },
         {
           "path": "/usr/lib/geomask/geomask-apply.py",
           "source": "assets/geomask-apply.py",
           "mode": "0755",
-          "sha256": "532d02d66727b682ab35471e02bbbe56239f3e277c95da016a4cc2698a4bdec9"
+          "sha256": "1acad6d02e67af871ebf5061ae8ba22b1c1e2dc28e7dafc220b258fbdbaa12d1"
         },
         {
           "path": "/usr/lib/geomask/geomask-audit-scheduler.py",
@@ -13901,7 +14625,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-config-tx.py",
           "source": "assets/geomask-config-tx.py",
           "mode": "0755",
-          "sha256": "53e77fe83b65a9c824a66d239ddc4bb4213aef1427a384d650ea2ea820be6fcb"
+          "sha256": "d578ca354aed2adcc058a8b64f959fef5b88a4c3bc66422b71849810eeafcf9e"
         },
         {
           "path": "/usr/lib/geomask/geomask-console.py",
@@ -13931,13 +14655,19 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-lane-torrent.py",
           "source": "assets/geomask-lane-torrent.py",
           "mode": "0755",
-          "sha256": "f7ba7bfc412ae929a7a464b085ac405c62fb4e44043adf0a80a04354a6ee484a"
+          "sha256": "21a7b5ddb49fcc132c4d010e855d57160f3fe4867da2262fbdef202ff5c2fe7e"
         },
         {
           "path": "/usr/lib/geomask/geomask-lists-edit.py",
           "source": "assets/geomask-lists-edit.py",
           "mode": "0755",
           "sha256": "058aec0a08d350d590f09bc01379a0f6f87a2e8855ba7d1cafb8334f31696a62"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-lock.sh",
+          "source": "assets/geomask-lock.sh",
+          "mode": "0644",
+          "sha256": "eb72c61b78258c9cbedfe5e1992d04089310d86570e560bcaf7f2153508c3883"
         },
         {
           "path": "/usr/lib/geomask/geomask-node-audit.py",
@@ -13949,7 +14679,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "0963e09bb0a27476e3c055c8210202aaf0db47f1cb86e55d7b8aba27faf34b2d"
+          "sha256": "bba9e027b22ba2498342fa03352abb323c8545d606f7a63a971f9f3cebbbfb89"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",
@@ -13967,7 +14697,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-sync-youtube.py",
           "source": "assets/geomask-sync-youtube.py",
           "mode": "0755",
-          "sha256": "22b4a2e34ed05045e5304c11fb0e1a98f2c5346cbd58122f5fea1e4c040db6b2"
+          "sha256": "40bb9c6488640d09b453707c23b08370611585aa79538e45e6b3fded9d852467"
         }
       ]
     },
@@ -14049,7 +14779,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "4532108d7667e323103ba05d5ae00549a1ec50afd8957c4ebdb051c4f2a45df7"
+          "sha256": "ce81c3f3cf076a514c6e2e9a0328f1cdb7a27cf042821a59cad86984f1ea02ff"
         }
       ]
     },
@@ -14065,7 +14795,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "4c35df37d2f3558e87fcb83872802ae63a842d1434fa0b2f38febe56adad7610"
+          "sha256": "6caabd31b60918c86cbc8b4464e221504a981348d44f8f70b9fec9a9c7071b09"
         },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
@@ -14152,7 +14882,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-torrent.sh",
           "source": "assets/geomask-torrent.sh",
           "mode": "0755",
-          "sha256": "e9dab1c3d8d58896fcedfe4b54d0e73ee3e55bdf38a74943a4b019068cbf7d5f"
+          "sha256": "fdba7ae65803ff52d6f63e03115769dbc91cc915a29b2b5f26464aa868e73387"
         }
       ]
     },
@@ -16524,7 +17254,27 @@ step3_verify() { step3_check; }
 
 # write a fresh 2-provider mihomo config: write_mihomo_config <vpn_url> <ai_url>
 # validates with `mihomo -t`, keeps backup of the previous config; no restart here.
-write_mihomo_config() {
+write_mihomo_config() { # <vpn-url> <ai-url> - public entry: serialised live-config rewrite (R04)
+  # rpcd is reloaded in step2 and the panel can already commit through geomask-config-tx.py
+  # when step3 calls this: without the SAME kernel lock the installer's mv could land on top
+  # of a panel commit (lost update / mixed file) and the transaction CAS would be worthless.
+  # Rank config-tx(30) is above the installer's maintenance(10), so the fixed order holds.
+  if ! command -v gm_lock_acquire >/dev/null 2>&1; then
+    bad "lock helper missing - refusing to rewrite the mihomo config"
+    return 1
+  fi
+  if ! gm_lock_acquire config-tx 30; then
+    bad "mihomo config is busy (config transaction lock) - reinstall aborted, nothing changed"
+    return 1
+  fi
+  _wmc_rc=0
+  _write_mihomo_config_unlocked "$@" || _wmc_rc=$?
+  gm_lock_release config-tx
+  return $_wmc_rc
+}
+
+_write_mihomo_config_unlocked() { # the actual writer; called only under config-tx
+  _wpid=$$
   _c="$(P $MIHOMO_CONF)"
   _vpnu="$1"; _aiu="$2"
   # The rollback source must be the file as it was BEFORE this run touched it. The old code
@@ -16566,9 +17316,9 @@ write_mihomo_config() {
         sect=="proxy-providers" && /^  de5:[[:space:]]*$/ {d=1; next}
         d && /^  [A-Za-z0-9_-]+:/ {d=0}
         d && /^[A-Za-z]/ {d=0}
-        !d {print}' "$_c" > "$_c.de5rm" \
-        && mihomo_validate "$_c.de5rm" && mv -f "$_c.de5rm" "$_c" && rm -f "$_c.de5rm" \
-        && info "retired de5 provider removed from config" || { rm -f "$_c.de5rm"; warn "de5 removal skipped (validation)"; }
+        !d {print}' "$_c" > "$_c.de5rm.$_wpid" \
+        && mihomo_validate "$_c.de5rm.$_wpid" && mv -f "$_c.de5rm.$_wpid" "$_c" && rm -f "$_c.de5rm.$_wpid" \
+        && info "retired de5 provider removed from config" || { rm -f "$_c.de5rm.$_wpid"; warn "de5 removal skipped (validation)"; }
     fi
     _curv=$(_prov_url "$_c" sub)
     if [ -n "${_vpnu:-}" ] && [ "$_vpnu" != "$_curv" ]; then
@@ -16583,21 +17333,21 @@ write_mihomo_config() {
         }
         f && /^    url:/ {print "    url: \"" nu "\""; done=1; f=0; next}
         {print}
-        END{exit done?0:1}' "$_c" > "$_c.urlnew"; then
-        rm -f "$_c.urlnew"; bad "provider url patch failed - точечное обновление невозможно, нужен --replace-config"; return 1
+        END{exit done?0:1}' "$_c" > "$_c.urlnew.$_wpid"; then
+        rm -f "$_c.urlnew.$_wpid"; bad "provider url patch failed - точечное обновление невозможно, нужен --replace-config"; return 1
       fi
-      mihomo_validate "$_c.urlnew" && mv -f "$_c.urlnew" "$_c" || { rm -f "$_c.urlnew"; bad "mihomo -t failed - config kept"; return 1; }
+      mihomo_validate "$_c.urlnew.$_wpid" && mv -f "$_c.urlnew.$_wpid" "$_c" || { rm -f "$_c.urlnew.$_wpid"; bad "mihomo -t failed - config kept"; return 1; }
       info "provider url updated in place (sub)"
     fi
     if ! grep -q 'ai-devices' "$_c"; then
       cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
       awk -v L="$_lanip" 'BEGIN{d=0}
         /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: " L;print "";d=1}
-        {print}' "$_c" > "$_c.zmnew" || return 1
-      if mihomo_validate "$_c.zmnew"; then
-        mv -f "$_c.zmnew" "$_c"; info "listeners block added to existing config (custom rules preserved)"
+        {print}' "$_c" > "$_c.zmnew.$_wpid" || return 1
+      if mihomo_validate "$_c.zmnew.$_wpid"; then
+        mv -f "$_c.zmnew.$_wpid" "$_c"; info "listeners block added to existing config (custom rules preserved)"
       else
-        rm -f "$_c.zmnew"; bad "mihomo -t failed after adding listeners - config kept"; return 1
+        rm -f "$_c.zmnew.$_wpid"; bad "mihomo -t failed after adding listeners - config kept"; return 1
       fi
     else
       # v1.14.4: config already had listeners - make sure the torrent DIRECT one exists
@@ -16605,11 +17355,11 @@ write_mihomo_config() {
         cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
         awk -v L="$_lanip" 'BEGIN{d=0} {print} (!d && $0 ~ /^    proxy: AI$/) {
               print "  - name: torrent-direct"; print "    type: mixed"; print "    port: 7894";
-              print "    listen: " L; d=1 }' "$_c" > "$_c.tdnew" || return 1
-        if mihomo_validate "$_c.tdnew"; then
-          mv -f "$_c.tdnew" "$_c"; info "torrent-direct listener added (listeners already present)"
+              print "    listen: " L; d=1 }' "$_c" > "$_c.tdnew.$_wpid" || return 1
+        if mihomo_validate "$_c.tdnew.$_wpid"; then
+          mv -f "$_c.tdnew.$_wpid" "$_c"; info "torrent-direct listener added (listeners already present)"
         else
-          rm -f "$_c.tdnew"; bad "mihomo -t failed after adding torrent-direct - config kept"; return 1
+          rm -f "$_c.tdnew.$_wpid"; bad "mihomo -t failed after adding torrent-direct - config kept"; return 1
         fi
       else
         info "existing 2-subscription config kept as-is (ai-devices + torrent-direct present)"
@@ -16623,11 +17373,11 @@ write_mihomo_config() {
       ''|*127.0.0.1*|*localhost*) ;;
       *)
         cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
-        if sed 's|^external-controller:.*|external-controller: 127.0.0.1:9090|' "$_c" > "$_c.ecnew" \
-           && mihomo_validate "$_c.ecnew" && mv -f "$_c.ecnew" "$_c"; then
+        if sed 's|^external-controller:.*|external-controller: 127.0.0.1:9090|' "$_c" > "$_c.ecnew.$_wpid" \
+           && mihomo_validate "$_c.ecnew.$_wpid" && mv -f "$_c.ecnew.$_wpid" "$_c"; then
           info "external-controller moved to 127.0.0.1:9090 (LAN devices could switch nodes)"
         else
-          rm -f "$_c.ecnew"; warn "external-controller not changed (validation) - check it manually"
+          rm -f "$_c.ecnew.$_wpid"; warn "external-controller not changed (validation) - check it manually"
         fi
         ;;
     esac
@@ -16645,7 +17395,7 @@ write_mihomo_config() {
   fi
   if [ -s "$_c" ]; then warn "полная замена конфига mihomo по --replace-config (прежний файл в бэкапе)"; fi
   _hwid=$(grep -A1 'x-hwid' "$_c" 2>/dev/null | sed -n 's/^[[:space:]]*-[[:space:]]*"\(.*\)"/\1/p' | head -1)
-  _tmpconf="$_c.zmnew"
+  _tmpconf="$_c.zmnew.$_wpid"
   {
     printf '%s\n' '# geomask-managed: 1'
     printf '%s\n' 'mixed-port: 7890'
@@ -17171,6 +17921,25 @@ mihomo_restart_verified() {
   return 0
 }
 
+# Restore the pre-run config bytes under the transaction lock. safe_mihomo_restart runs in
+# step3 AFTER write_mihomo_config released the lock and rpcd is live, so a bare `cp` could land
+# on a newer panel commit. Fail closed when the lock cannot be taken: a refused rollback is
+# reported, not silently written unlocked.
+_mihomo_restore_preimage() { # <preimage> <live>
+  if ! command -v gm_lock_acquire >/dev/null 2>&1; then
+    bad "lock helper missing - refusing to restore the mihomo preimage"
+    return 1
+  fi
+  if ! gm_lock_acquire config-tx 30; then
+    bad "config transaction lock is busy - refusing to restore the mihomo preimage unlocked"
+    return 1
+  fi
+  _mrp_rc=0
+  cp -p "$1" "$2" 2>/dev/null || _mrp_rc=1
+  gm_lock_release config-tx
+  return $_mrp_rc
+}
+
 # full safe mihomo restart: backup -> trial -> restart -> verify -> rollback on failure
 safe_mihomo_restart() {
   _c="$(P $MIHOMO_CONF)"
@@ -17189,7 +17958,11 @@ safe_mihomo_restart() {
     # the candidate is already on disk at this point: leaving it there means the next
     # restart picks up a config that does not start. Put the pre-run file back.
     if [ -n "$_pre" ] && [ -s "$_pre" ]; then
-      cp -p "$_pre" "$_c" && info "прежний конфиг возвращён ($_pre)"
+      if _mihomo_restore_preimage "$_pre" "$_c"; then
+        info "прежний конфиг возвращён ($_pre)"
+      else
+        warn "прежний конфиг НЕ возвращён (lock/копия) - проверьте $_c вручную"
+      fi
     else
       warn "копии прежнего конфига нет - проверьте $_c вручную"
     fi
@@ -17202,7 +17975,10 @@ safe_mihomo_restart() {
   fi
   bad "restart FAILED - rolling back config and re-starting"
   if [ -n "$_pre" ] && [ -s "$_pre" ]; then
-    cp -p "$_pre" "$_c"
+    if ! _mihomo_restore_preimage "$_pre" "$_c"; then
+      bad "config rollback could not be serialised (busy lock or copy failure) - mihomo NOT restarted on a possibly failed candidate; RESTORE FROM BACKUP: $_bk"
+      return 1
+    fi
     /etc/init.d/mihomo restart >/dev/null 2>&1
     sleep 3
     if svc_alive mihomo && controller_curl -s -m3 "http://127.0.0.1:9090/version" 2>/dev/null | grep -qi 'mihomo\|meta'; then
@@ -34728,7 +35504,9 @@ def write_if_changed(path, payload):
     if old == body:
         return False, len(payload)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + '.tmp'
+    # Per-process temp: cron, syncd and the panel can run sync at the same time, and a shared
+    # `<file>.tmp` let one writer install bytes another was still producing (report R11).
+    tmp = path + '.tmp.%d' % os.getpid()
     open(tmp, 'w').write(body)
     os.replace(tmp, path)
     return True, len(payload)
@@ -34825,9 +35603,10 @@ def _zapret_sync():
     if new == old:
         print('zapret exclude: up-to-date (%d tunneled domains)' % len(tunnel)); return False
     try:
-        with open(ZEXCL + '.tmp', 'w', encoding='utf-8', newline='\n') as f:
+        _ztmp = ZEXCL + '.tmp.%d' % os.getpid()
+        with open(_ztmp, 'w', encoding='utf-8', newline='\n') as f:
             f.write('\n'.join(new) + '\n')
-        os.replace(ZEXCL + '.tmp', ZEXCL)
+        os.replace(_ztmp, ZEXCL)
         print('zapret exclude: wrote %d tunneled domains (reload needed)' % len(tunnel))
         return True
     except Exception as e:
@@ -34878,9 +35657,10 @@ def _zapret_force_sync():
     if not moved and not restored:
         print('zapret force: up-to-date'); return
     try:
-        with open(ZFORCE + '.tmp', 'w', encoding='utf-8', newline='\n') as f:
+        _zf_tmp = ZFORCE + '.tmp.%d' % os.getpid()
+        with open(_zf_tmp, 'w', encoding='utf-8', newline='\n') as f:
             f.write('\n'.join(out) + '\n')
-        os.replace(ZFORCE + '.tmp', ZFORCE)
+        os.replace(_zf_tmp, ZFORCE)
         print('zapret force: %d out of DPI, %d restored (reload needed)' % (moved, restored))
     except Exception as e:
         print('zapret force: write failed (%s)' % e)
@@ -34914,9 +35694,10 @@ if c1 or c2 or c3 or c4:
 try:
     _st = {'ts': time.strftime('%F %T'), 'mt': n1, 'ai': n2, 'moved': moved,
            'changed': bool(c1 or c2), 'reload': _r_ok if (c1 or c2) else None}
-    with open('/tmp/geomask-sync.state.tmp', 'w') as f:
+    _s_tmp = '/tmp/geomask-sync.state.tmp.%d' % os.getpid()
+    with open(_s_tmp, 'w') as f:
         json.dump(_st, f)
-    os.replace('/tmp/geomask-sync.state.tmp', '/tmp/geomask-sync.state')
+    os.replace(_s_tmp, '/tmp/geomask-sync.state')
 except Exception:
     pass
 if c1 or c2:
@@ -35340,7 +36121,42 @@ ASSET_EOF
 # Everything it writes is validated with `mihomo -t` and rolled back on failure; reload goes
 # through the local controller API with the bearer token, never via argv.
 exec python3 - "$@" <<'PYEOF'
-import json, os, re, subprocess, sys, time, urllib.request
+import contextlib, json, os, re, subprocess, sys, time, urllib.request
+
+# The config transaction (geomask-config-tx.py) and this script write the same file. The lock
+# is the transaction's own lock file - the same kernel flock(2) the Python transaction and the
+# shell helper (geomask-lock.sh, rank config-tx) use, so no writer can interleave a commit
+# between our read and our write. The file is never deleted or recreated.
+TXLOCK=os.environ.get('GM_CONFIG_TX_LOCK','/etc/geomask/node-audit/state/.config-tx.lock')
+
+@contextlib.contextmanager
+def tx_lock():
+    try:
+        import fcntl
+    except ImportError:
+        if sys.platform.startswith('linux'):
+            sys.exit('geomask-torrent: the fcntl/flock primitive is missing - refusing to write the live config')
+        yield
+        return
+    os.makedirs(os.path.dirname(TXLOCK), exist_ok=True)
+    fd=os.open(TXLOCK, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        # Bounded wait like the Python transaction (30s) and the lane helper (15s): a blocking
+        # LOCK_EX could hang the panel call forever on a stuck/malicious holder (review round 2).
+        deadline=time.monotonic()+30.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic()>=deadline:
+                    sys.exit('geomask-torrent: the config transaction lock is busy for 30s - retry later')
+                time.sleep(0.1)
+        yield
+    finally:
+        try: fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError: pass
+        os.close(fd)
 
 CFG='/etc/mihomo/config.yaml'
 RS='/etc/mihomo/ruleset/torrentdirect.yaml'
@@ -35559,13 +36375,28 @@ def set_listener(on):
         lines=out
     return _commit_listener(t, ''.join(lines), 'enabled' if on else 'disabled')
 
+def _put(data):
+    """Atomic replace of the live config (a crash cannot leave a truncated file)."""
+    tmp=CFG+'.tmp.torrent.%d' % os.getpid()
+    open(tmp,'w',encoding='utf-8',newline='').write(data)
+    os.replace(tmp,CFG)
+
 def _commit_listener(old, new, why):
     if new==old: return False
-    bak=CFG+'.bak_torrent'; open(bak,'w',encoding='utf-8',newline='').write(old)
-    open(CFG,'w',encoding='utf-8',newline='').write(new)
-    if not validate():
-        open(CFG,'w',encoding='utf-8',newline='').write(old)
-        log('listener change rejected by mihomo -t, config restored'); return False
+    # Read-modify-write under the transaction lock, with a compare-and-swap: `old` is what the
+    # patch was derived from. A concurrent console/panel commit is refused, never overwritten.
+    with tx_lock():
+        if read(CFG)!=old:
+            log('listener change refused: config changed since it was read (another writer won)')
+            return False
+        bak=CFG+'.bak_torrent.%d' % os.getpid()
+        open(bak,'w',encoding='utf-8',newline='').write(old)
+        _put(new)
+        if not validate():
+            _put(old)
+            log('listener change rejected by mihomo -t, config restored'); return False
+        try: os.remove(bak)
+        except OSError: pass
     api('PUT','/configs?force=true', {'path': CFG})
     log('listener %s' % why)
     return True
@@ -35860,6 +36691,23 @@ LAN_DEV=$(uci -q get network.lan.device 2>/dev/null)
 
 die() { echo "lane: $*" >&2; exit 1; }
 
+# The mihomo config is written here by hand only after validation, but it is the same file the
+# config transaction owns. The lock is the transaction's own lock file (geomask-lock.sh rank
+# config-tx, the same kernel flock(2)), so a panel commit cannot interleave between our read and
+# our write. A killed lane run releases the lock in the kernel; nothing is deleted.
+GM_LOCK_LIB=${GM_LOCK_LIB:-/usr/lib/geomask/geomask-lock.sh}
+if ! command -v gm_lock_acquire >/dev/null 2>&1 && [ -r "$GM_LOCK_LIB" ]; then
+  . "$GM_LOCK_LIB"
+fi
+_cfg_lock() {
+  command -v gm_lock_acquire >/dev/null 2>&1 || die "lock helper missing ($GM_LOCK_LIB)"
+  gm_lock_acquire config-tx 15 || die "mihomo config is busy (another transaction holds the lock) - retry"
+}
+_cfg_unlock() {
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release config-tx
+  return 0
+}
+
 # _provision_netfw - give the tun a uci interface + firewall zone + lan forwarding.
 # Without this, fw4 treats the tun as "no zone" and REJECTs (tcp-reset) every MagiTrickle
 # flow routed to it, so every group assigned to this lane silently fails. This is exactly
@@ -35990,6 +36838,7 @@ INITend
   if grep -q "name: $LNAME" "$CFG"; then
     echo "  listener already present"
   else
+    _cfg_lock
     cp -p "$CFG" "$CFG.bak_lane"
     python3 - "$CFG" "$LNAME" "$LANE_PORT" "$LANE_GROUP" <<'PY'
 import re, sys
@@ -36009,8 +36858,9 @@ open(p, 'w', encoding='utf-8', newline='').write(new)
 print('  listener %s:%s -> proxy %s added' % (name, port, grp))
 PY
     if ! /usr/bin/mihomo -t -d /etc/mihomo >/dev/null 2>&1; then
-      cp -p "$CFG.bak_lane" "$CFG"; die "mihomo -t failed after adding the listener - config restored"
+      cp -p "$CFG.bak_lane" "$CFG"; _cfg_unlock; die "mihomo -t failed after adding the listener - config restored"
     fi
+    _cfg_unlock
     SECRET=$(grep -m1 -oE '^secret:[[:space:]]*["'\'']?[^"'\''[:space:]]+' "$CFG" | sed -E 's/^secret:[[:space:]]*["'\'']?//')
     curl -s -o /dev/null -X PUT "http://127.0.0.1:9090/configs?force=true" \
       -H "Authorization: Bearer $SECRET" -H 'Content-Type: application/json' \
@@ -36027,6 +36877,7 @@ remove() {
   "$INITD" stop >/dev/null 2>&1; "$INITD" disable >/dev/null 2>&1
   rm -f "$INITD" "$YML"
   if grep -q "name: $LNAME" "$CFG" 2>/dev/null; then
+    _cfg_lock
     cp -p "$CFG" "$CFG.bak_lane"
     python3 - "$CFG" "$LNAME" <<'PY'
 import re, sys
@@ -36036,7 +36887,8 @@ new = re.sub(r'(?m)^  - name: %s\n(?:[ ]{4}.*\n)+' % re.escape(name), '', t)
 open(p, 'w', encoding='utf-8', newline='').write(new)
 print('  listener removed' if new != t else '  nothing to remove')
 PY
-    /usr/bin/mihomo -t -d /etc/mihomo >/dev/null 2>&1 || { cp -p "$CFG.bak_lane" "$CFG"; die "config invalid after removing the listener - restored"; }
+    /usr/bin/mihomo -t -d /etc/mihomo >/dev/null 2>&1 || { cp -p "$CFG.bak_lane" "$CFG"; _cfg_unlock; die "config invalid after removing the listener - restored"; }
+    _cfg_unlock
     SECRET=$(grep -m1 -oE '^secret:[[:space:]]*["'\'']?[^"'\''[:space:]]+' "$CFG" | sed -E 's/^secret:[[:space:]]*["'\'']?//')
     curl -s -o /dev/null -X PUT "http://127.0.0.1:9090/configs?force=true" \
       -H "Authorization: Bearer $SECRET" -H 'Content-Type: application/json' -d "{\"path\":\"$CFG\"}"
@@ -36429,6 +37281,10 @@ sync_table() { # sync_table <table> - mirror LAN connected routes, drop only our
     command -v logger >/dev/null 2>&1 && logger -t geomask "route sync skipped: $_rl missing"
     return 1
   fi
+  # R05: this runs inside netifd's ifup. The route lock is try-lock only here: a table that
+  # is busy (panel apply, another ifup) is left to its owner and reported, never waited for.
+  GM_ROUTE_LOCK_WAIT=0
+  export GM_ROUTE_LOCK_WAIT
   . "$_rl"
   geomask_routes_sync "$1"
 }
@@ -36557,6 +37413,10 @@ sync_table() { # sync_table <table> - mirror LAN connected routes, drop only our
     command -v logger >/dev/null 2>&1 && logger -t geomask "route sync skipped: $_rl missing"
     return 1
   fi
+  # R05: this runs inside netifd's ifup. The route lock is try-lock only here: a table that
+  # is busy (panel apply, another ifup) is left to its owner and reported, never waited for.
+  GM_ROUTE_LOCK_WAIT=0
+  export GM_ROUTE_LOCK_WAIT
   . "$_rl"
   geomask_routes_sync "$1"
 }
@@ -36850,11 +37710,19 @@ fi
 # The kill switch and this block must not interleave: `off` writes enabled=0 and removes the
 # rule, so a watchdog that had read the state BEFORE that would put the rule straight back
 # after the owner switched the lane off. The state is therefore re-read INSIDE the same lock
-# that `on`/`off` hold for their whole operation. BusyBox has no flock everywhere, so the lock
-# is a directory with the owner pid inside; a stale lock (owner gone) is broken once, and a
-# lock that stays busy means "skip this run", never "work without it".
+# that `on`/`off` hold for their whole operation. The lock is the kernel flock of
+# geomask-lock.sh: a killed holder is released by the kernel, the file is never deleted and
+# there is no PID to guess. A busy lane means "skip this run", never "work without it".
 CS=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
-CLOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
+CLOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-locks/console.lock}
+# The kill switch and this block hold the same kernel lock (geomask-lock.sh, console rank).
+# The watchdog is a cron/hotplug background run: it takes the lock with a single non-blocking
+# attempt and skips the run when the lane is busy - it never waits, never reclaims a lock and
+# never deletes the lock file (a killed holder is released by the kernel).
+GM_LOCK_LIB=${GM_LOCK_LIB:-/usr/lib/geomask/geomask-lock.sh}
+if ! command -v gm_lock_acquire >/dev/null 2>&1 && [ -r "$GM_LOCK_LIB" ]; then
+  . "$GM_LOCK_LIB"
+fi
 # Table 102 is the only path the console device has, so both halves of it are watched: the LAN
 # prefixes (mirrored through the same helper as table 101) and a default that really points at
 # our tunnel. `grep '^default'` accepted the WAN default netifd restores for every table, so a
@@ -36862,29 +37730,9 @@ CLOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
 CTUN=${GM_CONSOLE_TUN:-Console}
 CTBL=${GM_CONSOLE_TABLE:-102}
 CROUTES=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
-console_lock() {
-  _ct=0
-  while [ "$_ct" -lt 10 ]; do
-    if mkdir "$CLOCK" 2>/dev/null; then
-      if printf '%s\n' "$$" > "$CLOCK/pid" 2>/dev/null; then
-        return 0
-      fi
-      rm -rf "$CLOCK" 2>/dev/null
-      return 1
-    fi
-    _ct=$((_ct+1))
-    _cop=''
-    [ -f "$CLOCK/pid" ] && _cop=$(cat "$CLOCK/pid" 2>/dev/null)
-    if [ -z "$_cop" ] && [ "$_ct" -eq 1 ]; then
-      # The owner may be between `mkdir` and writing its pid: look again before breaking it.
-      sleep 1
-    elif [ -n "$_cop" ] && kill -0 "$_cop" 2>/dev/null; then
-      sleep 1
-    else
-      rm -rf "$CLOCK" 2>/dev/null
-    fi
-  done
-  return 1
+console_lock() { # 0 only with the kernel lock held; busy or no primitive = skip, never forced
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire console 0 "$CLOCK"
 }
 if console_lock; then
   if [ -f "$CS" ] && [ "$(sed -n 's/^enabled=//p' "$CS" 2>/dev/null | head -1)" = 1 ]; then
@@ -36892,9 +37740,13 @@ if console_lock; then
     if [ -n "$CIP" ]; then
       # The table first: the rule below sends the console into it, and a table without the LAN
       # prefixes hides the local network from the console. Sourced in a subshell so the shared
-      # helper cannot leak its variables into this script.
+      # helper cannot leak its variables into this script. The route lock is a TRY-LOCK here:
+      # this block already holds `console`, and waiting up to 20 s for `route-102` would make
+      # `console off` fail for that whole window. A busy table is skipped and reported; the next
+      # guard run (5 min) retries. No-wait in the subshell, without changing the default for
+      # every other caller.
       if [ -r "$CROUTES" ]; then
-        ( . "$CROUTES" && geomask_routes_sync "$CTBL" ) >/dev/null 2>&1 \
+        ( GM_ROUTE_LOCK_WAIT=0; . "$CROUTES" && geomask_routes_sync "$CTBL" ) >/dev/null 2>&1 \
           || log "WARN console table $CTBL not synced"
       else
         log "WARN console routes helper missing ($CROUTES)"
@@ -36920,12 +37772,9 @@ if console_lock; then
       fi
     fi
   fi
-  _cup=$(cat "$CLOCK/pid" 2>/dev/null)
-  if [ -z "$_cup" ] || [ "$_cup" = "$$" ]; then
-    rm -rf "$CLOCK" 2>/dev/null
-  fi
+  gm_lock_release console
 else
-  log "SKIP console watchdog: lane lock is busy"
+  log "SKIP console watchdog: lane lock is busy or the lock primitive is unavailable"
 fi
 
 # ---------- (D) AI-DNS self-heal ----------
@@ -36954,7 +37803,9 @@ ASSET_EOF
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     info "cron already present"
   else
+    _cron_begin
     ( crontab -l 2>/dev/null; echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' ) | crontab - 2>/dev/null && info "cron added: */5 sync" || warn "cannot set crontab"
+    _cron_end
   fi
   # v1.11.0: nightly node audit (registry check of every subscription server)
   save_stream /usr/bin/geomask-node-scan.sh 755 <<'ASSET_EOF'
@@ -36990,9 +37841,44 @@ def log(msg, lv='INFO'):
     except Exception: pass
 
 # The managed transaction (geomask-config-tx.py) owns the same config file. This scan
-# reads the file, spends minutes probing, then writes: without a check it would install
-# a candidate built on a file that no longer exists and silently undo a committed apply.
-TX_LOCK=_E.get('GM_CONFIG_TX_LOCK','/etc/geomask/.config-tx.lock')
+# reads the file, spends minutes probing, then writes: without the SAME lock the digest check
+# is not atomic with a transaction commit and the scan silently undoes a committed apply.
+# R04: the path must be the transaction's own lock file - the old /etc/geomask/.config-tx.lock
+# was a different inode, so the two writers never met. GM_CONFIG_TX_LOCK only redirects the
+# path for injected test roots; it cannot disable the lock.
+TX_LOCK=_E.get('GM_CONFIG_TX_LOCK','/etc/geomask/node-audit/state/.config-tx.lock')
+# Per-process temp/backup names: two scans (cron 03:30 and the panel's background run) used to
+# share CFG.tmp, so one could install bytes the other was still writing (report R04).
+_PID=os.getpid()
+TMP_CFG=CFG+'.tmp.%d' % _PID
+
+def save_backup(kind, text):
+    """Keep ONE backup per kind under a fixed name, replaced atomically.
+
+    The first R04 version used CFG.bak_<kind>.<pid>: every daily and every panel scan left a
+    file behind in /etc/mihomo, i.e. unbounded overlay growth (review round 2). A fixed name
+    with an atomic replace keeps exactly one file and still never exposes a half-written one.
+    """
+    target = CFG + '.bak_' + kind
+    tmp = target + '.tmp.%d' % _PID
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(tmp, target)
+        return True
+    except Exception as e:
+        # A backup that could not be written (ENOSPC, chmod) must be visible, not swallowed:
+        # the write below still proceeds, but the operator has to learn that the pre-change
+        # bytes are not on disk.
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        try:
+            log('backup %s NOT saved: %s' % (target, e), 'WARN')
+        except Exception:
+            pass
+        return False
 # Provider ids created by the node-audit coordinator. Its groups are not ours to edit.
 MANAGED_PREFIX='audit-'
 
@@ -37018,16 +37904,28 @@ def install_config_candidate(candidate_path, expected_live):
     @contextlib.contextmanager
     def held():
         if fcntl is None:
+            # Fail closed on the target: a weaker fallback (or no lock) is exactly the R04
+            # defect. Non-Linux is the Windows-hosted test host, where flock(2) does not exist.
+            if sys.platform.startswith('linux'):
+                raise ConfigWriteRefused(
+                    'the fcntl/flock primitive is missing: refusing to replace the live config unlocked')
             yield
             return
         try:
             os.makedirs(os.path.dirname(TX_LOCK), exist_ok=True)
-            fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
-        except OSError:
-            yield
-            return
+            fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        except OSError as exc:
+            raise ConfigWriteRefused('cannot open the transaction lock %s: %s' % (TX_LOCK, exc))
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise ConfigWriteRefused('the config transaction lock is busy for 30s')
+                    time.sleep(0.1)
             yield
         finally:
             try: fcntl.flock(fd, fcntl.LOCK_UN)
@@ -37171,18 +38069,18 @@ if '--ai-guard' in _argv:
     if nb==blk:
         log('ai-guard: AI exclude-filter already up to date', 'OK'); sys.exit(0)
     out=text[:mb.start()]+nb+text[mb.end():]
-    open(CFG+'.bak_aiguard','w',encoding='utf-8').write(text)
-    open(CFG+'.tmp','w',encoding='utf-8').write(out)
-    try: rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',CFG+'.tmp','-t'],capture_output=True,timeout=30).returncode
+    save_backup('aiguard', text)
+    open(TMP_CFG,'w',encoding='utf-8').write(out)
+    try: rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',TMP_CFG,'-t'],capture_output=True,timeout=30).returncode
     except Exception: rc=1
     if rc!=0:
-        try: os.remove(CFG+'.tmp')
+        try: os.remove(TMP_CFG)
         except Exception: pass
         log('ai-guard: VALIDATION FAILED, config untouched (rc=%d)'%rc, 'ERR'); sys.exit(1)
     try:
-        install_config_candidate(CFG+'.tmp', text)
+        install_config_candidate(TMP_CFG, text)
     except ConfigWriteRefused as e:
-        try: os.remove(CFG+'.tmp')
+        try: os.remove(TMP_CFG)
         except Exception: pass
         log('ai-guard: not applying - %s' % e, 'WARN')
         sys.exit(4)
@@ -37472,17 +38370,17 @@ if not changed:
           % (total, len(blocked), errs)); sys.exit(0)
 applied=False
 if changed:
-    open(CFG+'.bak_nodescan','w',encoding='utf-8').write(text)
-    open(CFG+'.tmp','w',encoding='utf-8').write(out)
+    save_backup('nodescan', text)
+    open(TMP_CFG,'w',encoding='utf-8').write(out)
     try:
-        rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',CFG+'.tmp','-t'], capture_output=True, timeout=30).returncode
+        rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',TMP_CFG,'-t'], capture_output=True, timeout=30).returncode
     except Exception:
         rc=1
     if rc==0:
         try:
-            install_config_candidate(CFG+'.tmp', text)
+            install_config_candidate(TMP_CFG, text)
         except ConfigWriteRefused as e:
-            try: os.remove(CFG+'.tmp')
+            try: os.remove(TMP_CFG)
             except Exception: pass
             log('not applying - %s' % e, 'WARN')
             print('nodes=%d blocked=%d errors=%d applied=False (config changed during the scan)'
@@ -37501,7 +38399,7 @@ if changed:
         log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs), 'OK')
         applied=True
     else:
-        try: os.remove(CFG+'.tmp')
+        try: os.remove(TMP_CFG)
         except Exception: pass
         log('VALIDATION FAILED - config untouched (test rc=%d)' % rc, 'ERR')
 else:
@@ -37614,7 +38512,9 @@ PYEOF
   elif [ "$(nodescan_schedule_active)" = "1" ]; then
     info "per-path scheduler is active: not adding the legacy nodescan cron"
   else
+    _cron_begin
     ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
+    _cron_end
   fi
   # v1.14.0: YouTube edge watchdog - failing *.googlevideo.com edges get pinned to VPN,
   # released back to zapret nightly. Source of truth stays in MagiTrickle (group feeds ytvpn.yaml).
@@ -38129,8 +39029,10 @@ PYEOF
   # v1.29.0: the migration only runs for a selected module, and cron_ensure owns creation.
   if module_selected youtube \
      && crontab -l 2>/dev/null | grep -qE '^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch\.sh.*# geomask-ytwatch$'; then
+    _cron_begin
     ( crontab -l 2>/dev/null | sed 's|^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch.sh|*/1 * * * * /usr/bin/geomask-ytwatch.sh|' ) | crontab - 2>/dev/null \
       && info "ytwatch cron migrated */5 -> */1" || warn "cannot migrate the ytwatch cron"
+    _cron_end
   fi
   cron_ensure youtube '# geomask-ytwatch$' '*/1 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch'
   cron_ensure youtube '# geomask-ytwatch-reset$' '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset'
@@ -38455,6 +39357,20 @@ run_step() { # run_step N  (interactive/auto common logic)
     return 0
   fi
   info "check: issues found - apply needed"
+  # A missing lock primitive (step 1 sets GM_STEP1_FATAL) is not something "apply" can fix:
+  # refuse to apply ANY step, in the interactive wizard as well as in --auto. Without this the
+  # wizard printed the step-1 error and still installed steps 2-7 into a system whose writers
+  # are all fail-closed.
+  # `--step N` and menu item 3 run a step in a fresh process where step1_check never ran, so
+  # the sticky flag alone is not enough: probe the primitive directly for every other step.
+  if [ "$_n" != 1 ] && [ "${GM_STEP1_FATAL:-0}" != 1 ]; then
+    _rs_lpm=$(lock_primitive_missing)
+    [ -z "$_rs_lpm" ] || GM_STEP1_FATAL=1
+  fi
+  if [ "${GM_STEP1_FATAL:-0}" = 1 ] && [ "$GM_CHECK_ONLY" != 1 ]; then
+    bad "step $_n: step 1 did not pass its mandatory lock-primitive check - refusing to apply"
+    return 1
+  fi
   if [ "$GM_CHECK_ONLY" = 1 ]; then
     info "(check-only mode: not applying)"
     return 1
@@ -38632,6 +39548,12 @@ prompt_url() { # prompt_url <label> <current> <flag-value>  -> prints url, rc=1 
 # remove geomask parts (geo overlay, sync script, cron); keeps mihomo config
 # $1 = noreload: skip the rpcd reload (caller re-registers right after install)
 geomask_uninstall() {
+  # Every crontab rewrite below is a read-modify-write. Hold the shared `cron` lock for the
+  # whole removal so a panel nodes_set/sync_set cannot re-add a line from a stale read while
+  # the uninstall removes it (report R09). --reinstall calls this with the maintenance lock
+  # already held; the fixed order allows maintenance(10) -> cron(50).
+  _un_cron=0
+  _cron_begin && _un_cron=1
   for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
            /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
            /usr/share/luci/menu.d/luci-app-geo-sync.json; do
@@ -38701,6 +39623,7 @@ geomask_uninstall() {
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi
   [ "$1" = "noreload" ] || initd rpcd reload 2>/dev/null || true
+  [ "$_un_cron" = 1 ] && _cron_end
   return 0
 }
 
@@ -38745,6 +39668,13 @@ REINSTALL_LIST_DIRS="/usr/bin /usr/lib/geomask /usr/libexec/rpcd /usr/share/rpcd
 # patcher, the lane). Only names that did NOT exist at snapshot time are removed: a backup
 # or temp file another writer had before the transaction is never deleted.
 REINSTALL_TEMP_SUFFIXES=".zmnew .de5rm .urlnew .tdnew .ecnew .gm.tmp"
+# R04: the installer and the scanner now name their temps per process (two writers must not
+# share one file), so a crash leaves <object>.zmnew.<pid> instead of <object>.zmnew. These
+# globs are pruned only for objects the transaction snapshotted and only for names created
+# after the snapshot; a file that was already there is in the listing and is left alone.
+# Deliberately no generic `.tmp.*`: `<object>.tmp.<pid>` may be another writer's LIVE temporary
+# (node-scan writes config.yaml.tmp.<pid> while the installer runs).
+REINSTALL_TEMP_GLOBS=".zmnew.* .de5rm.* .urlnew.* .tdnew.* .ecnew.* .bak_nodescan.* .bak_aiguard.*"
 # Objects the manifest marks restore=NR even though a byte preimage exists: the owner
 # (a daemon) rewrites them, so a rollback must NOT write stale bytes over live state.
 # They are recorded by identity+hash and the restore reports "incomplete" when they
@@ -39605,7 +40535,33 @@ _rs_stop_new_services() { # _rs_stop_new_services <dir> - stop what the run star
   return 0
 }
 
-_rs_restore_files() { # _rs_restore_files <dir> - bytes/absence/mode of the byte objects
+_rs_restore_files() { # <dir> - byte objects, serialised with the config transaction (R04 round 3)
+  # rpcd is reloaded in step2, so by the time a failed reinstall rolls back the panel is live
+  # and can commit config.yaml through geomask-config-tx.py. This restore writes that very
+  # file (cp) and then proves it: without the SAME kernel lock a live commit can land between
+  # the copy and the verification (or be overwritten by an older snapshot), and the rollback
+  # would report a state that no longer exists. Fail closed when the lock cannot be taken.
+  if ! command -v gm_lock_acquire >/dev/null 2>&1; then
+    bad "rollback: lock helper missing - refusing to restore config.yaml without serialisation"
+    _rr=1
+    return 1
+  fi
+  if ! gm_lock_acquire config-tx 30; then
+    bad "rollback: config transaction lock is busy - refusing to restore config.yaml unlocked (retry after the live commit finishes)"
+    _rr=1
+    return 1
+  fi
+  _rs_rf_rc=0
+  _rs_restore_files_unlocked "$@" || _rs_rf_rc=1
+  # Verify the bytes while the lock is still held: no live commit can slip between the copy and
+  # this check. The later _rs_restore_verify repeats it outside the lock on purpose - if a
+  # writer changed the file after our restore, that verify must fail loudly.
+  _rs_verify_files "$@" || { bad "rollback: byte objects do not match the snapshot while the transaction lock is held"; _rs_rf_rc=1; }
+  gm_lock_release config-tx
+  return $_rs_rf_rc
+}
+
+_rs_restore_files_unlocked() { # the byte restore itself; called only under config-tx
   [ -f "$_rs_snap/objects" ] || { bad "rollback: snapshot objects list missing"; return 1; }
   while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
     [ -n "${_rs_op:-}" ] || continue
@@ -39721,6 +40677,16 @@ _rs_prune_temps() { # _rs_prune_temps <dir> - only temp/backup names this transa
           _rs_in_list "$_rs_snap" "$_rs_cand" && continue
           rm -f "$(P "$_rs_cand")" 2>/dev/null \
             || { bad "rollback: cannot remove our temporary $_rs_cand"; _rr=1; }
+        done
+        # Per-PID names: same rule, matched as a glob instead of an exact suffix.
+        for _rs_glob in ${REINSTALL_TEMP_GLOBS:-}; do
+          for _rs_cand in "$(P "$_rs_op")"$_rs_glob; do
+            [ -e "$_rs_cand" ] || continue
+            _rs_rel=${_rs_cand#"$GM_PREFIX"}
+            _rs_in_list "$_rs_snap" "$_rs_rel" && continue
+            rm -f "$_rs_cand" 2>/dev/null \
+              || { bad "rollback: cannot remove our temporary $_rs_rel"; _rr=1; }
+          done
         done
         for _rs_cand in "$(P "$_rs_op")".bak_geomask_* "$(P "$_rs_op")".pre-run-*; do
           [ -e "$_rs_cand" ] || continue
@@ -40193,8 +41159,12 @@ _rs_restore_cron() { # _rs_restore_cron <dir> - exact crontab, foreign lines are
     _rr=1
     return 1
   fi
+  # Same kernel `cron` lock as every other crontab writer: a panel nodes_set/sync_set must not
+  # interleave with this exact restore (report R09).
+  _cron_begin
   crontab "$_rs_snap/cron" 2>/dev/null \
-    || { bad "rollback: crontab write failed"; _rr=1; return 1; }
+    || { _cron_end; bad "rollback: crontab write failed"; _rr=1; return 1; }
+  _cron_end
   _rs_after=$(crontab -l 2>/dev/null)
   if [ "$_rs_after" != "$_rs_want" ]; then
     bad "rollback: crontab did not verify (silent write failure?)"
@@ -40205,6 +41175,9 @@ _rs_restore_cron() { # _rs_restore_cron <dir> - exact crontab, foreign lines are
 }
 
 _rs_verify_files() { # _rs_verify_files <dir>
+  # Honour the argument every caller already passes: relying on a global _rs_snap silently
+  # verified "whatever snapshot was set last" when a test or a future caller pointed elsewhere.
+  _rs_snap=${1:-$_rs_snap}
   [ -f "$_rs_snap/objects" ] || return 1
   _rs_vr=0
   while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
@@ -40766,7 +41739,11 @@ _rs_nr_notes() { # _rs_nr_notes <dir> - honest NR list (they are not restored by
 
 _rs_restore_verify() { # _rs_restore_verify <dir> - the rollback is not trusted, it is verified
   _rs_vok=0
-  _rs_verify_files || { _rs_vok=1; bad "rollback verification failed: file objects"; }
+  # R04: the byte objects were written and proven under config-tx already. This second check
+  # runs after that lock was released, so a live panel commit may legitimately (or not) change
+  # config.yaml in between. A mismatch here is reported as a concurrent writer, not silently
+  # accepted as "restored": the snapshot no longer describes the live file.
+  _rs_verify_files || { _rs_vok=1; bad "rollback verification failed: file objects (a concurrent writer - e.g. a live config transaction - changed them after the serialised restore)"; }
   _rs_verify_shared || { _rs_vok=1; bad "rollback verification failed: shared files"; }
   _rs_verify_uci || { _rs_vok=1; bad "rollback verification failed: uci keys"; }
   _rs_verify_sysctl || { _rs_vok=1; bad "rollback verification failed: sysctl"; }
@@ -40936,6 +41913,7 @@ REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-o
 /usr/lib/geomask/geomask-diag-spool.py|regular-or-absent
 /usr/lib/geomask/geomask-diag-redact.py|regular-or-absent
 /usr/lib/geomask/geomask-routes.sh|regular-or-absent
+/usr/lib/geomask/geomask-lock.sh|regular-or-absent
 /usr/lib/geomask/geomask-module-update.py|regular-or-absent
 /usr/lib/geomask/geomask-lists-edit.py|regular-or-absent
 /usr/lib/geomask/geomask-doctor.py|regular-or-absent
@@ -41083,6 +42061,15 @@ reinstall_preflight() {
   done
   if have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
     _pf_reason "dependency missing: python3-yaml (python3 -c 'import yaml' fails; auto-install is forbidden during reinstall)"
+  fi
+  # R04: lock primitive is mandatory on the target. Without it every writer (route, console,
+  # config transaction, cron) refuses to mutate; the installer must refuse first instead of
+  # installing a system whose writers all fail closed. No mkdir fallback exists on purpose.
+  if [ "$(uname -s 2>/dev/null)" = Linux ]; then
+    have flock || _pf_reason "dependency missing: flock (BusyBox applet; auto-install is forbidden during reinstall - use an image that ships it)"
+    if have python3 && ! python3 -c 'import fcntl' >/dev/null 2>&1; then
+      _pf_reason "dependency missing: python3 fcntl (the config transaction lock is fail-closed without it)"
+    fi
   fi
   _pf_scope_ai=0
   module_selected ai_dns && [ ! -f "$(P /etc/geomask-aidns.off)" ] && _pf_scope_ai=1
@@ -41303,13 +42290,22 @@ menu_reinstall() {
     info "  Ничего не изменено. Установите недостающие зависимости вручную и повторите."
     return 1
   fi
-  backup_gate || return 1
-  _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; return 1; }
+  # R04: single instance. The preflight above is read-only; from here on the run mutates
+  # save_stream targets, uci, services and crontab, so two reinstallers must not interleave.
+  # The kernel lock is a try-lock: the second run refuses immediately and nothing is
+  # unlocked on the way out (the kernel releases a killed run).
+  if ! gm_lock_acquire maintenance 0; then
+    bad "переустановка уже выполняется: второй экземпляр не запущен (блокировка maintenance)"
+    info "  Дождитесь завершения текущей переустановки или перезагрузки; ничего не изменено."
+    return 1
+  fi
+  backup_gate || { gm_lock_release maintenance; return 1; }
+  _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; gm_lock_release maintenance; return 1; }
   # A snapshot from an earlier failed attempt may still hold the only copy of the old
   # components: never delete a fixed name here (same rule as the backup park, F03).
   _snap=$(mktemp -d "$(P /tmp)/geomask-reinstall-XXXXXX" 2>/dev/null) \
-    || { bad "не удалось создать каталог снимка в /tmp"; return 1; }
-  _reinstall_snapshot "$_snap" || { bad "не удалось сохранить текущие компоненты - переустановка отменена"; rm -rf "$_snap"; return 1; }
+    || { bad "не удалось создать каталог снимка в /tmp"; gm_lock_release maintenance; return 1; }
+  _reinstall_snapshot "$_snap" || { bad "не удалось сохранить текущие компоненты - переустановка отменена"; rm -rf "$_snap"; gm_lock_release maintenance; return 1; }
   if ! _reinstall_steps "$_vpn"; then
     bad "переустановка не завершена - возвращаю прежние компоненты"
     if ! _reinstall_restore "$_snap"; then
@@ -41317,9 +42313,11 @@ menu_reinstall() {
     else
       info "откат проверен: прежние компоненты и runtime восстановлены"
     fi
+    gm_lock_release maintenance
     return 1
   fi
   rm -rf "$_snap"
+  gm_lock_release maintenance
   log "Пересстановка geomask завершена."
   return 0
 }
@@ -41416,6 +42414,10 @@ if [ "$GM_RESTART" = 1 ] && [ -f "$(P /root/.geomask-norestart)" ]; then
 fi
 
 RC=0
+# The self-update runner holds the `updater` lock and passes its descriptor to this installer.
+# Close it here: the runner still holds that lock, and no service we start below may inherit
+# the descriptor and keep the updater lock alive after the update has finished.
+if command -v gm_lock_close_inherited >/dev/null 2>&1; then gm_lock_close_inherited; fi
 if [ "$GM_BACKUP" = 1 ]; then
   _b=$(ensure_backup full) && { info "полный бэкап: $_b"; info "SMB (свежая копия): \\\\$(lan_ip)\\geomask-backups ; история на ПК: geomask\\fetch_backup.ps1"; RC=0; } || { bad "полный бэкап не создан"; RC=1; }
 elif [ "$GM_REINSTALL" = 1 ]; then

@@ -544,7 +544,8 @@ def apply_preview(path_id, preview_id, expected_path_revision):
         result = start_transaction(
             {str(DEFAULT_CONFIG): yaml.safe_dump(config, allow_unicode=True,
                                                  sort_keys=False).encode('utf-8')},
-            require_exactly={group_name: eligible_names})
+            require_exactly={group_name: eligible_names},
+            expect_sha256=digest(live_raw))
     except Exception:
         _restore_applied_record(path_id, previous_applied)
         try:
@@ -645,7 +646,12 @@ def revoke_applied_pool(path_id):
     if applied.get('status') not in ('applied', 'expired'):
         return {'ok': True, 'revoked': False, 'message': 'No applied pool to revoke'}
 
-    config = yaml_load(open(DEFAULT_CONFIG, encoding='utf-8').read())
+    # ONE read: the candidate is built from these bytes and the CAS base is their digest.
+    # Two reads (open() then read_bytes()) could see two different files and hand the
+    # transaction a base newer than the candidate it protects (review round 2, defect 4).
+    _revoke_raw = DEFAULT_CONFIG.read_bytes()
+    config = yaml_load(_revoke_raw.decode('utf-8'))
+    _revoke_base = _tx.digest(_revoke_raw)
     group_name = PATHS[path_id][0]
     target = None
     for g in config.get('proxy-groups', []):
@@ -680,7 +686,8 @@ def revoke_applied_pool(path_id):
     # Widening is the point of a revoke, so an empty result here is not a failure mode
     # to guard against: the previous source and filter are restored as recorded.
     result = start_transaction({str(DEFAULT_CONFIG): yaml.safe_dump(
-        config, allow_unicode=True, sort_keys=False).encode('utf-8')})
+        config, allow_unicode=True, sort_keys=False).encode('utf-8')},
+        expect_sha256=_revoke_base)
     if not result.get('ok'):
         raise ApplyError('transaction rejected the candidate; group left as it was')
 

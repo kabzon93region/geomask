@@ -233,7 +233,9 @@ def write_if_changed(path, payload):
     if old == body:
         return False, len(payload)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + '.tmp'
+    # Per-process temp: cron, syncd and the panel can run sync at the same time, and a shared
+    # `<file>.tmp` let one writer install bytes another was still producing (report R11).
+    tmp = path + '.tmp.%d' % os.getpid()
     open(tmp, 'w').write(body)
     os.replace(tmp, path)
     return True, len(payload)
@@ -330,9 +332,10 @@ def _zapret_sync():
     if new == old:
         print('zapret exclude: up-to-date (%d tunneled domains)' % len(tunnel)); return False
     try:
-        with open(ZEXCL + '.tmp', 'w', encoding='utf-8', newline='\n') as f:
+        _ztmp = ZEXCL + '.tmp.%d' % os.getpid()
+        with open(_ztmp, 'w', encoding='utf-8', newline='\n') as f:
             f.write('\n'.join(new) + '\n')
-        os.replace(ZEXCL + '.tmp', ZEXCL)
+        os.replace(_ztmp, ZEXCL)
         print('zapret exclude: wrote %d tunneled domains (reload needed)' % len(tunnel))
         return True
     except Exception as e:
@@ -383,9 +386,10 @@ def _zapret_force_sync():
     if not moved and not restored:
         print('zapret force: up-to-date'); return
     try:
-        with open(ZFORCE + '.tmp', 'w', encoding='utf-8', newline='\n') as f:
+        _zf_tmp = ZFORCE + '.tmp.%d' % os.getpid()
+        with open(_zf_tmp, 'w', encoding='utf-8', newline='\n') as f:
             f.write('\n'.join(out) + '\n')
-        os.replace(ZFORCE + '.tmp', ZFORCE)
+        os.replace(_zf_tmp, ZFORCE)
         print('zapret force: %d out of DPI, %d restored (reload needed)' % (moved, restored))
     except Exception as e:
         print('zapret force: write failed (%s)' % e)
@@ -419,9 +423,10 @@ if c1 or c2 or c3 or c4:
 try:
     _st = {'ts': time.strftime('%F %T'), 'mt': n1, 'ai': n2, 'moved': moved,
            'changed': bool(c1 or c2), 'reload': _r_ok if (c1 or c2) else None}
-    with open('/tmp/geomask-sync.state.tmp', 'w') as f:
+    _s_tmp = '/tmp/geomask-sync.state.tmp.%d' % os.getpid()
+    with open(_s_tmp, 'w') as f:
         json.dump(_st, f)
-    os.replace('/tmp/geomask-sync.state.tmp', '/tmp/geomask-sync.state')
+    os.replace(_s_tmp, '/tmp/geomask-sync.state')
 except Exception:
     pass
 if c1 or c2:

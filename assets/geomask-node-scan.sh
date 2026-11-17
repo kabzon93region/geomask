@@ -30,9 +30,44 @@ def log(msg, lv='INFO'):
     except Exception: pass
 
 # The managed transaction (geomask-config-tx.py) owns the same config file. This scan
-# reads the file, spends minutes probing, then writes: without a check it would install
-# a candidate built on a file that no longer exists and silently undo a committed apply.
-TX_LOCK=_E.get('GM_CONFIG_TX_LOCK','/etc/geomask/.config-tx.lock')
+# reads the file, spends minutes probing, then writes: without the SAME lock the digest check
+# is not atomic with a transaction commit and the scan silently undoes a committed apply.
+# R04: the path must be the transaction's own lock file - the old /etc/geomask/.config-tx.lock
+# was a different inode, so the two writers never met. GM_CONFIG_TX_LOCK only redirects the
+# path for injected test roots; it cannot disable the lock.
+TX_LOCK=_E.get('GM_CONFIG_TX_LOCK','/etc/geomask/node-audit/state/.config-tx.lock')
+# Per-process temp/backup names: two scans (cron 03:30 and the panel's background run) used to
+# share CFG.tmp, so one could install bytes the other was still writing (report R04).
+_PID=os.getpid()
+TMP_CFG=CFG+'.tmp.%d' % _PID
+
+def save_backup(kind, text):
+    """Keep ONE backup per kind under a fixed name, replaced atomically.
+
+    The first R04 version used CFG.bak_<kind>.<pid>: every daily and every panel scan left a
+    file behind in /etc/mihomo, i.e. unbounded overlay growth (review round 2). A fixed name
+    with an atomic replace keeps exactly one file and still never exposes a half-written one.
+    """
+    target = CFG + '.bak_' + kind
+    tmp = target + '.tmp.%d' % _PID
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(tmp, target)
+        return True
+    except Exception as e:
+        # A backup that could not be written (ENOSPC, chmod) must be visible, not swallowed:
+        # the write below still proceeds, but the operator has to learn that the pre-change
+        # bytes are not on disk.
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        try:
+            log('backup %s NOT saved: %s' % (target, e), 'WARN')
+        except Exception:
+            pass
+        return False
 # Provider ids created by the node-audit coordinator. Its groups are not ours to edit.
 MANAGED_PREFIX='audit-'
 
@@ -58,16 +93,28 @@ def install_config_candidate(candidate_path, expected_live):
     @contextlib.contextmanager
     def held():
         if fcntl is None:
+            # Fail closed on the target: a weaker fallback (or no lock) is exactly the R04
+            # defect. Non-Linux is the Windows-hosted test host, where flock(2) does not exist.
+            if sys.platform.startswith('linux'):
+                raise ConfigWriteRefused(
+                    'the fcntl/flock primitive is missing: refusing to replace the live config unlocked')
             yield
             return
         try:
             os.makedirs(os.path.dirname(TX_LOCK), exist_ok=True)
-            fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
-        except OSError:
-            yield
-            return
+            fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        except OSError as exc:
+            raise ConfigWriteRefused('cannot open the transaction lock %s: %s' % (TX_LOCK, exc))
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise ConfigWriteRefused('the config transaction lock is busy for 30s')
+                    time.sleep(0.1)
             yield
         finally:
             try: fcntl.flock(fd, fcntl.LOCK_UN)
@@ -211,18 +258,18 @@ if '--ai-guard' in _argv:
     if nb==blk:
         log('ai-guard: AI exclude-filter already up to date', 'OK'); sys.exit(0)
     out=text[:mb.start()]+nb+text[mb.end():]
-    open(CFG+'.bak_aiguard','w',encoding='utf-8').write(text)
-    open(CFG+'.tmp','w',encoding='utf-8').write(out)
-    try: rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',CFG+'.tmp','-t'],capture_output=True,timeout=30).returncode
+    save_backup('aiguard', text)
+    open(TMP_CFG,'w',encoding='utf-8').write(out)
+    try: rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',TMP_CFG,'-t'],capture_output=True,timeout=30).returncode
     except Exception: rc=1
     if rc!=0:
-        try: os.remove(CFG+'.tmp')
+        try: os.remove(TMP_CFG)
         except Exception: pass
         log('ai-guard: VALIDATION FAILED, config untouched (rc=%d)'%rc, 'ERR'); sys.exit(1)
     try:
-        install_config_candidate(CFG+'.tmp', text)
+        install_config_candidate(TMP_CFG, text)
     except ConfigWriteRefused as e:
-        try: os.remove(CFG+'.tmp')
+        try: os.remove(TMP_CFG)
         except Exception: pass
         log('ai-guard: not applying - %s' % e, 'WARN')
         sys.exit(4)
@@ -512,17 +559,17 @@ if not changed:
           % (total, len(blocked), errs)); sys.exit(0)
 applied=False
 if changed:
-    open(CFG+'.bak_nodescan','w',encoding='utf-8').write(text)
-    open(CFG+'.tmp','w',encoding='utf-8').write(out)
+    save_backup('nodescan', text)
+    open(TMP_CFG,'w',encoding='utf-8').write(out)
     try:
-        rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',CFG+'.tmp','-t'], capture_output=True, timeout=30).returncode
+        rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',TMP_CFG,'-t'], capture_output=True, timeout=30).returncode
     except Exception:
         rc=1
     if rc==0:
         try:
-            install_config_candidate(CFG+'.tmp', text)
+            install_config_candidate(TMP_CFG, text)
         except ConfigWriteRefused as e:
-            try: os.remove(CFG+'.tmp')
+            try: os.remove(TMP_CFG)
             except Exception: pass
             log('not applying - %s' % e, 'WARN')
             print('nodes=%d blocked=%d errors=%d applied=False (config changed during the scan)'
@@ -541,7 +588,7 @@ if changed:
         log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs), 'OK')
         applied=True
     else:
-        try: os.remove(CFG+'.tmp')
+        try: os.remove(TMP_CFG)
         except Exception: pass
         log('VALIDATION FAILED - config untouched (test rc=%d)' % rc, 'ERR')
 else:

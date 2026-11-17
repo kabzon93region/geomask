@@ -29,6 +29,10 @@ SMB_SHARE_ENABLE=${GM_SMB_SHARE_ENABLE:-/etc/geomask/backup-share.enable}
 # How long a bundle may sit in the temporary directory before it is removed (hours).
 CONSOLE_DIAG_KEEP_H=${GM_CONSOLE_DIAG_KEEP:-24}
 DHCP_OWNED=/etc/geomask/dhcp-hosts   # id|ip|mac of host sections geomask created
+# Device/subscription lists are read-modify-written by the panel and the guard. The RMW is
+# serialised by the shared kernel `devices` lock and the temporary file is per-process, so two
+# writers cannot install a half-rewritten list or overwrite each other's temp (report R08).
+DEVICES_LOCK=${GM_DEVICES_LOCK:-/tmp/geomask-locks/devices.lock}
 AI_TUN_DEV=AI
 AI_TUN_IP=198.19.0.1
 AI_SOCKS_PORT=7891
@@ -46,6 +50,13 @@ UPD_DIR=/tmp/geomask-upd
 SAFE_WRITE_PY=/usr/bin/safe_write.py
 # Shared route-table helper (also sourced by /etc/hotplug.d/iface/99-default-vpn-route).
 GM_ROUTES_LIB=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
+# The one lock helper (R04): kernel flock on a persistent inode - route tables, the console
+# lane, crontab/devices read-modify-write, the updater and the config transaction share the
+# same primitive and the same rank order. No PID heuristics, no stale-lock reclaim.
+GM_LOCK_LIB=${GM_LOCK_LIB:-/usr/lib/geomask/geomask-lock.sh}
+if ! command -v gm_lock_acquire >/dev/null 2>&1 && [ -r "$GM_LOCK_LIB" ]; then
+  . "$GM_LOCK_LIB"
+fi
 
 # ---- write gate ------------------------------------------------------------
 # The project rule is "a full settings backup before ANY change on the router". The panel
@@ -116,7 +127,8 @@ PYTHON_BIN=${GM_PYTHON:-python3}
 SUB_STATUS_PYTHON=$PYTHON_BIN
 UPD_CHECK=$UPD_DIR/check.json
 UPD_STATUS=$UPD_DIR/status.json
-UPD_PIDF=$UPD_DIR/pid
+UPD_PIDF=$UPD_DIR/pid              # legacy, read-only: the lock replaced it
+UPD_LOCK=${GM_UPD_LOCK:-/tmp/geomask-locks/updater.lock}
 UPD_TTL=3600
 
 # safe_write shell wrapper
@@ -646,11 +658,27 @@ _ipv4_ok() {
   }'
 }
 
+_devices_lock() {
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire devices 20 "$DEVICES_LOCK"
+}
+
+_devices_unlock() {
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release devices
+}
+
 _dhcp_owned_add() { # _dhcp_owned_add <section> <ip> <mac>
   mkdir -p "$(dirname "$DHCP_OWNED")" 2>/dev/null
-  [ -f "$DHCP_OWNED" ] && awk -F'|' -v id="$1" '$1!=id' "$DHCP_OWNED" > "$DHCP_OWNED.tmp" 2>/dev/null && mv -f "$DHCP_OWNED.tmp" "$DHCP_OWNED"
+  _do_tmp="$DHCP_OWNED.tmp.$$"
+  _devices_lock || return 1
+  if [ -f "$DHCP_OWNED" ]; then
+    awk -F'|' -v id="$1" '$1!=id' "$DHCP_OWNED" > "$_do_tmp" 2>/dev/null || { rm -f "$_do_tmp"; _devices_unlock; return 1; }
+    mv -f "$_do_tmp" "$DHCP_OWNED" 2>/dev/null || { rm -f "$_do_tmp"; _devices_unlock; return 1; }
+  fi
   printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$DHCP_OWNED"
   chmod 600 "$DHCP_OWNED" 2>/dev/null
+  _devices_unlock
 }
 
 # add/update a device geo-policy: dev_add <ip> <mode> [mac] [name]
@@ -664,17 +692,22 @@ cmd_dev_add() {
   # replace existing entry for this ip (exact first field, not a regex: a dotted address used
   # as a regex matches unrelated lines). A failed awk (ENOSPC) must NOT leave an empty file
   # behind: the old `|| : > tmp` truncated the list and dropped every device policy.
-  if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$DEVICES.tmp" 2>/dev/null; then
-    rm -f "$DEVICES.tmp"
+  # The rewrite runs under the shared `devices` lock and through a per-process temp, so two
+  # panel calls cannot install a list built from the same stale baseline (report R08).
+  _devices_lock || { printf '{"ok":false,"error":"device list is busy: another writer holds the lock"}\n'; return 1; }
+  _dv_tmp="$DEVICES.tmp.$$"
+  if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$_dv_tmp" 2>/dev/null; then
+    rm -f "$_dv_tmp"; _devices_unlock
     printf '{"ok":false,"error":"cannot rewrite %s (disk full?) - nothing changed"}\n' "$DEVICES"
     return 1
   fi
-  if ! mv -f "$DEVICES.tmp" "$DEVICES"; then
-    rm -f "$DEVICES.tmp"
+  if ! mv -f "$_dv_tmp" "$DEVICES"; then
+    rm -f "$_dv_tmp"; _devices_unlock
     printf '{"ok":false,"error":"cannot replace %s - nothing changed"}\n' "$DEVICES"
     return 1
   fi
   echo "$IP $MODE $NAME" >> "$DEVICES"
+  _devices_unlock
   # stable lease if mac given (strict MAC format only)
   if [ -n "$MAC" ] && echo "$MAC" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'; then
     if ! uci show dhcp 2>/dev/null | grep -q "\.mac='$MAC'"; then
@@ -701,12 +734,15 @@ cmd_dev_del() {
   _ipv4_ok "$IP" || { printf '{"error":"bad ip"}'; return 1; }
   _require_backup || return 1
   if [ -f "$DEVICES" ]; then
-    if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$DEVICES.tmp" 2>/dev/null; then
-      rm -f "$DEVICES.tmp"
+    _devices_lock || { printf '{"ok":false,"error":"device list is busy: another writer holds the lock"}\n'; return 1; }
+    _dv_tmp="$DEVICES.tmp.$$"
+    if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$_dv_tmp" 2>/dev/null; then
+      rm -f "$_dv_tmp"; _devices_unlock
       printf '{"ok":false,"error":"cannot rewrite %s (disk full?) - nothing changed"}\n' "$DEVICES"
       return 1
     fi
-    mv -f "$DEVICES.tmp" "$DEVICES" || { rm -f "$DEVICES.tmp"; printf '{"ok":false,"error":"cannot replace %s"}\n' "$DEVICES"; return 1; }
+    mv -f "$_dv_tmp" "$DEVICES" || { rm -f "$_dv_tmp"; _devices_unlock; printf '{"ok":false,"error":"cannot replace %s"}\n' "$DEVICES"; return 1; }
+    _devices_unlock
   fi
   # remove rules for this ip explicitly per table (bypass -> main, ai -> 101).
   # NEVER delete by pref alone: all per-device rules share priority 19900, so
@@ -722,7 +758,13 @@ cmd_dev_del() {
     _smac=$(uci -q get "$_sec.mac" 2>/dev/null)
     if [ "$_sip" = "$IP" ] && [ -n "$_smac" ]; then
       if uci -q delete "$_sec" 2>/dev/null && uci commit dhcp 2>/dev/null; then
-        awk -F'|' -v id="$_sec" '$1!=id' "$DHCP_OWNED" > "$DHCP_OWNED.tmp" 2>/dev/null && mv -f "$DHCP_OWNED.tmp" "$DHCP_OWNED"
+        _do_tmp="$DHCP_OWNED.tmp.$$"
+        if _devices_lock; then
+          awk -F'|' -v id="$_sec" '$1!=id' "$DHCP_OWNED" > "$_do_tmp" 2>/dev/null \
+            && mv -f "$_do_tmp" "$DHCP_OWNED" 2>/dev/null
+          rm -f "$_do_tmp"
+          _devices_unlock
+        fi
       else
         warn "cannot remove dhcp host $_sec - section left in place"
       fi
@@ -1210,11 +1252,17 @@ cmd_sub_add() {
   [ "$_internal" = internal ] || _require_backup || return 1
   [ -n "$NAME" ] || NAME=$(printf '%s' "$URL" | sed 's|^https\?://||; s|/.*||')
   NAME=$(printf '%s' "$NAME" | tr -d '|' | head -c 48)
+  # The registry is read-modify-written (id allocation + append / delete): the shared `subs`
+  # kernel lock makes the id unique and keeps a concurrent delete from dropping this append.
+  command -v gm_lock_acquire >/dev/null 2>&1 && gm_lock_acquire subs 20 || {
+    printf '{"ok":false,"error":"subscription registry is busy"}\n'; return 1; }
   ID=$(date +%s | tail -c 9)
-  while grep -q "^$ID|" "$SUBS_FILE" 2>/dev/null; do ID=$((ID+1)); done
+  _sa_i=0
+  while grep -q "^$ID|" "$SUBS_FILE" 2>/dev/null && [ "$_sa_i" -lt 100 ]; do ID=$((ID+1)); _sa_i=$((_sa_i+1)); done
   echo "$ID|$NAME|$URL" >> "$SUBS_FILE"
   # The registry holds subscription tokens: root-only, like the mihomo config itself.
   chmod 600 "$SUBS_FILE" 2>/dev/null
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
   echo "$(date +%FT%T) SUB add $ID $NAME" >> "$LOG"
   printf '{"ok":true,"subs":%s}' "$(_subs_json)"
 }
@@ -1235,8 +1283,18 @@ cmd_sub_del() {
         return 1 ;;
     esac
   fi
-  grep -v "^$ID|" "$SUBS_FILE" > "$SUBS_FILE.tmp" || true
-  mv -f "$SUBS_FILE.tmp" "$SUBS_FILE"
+  command -v gm_lock_acquire >/dev/null 2>&1 && gm_lock_acquire subs 20 || {
+    printf '{"ok":false,"error":"subscription registry is busy"}\n'; return 1; }
+  _sd_tmp="$SUBS_FILE.tmp.$$"
+  if ! grep -v "^$ID|" "$SUBS_FILE" > "$_sd_tmp"; then
+    rm -f "$_sd_tmp"; command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
+    printf '{"ok":false,"error":"cannot rewrite the subscription registry"}\n'; return 1
+  fi
+  if ! mv -f "$_sd_tmp" "$SUBS_FILE"; then
+    rm -f "$_sd_tmp"; command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
+    printf '{"ok":false,"error":"cannot replace the subscription registry"}\n'; return 1
+  fi
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
   echo "$(date +%FT%T) SUB del $ID" >> "$LOG"
   printf '{"ok":true,"subs":%s}' "$(_subs_json)"
 }
@@ -1406,9 +1464,11 @@ _upd_check_now() { # $1 = "force" bypasses the TTL cache
 }
 
 _upd_running() {
-  [ -f "$UPD_PIDF" ] || return 1
-  _p=$(cat "$UPD_PIDF" 2>/dev/null)
-  [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null
+  # The runner holds the shared kernel `updater` lock from the moment it is spawned until it
+  # exits; a pid file was check-then-write and a killed runner left a pid that could be
+  # reused, so the lock is the truth here (R10).
+  command -v gm_lock_busy >/dev/null 2>&1 || return 1
+  gm_lock_busy updater "$UPD_LOCK"
 }
 
 cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
@@ -1564,6 +1624,13 @@ cmd_upd_apply() {
   # verify the download against, and a hash from the same source proves nothing (F22).
   _dig=$(sed -n 's/.*"digest":"\(sha256:[0-9a-f]*\)".*/\1/p' "$UPD_CHECK" | head -1)
   [ -n "$_dig" ] || { printf '{"ok":false,"err":"release digest unavailable - refusing to run an unverified installer"}\n'; return 1; }
+  # Single instance: the kernel lock is acquired BEFORE the runner script is written, and the
+  # detached runner inherits the descriptor, so the lock lives exactly as long as the update.
+  # The old check-then-write pid let two callers both pass the check (R10).
+  command -v gm_lock_acquire >/dev/null 2>&1 || {
+    printf '{"ok":false,"err":"lock helper missing - refusing to start an update"}\n'; return 1; }
+  gm_lock_acquire updater 0 "$UPD_LOCK" || {
+    printf '{"ok":false,"err":"already running"}\n'; return 1; }
   cat > "$UPD_DIR/run.sh" <<'RUNEOF'
 #!/bin/sh
 # geomask self-update runner (detached): backup -> download -> validate -> reinstall
@@ -1574,7 +1641,7 @@ ST=$D/status.json
 SL=$D/steps.log
 LOGF=/root/geo-sync.log
 say() { _t=$(date '+%F %T'); _j=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g'); printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$_j" "$_t" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; printf '%s [%s] %s\n' "$_t" "$1" "$2" >> "$SL"; printf '%s GEOMASK-UPD [%s] %s\n' "$_t" "$1" "$2" >> "$LOGF"; }
-trap 'rm -f "$D/pid"' EXIT
+trap ':' EXIT
 TAG="$1"
 say queued "update to $TAG started"
 say backup "creating full router backup (sysupgrade -b)..."
@@ -1675,7 +1742,9 @@ say done "updated to $NEWV - refresh the panel page (Ctrl+F5)"
 RUNEOF
   printf '{"phase":"queued","msg":"starting update to %s","ts":"%s"}\n' "$_tag" "$(date '+%F %T')" > "$UPD_STATUS"
   sh "$UPD_DIR/run.sh" "$_tag" >/dev/null 2>&1 &
-  echo $! > "$UPD_PIDF"
+  # The runner inherited the `updater` descriptor: the lock is released by the kernel when it
+  # (and every copy of that open file description) exits. Do NOT unlock here - that would
+  # release the lock of the running update.
   printf '{"ok":true,"to":"%s"}\n' "$_tag"
 }
 
@@ -1715,24 +1784,19 @@ cmd_nodes_get() {
 # file and the cron line are one transaction. The old version rewrote the whole file with a
 # four-line template (dropping ai_*, name_filter_groups, ...) and accepted a newline inside
 # base_filter, which appended an arbitrary key such as ai_guard=0 (audit 14.11.2026, F07).
-NODES_LOCK=/tmp/geomask-nodes.lock
+# The lock is the shared kernel `cron` lock: it serialises this file together with every
+# other read-modify-write of /etc/crontabs/root (cmd_sync_set, the installer, uninstall).
+NODES_LOCK=${GM_NODES_LOCK:-/tmp/geomask-locks/cron.lock}
 
 _nodes_lock() {
-  _nl_i=0
-  while [ "$_nl_i" -lt 20 ]; do
-    mkdir "$NODES_LOCK" 2>/dev/null && return 0
-    # a writer that crashed must not lock the panel forever
-    _nl_m=$(stat -c %Y "$NODES_LOCK" 2>/dev/null || echo 0)
-    case "$_nl_m" in ''|*[!0-9]*) _nl_m=0 ;; esac
-    if [ "$_nl_m" -gt 0 ] && [ $(( $(date +%s) - _nl_m )) -gt 60 ]; then
-      rmdir "$NODES_LOCK" 2>/dev/null
-    fi
-    _nl_i=$((_nl_i+1)); sleep 0.2
-  done
-  return 1
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire cron 20 "$NODES_LOCK"
 }
 
-_nodes_unlock() { rmdir "$NODES_LOCK" 2>/dev/null; }
+_nodes_unlock() {
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release cron
+}
 
 _nodes_candidate() { # stdin: live conf -> stdout: candidate with the four keys replaced
   awk -v cc="$1" -v as="$2" -v bf="$3" -v pv="$4" '
@@ -1823,10 +1887,14 @@ cmd_nodes_set() {
 # sync insurance cron interval: */N minutes (N: 1,2,3,5,10,15,30)
 cmd_sync_set() {
   case "$1" in 1|2|3|5|10|15|30) : ;; *) printf '{"ok":false,"error":"bad interval"}\n'; return 1;; esac
+  # The crontab is shared with nodes_set, the installer and uninstall: same kernel lock, so a
+  # concurrent read-modify-write can no longer drop the other writer's line.
+  _nodes_lock || { printf '{"ok":false,"error":"crontab is busy: another writer holds the lock"}\n'; return 1; }
   _tmp=/tmp/gm-cron.$$
   crontab -l 2>/dev/null | grep -vF "/root/sync_mtrickle_mihomo.sh" > "$_tmp" || true
   printf '*/%s * * * * %s # %s\n' "$1" "$SYNCLISTS" "$SYNC_TAG" >> "$_tmp"
-  crontab "$_tmp" && rm -f "$_tmp" || { printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
+  crontab "$_tmp" && rm -f "$_tmp" || { rm -f "$_tmp"; _nodes_unlock; printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
+  _nodes_unlock
   printf '%s SYNC cron set to */%s\n' "$(date '+%F %T')" "$1" >> "$LOG"
   printf '{"ok":true,"interval":"*/%s"}\n' "$1"
 }
@@ -2092,58 +2160,40 @@ CONSOLE_PY=/usr/lib/geomask/geomask-console.py
 TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}
 # One lock for `on`, `off` and the guard's console block: a rule must not come back after the
 # kill switch removed it. `status` never takes it - the panel calls it on every render.
-CONSOLE_LOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-console.lock}
+# The primitive is the shared kernel lock (geomask-lock.sh, console rank): a killed switch is
+# released by the kernel, the lock file is never deleted and there is no PID to guess. The
+# emergency path waits a bounded number of seconds and then fails; it never works unserialised.
+CONSOLE_LOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-locks/console.lock}
 
 _console_get() { sed -n "s/^$1=//p" "$CONSOLE_STATE" 2>/dev/null | head -1; }
 
-# BusyBox on OpenWrt does not ship flock everywhere, so the lane lock is a directory with the
-# owner pid inside. A lock whose owner is gone (a killed switch) is broken once and retried; if
-# the lane is still busy after the wait, the caller fails instead of working unserialised.
 _console_lock() {
-  _lt=0
-  while [ "$_lt" -lt "${CONSOLE_LOCK_TRIES:-10}" ]; do
-    if mkdir "$CONSOLE_LOCK" 2>/dev/null; then
-      if printf '%s\n' "$$" > "$CONSOLE_LOCK/pid" 2>/dev/null; then
-        return 0
-      fi
-      rm -rf "$CONSOLE_LOCK" 2>/dev/null     # cannot name the owner: do not keep a half lock
-      return 1
-    fi
-    _lt=$((_lt+1))
-    _owner=''
-    [ -f "$CONSOLE_LOCK/pid" ] && _owner=$(cat "$CONSOLE_LOCK/pid" 2>/dev/null)
-    if [ -z "$_owner" ] && [ "$_lt" -eq 1 ]; then
-      # The owner may be between `mkdir` and writing its pid: look again before breaking it.
-      sleep 1
-    elif [ -n "$_owner" ] && kill -0 "$_owner" 2>/dev/null; then
-      sleep 1
-    else
-      rm -rf "$CONSOLE_LOCK" 2>/dev/null     # ownerless or dead owner: a killed switch
-    fi
-  done
-  return 1
+  command -v gm_lock_acquire >/dev/null 2>&1 || {
+    echo "console: lock helper missing ($GM_LOCK_LIB) - refusing to switch the lane" >&2
+    return 1
+  }
+  gm_lock_acquire console "${CONSOLE_LOCK_TRIES:-10}" "$CONSOLE_LOCK"
 }
 
-# Never release a lock this process does not own: a slow switch whose lock was taken over
-# must not delete the new owner's lock on the way out.
+# Releases only the lock this process holds. The lock file stays: deleting or recreating it
+# would give two writers two different inodes (the historical reclaim bug, R04).
 _console_unlock() {
-  [ -n "${CONSOLE_LOCK:-}" ] || return 0
-  _uo=$(cat "$CONSOLE_LOCK/pid" 2>/dev/null)
-  [ -z "$_uo" ] || [ "$_uo" = "$$" ] || return 0
-  rm -rf "$CONSOLE_LOCK" 2>/dev/null
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release console
   return 0
 }
 
 _console_set() { # _console_set <key> <value>
   mkdir -p "$(dirname "$CONSOLE_STATE")" 2>/dev/null || return 1
+  _ct_tmp="$CONSOLE_STATE.tmp.$$"
   if [ -f "$CONSOLE_STATE" ]; then
-    grep -v "^$1=" "$CONSOLE_STATE" > "$CONSOLE_STATE.tmp" 2>/dev/null || : > "$CONSOLE_STATE.tmp"
+    grep -v "^$1=" "$CONSOLE_STATE" > "$_ct_tmp" 2>/dev/null || : > "$_ct_tmp"
   else
-    : > "$CONSOLE_STATE.tmp"
+    : > "$_ct_tmp"
   fi
-  printf '%s=%s\n' "$1" "$2" >> "$CONSOLE_STATE.tmp" 2>/dev/null || { rm -f "$CONSOLE_STATE.tmp"; return 1; }
-  chmod 600 "$CONSOLE_STATE.tmp" 2>/dev/null
-  mv -f "$CONSOLE_STATE.tmp" "$CONSOLE_STATE" 2>/dev/null
+  printf '%s=%s\n' "$1" "$2" >> "$_ct_tmp" 2>/dev/null || { rm -f "$_ct_tmp"; return 1; }
+  chmod 600 "$_ct_tmp" 2>/dev/null
+  mv -f "$_ct_tmp" "$CONSOLE_STATE" 2>/dev/null
 }
 
 _console_tun_ensure() {
@@ -2173,7 +2223,13 @@ _console_tun_ensure() {
     chmod 755 "$CONSOLE_INITD" 2>/dev/null
   fi
   "$CONSOLE_INITD" enable >/dev/null 2>&1
-  "$CONSOLE_INITD" start >/dev/null 2>&1
+  # The tunnel is a procd service: run the init script without the lock descriptor, or the
+  # daemon inherits it and holds the console lock until reboot.
+  if command -v gm_lock_safe_exec >/dev/null 2>&1; then
+    gm_lock_safe_exec "$CONSOLE_INITD" start >/dev/null 2>&1
+  else
+    "$CONSOLE_INITD" start >/dev/null 2>&1
+  fi
   _i=0
   while [ "$_i" -lt 10 ] && ! ip link show "$CONSOLE_TUN_DEV" >/dev/null 2>&1; do
     sleep 1; _i=$((_i+1))
@@ -2284,6 +2340,8 @@ _console_on_fail() { # _console_on_fail <step> <message>
     rm -f "$_orig" 2>/dev/null
   fi
   rm -f "$_cand" 2>/dev/null
+  # Every failure path ends here; none of them may return with the lane lock still held.
+  _console_unlock
   if [ "$_restored" = true ]; then
     printf '{"ok":false,"step":"%s","restored":true,"error":"%s - previous config restored"}\n' "$1" "$2"
   else
@@ -2386,6 +2444,16 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
     _console_unlock
     printf '{"ok":false,"error":"cannot read the mihomo config"}\n'; return 1
   }
+  # The candidate is patched from THIS copy, so its digest is the base the transaction must
+  # still find live at commit time. Without it a concurrent mtrickle_sync/apply commit would
+  # be silently erased by a candidate built before it (report R06): the transaction refuses
+  # with "changed since read" instead.
+  _base_sha=$("$PYTHON_BIN" -B -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
+    "$_cand" 2>/dev/null)
+  [ -n "$_base_sha" ] || {
+    rm -f "$_cand"; _console_unlock
+    printf '{"ok":false,"error":"cannot fingerprint the mihomo config - live config untouched"}\n'; return 1
+  }
   if [ -n "$_url" ]; then
     _res=$(printf '%s\n' "$_url" | "$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --url - --countries "$_countries" 2>&1)
   else
@@ -2420,7 +2488,7 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   chmod 600 "$_orig" 2>/dev/null
   # The switch itself: preimage, mihomo -t, isolated trial, atomic write, reload and a rollback
   # if any of it fails. Nothing here changes the live file by hand.
-  _txout=$("$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" < "$_cand" 2>&1)
+  _txout=$("$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" --expect-sha256 "$_base_sha" < "$_cand" 2>&1)
   _txrc=$?
   if [ "$_txrc" != 0 ]; then
     _detail=$(printf '%s' "$_txout" | tail -1 | sed 's/["\\]//g' | cut -c1-300)

@@ -38,6 +38,29 @@
 - Осталось: slot→TX на живом mihomo (стенд), `_rs_restore_cron`-подобный CAS для
   restart-preimage (I04, вторая половина).
 
+## Партия 9 — этап 0: baseline и composer (0а, 0б)
+
+- 0а: зафиксирован baseline для будущего переноса — `docs/source-split/BASELINE-0a.md`:
+  HEAD `5d3fde9`, sha256/байты трёх delivery-целей и собранного установщика, source-size
+  inventory (17 authored-файлов, ≥500 строк), baseline проверок (gate17: 94 модуля, 1365
+  тестов, 0 fail), карта generators→consumers (build.py, build_module_index.py,
+  gen-geo-rpc.py, extraction/catalogue тесты) и явная фиксация, что локальный CODE_MAP/index
+  плагина DSH из инструментов недоступен — навигация по исходникам/манифестам, дубль карты
+  не создавался.
+- 0б: `tools/compose_sources.py` — `compose_target(target) -> bytes` (чистое чтение и
+  конкатенация) и CLI `--check` (немутирующий, называет первую разошедшуюся часть),
+  `--write` (публикует только после валидации всех трёх целей), `--list`, `--inventory`.
+  Manifest (`src/<target>/order.json`) — фиксированный упорядоченный список частей, без
+  include-графа: отказ на неизвестную цель, отсутствующую/дублирующуюся/не указанную/
+  выходящую за корень часть, симлинк, битый манифест и манифест чужой цели. Без цели
+  (`monolith`) check не падает, поэтому инструмент мог появиться до переноса.
+- Доказательства: новый `tests/test_source_composition.py` 18 — точный порядок/байты,
+  изменённая часть → drift без перезаписи output, отказ до публикации любой цели,
+  детерминированные LF/EOF (конкатенация без разделителей), CLI-поведение.
+- Осталось по этапу 0: 0в (механический перенос installer/backend/panel в parts с
+  байт-паритетом и переводом RPC-writer'а на generated part), 0г, 0д и gate этапа 0 —
+  это отдельная партия, требующая полного gate-прогона.
+
 ## Партия 8 — reload-proof, AND/OR, dhcp, syncd, release, start order (C04/C07, G02, G03, P11, P10, P12, R01)
 
 - Коммиты: `16c3ed7` (C04/C07), `1f7baba` (G02/P12), `3c14bfd` (G03), `fd28828` (R01),

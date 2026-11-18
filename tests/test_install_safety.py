@@ -600,6 +600,16 @@ crontab() {
         self.assertIn('RC=0', result.stdout, result.stderr)
         self.assertTrue(guard.exists(), 'a module that is still selected lost its files')
 
+
+    # ---------------------------------------------------------------- P10 start order
+    def test_the_ifup_hook_exists_before_mihomo_is_started(self):
+        """P10: the first mihomo start ran before the hook that restores tables 100/102."""
+        body = extract('step3_apply')
+        self.assertIn('99-default-vpn-route', body,
+                      'step3 starts mihomo without installing the ifup hook first')
+        self.assertLess(body.index('99-default-vpn-route'), body.index('safe_mihomo_restart'),
+                        'the ifup hook is installed only after mihomo is started')
+
     # ---------------------------------------------------------------- B9
     def test_save_stream_repairs_a_lost_mode(self):
         target = self.case / 'usr/bin/tool.sh'

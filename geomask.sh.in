@@ -1373,7 +1373,16 @@ step3_apply() {
   if [ "$GM_RESTART" = 1 ]; then
     # A failed restart is a failed step: `|| true` reported success while the candidate was
     # rolled back and the VPN never came up with the new config.
-    safe_mihomo_restart || { bad "mihomo restart failed - шаг 3 не завершён"; return 1; }
+    # P10 (audit 18.11.2026): mihomo was started before the ifup hook that (re)installs the
+  # VPN default in tables 100/102 existed - the first start of a fresh router could leave the
+  # VPN default missing until somebody re-plugged an interface. Install the hook before the
+  # restart; step5 still updates it on upgrades, this only covers the first start.
+  if ! mod_skipped guard && [ ! -s "$(P /etc/hotplug.d/iface/99-default-vpn-route)" ]; then
+    save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
+@@ASSET:99-default-vpn-route@@
+ASSET_EOF
+  fi
+  safe_mihomo_restart || { bad "mihomo restart failed - шаг 3 не завершён"; return 1; }
   elif api_refresh_provider sub "$_vpnu"; then
     info "providers refreshed via API (no restart, VPN stays up)"
   elif svc_alive mihomo; then

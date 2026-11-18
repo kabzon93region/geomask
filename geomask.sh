@@ -20934,7 +20934,92 @@ step3_apply() {
   if [ "$GM_RESTART" = 1 ]; then
     # A failed restart is a failed step: `|| true` reported success while the candidate was
     # rolled back and the VPN never came up with the new config.
-    safe_mihomo_restart || { bad "mihomo restart failed - шаг 3 не завершён"; return 1; }
+    # P10 (audit 18.11.2026): mihomo was started before the ifup hook that (re)installs the
+  # VPN default in tables 100/102 existed - the first start of a fresh router could leave the
+  # VPN default missing until somebody re-plugged an interface. Install the hook before the
+  # restart; step5 still updates it on upgrades, this only covers the first start.
+  if ! mod_skipped guard && [ ! -s "$(P /etc/hotplug.d/iface/99-default-vpn-route)" ]; then
+    save_stream /etc/hotplug.d/iface/99-default-vpn-route 755 <<'ASSET_EOF'
+#!/bin/sh
+# Route unmarked LAN traffic to Mihomo TUN; magitrickle marks take precedence.
+# Devices from /etc/geo-devices.list with mode=bypass go DIRECT (real IP), never via VPN.
+# Devices with mode=realtz follow normal mihomo routing (masked IP), only tz is real (PC-side).
+#
+# R05: this file runs inside netifd's ifup path. It must NOT block here (that would stall PPPoE
+# auth / WAN) and it must not LOSE the event either. Therefore it only records what has to be
+# applied - `pending-100`, plus `pending-101`/`pending-102` when those lanes have devices - and
+# spawns ONE detached worker (`geomask-routes.sh`, `routes-worker` lock). All `ip`, `uci`,
+# waiting for the TUN and retries happen in that worker.
+#
+# Exit contract (read by the worker/procd logs, not by netifd):
+#   0  the event is queued (NOT "the routes are applied")
+#   1  the pending event could not be written
+#   2  the lock primitive is unavailable - nothing can ever apply the event, so do not lie
+[ "$ACTION" = "ifup" ] || exit 0
+
+GM_ROUTE_STATE_DIR=${GM_ROUTE_STATE_DIR:-/tmp/geomask-routes}
+MIHOMO_CONF=${MIHOMO_CONF:-/etc/mihomo/config.yaml}
+DEVICES=${DEVICES:-/etc/geo-devices.list}
+GM_ROUTES_LIB=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
+GM_CONSOLE_STATE=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
+export GM_ROUTE_STATE_DIR MIHOMO_CONF DEVICES GM_ROUTES_LIB GM_CONSOLE_STATE
+
+if [ ! -r "$GM_ROUTES_LIB" ]; then
+  command -v logger >/dev/null 2>&1 \
+    && logger -t geomask "route event not queued: $GM_ROUTES_LIB is missing"
+  exit 2
+fi
+# shellcheck disable=SC1090
+. "$GM_ROUTES_LIB" || exit 2
+
+# Enqueue every applicable table; a failure for one lane must NOT cancel the worker for the
+# events that were already written. Exit code reports the worst failure after the spawn.
+_enq_rc=0
+_enq_any=0
+enqueue() { # enqueue <table>; records the outcome, never exits early
+  gm_route_enqueue "$1"
+  case "$?" in
+    0) _enq_any=1 ;;
+    2) [ "$_enq_rc" = 0 ] && _enq_rc=2 ;;
+    *) [ "$_enq_rc" = 0 ] && _enq_rc=1 ;;
+  esac
+  return 0
+}
+
+# The normal lane always has an event on ifup: the worker decides (bounded) whether the TUN is
+# up yet, and a later drain applies what was deferred.
+enqueue 100
+
+# AI lane: only when a device is managed in ai mode. Reading the list is not a network action.
+if [ -f "$DEVICES" ] && grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' "$DEVICES" 2>/dev/null; then
+  enqueue 101
+fi
+
+# Console lane: only while the panel says it is on. The guard owns the rule; the worker fills
+# the table so the console keeps its LAN before the next guard run.
+if [ -f "$GM_CONSOLE_STATE" ] \
+   && [ "$(sed -n 's/^enabled=//p' "$GM_CONSOLE_STATE" 2>/dev/null | head -1)" = 1 ]; then
+  enqueue 102
+fi
+
+# Detached, descriptor-clean worker. `gm_lock_close_inherited` runs before it takes any lock:
+# otherwise the child would keep a console/updater descriptor of its caller and hold that lock
+# for as long as the worker lives. The whole body is a subshell, so the spawn never delays ifup.
+# Spawn whenever AT LEAST ONE table was accepted: a partial enqueue failure (e.g. 101 could not
+# be written) does not throw away the pending-100 event.
+if [ "$_enq_any" = 1 ]; then
+  (
+    cd / 2>/dev/null
+    command -v gm_lock_close_inherited >/dev/null 2>&1 && gm_lock_close_inherited
+    # shellcheck disable=SC1090
+    . "$GM_ROUTES_LIB" 2>/dev/null || exit 0
+    gm_route_worker
+  ) >/dev/null 2>&1 &
+fi
+exit "$_enq_rc"
+ASSET_EOF
+  fi
+  safe_mihomo_restart || { bad "mihomo restart failed - шаг 3 не завершён"; return 1; }
   elif api_refresh_provider sub "$_vpnu"; then
     info "providers refreshed via API (no restart, VPN stays up)"
   elif svc_alive mihomo; then

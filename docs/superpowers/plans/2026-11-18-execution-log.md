@@ -52,6 +52,9 @@
 - Документация: в `docs/DEVELOPMENT.md` описано, что RPC-регионы живут в generated-частях.
 - Доказательства: `tests/test_source_composition.py` 23 → 26 (маппинг writer'а, ровно один
   помеченный регион на часть, `target_for_output`).
+- Полный gate после 0в-хвоста: 95 модулей, 1391 тест (1361 выполнено, 30 allowlisted skip),
+  0 fail, 0 timeout, PASS (лог `gate21`); `compose --check`, `gen-geo-rpc --check`,
+  `check_build --verify-only` зелёные, `build.py` даёт прежний `geomask.sh`.
 - Осталось по этапу 0: 0г (перенос остальных кандидатов по ответственности — по одной цели на
   repair-задачу) и 0д-хвост (repo-check oversized authored files, обновление локального
   индекса); плюс gate этапа 0 на изолированной машине.

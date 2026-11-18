@@ -157,6 +157,24 @@ class SyncdWatchdogTests(unittest.TestCase):
         self.assertIn('BACKOFF=15', after,
                       'BACKOFF must be reset after a successful inotifywait')
 
+    def test_startup_reconciles_before_waiting_for_an_event(self):
+        """P11: an already-up router had no event to wait for."""
+        self.assertIn('run_catchup', self.text)
+        startup = self.text.split('watchdog started', 1)[1].split('while true', 1)[0]
+        self.assertIn('run_catchup', startup,
+                      'the watchdog waits for an event before it ever syncs')
+
+    def test_a_write_during_the_sync_is_applied_without_a_second_event(self):
+        """P11: the blind window - the change landed while the sync was reading."""
+        self.assertIn('_before=$(digest)', self.text)
+        self.assertIn('_after=$(digest)', self.text)
+        self.assertIn('CATCHUP_MAX', self.text)
+        self.assertIn('state changed during the sync', self.text)
+
+    def test_the_fallback_digest_sees_content_not_mtime(self):
+        """`ls -l` cannot see a same-size rewrite in the same minute."""
+        self.assertIn('md5sum', self.text)
+        self.assertNotIn('ls -l "$DIR"', self.text)
 
 if __name__ == '__main__':
     unittest.main()

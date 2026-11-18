@@ -122,7 +122,7 @@
           "path": "/usr/bin/geomask-syncd.sh",
           "source": "assets/geomask-syncd.sh",
           "mode": "0755",
-          "sha256": "52744d7a73ccb535ae7f1391e67112876cf46f3c9b811f3fef8b6c08209756df"
+          "sha256": "da8f32894a8f42937358b4954d49212f99b5f84626c008cb77975b08354b6488"
         },
         {
           "path": "/usr/lib/geomask/99-default-vpn-route.dist",

@@ -27,7 +27,7 @@
   "test_dnscheck_contract.py": 11,
   "test_dnsguard.py": 44,
   "test_docs_claims.py": 4,
-  "test_doctor.py": 61,
+  "test_doctor.py": 64,
   "test_event_timestamp.py": 7,
   "test_gn_mapping.py": 7,
   "test_guard_entrypoint.py": 13,

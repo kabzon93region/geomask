@@ -1317,6 +1317,10 @@ def list_checks():
 
 # --------------------------------------------------------------------------- domain
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) geomask-doctor'
+# One budget for the whole live trace (audit B-020). The LuCI RPC timeout was observed at 20 s
+# while the trace itself took ~29 s, so the panel lost the answer entirely; 15 s keeps a margin
+# and every network step is capped by what is left, not by its own timeout.
+DOMAIN_TRACE_BUDGET = int(os.environ.get('GM_DOMAIN_TRACE_BUDGET') or 15)
 
 
 def node_delay(name, timeout=5000):
@@ -1331,17 +1335,30 @@ def node_delay(name, timeout=5000):
     return None
 
 
-def http_probe(domain, timeout=20):
+def http_probe(domain, timeout=20, deadline=None):
     """One HTTPS request from the router, explained instead of just "rc=28".
 
     curl exit codes carry the answer: 28 means nothing came back in time, 6 is DNS,
     35 is TLS, 56 is a reset. A timeout is the interesting one - it can be the exit node
     or the site refusing that exit, and the owner needs to know which.
+
+    deadline (monotonic seconds) is the whole trace's budget: a step never runs past it, so
+    the RPC handler answers inside its own timeout and the owner gets a partial result with
+    a reason instead of an XHR timeout (audit B-020).
     """
-    rc, out = run(['curl', '-m', str(timeout), '--connect-timeout', '8', '-sS',
+    budget = timeout
+    if deadline is not None:
+        budget = int(deadline - time.monotonic())
+        if budget < 1:
+            return {'ok': False, 'code': '', 'took': '', 'ip': '', 'rc': 124,
+                    'kind': 'deadline', 'deadline': True,
+                    'detail': 'общий бюджет трассы исчерпан до HTTP-запроса'}
+        budget = min(timeout, budget)
+    connect = 8 if budget >= 8 else max(1, budget)
+    rc, out = run(['curl', '-m', str(budget), '--connect-timeout', str(connect), '-sS',
                    '-o', '/dev/null', '-A', USER_AGENT,
                    '-w', '%{http_code} %{time_total} %{remote_ip}', 'https://' + domain],
-                  timeout=timeout + 8)
+                  timeout=budget + 8)
     parts = (out or '').split()
     code = parts[0] if parts else ''
     took = parts[1] if len(parts) > 1 else ''
@@ -1355,7 +1372,7 @@ def http_probe(domain, timeout=20):
     kinds = {28: 'timeout', 6: 'dns', 7: 'refused', 35: 'tls', 52: 'empty', 56: 'reset',
              60: 'cert'}
     kind = kinds.get(rc, 'other')
-    words = {'timeout': 'нет ответа за %d с' % timeout, 'dns': 'имя не разрешилось',
+    words = {'timeout': 'нет ответа за %d с' % budget, 'dns': 'имя не разрешилось',
              'refused': 'соединение отклонено', 'tls': 'TLS не поднялся',
              'empty': 'сервер закрыл соединение без ответа', 'reset': 'соединение сброшено',
              'cert': 'сертификат не проверен', 'other': 'сбой запроса'}
@@ -1381,7 +1398,7 @@ PAGE_FILE = '/tmp/geomask-doctor-page.html'
 HOPS_FILE = '/tmp/geomask-doctor-hops.txt'
 
 
-def related_hosts(domain, limit=12):
+def related_hosts(domain, limit=12, deadline=None):
     """Hosts the page itself depends on, with the kind of reference that found them.
 
     A shop is rarely one host: the catalogue answers from one domain and the payment
@@ -1391,9 +1408,18 @@ def related_hosts(domain, limit=12):
 
     The kind matters: pictures and stylesheets on another path are harmless, a form or an
     iframe on another path carries the session and can be rejected by the site.
+
+    deadline (monotonic seconds) bounds both requests, like http_probe: an exhausted budget
+    returns what the certificate already yielded and marks the rest as not checked, instead
+    of blowing past the RPC timeout (audit B-020).
     """
     page = PAGE_FILE
     hops = HOPS_FILE
+
+    def remaining():
+        if deadline is None:
+            return None
+        return max(0, int(deadline - time.monotonic()))
     # a failed request leaves the previous page behind, and the previous site's hosts were
     # then reported as this domain's (a nonexistent host showed plati.market's six hosts)
     for stale in (page, hops):
@@ -1416,8 +1442,12 @@ def related_hosts(domain, limit=12):
                 return
         found.append({'host': host, 'kinds': [kind], 'session': kind in SESSION_KINDS})
 
-    run(['curl', '-sS', '-L', '--max-time', '20', '-A', USER_AGENT,
-         '-D', hops, '-o', page, 'https://' + domain], timeout=26)
+    _budget = remaining()
+    if _budget is not None and _budget < 2:
+        return found[:limit]
+    _page_to = 20 if _budget is None else min(20, _budget)
+    run(['curl', '-sS', '-L', '--max-time', str(_page_to), '-A', USER_AGENT,
+         '-D', hops, '-o', page, 'https://' + domain], timeout=_page_to + 6)
     for line in read_text(hops).splitlines():
         if line.lower().startswith('location:'):
             add(host_of(line.split(':', 1)[1]), 'redirect')
@@ -1426,14 +1456,18 @@ def related_hosts(domain, limit=12):
         pattern = r'<%s\b[^>]{0,400}?(?:src|href|action)\s*=\s*["\']([^"\']{4,300})' % tag
         for match in re.finditer(pattern, html, re.I):
             add(host_of(match.group(1)), tag)
-    rc, out = run(['sh', '-c',
-                   'echo | timeout 8 openssl s_client -connect %s:443 -servername %s 2>/dev/null '
-                   '| openssl x509 -noout -text 2>/dev/null' % (domain, domain)], timeout=12)
-    for match in re.finditer(r'DNS:([^,\n]+)', out or ''):
-        name = match.group(1).strip()
-        if name.startswith('*.'):
-            continue
-        add(name, 'cert')
+    _budget = remaining()
+    if _budget is None or _budget >= 3:
+        _tls_to = 8 if _budget is None else min(8, _budget - 1)
+        rc, out = run(['sh', '-c',
+                       'echo | timeout %d openssl s_client -connect %s:443 -servername %s '
+                       '2>/dev/null | openssl x509 -noout -text 2>/dev/null'
+                       % (_tls_to, domain, domain)], timeout=_tls_to + 4)
+        for match in re.finditer(r'DNS:([^,\n]+)', out or ''):
+            name = match.group(1).strip()
+            if name.startswith('*.'):
+                continue
+            add(name, 'cert')
     return found[:limit]
 
 
@@ -1471,6 +1505,16 @@ def trace_domain(domain, live=False):
     route_country = ''
     mt_iface = ''
     lines = ['Домен: %s' % domain, '']
+    # B-020 (audit 18.11.2026): the live part of the trace overran the RPC timeout (observed
+    # 29 s against a 20 s handler), so the panel lost the whole answer. One budget covers
+    # every network step; what does not fit is reported as not checked, with the reason.
+    deadline = time.monotonic() + DOMAIN_TRACE_BUDGET if live else None
+    partial = False
+
+    def left():
+        if deadline is None:
+            return None
+        return max(0, int(deadline - time.monotonic()))
 
     def step(stage, verdict, detail, fix=''):
         steps.append({'stage': stage, 'verdict': verdict, 'detail': detail, 'fix': fix})
@@ -1670,8 +1714,14 @@ def trace_domain(domain, live=False):
 
     # 5. live probe - and the reason when it fails
     if live:
-        probe = http_probe(domain)
-        if probe['ok']:
+        probe = http_probe(domain, deadline=deadline)
+        if probe.get('deadline'):
+            partial = True
+            step('Проверка HTTP', 'warn', probe['detail'],
+                 'Трасса уложилась в %d с: сетевая проба не выполнялась. Повторите позже или '
+                 'проверьте домен без галочки «живая проверка» (быстрый расчёт маршрута).'
+                 % DOMAIN_TRACE_BUDGET)
+        elif probe['ok']:
             step('Проверка HTTP', 'ok', probe['detail'] + ' — сайт ответил (запрос с роутера)')
         elif probe['kind'] == 'http':
             step('Проверка HTTP', 'warn', probe['detail'] + ' — сайт ответил (запрос с роутера)',
@@ -1710,7 +1760,17 @@ def trace_domain(domain, live=False):
 
     # 6. the hosts this page depends on (v1.30.2): the second domain is the one that matters
     if live:
-        related = related_hosts(domain)
+        related = []
+        _left = left()
+        if _left is not None and _left < 2:
+            partial = True
+            step('Связанные хосты', 'warn',
+                 'не проверялось — общий бюджет трассы (%d с) исчерпан' % DOMAIN_TRACE_BUDGET,
+                 'Повторите позже или проверьте домен без галочки «живая проверка».')
+        else:
+            related = related_hosts(domain, deadline=deadline)
+            if left() == 0:
+                partial = True
         if related:
             main_policy = (hit or {}).get('policy', 'GLOBAL')
             rows = []
@@ -1759,6 +1819,13 @@ def trace_domain(domain, live=False):
                      'не найдено — страница не ссылается на другие домены')
 
     lines.append('')
+    # The probe path is part of the answer (D1): this curl leaves from the router, not from a
+    # LAN client through PREROUTING, so its result is not "the site is down for the console".
+    if live:
+        lines.append('Проба: HTTP-запрос с роутера (не путь LAN-клиента)')
+    if partial:
+        lines.append('Результат частичный: часть сетевых проб не выполнялась из-за бюджета %d с'
+                     % DOMAIN_TRACE_BUDGET)
     if route_path:
         summary = ' → '.join(route_path)
         if route_country:
@@ -1786,7 +1853,9 @@ def trace_domain(domain, live=False):
             state = 'warn'
     write_log('domain_trace', state, lines)
     return {'ok': True, 'domain': domain, 'state': state, 'steps': steps,
-            'lines': lines, 'fix': fix, 'log': log_path('domain_trace')}
+            'lines': lines, 'fix': fix, 'log': log_path('domain_trace'),
+            'partial': partial, 'probe_path': 'router' if live else 'none',
+            'budget_s': DOMAIN_TRACE_BUDGET if live else 0}
 
 
 # --------------------------------------------------------------------------- cli

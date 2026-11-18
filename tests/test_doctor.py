@@ -332,6 +332,22 @@ class DoctorRegistryTests(unittest.TestCase):
         self.assertIn('MagiTrickle: группа', summary)
         self.assertIn(' → ', summary)
 
+    def test_a_live_trace_over_budget_reports_a_partial_result(self):
+        """B-020: the RPC gets an answer inside its timeout, with what was not checked named."""
+        original = doctor.run
+        self.addCleanup(lambda: setattr(doctor, 'run', original))
+        saved = doctor.DOMAIN_TRACE_BUDGET
+        self.addCleanup(lambda: setattr(doctor, 'DOMAIN_TRACE_BUDGET', saved))
+        doctor.run = lambda cmd, timeout=8, stdin=None: (28, '')
+        doctor.DOMAIN_TRACE_BUDGET = 1
+        result = doctor.trace_domain('example.com', live=True)
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['partial'], 'a budget-limited trace claimed to be complete')
+        self.assertEqual(result['probe_path'], 'router')
+        self.assertTrue(any('частичный' in line for line in result['lines']),
+                        result['lines'])
+        self.assertTrue(any('с роутера' in line for line in result['lines']),
+                        'the probe path is not stated in the answer')
     def test_domain_trace_puts_zapret_first_when_it_processes_the_domain(self):
         self._route_fixture()
         original = {name: getattr(doctor, name)
@@ -616,6 +632,39 @@ class DoctorStalePageTests(unittest.TestCase):
         doctor.run = lambda cmd, timeout=8, stdin=None: (6, '')
         self.assertEqual(doctor.related_hosts('nope-not-in-any-list.org'), [])
 
+    def test_an_exhausted_budget_skips_both_requests(self):
+        """B-020: a step must never run past the trace budget."""
+        calls = []
+
+        def fake(cmd, timeout=8, stdin=None):
+            calls.append(cmd)
+            return 0, ''
+
+        doctor.run = fake
+        deadline = doctor.time.monotonic() - 1          # budget already spent
+        self.assertEqual(doctor.related_hosts('shop.example.com', deadline=deadline), [])
+        self.assertEqual(calls, [], 'a request was made after the deadline')
+        probe = doctor.http_probe('shop.example.com', deadline=deadline)
+        self.assertTrue(probe['deadline'])
+        self.assertEqual(probe['kind'], 'deadline')
+        self.assertEqual(calls, [], 'http_probe ignored the exhausted budget')
+
+    def test_a_partial_budget_still_caps_the_request(self):
+        seen = []
+
+        def fake(cmd, timeout=8, stdin=None):
+            seen.append((cmd, timeout))
+            return 28, ''
+
+        doctor.run = fake
+        deadline = doctor.time.monotonic() + 4
+        probe = doctor.http_probe('shop.example.com', deadline=deadline)
+        self.assertEqual(probe['kind'], 'timeout')
+        self.assertTrue(seen)
+        cmd, run_timeout = seen[0]
+        self.assertLessEqual(int(cmd[cmd.index('-m') + 1]), 4,
+                             'curl was allowed to run past the trace budget')
+        self.assertLessEqual(run_timeout, 12)
     def test_a_real_page_still_yields_its_hosts(self):
         def fake(cmd, timeout=8, stdin=None):
             if cmd[0] == 'curl':

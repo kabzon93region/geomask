@@ -30,7 +30,13 @@
       "path": "090-diag-collect.sh.part"
     },
     {
-      "path": "100-diag-archive.sh.part"
+      "path": "100a-diag-head.sh.part"
+    },
+    {
+      "path": "900-rpc-dispatch.sh.part"
+    },
+    {
+      "path": "100b-diag-tail.sh.part"
     }
   ]
 }

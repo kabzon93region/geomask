@@ -33,10 +33,21 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.normpath(os.path.join(HERE, "..", "assets"))
+ROOT = os.path.dirname(HERE)
+TOOLS_DIR = HERE
 MANIFEST = os.path.join(HERE, "geo-rpc.json")
 
 BEGIN_MARK = ">>> geo-rpc generated:{region} (tools/geo-rpc.json) >>>"
 END_MARK = "<<< geo-rpc generated:{region} <<<"
+
+# Stage 0v: after the move the assets are generated compatibility views. The regions that
+# this tool owns live in their own parts, so the tool writes the PART and lets the composer
+# refresh the view - there is exactly one writer for those bytes. A target that has no parts
+# is still written directly (the tool works before and after the move).
+GENERATED_PARTS = {
+    ("geo-backend.sh", "dispatch"): "src/backend/900-rpc-dispatch.sh.part",
+    ("geo-sync-page.js", "decl"): "src/panel/900-rpc-decl.js.part",
+}
 
 # file -> (regions in file order, comment prefix for markers)
 TARGETS = [
@@ -241,16 +252,37 @@ def main():
     for name, regions, prefix in TARGETS:
         new = files[name]
         touched = []
+        part_touched = []
         for region in regions:
+            part_rel = GENERATED_PARTS.get((name, region))
+            if part_rel:
+                part_path = os.path.join(ROOT, part_rel)
+                part_old = read_text(part_path)
+                part_new, part_changed = apply_region(part_old, region, prefix, rendered[region])
+                if part_changed:
+                    part_touched.append(region)
+                    if not check:
+                        write_text(part_path, part_new)
+                continue
             new, ch = apply_region(new, region, prefix, rendered[region])
             if ch:
-                touched.append(region)
-        if touched and not check:
-            write_text(os.path.join(ASSETS, name), new)
-            changed.append("%s (%s)" % (name, ", ".join(touched)))
-        if touched and check:
-            drift.append("%s: %s" % (name, ", ".join(touched)))
-        state = "DRIFT" if (touched and check) else ("rewritten" if touched else "in sync")
+                touched.append((region, new))
+        for region, text in touched:
+            if not check:
+                write_text(os.path.join(ASSETS, name), text)
+                new = text
+        if part_touched and not check:
+            # The view is regenerated from its parts; writing the part only keeps one writer.
+            sys.path.insert(0, TOOLS_DIR)
+            import compose_sources
+            compose_sources.write_target_for_asset(name, ROOT)
+        regions_drift = sorted({r for r, _t in touched} | set(part_touched))
+        if regions_drift and not check:
+            changed.append("%s (%s)" % (name, ", ".join(regions_drift)))
+        if regions_drift and check:
+            drift.append("%s: %s" % (name, ", ".join(regions_drift)))
+        state = ("DRIFT" if regions_drift and check
+                 else ("rewritten" if regions_drift else "in sync"))
         print("[%d/%d] %s: %s" % (step, TOTAL_STEPS, name, state), flush=True)
         step += 1
 
@@ -264,6 +296,20 @@ def main():
     if acl_touched and check:
         drift.append(ACL_FILE)
     step += 1
+
+    if check:
+        # The regions can be correct while the delivery view is stale (someone edited the
+        # generated file): the composer is the authority for the assembled bytes.
+        sys.path.insert(0, TOOLS_DIR)
+        import compose_sources
+        for target in compose_sources.TARGETS:
+            try:
+                status, detail = compose_sources.check_target(target, ROOT)
+            except compose_sources.ComposeError as exc:
+                drift.append('%s: %s' % (target, exc))
+                continue
+            if status == 'drift':
+                drift.append('%s: assembled view is stale (%s)' % (target, detail))
 
     errs = cross_checks(manifest, files)
     print("[%d/%d] cross-checks (backend functions, js declarations): %s"

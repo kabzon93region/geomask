@@ -43,6 +43,10 @@ python tools/check_build.py         # geomask.sh == сборка из исход
 - Части — только для разработки/сборки: на роутер по-прежнему уезжает один `geomask.sh`,
   никаких runtime-imports. Часть не должна открывать heredoc, который не закрывает, и
   мягкий предел — ~500 строк на авторскую часть.
+- Generated-регионы RPC (`dispatch` в backend, `decl` в panel) живут в отдельных частях
+  `900-rpc-dispatch.sh.part` / `900-rpc-decl.js.part`: `tools/gen-geo-rpc.py` пишет **часть**,
+  а view пересобирается композицией — один writer для этих байтов. `--check` проверяет и
+  регион, и собранный view.
 - Baseline для паритета после переноса: [`docs/source-split/BASELINE-0a.md`](source-split/BASELINE-0a.md).
 
 **Инвариант байтов:** установщик пишет ассет через heredoc — текст (LF) без хвостовых

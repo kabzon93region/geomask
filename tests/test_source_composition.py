@@ -253,6 +253,31 @@ class MigratedTreeTests(unittest.TestCase):
         self.assertNotIn('write_target(', source,
                          'check_build publishes the composition it is verifying')
 
+    def test_the_rpc_generator_owns_a_generated_part_not_the_view(self):
+        """0v tail: one writer for the generated regions."""
+        generator = (ROOT / 'tools' / 'gen-geo-rpc.py').read_text(encoding='utf-8')
+        self.assertIn('GENERATED_PARTS', generator)
+        self.assertIn('src/backend/900-rpc-dispatch.sh.part', generator)
+        self.assertIn('src/panel/900-rpc-decl.js.part', generator)
+        self.assertIn('write_target_for_asset', generator,
+                      'the generator does not refresh the view from its parts')
+
+    def test_generated_parts_hold_exactly_the_marked_region(self):
+        for target, part in (('backend', 'src/backend/900-rpc-dispatch.sh.part'),
+                             ('panel', 'src/panel/900-rpc-decl.js.part')):
+            path = ROOT / part
+            self.assertTrue(path.is_file(), '%s is missing' % part)
+            text = path.read_text(encoding='utf-8')
+            self.assertEqual(text.count('geo-rpc generated:'), 2,
+                             '%s must hold exactly one marked region' % part)
+            self.assertIn(part, [os.path.relpath(p, ROOT).replace(os.sep, '/')
+                                 for p in composer.load_manifest(target, str(ROOT))])
+
+    def test_an_asset_maps_back_to_its_target(self):
+        self.assertEqual(composer.target_for_output('assets/geo-backend.sh'), 'backend')
+        self.assertEqual(composer.target_for_output('assets/geo-sync-page.js'), 'panel')
+        self.assertIsNone(composer.target_for_output('assets/geo-sync'))
+
 
 if __name__ == '__main__':
     unittest.main()

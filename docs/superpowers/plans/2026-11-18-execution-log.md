@@ -38,6 +38,24 @@
 - Осталось: slot→TX на живом mihomo (стенд), `_rs_restore_cron`-подобный CAS для
   restart-preimage (I04, вторая половина).
 
+## Партия 11 — этап 0в-хвост: RPC-writer на generated part
+
+- `dispatch` (backend) и `decl` (panel) вынесены в собственные generated-части
+  `src/backend/900-rpc-dispatch.sh.part` и `src/panel/900-rpc-decl.js.part`; окружающие части
+  разрезаны по границам маркеров, паритет сохранён (12 частей backend, 8 panel).
+- `tools/gen-geo-rpc.py` больше не пишет в view: для этих двух регионов он пишет часть, а
+  собранный asset пересобирается композицией (`write_target_for_asset`) — один writer на байты.
+  `--check` проверяет и регион, и собранный view (stale view = drift).
+- Проверено вживую: удаление одной строки из `900-rpc-dispatch.sh.part` → `--check` rc1 с
+  «geo-backend.sh: DRIFT», `apply` восстанавливает часть байт-в-байт, `compose --check` снова
+  ok, `check_build --verify-only` зелёный; `build.py` даёт прежний `geomask.sh`.
+- Документация: в `docs/DEVELOPMENT.md` описано, что RPC-регионы живут в generated-частях.
+- Доказательства: `tests/test_source_composition.py` 23 → 26 (маппинг writer'а, ровно один
+  помеченный регион на часть, `target_for_output`).
+- Осталось по этапу 0: 0г (перенос остальных кандидатов по ответственности — по одной цели на
+  repair-задачу) и 0д-хвост (repo-check oversized authored files, обновление локального
+  индекса); плюс gate этапа 0 на изолированной машине.
+
 ## Партия 10 — этап 0в: перенос трёх целей с байт-паритетом
 
 - Инсталлятор: `geomask.sh.in` (6 386 строк) → 17 частей `src/installer/010-…170-*.sh.part`

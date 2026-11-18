@@ -1,0 +1,2 @@
+  *) printf '{"error":"usage"}'; exit 1 ;;
+esac

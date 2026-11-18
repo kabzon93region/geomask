@@ -3,7 +3,13 @@
   "target": "panel",
   "parts": [
     {
-      "path": "010-helpers.js.part"
+      "path": "010a-helpers-head.js.part"
+    },
+    {
+      "path": "900-rpc-decl.js.part"
+    },
+    {
+      "path": "010b-helpers-tail.js.part"
     },
     {
       "path": "020-render-overview.js.part"

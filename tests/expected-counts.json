@@ -80,7 +80,7 @@
   "test_scheduler_apply_chain.py": 3,
   "test_scheduler_runner.py": 14,
   "test_slot_patch.py": 12,
-  "test_source_composition.py": 23,
+  "test_source_composition.py": 26,
   "test_source_delete_guard.py": 7,
   "test_status_contract.py": 14,
   "test_step_freshness.py": 4,

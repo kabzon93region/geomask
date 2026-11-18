@@ -144,6 +144,26 @@ def output_path(target, root=ROOT):
     return os.path.join(root, spec['output'])
 
 
+def target_for_output(output_name, root=ROOT):
+    """Which target publishes this delivery file (None when it is not a target)."""
+    for name, spec in TARGETS.items():
+        if os.path.normpath(spec['output']) == os.path.normpath(output_name):
+            return name
+    return None
+
+
+def write_target_for_asset(output_name, root=ROOT):
+    """Refresh the view of the asset a generator just wrote a part for.
+
+    Returns the number of bytes published, or None when the file is not a migrated target
+    (the caller then keeps writing the asset itself, as before the move).
+    """
+    target = target_for_output(output_name, root)
+    if target is None or compose_target(target, root) is None:
+        return None
+    return write_target(target, root)
+
+
 def check_target(target, root=ROOT):
     """(status, detail): status is 'monolith', 'ok' or 'drift'."""
     composed = compose_target(target, root)

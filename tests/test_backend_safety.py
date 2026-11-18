@@ -3,6 +3,8 @@
 Every function is extracted from the shipped asset and run in bash with stub `uci`/`ip`/
 `crontab` and a fake root inside a temporary directory. No router, no network.
 """
+import hashlib
+import json
 from pathlib import Path
 import re
 import shutil
@@ -351,6 +353,73 @@ uci() {
         self.assertIn('dnat ip to 192.168.1.54:5353', second)
         self.assertNotIn('192.168.1.53', second)
 
+
+    # ---------------------------------------------------------------- P02 updater gate
+    def module_fixture(self, protocol=2, catalogue_sha=None, installed=b'#!/usr/bin/env python3\n'):
+        """A fake updater + catalogue; the caller must check protocol AND catalogue bytes."""
+        updater = self.case / 'geomask-module-update.py'
+        updater.write_bytes(installed)
+        index = self.case / 'modules-index.json'
+        import hashlib
+        sha = catalogue_sha if catalogue_sha is not None else hashlib.sha256(installed).hexdigest()
+        index.write_text(json.dumps({'modules': {'core': {'files': [
+            {'path': '/usr/lib/geomask/geomask-module-update.py', 'sha256': sha}]}}}),
+            encoding='utf-8', newline='\n')
+        calls = self.case / 'updater.calls'
+        expected = self.case / 'expected-hash'
+        expected.write_text(sha, encoding='utf-8', newline='\n')
+        extra = r'''
+MODULE_UPDATER="@UPD@"
+MODULE_INDEX="@IDX@"
+MODULE_UPDATE_PROTOCOL=2
+python3() {
+  printf '%s\n' "$*" >> "@CALLS@"
+  case "$*" in
+    "- "*|" - "*) cat "@EXPECTED@" ; return 0 ;;
+    *" protocol") printf '{"protocol": %d}\n' @PROTO@ ; return 0 ;;
+    *) printf '{"ok": true, "modules": []}\n' ; return 0 ;;
+  esac
+}
+'''
+        extra = (extra.replace('@UPD@', posix(updater)).replace('@IDX@', posix(index))
+                 .replace('@CALLS@', posix(calls)).replace('@PROTO@', str(protocol))
+                 .replace('@EXPECTED@', posix(expected)))
+        return calls, extra
+
+    def test_a_protocol_mismatch_is_refused_before_any_update(self):
+        """P02: 'the helper exists' used to be the whole gate."""
+        calls, extra = self.module_fixture(protocol=1)
+        result = self.run_backend('cmd_mod_update feature; printf "\\nRC=%s\\n" "$?"',
+                                  functions=['cmd_mod_update', '_module_updater_ready',
+                                             '_module_updater_guard', 'json_esc'],
+                                  extra=extra + '_require_backup() { return 0; }\n')
+        self.assertIn('RC=1', result.stdout)
+        self.assertIn('protocol mismatch', result.stdout)
+        calls_text = calls.read_text(encoding='utf-8') if calls.exists() else ''
+        self.assertNotIn(' update ', calls_text,
+                         'an update was attempted with an incompatible helper')
+
+    def test_a_helper_that_differs_from_the_catalogue_is_refused(self):
+        calls, extra = self.module_fixture(protocol=2, catalogue_sha='0' * 64)
+        result = self.run_backend('cmd_mod_list; printf "\\nRC=%s\\n" "$?"',
+                                  functions=['cmd_mod_list', '_module_updater_ready',
+                                             '_module_updater_guard', 'json_esc'],
+                                  extra=extra)
+        self.assertIn('RC=1', result.stdout)
+        self.assertIn('does not match the catalogue', result.stdout)
+        self.assertNotIn('status', calls.read_text(encoding='utf-8')
+                         if calls.exists() else '',
+                         'the caller trusted a helper that is not the catalogue bytes')
+
+    def test_a_matching_helper_runs_the_command(self):
+        calls, extra = self.module_fixture(protocol=2)
+        result = self.run_backend('cmd_mod_list; printf "\\nRC=%s\\n" "$?"',
+                                  functions=['cmd_mod_list', '_module_updater_ready',
+                                             '_module_updater_guard', 'json_esc'],
+                                  extra=extra)
+        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
+        self.assertIn('"ok": true', result.stdout)
+        self.assertIn(' status', calls.read_text(encoding='utf-8'))
 
     # ---------------------------------------------------------------- C04 reload proof
     def aidns_fixture(self, reload_ok, table_live):

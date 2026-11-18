@@ -1935,6 +1935,58 @@ cmd_backups() {
 }
 
 MODULE_UPDATER=/usr/lib/geomask/geomask-module-update.py
+# P02: the caller and the helper share a wire format. "The file exists" is not proof that it can
+# answer this build's questions, and a same-version helper from another build used to pass.
+MODULE_UPDATE_PROTOCOL=2
+MODULE_INDEX=${GM_MODULE_INDEX:-/etc/geomask/modules-index.json}
+
+# Returns 0 only when the installed helper matches the catalogue bytes AND speaks our protocol.
+_module_updater_ready() {
+  [ -f "$MODULE_UPDATER" ] || { printf 'module updater not installed'; return 1; }
+  if [ -r "$MODULE_INDEX" ]; then
+    _mur_want=$(python3 - "$MODULE_INDEX" "$MODULE_UPDATER" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as handle:
+        data = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+path = sys.argv[2]
+want = ''
+for module in (data.get('modules') or {}).values():
+    for item in module.get('files') or []:
+        if item.get('path') == path:
+            want = item.get('sha256') or ''
+if not want:
+    raise SystemExit(1)
+print(want)
+PYEOF
+)
+    if [ -n "$_mur_want" ]; then
+      _mur_have=$(sha256sum "$MODULE_UPDATER" 2>/dev/null | awk '{print $1}')
+      if [ "$_mur_have" != "$_mur_want" ]; then
+        printf 'module updater does not match the catalogue (sha256) - reinstall the panel'
+        return 1
+      fi
+    fi
+  fi
+  _mur_proto=$(python3 "$MODULE_UPDATER" protocol 2>/dev/null)
+  # Compare parsed numbers, not a substring: json.dumps formatting is not a contract, and a
+  # substring check would also accept 20 for 2.
+  _mur_got=$(printf '%s' "$_mur_proto" | sed -n 's/.*"protocol"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  if [ "$_mur_got" != "$MODULE_UPDATE_PROTOCOL" ]; then
+    printf 'module updater protocol mismatch (want %s, got %s) - reinstall the panel' \
+      "$MODULE_UPDATE_PROTOCOL" "${_mur_got:-no answer}"
+    return 1
+  fi
+  return 0
+}
+
+_module_updater_guard() { # prints a JSON error and returns 1 when the helper is not usable
+  _mug_why=$(_module_updater_ready) && return 0
+  printf '{"ok":false,"error":"%s"}\n' "$(json_esc "${_mug_why:-module updater not usable}")"
+  return 1
+}
 DOCTOR=/usr/lib/geomask/geomask-doctor.py
 
 # The diagnostics engine ships as its own optional module: without it the tab must say so
@@ -1987,24 +2039,18 @@ cmd_diag_domain() { # $1 = domain, $2 = "live" to make a real request
 cmd_mod_list() {
   # Installed modules and what the cached index says about them. Read-only: never
   # touches the network, so the panel can paint the list instantly.
-  if [ ! -f "$MODULE_UPDATER" ]; then
-    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
-  fi
+  _module_updater_guard || return 1
   python3 "$MODULE_UPDATER" status 2>&1
 }
 
 cmd_mod_check() {
   # Force a fresh index fetch; falls back to the cache when the network is down.
-  if [ ! -f "$MODULE_UPDATER" ]; then
-    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
-  fi
+  _module_updater_guard || return 1
   python3 "$MODULE_UPDATER" check 2>&1
 }
 
 cmd_mod_update() { # $1 = module id, $2 = "force" to overwrite local edits
-  if [ ! -f "$MODULE_UPDATER" ]; then
-    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
-  fi
+  _module_updater_guard || return 1
   case "$1" in
     ''|*[!A-Za-z0-9_]*) printf '{"ok":false,"error":"bad module id"}\n'; return 1 ;;
   esac

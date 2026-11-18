@@ -8652,6 +8652,58 @@ cmd_backups() {
 }
 
 MODULE_UPDATER=/usr/lib/geomask/geomask-module-update.py
+# P02: the caller and the helper share a wire format. "The file exists" is not proof that it can
+# answer this build's questions, and a same-version helper from another build used to pass.
+MODULE_UPDATE_PROTOCOL=2
+MODULE_INDEX=${GM_MODULE_INDEX:-/etc/geomask/modules-index.json}
+
+# Returns 0 only when the installed helper matches the catalogue bytes AND speaks our protocol.
+_module_updater_ready() {
+  [ -f "$MODULE_UPDATER" ] || { printf 'module updater not installed'; return 1; }
+  if [ -r "$MODULE_INDEX" ]; then
+    _mur_want=$(python3 - "$MODULE_INDEX" "$MODULE_UPDATER" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as handle:
+        data = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+path = sys.argv[2]
+want = ''
+for module in (data.get('modules') or {}).values():
+    for item in module.get('files') or []:
+        if item.get('path') == path:
+            want = item.get('sha256') or ''
+if not want:
+    raise SystemExit(1)
+print(want)
+PYEOF
+)
+    if [ -n "$_mur_want" ]; then
+      _mur_have=$(sha256sum "$MODULE_UPDATER" 2>/dev/null | awk '{print $1}')
+      if [ "$_mur_have" != "$_mur_want" ]; then
+        printf 'module updater does not match the catalogue (sha256) - reinstall the panel'
+        return 1
+      fi
+    fi
+  fi
+  _mur_proto=$(python3 "$MODULE_UPDATER" protocol 2>/dev/null)
+  # Compare parsed numbers, not a substring: json.dumps formatting is not a contract, and a
+  # substring check would also accept 20 for 2.
+  _mur_got=$(printf '%s' "$_mur_proto" | sed -n 's/.*"protocol"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  if [ "$_mur_got" != "$MODULE_UPDATE_PROTOCOL" ]; then
+    printf 'module updater protocol mismatch (want %s, got %s) - reinstall the panel' \
+      "$MODULE_UPDATE_PROTOCOL" "${_mur_got:-no answer}"
+    return 1
+  fi
+  return 0
+}
+
+_module_updater_guard() { # prints a JSON error and returns 1 when the helper is not usable
+  _mug_why=$(_module_updater_ready) && return 0
+  printf '{"ok":false,"error":"%s"}\n' "$(json_esc "${_mug_why:-module updater not usable}")"
+  return 1
+}
 DOCTOR=/usr/lib/geomask/geomask-doctor.py
 
 # The diagnostics engine ships as its own optional module: without it the tab must say so
@@ -8704,24 +8756,18 @@ cmd_diag_domain() { # $1 = domain, $2 = "live" to make a real request
 cmd_mod_list() {
   # Installed modules and what the cached index says about them. Read-only: never
   # touches the network, so the panel can paint the list instantly.
-  if [ ! -f "$MODULE_UPDATER" ]; then
-    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
-  fi
+  _module_updater_guard || return 1
   python3 "$MODULE_UPDATER" status 2>&1
 }
 
 cmd_mod_check() {
   # Force a fresh index fetch; falls back to the cache when the network is down.
-  if [ ! -f "$MODULE_UPDATER" ]; then
-    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
-  fi
+  _module_updater_guard || return 1
   python3 "$MODULE_UPDATER" check 2>&1
 }
 
 cmd_mod_update() { # $1 = module id, $2 = "force" to overwrite local edits
-  if [ ! -f "$MODULE_UPDATER" ]; then
-    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
-  fi
+  _module_updater_guard || return 1
   case "$1" in
     ''|*[!A-Za-z0-9_]*) printf '{"ok":false,"error":"bad module id"}\n'; return 1 ;;
   esac
@@ -11912,6 +11958,10 @@ DEFAULT_REPO = 'kabzon93region/geomask'
 DEFAULT_REF = 'master'
 DEFAULT_CONFIG = '/etc/geomask/module-update.json'
 DEFAULT_STATE = '/etc/geomask/modules-state.json'
+# P02 (audit 18.11.2026): the caller gate used to be "the helper exists (and maybe a
+# version string)", so a helper from another build could pass a newer caller. The wire format
+# between caller and helper is versioned here, and both sides refuse a mismatch explicitly.
+PROTOCOL = 2
 DEFAULT_SELECTION = '/etc/geomask/modules.json'
 # The cached catalogue decides which paths a root-owned update writes. In /tmp any local
 # user could plant one (audit U01), so it lives in a private root-owned directory and is
@@ -12807,7 +12857,8 @@ def run_command(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='geomask-module-update')
-    parser.add_argument('command', choices=['status', 'check', 'update', 'verify', 'seed'])
+    parser.add_argument('command',
+                        choices=['status', 'check', 'update', 'verify', 'seed', 'protocol'])
     parser.add_argument('module', nargs='?')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--state', default=DEFAULT_STATE)
@@ -12816,6 +12867,10 @@ def main(argv=None):
     parser.add_argument('--versions', action='store_true')
     parser.add_argument('--index-file', default='')
     args = parser.parse_args(argv)
+    if args.command == 'protocol':
+        # Cheap and lock-free: the caller checks the format before it trusts any other answer.
+        print(json.dumps({'protocol': PROTOCOL}, ensure_ascii=False))
+        return 0
 
     try:
         # The state file is a read-modify-write record. Taking the lock only in install_staged
@@ -18316,7 +18371,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "597722fd1ee60300fec399bfd363c4b017b45716d3699cc67a9fd8b71423fb0b"
+          "sha256": "481da8da6f5478faa2a095444981c4397c359c64116b71bb5bad73b52072a0c1"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",

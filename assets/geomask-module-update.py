@@ -48,6 +48,10 @@ DEFAULT_REPO = 'kabzon93region/geomask'
 DEFAULT_REF = 'master'
 DEFAULT_CONFIG = '/etc/geomask/module-update.json'
 DEFAULT_STATE = '/etc/geomask/modules-state.json'
+# P02 (audit 18.11.2026): the caller gate used to be "the helper exists (and maybe a
+# version string)", so a helper from another build could pass a newer caller. The wire format
+# between caller and helper is versioned here, and both sides refuse a mismatch explicitly.
+PROTOCOL = 2
 DEFAULT_SELECTION = '/etc/geomask/modules.json'
 # The cached catalogue decides which paths a root-owned update writes. In /tmp any local
 # user could plant one (audit U01), so it lives in a private root-owned directory and is
@@ -943,7 +947,8 @@ def run_command(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='geomask-module-update')
-    parser.add_argument('command', choices=['status', 'check', 'update', 'verify', 'seed'])
+    parser.add_argument('command',
+                        choices=['status', 'check', 'update', 'verify', 'seed', 'protocol'])
     parser.add_argument('module', nargs='?')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--state', default=DEFAULT_STATE)
@@ -952,6 +957,10 @@ def main(argv=None):
     parser.add_argument('--versions', action='store_true')
     parser.add_argument('--index-file', default='')
     args = parser.parse_args(argv)
+    if args.command == 'protocol':
+        # Cheap and lock-free: the caller checks the format before it trusts any other answer.
+        print(json.dumps({'protocol': PROTOCOL}, ensure_ascii=False))
+        return 0
 
     try:
         # The state file is a read-modify-write record. Taking the lock only in install_staged

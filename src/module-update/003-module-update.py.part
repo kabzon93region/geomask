@@ -122,7 +122,8 @@ def run_command(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='geomask-module-update')
-    parser.add_argument('command', choices=['status', 'check', 'update', 'verify', 'seed'])
+    parser.add_argument('command',
+                        choices=['status', 'check', 'update', 'verify', 'seed', 'protocol'])
     parser.add_argument('module', nargs='?')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--state', default=DEFAULT_STATE)
@@ -131,6 +132,10 @@ def main(argv=None):
     parser.add_argument('--versions', action='store_true')
     parser.add_argument('--index-file', default='')
     args = parser.parse_args(argv)
+    if args.command == 'protocol':
+        # Cheap and lock-free: the caller checks the format before it trusts any other answer.
+        print(json.dumps({'protocol': PROTOCOL}, ensure_ascii=False))
+        return 0
 
     try:
         # The state file is a read-modify-write record. Taking the lock only in install_staged

@@ -591,6 +591,28 @@ class ModuleUpdateTests(unittest.TestCase):
         self.assertEqual(updater.version_tuple('1.27'), (1, 27, 0))
 
 
+class ProtocolTests(unittest.TestCase):
+    """P02: the caller and the helper share a versioned wire format."""
+
+    def test_the_helper_announces_its_protocol_generation(self):
+        self.assertIsInstance(updater.PROTOCOL, int)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = updater.main(['protocol'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload['protocol'], updater.PROTOCOL)
+
+    def test_the_protocol_answer_needs_no_state_or_lock(self):
+        """A broken state file must not hide the protocol: the caller asks before it trusts."""
+        buf = io.StringIO()
+        with mock.patch.object(updater, 'DEFAULT_STATE', '/nonexistent/state.json'), \
+                contextlib.redirect_stdout(buf):
+            rc = updater.main(['protocol'])
+        self.assertEqual(rc, 0)
+        self.assertIn('protocol', buf.getvalue())
+
+
 class UpdateLockScopeTests(unittest.TestCase):
     """#25: the lock covers the read of the state, not only the final write.
 

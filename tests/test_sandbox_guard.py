@@ -266,12 +266,24 @@ class SandboxGuardTests(unittest.TestCase):
                     'PYTHONDONTWRITEBYTECODE': '1',
                 })
                 timed_out = False
+                cmd = [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests',
+                       '-p', module]
                 try:
-                    result = subprocess.run(
-                        [sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'tests',
-                         '-p', module],
-                        cwd=str(ROOT), env=environment, capture_output=True, text=True,
-                        timeout=MODULE_TIMEOUT)
+                    try:
+                        result = subprocess.run(
+                            cmd, cwd=str(ROOT), env=environment, capture_output=True, text=True,
+                            timeout=MODULE_TIMEOUT)
+                    except FileNotFoundError:
+                        # Windows CreateProcess fails with WinError 2 now and then under load
+                        # (observed once in a full gate run, never standalone). One retry with
+                        # an explicit interpreter path; only then is it a real problem.
+                        other = shutil.which('python') or shutil.which('python3')
+                        if not other:
+                            raise
+                        cmd[0] = other
+                        result = subprocess.run(
+                            cmd, cwd=str(ROOT), env=environment, capture_output=True, text=True,
+                            timeout=MODULE_TIMEOUT)
                     rc = result.returncode
                     output = (result.stdout or '') + (result.stderr or '')
                 except subprocess.TimeoutExpired:

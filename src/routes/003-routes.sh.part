@@ -1,0 +1,27 @@
+_gm_route_retry_all() {
+  _ry_dir=$(_gm_route_dir)
+  for _ry_f in "$_ry_dir"/retry-*; do
+    [ -f "$_ry_f" ] || continue
+    _ry_t=${_ry_f##*-}
+    case "$_ry_t" in ''|*[!0-9]*) continue ;; esac
+    if [ -f "$_ry_dir/pending-$_ry_t" ] || [ -f "$_ry_dir/work-$_ry_t" ]; then
+      rm -f "$_ry_f" 2>/dev/null
+      continue
+    fi
+    mv -f "$_ry_f" "$_ry_dir/pending-$_ry_t" 2>/dev/null \
+      || _gm_route_log "route table $_ry_t: retry marker could not become a pending event"
+  done
+  return 0
+}
+
+# Backstop for the guard/cron and the installer: apply the queue inline, without spawning a
+# detached worker (the installer holds `maintenance`, and an inline call keeps the result
+# observable before it reads error-<table>). Every pending table is processed in one call.
+gm_route_drain() {
+  GM_ROUTE_DRAIN=1
+  GM_ROUTE_TUN_WAIT=0
+  export GM_ROUTE_DRAIN GM_ROUTE_TUN_WAIT
+  _gm_route_prune_temps
+  _gm_route_retry_all
+  gm_route_worker
+}

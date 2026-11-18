@@ -1,0 +1,426 @@
+def trace_domain(domain, live=False):
+    domain = (domain or '').strip().lower()
+    domain = re.sub(r'^[a-z]+://', '', domain).split('/')[0].split('?')[0].rstrip('.')
+    if not re.match(r'^[a-z0-9.*_-]+\.[a-z0-9._-]+$', domain):
+        return {'ok': False, 'error': 'похоже, это не домен: %r' % domain}
+    steps = []
+    route_path = []          # the path itself: zapret -> MagiTrickle -> mihomo -> internet
+    route_country = ''
+    mt_iface = ''
+    lines = ['Домен: %s' % domain, '']
+    # B-020 (audit 18.11.2026): the live part of the trace overran the RPC timeout (observed
+    # 29 s against a 20 s handler), so the panel lost the whole answer. One budget covers
+    # every network step; what does not fit is reported as not checked, with the reason.
+    deadline = time.monotonic() + DOMAIN_TRACE_BUDGET if live else None
+    partial = False
+
+    def left():
+        if deadline is None:
+            return None
+        return max(0, int(deadline - time.monotonic()))
+
+    def step(stage, verdict, detail, fix=''):
+        steps.append({'stage': stage, 'verdict': verdict, 'detail': detail, 'fix': fix})
+        lines.append('%-22s %s' % (stage + ':', detail))
+
+    # 1. DNS
+    probe = resolve(domain)
+    if probe['blocked']:
+        step('DNS', 'fail', '0.0.0.0 — домен заблокирован на роутере (adblock или hosts)',
+             'Разрешите домен в LuCI → adblock-fast (список разрешённых) или уберите его из hosts.')
+    elif probe['ips']:
+        step('DNS', 'ok', '→ %s' % ', '.join(probe['ips'][:4]))
+    elif probe.get('nxdomain'):
+        step('DNS', 'fail', 'домен не существует (NXDOMAIN)',
+             'Проверьте написание домена. Если он только что появился — подождите обновления DNS.')
+    else:
+        step('DNS', 'fail', 'роутер не смог узнать адрес домена — DNS не отвечает',
+             'DNS не отвечает: /etc/init.d/dnsmasq restart; upstream — LuCI → Сеть → DHCP/DNS.')
+    ips = probe['ips']
+
+    # 2. MagiTrickle
+    route = magitrickle_route(domain)
+    if route is None:
+        off_group, off_rule = magitrickle_disabled(domain)
+        if off_group is not None:
+            step('MagiTrickle', 'warn',
+                 'правило есть в группе «%s», но выключено (enable: false)'
+                 % (off_group['name'] or 'без имени'),
+                 'Включите правило в MagiTrickle (галочка у домена %s) или перенесите домен '
+                 'в нужную группу: geomask-lists-edit.py move --group "<группа>" --domain %s'
+                 % (off_rule.get('rule'), domain))
+        else:
+            route_path.append('группы MagiTrickle нет')
+            step('MagiTrickle', 'warn', 'домена нет ни в одной группе — сработает общее правило mihomo',
+                 'Чтобы задать направление, добавьте домен в группу MagiTrickle: '
+                 'geomask-lists-edit.py add --group "<группа>" --domain %s' % domain)
+    else:
+        group, rule, _ = route
+        mt_iface = group['interface'] or ''
+        route_path.append('MagiTrickle: группа «%s»' % group['name'])
+        if mt_iface and mt_iface not in TUNNELED_IFACES:
+            route_path.append(mt_iface)
+        step('MagiTrickle', 'ok', 'группа «%s» → %s; правило %s:%s'
+             % (group['name'], plain_iface(group['interface']),
+                rule.get('type') or 'namespace', rule.get('rule')),
+             'Поменять направление: MagiTrickle → группа «%s» (вкладка «Списки и синк»).' % group['name'])
+
+    # 3. mihomo rule
+    hit = mihomo_route(domain, ips)
+    if mt_iface and mt_iface not in TUNNELED_IFACES:
+        # a group bound to a physical interface hands the packet to the WAN directly:
+        # mihomo never sees it, so its rules cannot be "missing"
+        step('Правило mihomo', 'ok',
+             'не используется: трафик уходит %s, mihomo его не видит' % plain_iface(mt_iface))
+    elif hit is None:
+        step('Правило mihomo', 'warn', 'ни одно правило не подошло — сработает правило «любой другой домен»',
+             'Домен не покрыт ни одним списком mihomo: добавьте его в список нужной группы.')
+    else:
+        route_path.append('mihomo: %s' % plain_rule(hit['rule']))
+        if hit.get('conditional'):
+            # G02: a rule whose other conditions are decided by the packet is "may apply",
+            # never a confirmed route.
+            step('Правило mihomo', 'warn',
+                 '№%d %s → вероятно %s — %s'
+                 % (hit['index'], plain_rule(hit['rule']), hit['policy'] or '?',
+                    hit.get('note') or 'условие вне проверки'),
+                 'Правило содержит условие, которое doctor проверить не может '
+                 '(протокол, порт, процесс). Направление зависит от реального трафика.')
+        else:
+            step('Правило mihomo', 'ok', '№%d %s → группа %s%s'
+                 % (hit['index'], plain_rule(hit['rule']), hit['policy'],
+                    (' — %s' % hit['note']) if hit.get('note') else ''))
+
+    # 3b. where that rule set comes from - the owner asked whether it duplicates MagiTrickle
+    if hit and hit.get('ruleset'):
+        ruleset_path = hit['ruleset']
+        head = read_text(ruleset_path)[:200]
+        stamp = ''
+        try:
+            stamp = time.strftime('%d.%m %H:%M', time.localtime(os.path.getmtime(ruleset_path)))
+        except OSError:
+            pass
+        name = os.path.basename(ruleset_path)
+        if 'AUTO-GENERATED' in head:
+            step('Источник правила', 'ok',
+                 '%s (собран %s из групп MagiTrickle)' % (name, stamp or '?'),
+                 'Домен вписан один раз, в MagiTrickle; файл для mihomo делает '
+                 'sync_mtrickle_mihomo.sh при каждом изменении групп.')
+        else:
+            step('Источник правила', 'ok', '%s — отдельный список, в MagiTrickle его нет' % name,
+                 'Этот файл ведётся отдельно от групп MagiTrickle: смотрите его историю в git.')
+
+    # 4. exit
+    policy = (hit or {}).get('policy', 'GLOBAL')
+    if mt_iface and mt_iface not in TUNNELED_IFACES:
+        route_path.append('интернет, мимо mihomo')
+        _cc = direct_country(live)
+        route_country = country_label(_cc)
+        step('Выход', 'ok', 'напрямую в интернет через %s — так решила группа «%s»; %s'
+             % (mt_iface, (group['name'] if route else ''), exit_country_text(_cc)),
+             'Направление задаётся группой «%s»: вкладка «Списки и синк».' % (group['name'] if route else ''))
+    elif policy in ('DIRECT', 'REJECT'):
+        if policy == 'REJECT':
+            # a QUIC reject is the deliberate policy for video hosts: UDP/443 is dropped,
+            # the same page loads fine over TCP, so this is not a broken route
+            if 'UDP' in ((hit or {}).get('rule') or '').upper():
+                route_path.append('QUIC (UDP/443) отбрасывается, видео идёт по TCP')
+                step('Выход', 'ok', 'видео-запросы по QUIC (UDP/443) отбрасываются намеренно — '
+                     'то же видео идёт по TCP и работает')
+            else:
+                route_path.append('REJECT — трафик отбрасывается')
+                step('Выход', 'fail', 'REJECT — трафик к домену отбрасывается, сайт не откроется',
+                     'Правило REJECT блокирует домен: найдите его в правилах mihomo и уберите или смените политику.')
+        else:
+            route_path.append('интернет через провайдера')
+            _cc = direct_country(live)
+            route_country = country_label(_cc)
+            step('Выход', 'ok', 'напрямую в интернет через провайдера; %s'
+                 % exit_country_text(_cc))
+    elif policy in ('VPN', 'VPN-noP2P', 'AI'):
+        info = group_state(policy)
+        if info and info['now']:
+            route_path.append('туннель %s' % policy)
+            route_path.append('узел «%s»' % info['now'])
+            route_country = (info['country'] + (' (%s)' % info['cc'] if info.get('cc') else '')
+                             if info['country'] else '')
+            step('Выход', 'ok', 'через туннель %s на узел «%s»%s' % (
+                policy, info['now'],
+                ('; страна ' + info['country'] + ' (' + info['cc'] + ')') if info['country'] else ''))
+        elif info:
+            step('Выход', 'warn', '%s не выбрал узел (узлов: %d)' % (policy, info['nodes']),
+                 'Группа %s пуста: панель → Подписки → «Обновить»; если узлов нет — проверьте провайдера.' % policy)
+        else:
+            step('Выход', 'warn', 'группа %s не отвечает через API' % policy,
+                 'Mihomo не отвечает на 127.0.0.1:9090: /etc/init.d/mihomo restart.')
+    elif policy == 'GLOBAL':
+        info = group_state('GLOBAL')
+        now = (info or {}).get('now') or ''
+        if now:
+            if now.upper() == 'DIRECT':
+                _cc = direct_country(live)
+                where = 'напрямую в интернет через провайдера; %s' % exit_country_text(_cc)
+            else:
+                where = 'через узел «%s»%s' % (now, ('; страна ' + info['country'])
+                                               if info.get('country') else '')
+            route_path.append('группа GLOBAL')
+            route_path.append(where.split('; страна ')[0].strip())
+            route_country = (country_label(direct_country(live)) if now.upper() == 'DIRECT'
+                             else (info.get('country') or ''))
+            step('Выход', 'warn',
+                 'группа GLOBAL отправляет %s — домен не попал ни в одно правило' % where,
+                 'Домен не попал ни в одно правило, поэтому работает группа GLOBAL, а её '
+                 'выбор можно поменять в любой момент. Если нужен предсказуемый путь, '
+                 'добавьте домен в группу MagiTrickle: '
+                 'geomask-lists-edit.py add --group "<группа>" --domain %s' % domain)
+        else:
+            step('Выход', 'warn', 'группа GLOBAL не выбрала узел, а домен не попал ни в одно правило',
+                 'Добавьте домен в группу MagiTrickle: geomask-lists-edit.py add '
+                 '--group "<группа>" --domain %s' % domain)
+    else:
+        step('Выход', 'warn', 'политика %s — уточните вручную' % policy,
+             'Проверьте правило в /etc/mihomo/config.yaml.')
+
+    # 4b. zapret: a direct domain is only protected from DPI if zapret processes it
+    zap = zapret_route(domain)
+    _policy = (hit or {}).get('policy', 'GLOBAL')
+    if not zap['running']:
+        step('Запрет (DPI)', 'warn',
+             'выключен: служба zapret не запущена — запросы идут как есть, '
+             'блокировки провайдера не обходятся',
+             'Запустите запрет: /etc/init.d/zapret restart; если не поднимается — '
+             'проверьте /opt/zapret/config и установлен ли zapret.')
+    elif _policy in ('VPN', 'VPN-noP2P', 'AI'):
+        step('Запрет (DPI)', 'ok',
+             'не нужен: трафик идёт через туннель %s, провайдер видит только зашифрованный канал'
+             % _policy)
+    elif zap['excluded']:
+        step('Запрет (DPI)', 'warn',
+             'выключен: домен (или его зона) «%s» в списке исключений zapret — '
+             'запрос идёт как есть, провайдер видит сайт' % zap['excluded'],
+             'Уберите домен (или его родителя) из /opt/zapret/ipset/zapret-hosts-user-exclude.txt '
+             'и перезапустите zapret: /etc/init.d/zapret restart')
+    elif zap['listed']:
+        route_path.insert(0, zapret_path_label(zap))
+        if zap.get('queues'):
+            step('Запрет (DPI)', 'ok',
+                 'включён: домен в списке zapret (строка «%s»), nfqws работает и правила '
+                 'очередей в nft есть — запрос идёт через обход DPI (режим %s)'
+                 % (zap['listed'], zap['mode'] or '?'))
+        else:
+            step('Запрет (DPI)', 'warn',
+                 'настроен, но не подтверждён: домен в списке, nfqws работает, а правил '
+                 'очередей в nft не видно (строка «%s»)' % zap['listed'],
+                 'Проверьте, что таблица inet zapret загружена: nft list table inet zapret; '
+                 'перезапустите запрет: /etc/init.d/zapret restart')
+    elif zap['auto']:
+        route_path.insert(0, zapret_path_label(zap))
+        step('Запрет (DPI)', 'ok',
+             'включён: zapret добавил домен сам после нескольких неудачных попыток — '
+             'запрос к сайту маскируется от провайдера')
+    else:
+        step('Запрет (DPI)', 'warn',
+             'выключен: домена нет в списке zapret — запрос идёт как есть, '
+             'провайдер видит сайт',
+             'Добавьте домен в /opt/zapret/ipset/zapret-hosts-user.txt и перезапустите zapret: '
+             '/etc/init.d/zapret restart (или включите режим autohostlist).')
+
+    # 5. live probe - and the reason when it fails
+    if live:
+        probe = http_probe(domain, deadline=deadline)
+        if probe.get('deadline'):
+            partial = True
+            step('Проверка HTTP', 'warn', probe['detail'],
+                 'Трасса уложилась в %d с: сетевая проба не выполнялась. Повторите позже или '
+                 'проверьте домен без галочки «живая проверка» (быстрый расчёт маршрута).'
+                 % DOMAIN_TRACE_BUDGET)
+        elif probe['ok']:
+            step('Проверка HTTP', 'ok', probe['detail'] + ' — сайт ответил (запрос с роутера)')
+        elif probe['kind'] == 'http':
+            step('Проверка HTTP', 'warn', probe['detail'] + ' — сайт ответил (запрос с роутера)',
+                 'Сайт ответил HTTP %s: соединение проходит, это ответ самого сайта. '
+                 'Откройте страницу в браузере — если и там та же ошибка, дело в сайте, '
+                 'а не в маршруте.' % probe['code'])
+        else:
+            node = ''
+            if policy in ('VPN', 'VPN-noP2P', 'AI'):
+                state = group_state(policy) or {}
+                node = state.get('now') or ''
+            delay = node_delay(node) if node else None
+            if probe['kind'] == 'timeout' and delay is not None:
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'Узел «%s» живой (отклик %d мс), но сайт не ответил за 20 с — обычно это '
+                     'блокировка выходного адреса сайтом или его антибот. Смените узел в группе '
+                     '%s (панель → Обзор) или проверьте сайт с телефона через тот же VPN.'
+                     % (node, delay, policy))
+            elif probe['kind'] == 'timeout':
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'Узел «%s» не ответил даже на служебный запрос — смените узел в группе %s '
+                     '(панель → Обзор → «Сменить»), затем повторите трассу.' % (node or '?', policy or 'VPN'))
+            elif probe['kind'] in ('tls', 'cert'):
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'TLS не поднялся: сайт мог отклонить выходной адрес или подменить сертификат. '
+                     'Проверьте тот же адрес в браузере через VPN; если там всё открывается — '
+                     'дело в проверке TLS у сайта, а не в маршруте.')
+            elif probe['kind'] in ('reset', 'empty'):
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'Соединение сбросили: чаще всего сайт блокирует выходной адрес. '
+                     'Смените узел в группе %s и повторите.' % (policy or 'VPN'))
+            else:
+                step('Проверка HTTP', 'warn', probe['detail'] + ' (с роутера)',
+                     'Запрос не прошёл (%s). Повторите трассу; если повторяется — '
+                     'Диагностика → «Сеть».' % probe['kind'])
+
+    # 6. the hosts this page depends on (v1.30.2): the second domain is the one that matters
+    if live:
+        related = []
+        _left = left()
+        if _left is not None and _left < 2:
+            partial = True
+            step('Связанные хосты', 'warn',
+                 'не проверялось — общий бюджет трассы (%d с) исчерпан' % DOMAIN_TRACE_BUDGET,
+                 'Повторите позже или проверьте домен без галочки «живая проверка».')
+        else:
+            related = related_hosts(domain, deadline=deadline)
+            if left() == 0:
+                partial = True
+        if related:
+            main_policy = (hit or {}).get('policy', 'GLOBAL')
+            rows = []
+            off = []
+            for item in related:
+                info = host_route(item['host'])
+                kinds = '/'.join(item['kinds'])
+                rows.append('%s (%s) → %s%s' % (
+                    item['host'], kinds, info['policy'],
+                    (' · ' + info['country']) if info['country'] else ''))
+                if info['policy'] != main_policy:
+                    off.append((item, info))
+            detail = 'страница тянет данные с %d домен(ов): %s' % (len(rows), '; '.join(rows))
+            # a picture on another path is fine; a form or an iframe carries the session
+            session_off = [pair for pair in off if pair[0]['session']]
+            if session_off and not probe['ok']:
+                item, info = session_off[0]
+                step('Связанные хосты', 'warn', detail,
+                     '%s — это %s, он несёт сессию, а идёт другим путём (%s), чем %s (%s). '
+                     'Если сайт не пускает или сбрасывает вход, перенесите его в ту же группу: '
+                     'geomask-lists-edit.py move --group "<группа %s>" --domain %s'
+                     % (item['host'], '/'.join(item['kinds']), info['policy'], domain,
+                        main_policy, main_policy, item['host']))
+            elif session_off:
+                item, info = session_off[0]
+                step('Связанные хосты', 'ok', detail,
+                     '%s (%s) идёт другим путём, но страница ответила. Если вход или оплата '
+                     'начнут сбрасываться — перенесите его в группу «%s».'
+                     % (item['host'], '/'.join(item['kinds']), main_policy))
+            elif off:
+                names = ', '.join(item['host'] for item, _ in off)
+                # the explanation belongs in the line itself: an "ok" step's advice is not
+                # printed at the bottom, and this is exactly the question the owner asks
+                step('Связанные хосты', 'ok',
+                     detail + ' — другим путём только статика (%s), на работу сайта не влияет'
+                     % names)
+            else:
+                step('Связанные хосты', 'ok', detail)
+        else:
+            # a 404 page or a non-HTML host simply has nothing to list: that is not a fault,
+            # and the route above already answered the question
+            if not probe['ok']:
+                step('Связанные хосты', 'ok', 'не проверялось — сайт не ответил')
+            else:
+                step('Связанные хосты', 'ok',
+                     'не найдено — страница не ссылается на другие домены')
+
+    lines.append('')
+    # The probe path is part of the answer (D1): this curl leaves from the router, not from a
+    # LAN client through PREROUTING, so its result is not "the site is down for the console".
+    if live:
+        lines.append('Проба: HTTP-запрос с роутера (не путь LAN-клиента)')
+    if partial:
+        lines.append('Результат частичный: часть сетевых проб не выполнялась из-за бюджета %d с'
+                     % DOMAIN_TRACE_BUDGET)
+    if route_path:
+        summary = ' → '.join(route_path)
+        if route_country:
+            summary += '; страна %s' % route_country
+    else:
+        exit_step = next((item for item in steps if item['stage'] == 'Выход'), None)
+        summary = exit_step['detail'] if exit_step else ''
+    lines.append('Итог: %s' % summary)
+    fix = ''
+    for wanted in ('fail', 'warn'):
+        for item in steps:
+            if item['verdict'] == wanted and item.get('fix'):
+                fix = item['fix']
+                break
+        if fix:
+            break
+    if fix:
+        lines.append('Что делать: ' + fix)
+    state = 'ok'
+    for item in steps:
+        if item['verdict'] == 'fail':
+            state = 'fail'
+            break
+        if item['verdict'] == 'warn' and state == 'ok':
+            state = 'warn'
+    write_log('domain_trace', state, lines)
+    return {'ok': True, 'domain': domain, 'state': state, 'steps': steps,
+            'lines': lines, 'fix': fix, 'log': log_path('domain_trace'),
+            'partial': partial, 'probe_path': 'router' if live else 'none',
+            'budget_s': DOMAIN_TRACE_BUDGET if live else 0}
+
+
+# --------------------------------------------------------------------------- cli
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='geomask-doctor')
+    parser.add_argument('command', choices=['list', 'run', 'log', 'domain', 'prune'])
+    parser.add_argument('target', nargs='?')
+    parser.add_argument('--live', action='store_true')
+    parser.add_argument('--tail', type=int, default=120)
+    args = parser.parse_args(argv)
+
+    if args.command == 'list':
+        print(json.dumps(list_checks(), ensure_ascii=False))
+        return 0
+    if args.command == 'run':
+        target = args.target or 'all'
+        if target == 'all':
+            payload = run_all(include_live=args.live)
+            print(json.dumps(payload, ensure_ascii=False))
+            # R10b (D17): the JSON already carried verdict_state='fail', but the process
+            # exited 0, so a shell caller could not fail a gate on a red check. `ok` still
+            # means "the request ran"; the exit code is the health answer.
+            return 1 if payload.get('verdict_state') == 'fail' else 0
+        result = run_check(target)
+        print(json.dumps({'ok': result['state'] != 'fail', 'checks': [result]},
+                         ensure_ascii=False))
+        return 0 if result['state'] != 'fail' else 1
+    if args.command == 'log':
+        target = args.target or ''
+        text = log_tail(target, args.tail)
+        print(json.dumps({'ok': bool(text), 'id': target, 'text': text,
+                          'log': log_path(target)}, ensure_ascii=False))
+        return 0
+    if args.command == 'domain':
+        print(json.dumps(trace_domain(args.target or '', live=args.live), ensure_ascii=False))
+        return 0
+    if args.command == 'prune':
+        removed = 0
+        for name in sorted(os.listdir(LOG_DIR)) if os.path.isdir(LOG_DIR) else []:
+            if not name.endswith('.log'):
+                continue
+            path = os.path.join(LOG_DIR, name)
+            before = read_text(path)
+            after = prune_blocks(before)
+            if after != before:
+                with open(path, 'w', encoding='utf-8', newline='\n') as handle:
+                    handle.write(after)
+                removed += 1
+        print(json.dumps({'ok': True, 'pruned': removed, 'dir': LOG_DIR}, ensure_ascii=False))
+        return 0
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

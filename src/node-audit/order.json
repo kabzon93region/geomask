@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "target": "node-audit",
+  "parts": [
+    {
+      "path": "001-node-audit.py.part"
+    },
+    {
+      "path": "002-node-audit.py.part"
+    },
+    {
+      "path": "003-node-audit.py.part"
+    }
+  ]
+}

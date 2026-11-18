@@ -212,15 +212,20 @@ class MigratedTreeTests(unittest.TestCase):
                 self.assertEqual(composed, handle.read(),
                                  '%s is not the composition of its parts' % target)
 
+    # One explained exception: this file's code lives inside a single embedded heredoc, and a
+    # split would either cross that heredoc (forbidden) or cut the interpreter script in half.
+    SIZE_EXCEPTIONS = {'src/node-scan/001-node-scan.sh.part': 608}
+
     def test_the_plan_s_soft_size_limit_holds_with_explained_exceptions(self):
-        limits = {'installer': 500, 'backend': 500, 'panel': 500}
         oversized = []
-        for target, limit in limits.items():
+        for target in composer.TARGETS:
             for path in composer.load_manifest(target, str(ROOT)):
                 with open(path, 'rb') as handle:
                     size = handle.read().count(b'\n')
+                rel = os.path.relpath(path, ROOT).replace(os.sep, '/')
+                limit = self.SIZE_EXCEPTIONS.get(rel, 500)
                 if size > limit:
-                    oversized.append('%s (%d lines)' % (os.path.relpath(path, ROOT), size))
+                    oversized.append('%s (%d lines)' % (rel, size))
         self.assertEqual(oversized, [], 'authored parts over the soft limit: %s' % oversized)
 
     def test_no_part_starts_or_ends_mid_heredoc(self):

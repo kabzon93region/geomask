@@ -1,0 +1,152 @@
+def schedule_get(pid):
+    """Get schedule configuration for a path."""
+    try:
+        path_id(pid)
+    except AuditError as e:
+        return {'ok': False, 'error': str(e)}
+    data, _ = load_store()
+    path_data = data['paths'].get(pid, {})
+    schedule = path_data.get('schedule', {'enabled': False, 'time': '03:30', 'mode': 'check-only'})
+    return {'ok': True, 'schedule': schedule}
+
+def schedule_set(pid, enabled, time, mode):
+    """Set schedule configuration for a path."""
+    path_id(pid)
+    if enabled not in ('true', 'false'):
+        raise AuditError('enabled must be true or false')
+    if not re.fullmatch(r'([01]?[0-9]|2[0-3]):[0-5][0-9]', time):
+        raise AuditError('time must be HH:MM format')
+    if mode not in ('check-only', 'check-and-apply'):
+        raise AuditError('mode must be check-only or check-and-apply')
+    
+    with locked('settings'):
+        data, _ = load_store()
+        path_data = data['paths'].get(pid, {})
+        path_data['schedule'] = {
+            'enabled': enabled == 'true',
+            'time': time,
+            'mode': mode,
+        }
+        _save_store(data)
+        _append_event({
+            'path': pid,
+            'actor': 'luci',
+            'action': 'schedule-set',
+            'enabled': enabled == 'true',
+            'time': time,
+            'mode': mode,
+            'result': 'success'
+        })
+        return {'ok': True, 'schedule': path_data['schedule']}
+
+def audit_cancel(job_id, actor='luci'):
+    """Cancel a running job by job_id. Only works for queued/running jobs."""
+    try:
+        for state_file in STATE.glob('*.json'):
+            report = strict_json(state_file.read_bytes())
+            if report.get('job_id') == job_id:
+                status = report.get('status', '')
+                if status in ('queued', 'running'):
+                    report['status'] = 'cancelled'
+                    report['ok'] = False
+                    report['finished'] = stamp()
+                    report['error'] = 'cancelled by user'
+                    atomic_write(state_file, encode(report))
+                    _append_event({
+                        'path': report.get('path_id', ''),
+                        'actor': actor,
+                        'action': 'cancel',
+                        'job_id': job_id,
+                        'result': 'success'
+                    })
+                    return {'ok': True, 'cancelled': True}
+                else:
+                    return {'ok': False, 'error': f'job not cancellable (status: {status})'}
+        return {'ok': False, 'error': 'job not found'}
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+
+def validate_rpc(method, raw):
+    if len(raw.encode('utf-8')) > 16384:
+        raise AuditError('RPC request too large')
+    fields = {'nodes_paths_get': set(), 'nodes_path_check': {'path_id'},
+              'nodes_path_save': {'path_id', 'countries', 'expected_revision'},
+              'nodes_audit_job_get': {'job_id'},
+              'nodes_audit_cancel': {'job_id'},
+              'nodes_audit_events_get': {'path_id', 'before', 'limit'},
+              'nodes_audit_schedule_get': {'path_id'},
+              'nodes_audit_schedule_set': {'path_id', 'enabled', 'time', 'mode'}}
+    if method not in fields:
+        raise AuditError('unknown audit RPC')
+    request = strict_json(raw)
+    if not isinstance(request, dict):
+        raise AuditError('invalid RPC object')
+    has_session = 'ubus_rpc_session' in request
+    session = request.pop('ubus_rpc_session', None)
+    if has_session and (not isinstance(session, str) or not re.fullmatch(r'[a-f0-9]{32}', session)):
+        raise AuditError('invalid RPC session metadata')
+    if set(request) != fields[method]:
+        raise AuditError('invalid RPC fields')
+    for value in request.values():
+        if not isinstance(value, str) or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+            raise AuditError('RPC values must be strings without controls')
+    if 'path_id' in request:
+        path_id(request['path_id'])
+    if 'countries' in request:
+        countries(request['countries'])
+        if not re.fullmatch(r'[a-f0-9]{64}', request['expected_revision']):
+            raise AuditError('invalid revision')
+    if 'job_id' in request and not re.fullmatch(r'[a-f0-9]{24}', request['job_id']):
+        raise AuditError('invalid job_id')
+    if 'enabled' in request and request['enabled'] not in ('true', 'false'):
+        return {'ok': False, 'error': 'enabled must be true or false'}
+    if 'time' in request and not re.fullmatch(r'([01]?[0-9]|2[0-3]):[0-5][0-9]', request['time']):
+        return {'ok': False, 'error': 'time must be HH:MM format'}
+    if 'mode' in request and request['mode'] not in ('check-only', 'check-and-apply'):
+        return {'ok': False, 'error': 'mode must be check-only or check-and-apply'}
+    return {'ok': True}
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=['get', 'save', 'check', 'start', 'validate-rpc', 'prepare-save', 'audit-events', 'audit-job', 'audit-cancel', 'schedule-get', 'schedule-set', 'source-in-use'])
+    parser.add_argument('args', nargs='*')
+    args = parser.parse_args(argv)
+    try:
+        if args.command == 'validate-rpc' and len(args.args) == 1:
+            value = validate_rpc(args.args[0], sys.stdin.read(16385))
+        elif args.command == 'get' and not args.args:
+            value = get()
+        elif args.command == 'prepare-save' and len(args.args) == 3:
+            value = prepare_save(*args.args)
+        elif args.command == 'save' and len(args.args) == 3:
+            value = save(*args.args)
+        elif args.command == 'start' and len(args.args) == 1:
+            value = start(args.args[0], actor='cli')
+        elif args.command == 'check' and len(args.args) == 1:
+            value = check(args.args[0], actor='cli')
+        elif args.command == 'audit-events' and len(args.args) <= 3:
+            path_id = args.args[0] if len(args.args) > 0 else None
+            before = args.args[1] if len(args.args) > 1 else None
+            limit = args.args[2] if len(args.args) > 2 else '50'
+            value = audit_events_get(path_id, before, limit)
+        elif args.command == 'audit-job' and len(args.args) == 1:
+            value = audit_job_get(args.args[0])
+        elif args.command == 'audit-cancel' and len(args.args) == 1:
+            value = audit_cancel(args.args[0], actor='cli')
+        elif args.command == 'schedule-get' and len(args.args) == 1:
+            value = schedule_get(args.args[0])
+        elif args.command == 'schedule-set' and len(args.args) == 4:
+            value = schedule_set(*args.args)
+        elif args.command == 'source-in-use' and len(args.args) == 1:
+            value = source_in_use(args.args[0])
+        else:
+            raise AuditError('invalid command arguments')
+        print(json.dumps(value, ensure_ascii=False))
+        return 0 if value.get('ok', True) else 1
+    except Exception as exc:
+        error = str(exc) if isinstance(exc, AuditError) else type(exc).__name__
+        print(json.dumps({'ok': False, 'error': error, 'applied': False}))
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())

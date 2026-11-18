@@ -1,0 +1,386 @@
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+class IsolatedProbe:
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.work = None
+        self.process = None
+        self.watchdog = None
+        self.port = free_port()
+        self.api_port = free_port()
+        self.secret = secrets.token_hex(24)
+
+    def api(self, path, value=None):
+        headers = {'Authorization': 'Bearer ' + self.secret}
+        if value is not None:
+            headers['Content-Type'] = 'application/json'
+        request = urllib.request.Request('http://127.0.0.1:' + str(self.api_port) + path,
+            data=json.dumps(value).encode() if value is not None else None,
+            method='PUT' if value is not None else 'GET', headers=headers)
+        with urllib.request.urlopen(request, timeout=8) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else {}
+
+    def __enter__(self):
+        import yaml
+        self.work = Path(tempfile.mkdtemp(prefix='geomask-egress-', dir=str(STATE)))
+        try:
+            os.chmod(self.work, 0o700)
+            config = {'mixed-port': 0, 'allow-lan': False, 'bind-address': '127.0.0.1',
+                'external-controller': '127.0.0.1:' + str(self.api_port), 'secret': self.secret,
+                'mode': 'rule', 'log-level': 'silent', 'ipv6': False,
+                'listeners': [{'name': 'isolated-audit', 'type': 'mixed', 'listen': '127.0.0.1',
+                               'port': self.port, 'proxy': 'AUDIT'}],
+                'proxies': self.nodes,
+                'proxy-groups': [{'name': 'AUDIT', 'type': 'select', 'proxies': [n['name'] for n in self.nodes]}],
+                'rules': ['MATCH,AUDIT']}
+            candidate = self.work / 'config.yaml'
+            candidate.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding='utf-8')
+            os.chmod(candidate, 0o600)
+            checked = subprocess.run(['mihomo', '-d', str(self.work), '-f', str(candidate), '-t'],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+            if checked.returncode:
+                raise AuditError('isolated candidate validation failed')
+            self.process = subprocess.Popen(['mihomo', '-d', str(self.work), '-f', str(candidate)],
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._watch()
+            for _ in range(40):
+                if self.process.poll() is not None:
+                    break
+                try:
+                    self.api('/version')
+                    return self
+                except Exception:
+                    time.sleep(0.2)
+            raise AuditError('isolated controller did not start')
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+
+    def _watch(self):
+        pid = self.process.pid
+        proc = Path('/proc') / str(pid)
+        identity = (proc / 'stat').read_text().split(') ', 1)[1].split()[19]
+        work = str(self.work)
+        child = os.fork()
+        if child == 0:
+            try:
+                time.sleep(900)
+                current = (proc / 'stat').read_text().split(') ', 1)[1].split()[19]
+                command = (proc / 'cmdline').read_bytes()
+                if current == identity and work.encode() in command and b'mihomo' in command:
+                    os.kill(pid, 15)
+                    time.sleep(5)
+                    current = (proc / 'stat').read_text().split(') ', 1)[1].split()[19]
+                    command = (proc / 'cmdline').read_bytes()
+                    if current == identity and work.encode() in command and b'mihomo' in command:
+                        os.kill(pid, 9)
+            except (OSError, ValueError):
+                pass
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            os._exit(0)
+        self.watchdog = child
+
+    def probe(self, node, service):
+        endpoints = {'cloudflare': 'https://www.cloudflare.com/cdn-cgi/trace',
+                     'chatgpt': 'https://chatgpt.com/cdn-cgi/trace',
+                     'google': 'https://www.google.com/generate_204'}
+        self.api('/proxies/AUDIT', {'name': node})
+        args = ['curl', '--disable', '--silent', '--show-error', '--noproxy', '', '--connect-timeout', '6',
+                '--max-time', '12', '--max-filesize', '16000', '--proxy',
+                'socks5h://127.0.0.1:' + str(self.port), '--write-out', '\nhttp_code=%{http_code}\n',
+                endpoints[service] + '?_=' + secrets.token_hex(6)]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=15)
+        fields = dict(re.findall(r'(?m)^(ip|loc|colo|http_code)=([^\r\n]+)', result.stdout))
+        code = fields.get('http_code')
+        if service == 'google':
+            return {'status': 'unknown', 'availability': result.returncode == 0 and code == '204',
+                    'country': None, 'http_code': code, 'reason': 'HTTP 204 does not prove Google geography',
+                    'dns_context': 'remote SOCKS5h', 'time': stamp()}
+        country = fields.get('loc')
+        if result.returncode or code != '200' or not re.fullmatch(r'[A-Z]{2}', country or ''):
+            return {'status': 'unknown', 'country': None, 'http_code': code,
+                    'reason': 'trace unavailable or malformed', 'time': stamp()}
+        try:
+            ipaddress.ip_address(fields.get('ip', ''))
+        except ValueError:
+            return {'status': 'unknown', 'country': None, 'reason': 'invalid observed exit IP'}
+        return {'status': 'ok', 'country': country, 'ip': fields['ip'], 'colo': fields.get('colo'),
+                'http_code': code, 'dns_context': 'remote SOCKS5h', 'time': stamp(), 'tls_verified': True}
+
+    def __exit__(self, *unused):
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        if self.watchdog:
+            try:
+                os.kill(self.watchdog, 15)
+                os.waitpid(self.watchdog, 0)
+            except ProcessLookupError:
+                pass
+        if self.work:
+            shutil.rmtree(self.work, ignore_errors=True)
+
+@contextlib.contextmanager
+def job_budget(seconds):
+    import signal
+    deadline = time.monotonic() + seconds
+    if not hasattr(signal, 'SIGALRM'):
+        yield deadline
+        return
+    def expired(signum, frame):
+        raise AuditError('whole-job time budget exceeded; partial results are not a pass')
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(seconds)
+    try:
+        yield deadline
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+@contextlib.contextmanager
+def audit_locks(ident):
+    with locked('runtime', nonblocking=True), locked('job-' + ident, nonblocking=True):
+        yield
+
+def check(ident, owns_lock=False, job_id=None, actor='cli'):
+    path_id(ident)
+    lock = contextlib.nullcontext() if owns_lock else audit_locks(ident)
+    with lock, job_budget(720) as deadline:
+        data, _ = _load_store()
+        path_data = data['paths'].get(ident, {})
+        raw = CONFIG.read_bytes()
+        config = yaml_load(raw)
+        target = STATE / (ident + '.json')
+        previous_report = None
+        try:
+            previous_report = strict_json(target.read_bytes()) if target.exists() else None
+        except (OSError, AuditError):
+            previous_report = None
+        group, providers = resolve_audit_source(config, ident, path_data, previous_report)
+        allow = path_data.get('countries_allow', PATHS[ident][1])
+        path_rev = path_data.get('path_revision', '')
+        binding = _resolve_source_binding(config, ident, providers)
+        source_fingerprint = binding.get('source_fingerprint') if binding else None
+        # Use whole config digest for staleness (matches original behavior and tests)
+        config_digest = digest(raw)
+        
+        report = {'job_id': job_id or secrets.token_hex(12), 'path_id': ident, 'group': group, 'providers': providers, 
+                  'settings_revision': path_rev, 'source_revision': config_digest, 'countries_allow': allow, 'started': stamp(),
+                  'status': 'running', 'applied': False, 'nodes': [],
+                  'configured': ident in data['paths'],
+                  'probe_version': PROBE_VERSION,
+                  'probe_context': {'dns': 'remote SOCKS5h', 'services': (
+                      AI_REQUIRED_SERVICES + AI_INFORMATIONAL_SERVICES if ident == 'ai'
+                      else ['cloudflare']),
+                      'admission': ('chatgpt+cloudflare' if ident == 'ai' else 'cloudflare')},
+                  'scope': 'observed service egress with remote DNS; not actual client/hosts route',
+                  'limit': 'No automatic apply. Google geography is not measurable and is not '
+                           'used for admission; AI is judged by ChatGPT and Cloudflare. '
+                           'No claim for untested services.'}
+        atomic_write(target, encode(report))
+        audited_definitions = {}
+        try:
+            for provider_name in providers:
+                nodes, source = fetch_nodes(config['proxy-providers'][provider_name])
+                with IsolatedProbe(nodes) as probe:
+                    for node in nodes:
+                        if time.monotonic() > deadline:
+                            raise AuditError('audit time budget exceeded; partial results are not a pass')
+                        # Check for cancellation request
+                        try:
+                            current_report = strict_json(target.read_bytes())
+                            if current_report.get('status') == 'cancelled':
+                                report['status'] = 'cancelled'
+                                report['ok'] = False
+                                report['error'] = 'cancelled by user'
+                                report['finished'] = stamp()
+                                atomic_write(target, encode(report))
+                                _append_event({
+                                    'path': ident,
+                                    'actor': actor,
+                                    'action': 'cancel',
+                                    'job_id': report['job_id'],
+                                    'result': 'success'
+                                })
+                                return report
+                        except (OSError, AuditError):
+                            pass
+                        services = (AI_REQUIRED_SERVICES + AI_INFORMATIONAL_SERVICES
+                                    if ident == 'ai' else ['cloudflare'])
+                        observations = {}
+                        for service in services:
+                            try:
+                                observations[service] = probe.probe(node['name'], service)
+                            except Exception as exc:
+                                observations[service] = {'status': 'unknown', 'country': None,
+                                                         'reason': 'probe error (' + type(exc).__name__ + ')'}
+                        # Compute node identity fingerprint. The whole definition is covered:
+                        # a hand-picked subset would let a rewritten credential keep the
+                        # fingerprint of the node that was actually measured.
+                        node_identity = {
+                            'definition': node,
+                            'provider_id': provider_name,
+                        }
+                        node_fingerprint = digest(canonical_json(node_identity))
+                        audited_definitions[node['name']] = {
+                            'provider': provider_name,
+                            'node_fingerprint': node_fingerprint[:16],
+                            'definition': node,
+                        }
+                        report['nodes'].append({'name': node['name'], 'provider': provider_name,
+                            'node_fingerprint': node_fingerprint[:16], 'source_digest': source, 'probes': observations, **classify(ident, allow, observations)})
+                        atomic_write(target, encode(report))
+            # Check staleness using path_revision and config digest (matches original behavior)
+            current_data, _ = _load_store()
+            current_path_rev = current_data['paths'].get(ident, {}).get('path_revision', '')
+            current_config_raw = CONFIG.read_bytes()
+            current_config_digest = digest(current_config_raw)
+            stale = current_path_rev != path_rev or current_config_digest != config_digest
+            report['stale'] = stale
+            report['status'] = 'stale' if stale else 'complete'
+            report['counts'] = {key: sum(n['status'] == key for n in report['nodes'])
+                                for key in ('eligible', 'excluded', 'unknown')}
+            present = {p.get('country') for n in report['nodes'] for p in n['probes'].values()}
+            report['missing_countries'] = sorted(set(allow) - present)
+            report['ok'] = not stale
+        except Exception as exc:
+            report['status'] = 'error'
+            report['ok'] = False
+            report['error'] = str(exc) if isinstance(exc, AuditError) else type(exc).__name__
+        report['finished'] = stamp()
+        atomic_write(target, encode(report))
+        # Save immutable report
+        _save_report(report)
+        # Persist the exact definitions that were probed, so an apply can build a managed
+        # provider from what was actually measured instead of re-reading a moving source.
+        if report.get('status') in ('complete', 'stale') and audited_definitions:
+            # Keep the snapshots an applied manifest or the previous report still refer to;
+            # retention must not delete material a pending preview or a pool depends on.
+            protected = [path_data.get('applied', {}).get('job_id', '')]
+            if previous_report:
+                protected.append(previous_report.get('job_id', ''))
+            _save_node_snapshot(ident, report['job_id'], audited_definitions,
+                                protect=protected)
+        # Append event
+        _append_event({
+            'path': ident,
+            'actor': actor,
+            'action': 'check',
+            'job_id': report['job_id'],
+            'status': report['status'],
+            'counts': report.get('counts', {}),
+            'stale': report.get('stale', False),
+            'result': 'success' if report.get('ok') else 'failed'
+        })
+        return report
+
+def start(ident, actor='luci'):
+    path_id(ident)
+    with audit_locks(ident):
+        data, _ = _load_store()
+        path_data = data['paths'].get(ident, {})
+        raw = CONFIG.read_bytes()
+        config = yaml_load(raw)
+        resolve_source(config, ident)
+        job_id = secrets.token_hex(12)
+        queued = {'job_id': job_id, 'path_id': ident, 'status': 'queued', 'started': stamp(),
+                  'settings_revision': path_data.get('path_revision', ''), 'source_revision': digest(raw), 'applied': False}
+        atomic_write(STATE / (ident + '.json'), encode(queued))
+        try:
+            child = os.fork()
+        except OSError:
+            queued.update(status='error', ok=False, finished=stamp(), error='worker fork failed')
+            atomic_write(STATE / (ident + '.json'), encode(queued))
+            raise AuditError('worker fork failed') from None
+        if child == 0:
+            try:
+                os.setsid()
+                with open(os.devnull, 'r+b', buffering=0) as null:
+                    for descriptor in (0, 1, 2):
+                        os.dup2(null.fileno(), descriptor)
+                # The parent releases its reservation when start() returns, so the worker
+                # waits for it rather than racing it, then owns the slot for its own run.
+                with locked('runtime'), locked('job-' + ident):
+                    check(ident, owns_lock=True, job_id=job_id, actor=actor)
+            except Exception as exc:
+                queued.update(status='error', ok=False, finished=stamp(),
+                              error=str(exc) if isinstance(exc, AuditError) else type(exc).__name__)
+                atomic_write(STATE / (ident + '.json'), encode(queued))
+            finally:
+                os._exit(0)
+        return {'ok': True, 'started': True, 'job_id': job_id, 'path_id': ident, 'applied': False}
+
+def source_in_use(url):
+    """Report whether a subscription URL backs a provider some group actually uses.
+
+    Deleting a registry entry that a path still depends on would leave the group pointing
+    at a provider whose source is gone. The caller refuses the delete on a hit.
+    """
+    if not isinstance(url, str) or not url:
+        raise AuditError('source url required')
+    try:
+        config = yaml_load(CONFIG.read_bytes())
+    except OSError:
+        raise AuditError('mihomo config is unreadable') from None
+    providers = config.get('proxy-providers') or {}
+    used = set()
+    for group in config.get('proxy-groups') or []:
+        for provider_id in group.get('use') or []:
+            used.add(provider_id)
+    hits = sorted(pid for pid, spec in providers.items()
+                  if isinstance(spec, dict) and spec.get('url') == url and pid in used)
+    return {'ok': True, 'in_use': bool(hits), 'providers': hits}
+
+
+def audit_events_get(path_id=None, before=None, limit=50):
+    """Get paginated audit events."""
+    events = _get_events(path_id, before, min(int(limit), 100))
+    return {'ok': True, 'events': events}
+
+def audit_job_get(job_id):
+    """Get job status by job_id. Searches all path state files."""
+    try:
+        for state_file in STATE.glob('*.json'):
+            report = strict_json(state_file.read_bytes())
+            if report.get('job_id') == job_id:
+                return {'ok': True, 'job': report}
+        return {'ok': False, 'error': 'job not found'}
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+
+def audit_cancel(job_id, actor='luci'):
+    """Cancel a running job by job_id. Only works for queued/running jobs."""
+    try:
+        for state_file in STATE.glob('*.json'):
+            report = strict_json(state_file.read_bytes())
+            if report.get('job_id') == job_id:
+                status = report.get('status', '')
+                if status in ('queued', 'running'):
+                    report['status'] = 'cancelled'
+                    report['ok'] = False
+                    report['finished'] = stamp()
+                    report['error'] = 'cancelled by user'
+                    atomic_write(state_file, encode(report))
+                    _append_event({
+                        'path': report.get('path_id', ''),
+                        'actor': actor,
+                        'action': 'cancel',
+                        'job_id': job_id,
+                        'result': 'success'
+                    })
+                    return {'ok': True, 'cancelled': True}
+                else:
+                    return {'ok': False, 'error': f'job not cancellable (status: {status})'}
+        return {'ok': False, 'error': 'job not found'}
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+

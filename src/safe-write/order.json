@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "target": "safe-write",
+  "parts": [
+    {
+      "path": "001-safe-write.py.part"
+    },
+    {
+      "path": "002-safe-write.py.part"
+    }
+  ]
+}

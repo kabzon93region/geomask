@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "target": "apply",
+  "parts": [
+    {
+      "path": "001-apply.py.part"
+    },
+    {
+      "path": "002-apply.py.part"
+    }
+  ]
+}

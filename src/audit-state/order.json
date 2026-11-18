@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "target": "audit-state",
+  "parts": [
+    {
+      "path": "001-audit-state.py.part"
+    },
+    {
+      "path": "002-audit-state.py.part"
+    }
+  ]
+}

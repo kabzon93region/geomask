@@ -28,6 +28,14 @@ sys.path.insert(0, HERE)
 import compose_sources  # noqa: E402
 
 SOFT_LIMIT = 500
+
+# Explained exceptions (the plan allows a cohesive file to stay whole with a reason).
+EXCEPTIONS = {
+    'assets/geomask-guard.sh':
+        'security entrypoint kept in one file on purpose (543 lines after the G06/P01 hardening)',
+    'tools/geo-rpc.json':
+        'data manifest: splitting it would break the single source of RPC methods',
+}
 GENERATED = {'geomask.sh'}
 
 # Implementation paths the plan's inventory covers (tests/docs excluded on purpose).
@@ -92,17 +100,22 @@ def main(argv=None):
         return 1
     authored = [row for row in rows if row[2] == 'authored']
     generated = [row for row in rows if row[2] == 'generated']
+    excused = [row for row in authored if row[0] in EXCEPTIONS]
+    authored = [row for row in authored if row[0] not in EXCEPTIONS]
     for rel, lines, kind in generated:
         label = ('the generated installer artifact' if rel == 'geomask.sh'
                  else 'view of its parts - not an authored source')
         print('generated %6d lines  %s (%s)' % (lines, rel, label))
     for rel, lines, _kind in authored:
         print('oversized %6d lines  %s' % (lines, rel))
+    for rel, lines, _kind in excused:
+        print('exception %6d lines  %s (%s)' % (lines, rel, EXCEPTIONS[rel]))
     if not authored and not generated:
         print('OK: no authored file over %d lines' % args.limit)
         return 0
-    print('summary: %d authored file(s) over %d lines, %d generated view(s); '
-          'advisory during stage 0' % (len(authored), args.limit, len(generated)))
+    print('summary: %d authored file(s) over %d lines, %d explained exception(s), '
+          '%d generated view(s); advisory during stage 0'
+          % (len(authored), args.limit, len(excused), len(generated)))
     return 1 if (args.strict and authored) else 0
 
 

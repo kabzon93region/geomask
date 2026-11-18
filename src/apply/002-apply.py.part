@@ -1,0 +1,371 @@
+def _restore_applied_record(path_id, previous):
+    """Put the applied record back after a refused transaction."""
+    try:
+        data, _ = load_store()
+        if previous:
+            data.setdefault('paths', {}).setdefault(path_id, {})['applied'] = previous
+        else:
+            data.setdefault('paths', {}).setdefault(path_id, {}).pop('applied', None)
+        save_store(data)
+    except Exception:
+        # A failure to restore the bookkeeping must not mask the original error.
+        pass
+
+
+def apply_preview(path_id, preview_id, expected_path_revision):
+    """Apply a previewed pool by pinning the target group to exactly those nodes."""
+    path_id = _require_path(path_id)
+    data, _ = load_store()
+    path_data = data['paths'].get(path_id, {})
+    previous_applied = path_data.get('applied')
+
+    if path_data.get('path_revision') != expected_path_revision:
+        raise ApplyError('STALE: path revision changed; reload before applying')
+    report_path = DEFAULT_STATE_DIR / f'{path_id}.json'
+    if not report_path.exists():
+        raise ApplyError('Report not found; run a check first')
+    report = strict_json(report_path.read_bytes())
+
+    if report.get('status') != 'complete' or report.get('stale'):
+        raise ApplyError('Report is stale or incomplete; run a fresh check')
+
+    # Settings and config can both move after the check; derive, do not trust.
+    if report.get('settings_revision') != path_data.get('path_revision'):
+        raise ApplyError('STALE: path settings changed since the check; check again')
+    live_raw = DEFAULT_CONFIG.read_bytes()
+    live_config = live_raw.decode('utf-8')
+    if report.get('source_revision') != digest(live_raw):
+        raise ApplyError('STALE: mihomo config changed since the check; check again')
+
+    countries_allow = path_data.get('countries_allow', PATHS[path_id][1])
+    pool = _compile_eligible_pool(path_id, report, countries_allow)
+
+    if not pool['eligible']:
+        raise ApplyError('No eligible nodes: refusing to apply an empty pool (no DIRECT fallback)')
+    if _preview_token(path_id, report, pool, countries_allow) != preview_id:
+        raise ApplyError('STALE: preview no longer matches the audited result; preview again')
+
+    config = yaml_load(live_config)
+    group_name = PATHS[path_id][0]
+    target = None
+    for g in config.get('proxy-groups', []):
+        if g.get('name') == group_name:
+            target = g
+            break
+    if target is None:
+        raise ApplyError(f'group {group_name} not found in mihomo config')
+
+    applied_before = path_data.get('applied') or {}
+    previous_filter = target.get('filter', '')
+    previous_use = _original_source(applied_before, list(target.get('use') or []))
+    if not previous_use:
+        raise ApplyError('group %s is not provider-backed; refusing to guess its source'
+                         % group_name)
+    # An already-managed generation is replaced, not chained: its provider entry and file
+    # are dropped once the new one is verified, otherwise the group would collect dead
+    # providers and revoke could point at a pruned file.
+    stale_provider = applied_before.get('provider_id') or ''
+
+    generation = int(path_data.get('applied', {}).get('generation', 0)) + 1
+    provider_id = _provider_id(path_id, generation)
+    proxies = _build_managed_proxies(path_id, report, pool['eligible'])
+    # Unique names: the same node also exists in its source subscription, and mihomo keys
+    # proxies by name process-wide (see _unique_pool_names).
+    proxies, renames = _unique_pool_names(proxies, generation)
+    eligible_names = [p['name'] for p in proxies]
+
+    # The pool file is written before the transaction so `mihomo -t` can actually load it;
+    # it is removed again if the transaction refuses the candidate.
+    pool_path = _write_pool_file(path_id, generation, proxies)
+
+    config.setdefault('proxy-providers', {})[provider_id] = {
+        'type': 'file',
+        'path': str(pool_path),
+    }
+    if stale_provider and stale_provider != provider_id:
+        (config.get('proxy-providers') or {}).pop(stale_provider, None)
+    target['use'] = [provider_id]
+    target.pop('filter', None)
+    previous_exclude = target.pop('exclude-filter', '')
+
+    audit = {
+        'generation': generation,
+        'path_revision': expected_path_revision,
+        'preview_id': preview_id,
+        'job_id': report.get('job_id', ''),
+        'source_revision': report.get('source_revision', ''),
+        'applied_at': stamp(),
+        'runtime_verified': False,
+        'pool_digest': digest(canonical_json(sorted(
+            (n['name'], n.get('node_fingerprint', '')) for n in pool['eligible']))),
+        'status': 'applying',
+        'node_count': len(eligible_names),
+        # What the pool really reaches, so the panel can show desired against acting.
+        'acting_countries': _acting_countries(pool['eligible']),
+        'previous_filter': previous_filter,
+        'previous_exclude_filter': previous_exclude,
+        'previous_use': previous_use,
+        'provider_id': provider_id,
+        'pool_file': str(pool_path),
+        'group': group_name,
+        # original report name -> pooled name, so the panel and later readers can map back
+        'renames': renames,
+    }
+
+    try:
+        # Record the in-flight apply before the transaction starts. A crash between the
+        # commit and the bookkeeping used to leave no trace that the group might already be
+        # pinned to a managed provider, so nobody could tell a clean group from a half-done
+        # apply. Everything needed for a manual restore is in this record.
+        intent_data, _ = load_store()
+        intent_data.setdefault('paths', {}).setdefault(path_id, {})['applied'] = audit
+        save_store(intent_data)
+
+        result = start_transaction(
+            {str(DEFAULT_CONFIG): yaml.safe_dump(config, allow_unicode=True,
+                                                 sort_keys=False).encode('utf-8')},
+            require_exactly={group_name: eligible_names},
+            expect_sha256=digest(live_raw))
+    except Exception:
+        _restore_applied_record(path_id, previous_applied)
+        try:
+            pool_path.unlink()
+        except OSError:
+            pass
+        raise
+    if not result.get('ok'):
+        _restore_applied_record(path_id, previous_applied)
+        try:
+            pool_path.unlink()
+        except OSError:
+            pass
+        raise ApplyError('transaction rejected the candidate; config left unchanged')
+
+    # Nothing points at the replaced generation any more: previous_use carries the original
+    # subscription forward, so its file and provider entry are dropped here.
+    _prune_pool_files(path_id, generation)
+
+    data, _ = load_store()
+    data['paths'][path_id]['applied'] = dict(audit, status='applied', runtime_verified=True,
+                                             applied_at=stamp())
+    save_store(data)
+    append_event({
+        'path': path_id, 'actor': 'luci', 'action': 'apply',
+        'preview_id': preview_id, 'job_id': audit['job_id'],
+        'node_count': len(eligible_names), 'result': 'success',
+    })
+    return {
+        'ok': True, 'applied': True, 'path_id': path_id,
+        'tx_id': result.get('tx_id'), 'config_digest': result.get('config_digest'),
+        'node_count': len(eligible_names), 'pool_digest': audit['pool_digest'],
+    }
+
+def apply_status(path_id):
+    """Report the applied state honestly, including staleness of the evidence."""
+    path_id = _require_path(path_id)
+    data, _ = load_store()
+    applied = data['paths'].get(path_id, {}).get('applied', {})
+
+    status = applied.get('status', 'never')
+    if status == 'applying':
+        # The record is written before the transaction, so this state means either an apply
+        # in flight or one that died between commit and bookkeeping. The group may already
+        # point at the managed provider, so never claim the path is unrestricted here.
+        return {
+            'ok': True,
+            'path_id': path_id,
+            'applied': False,
+            'filter_in_force': True,
+            'evidence_age_hours': None,
+            'applied_detail': dict(applied, status='applying',
+                                   warning='применение не завершено; проверьте пул и при '
+                                           'необходимости отзовите фильтр'),
+        }
+    if status in ('applied', 'expired'):
+        applied_at = applied.get('applied_at', '')
+        age_hours = None
+        if applied_at:
+            try:
+                applied_time = datetime.fromisoformat(applied_at.replace('Z', '+00:00'))
+                age_hours = (datetime.now(applied_time.tzinfo) - applied_time).total_seconds() / 3600.0
+            except ValueError:
+                pass
+        stale = age_hours is not None and age_hours > POOL_MAX_AGE_HOURS
+        # A stale pool is still in force: the filter was never removed. Say so.
+        in_force = status == 'applied' and not stale
+        detail = dict(applied)
+        if stale:
+            detail['status'] = 'expired'
+            detail['warning'] = ('Filter is still in force but its evidence is older than %dh; '
+                                 'run a fresh check and re-apply. The pool was not widened.'
+                                 % POOL_MAX_AGE_HOURS)
+        return {
+            'ok': True,
+            'path_id': path_id,
+            'applied': in_force,
+            'filter_in_force': status in ('applied', 'expired'),
+            'evidence_age_hours': None if age_hours is None else round(age_hours, 1),
+            'applied_detail': detail,
+        }
+
+    return {
+        'ok': True,
+        'path_id': path_id,
+        'applied': False,
+        'filter_in_force': False,
+        'evidence_age_hours': None,
+        'applied_detail': applied,
+    }
+
+def revoke_applied_pool(path_id):
+    """Drop our applied pool filter and restore the group's previous filter."""
+    path_id = _require_path(path_id)
+    data, _ = load_store()
+    applied = data['paths'].get(path_id, {}).get('applied', {})
+
+    if applied.get('status') not in ('applied', 'expired'):
+        return {'ok': True, 'revoked': False, 'message': 'No applied pool to revoke'}
+
+    # ONE read: the candidate is built from these bytes and the CAS base is their digest.
+    # Two reads (open() then read_bytes()) could see two different files and hand the
+    # transaction a base newer than the candidate it protects (review round 2, defect 4).
+    _revoke_raw = DEFAULT_CONFIG.read_bytes()
+    config = yaml_load(_revoke_raw.decode('utf-8'))
+    _revoke_base = _tx.digest(_revoke_raw)
+    group_name = PATHS[path_id][0]
+    target = None
+    for g in config.get('proxy-groups', []):
+        if g.get('name') == group_name:
+            target = g
+            break
+    if target is None:
+        raise ApplyError(f'group {group_name} not found in mihomo config')
+
+    # Restore the group's original source and filter, and drop the managed provider.
+    previous_use = applied.get('previous_use') or []
+    provider_id = applied.get('provider_id') or ''
+    if previous_use:
+        target['use'] = list(previous_use)
+    elif provider_id:
+        target.pop('use', None)
+    previous = applied.get('previous_filter') or ''
+    if previous:
+        target['filter'] = previous
+    else:
+        target.pop('filter', None)
+    previous_exclude = applied.get('previous_exclude_filter') or ''
+    if previous_exclude:
+        target['exclude-filter'] = previous_exclude
+    else:
+        target.pop('exclude-filter', None)
+    providers = config.get('proxy-providers') or {}
+    if provider_id and provider_id in providers:
+        providers.pop(provider_id)
+    pool_file = applied.get('pool_file')
+
+    # Widening is the point of a revoke, so an empty result here is not a failure mode
+    # to guard against: the previous source and filter are restored as recorded.
+    result = start_transaction({str(DEFAULT_CONFIG): yaml.safe_dump(
+        config, allow_unicode=True, sort_keys=False).encode('utf-8')},
+        expect_sha256=_revoke_base)
+    if not result.get('ok'):
+        raise ApplyError('transaction rejected the candidate; group left as it was')
+
+    if pool_file:
+        try:
+            Path(pool_file).unlink()
+        except OSError:
+            pass
+
+    data, _ = load_store()
+    data['paths'][path_id]['applied'] = {
+        'generation': int(applied.get('generation', 0)) + 1,
+        'path_revision': data['paths'][path_id].get('path_revision', ''),
+        'preview_id': '',
+        'job_id': '',
+        'source_revision': '',
+        'applied_at': stamp(),
+        'runtime_verified': False,
+        'pool_digest': '',
+        'status': 'revoked',
+        'group': group_name,
+    }
+    save_store(data)
+    append_event({'path': path_id, 'actor': 'luci', 'action': 'revoke', 'result': 'success'})
+    return {'ok': True, 'revoked': True, 'path_id': path_id,
+            'restored_filter': previous, 'tx_id': result.get('tx_id')}
+
+def handle_expired_pools():
+    """Mark stale pools as expired without widening them.
+
+    Expiry means the evidence is old, not that the exclusion is void. Dropping the pinned
+    filter here would return the group to the full provider pool, including nodes proven
+    to sit in a disallowed country -- a fail-open. So expiry only records the state and
+    raises the flag; widening stays an explicit human action through revoke.
+    """
+    data, _ = load_store()
+    expired_any = False
+    changed = False
+    for ident, path_data in data.get('paths', {}).items():
+        applied = path_data.get('applied', {})
+        if applied.get('status') != 'applied':
+            continue
+        applied_at = applied.get('applied_at', '')
+        if not applied_at:
+            continue
+        try:
+            applied_time = datetime.fromisoformat(applied_at.replace('Z', '+00:00'))
+        except ValueError:
+            continue
+        if datetime.now(applied_time.tzinfo) - applied_time <= timedelta(hours=POOL_MAX_AGE_HOURS):
+            continue
+        data['paths'][ident]['applied'] = dict(
+            applied, status='expired',
+            expired_at=stamp(),
+            width_preserved=True)
+        changed = True
+        expired_any = True
+        append_event({'path': ident, 'actor': 'system', 'action': 'expire',
+                      'result': 'success',
+                      'detail': 'filter kept; pool not widened, re-check required'})
+    if changed:
+        save_store(data)
+    return {'ok': True, 'expired_any': expired_any, 'widened': False}
+
+
+def yaml_load(raw):
+    if yaml is None:
+        raise ApplyError('PyYAML is not installed on the router')
+    try:
+        value = _state.yaml12_load(raw)
+        if not isinstance(value, dict):
+            raise ApplyError('expected YAML mapping')
+        return value
+    except yaml.YAMLError:
+        raise ApplyError('invalid YAML source') from None
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=['preview', 'apply', 'revoke', 'status', 'expire'])
+    parser.add_argument('args', nargs='*')
+    parsed = parser.parse_args()
+    try:
+        if parsed.command == 'preview' and len(parsed.args) == 4:
+            value = preview_apply(parsed.args[0], parsed.args[1], parsed.args[2], parsed.args[3])
+        elif parsed.command == 'apply' and len(parsed.args) == 3:
+            value = apply_preview(parsed.args[0], parsed.args[1], parsed.args[2])
+        elif parsed.command == 'revoke' and len(parsed.args) == 1:
+            value = revoke_applied_pool(parsed.args[0])
+        elif parsed.command == 'status' and len(parsed.args) == 1:
+            value = apply_status(parsed.args[0])
+        elif parsed.command == 'expire' and not parsed.args:
+            value = handle_expired_pools()
+        else:
+            raise ApplyError('invalid command arguments')
+    except Exception as exc:
+        value = {'ok': False, 'applied': False,
+                 'error': str(exc) if isinstance(exc, (ApplyError, AuditError)) else type(exc).__name__}
+    print(json.dumps(value, ensure_ascii=False))
+    raise SystemExit(0 if value.get('ok') else 1)

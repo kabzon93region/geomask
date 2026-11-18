@@ -1,0 +1,386 @@
+def _mask_token(token):
+    if _is_placeholder(token):
+        return token
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
+        return token[0] + PLACEHOLDER + token[0]
+    return PLACEHOLDER
+
+
+def _url_without_credentials(match):
+    url = match.group(0)
+    parsed = re.match(r'(?i)^(https?)://(?:[^/@\s]*@)?([^/?#\s]+)', url)
+    if not parsed:
+        return PLACEHOLDER
+    host = parsed.group(2).rstrip('.,;:)]}')
+    return parsed.group(1) + '://' + host
+
+
+def _unique_json_object(pairs):
+    # Duplicate decoded keys are ambiguous (including escape-equivalent spellings).
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RedactionError('duplicate json key')
+        result[key] = value
+    return result
+
+
+_JSON_DECODER = json.JSONDecoder(object_pairs_hook=_unique_json_object)
+_JSON_OBJECT_START = re.compile(r'\s*(?:"(?:[^"\\]|\\.)*"\s*:|})')
+_JSON_ARRAY_START = re.compile(r'\s*(?:[\[\]{"0-9-]|true\b|false\b|null\b)')
+
+
+def _embedded_json(text):
+    """Yield whole object/array spans. Never decode a key apart from its value.
+
+    Quoted scalars are visited by the caller after decoding their complete string.
+    Malformed object-shaped candidates and duplicate keys fail closed. Ordinary
+    nft string sets and non-JSON bracket notation are not interpreted as JSON.
+    """
+    pos = 0
+    while pos < len(text):
+        quoted = _STRINGS.match(text, pos)
+        if quoted:
+            pos = quoted.end()
+            continue
+        char = text[pos]
+        looks_json = ((char == '{' and _JSON_OBJECT_START.match(text, pos + 1))
+                      or (char == '[' and _JSON_ARRAY_START.match(text, pos + 1)))
+        if looks_json:
+            try:
+                node, end = _JSON_DECODER.raw_decode(text, pos)
+            except ValueError:
+                if char == '[':
+                    # Bracketed timestamps/addresses are not necessarily arrays.
+                    # Keep scanning so any inner JSON object is still classified.
+                    pos += 1
+                    continue
+                raise RedactionError('embedded json parse failed')
+            except RecursionError:
+                raise RedactionError('embedded json nesting limit')
+            yield pos, end, node
+            pos = end
+        else:
+            pos += 1
+
+
+def _ambiguous_auth_folding(text):
+    spans = [match.span() for match in _STRINGS.finditer(text)]
+    for match in _UNFRAMED_HEADER.finditer(text):
+        if not any(start < match.start() < end for start, end in spans):
+            return True
+    for match in _HEADER.finditer(text):
+        if any(start < match.start() < end for start, end in spans):
+            continue
+        # Obs-fold must start with SP/HTAB. A bare scheme followed by a physical
+        # line without that framing cannot safely be separated from a credential.
+        if (match.group(2).strip().lower() in ('basic', 'bearer')
+                and (match.end() < len(text) and text[match.end()] in '\r\n')):
+            return True
+    return False
+
+
+def redact_text_line(line):
+    return redact_text(line)
+
+
+def redact_text(text, depth=0, *, embedded=True):
+    if depth > _MAX_NESTING:
+        raise RedactionError('text nesting limit')
+    # Parse whole embedded JSON before any lexical substitution can destroy its
+    # key/value association or quoting. Arrays and decoded keys share tree policy.
+    if embedded:
+        pieces, previous = [], 0
+        for start, end, node in _embedded_json(text):
+            pieces.append(text[previous:start])
+            pieces.append(json.dumps(_redact_tree(node, depth + 1), ensure_ascii=False))
+            previous = end
+        pieces.append(text[previous:])
+        text = ''.join(pieces)
+    # Work inside encoded log strings next, then serialize them back. This handles
+    # escaped JSON embedded in JSON scalar messages without corrupting outer JSON.
+    def quoted(match):
+        token = match.group(0)
+        decoded = _decoded_quote(token)
+        clean = redact_text(decoded, depth + 1)
+        if clean == decoded:
+            return token
+        if token[0] == '"':
+            return json.dumps(clean, ensure_ascii=False)
+        return "'" + clean.replace("'", "''") + "'"
+    text = _STRINGS.sub(quoted, text)
+    if _ambiguous_auth_folding(text):
+        raise RedactionError('ambiguous authorization folding')
+    # A header is a composite value (also Digest/custom schemes). Mask its whole
+    # credential, including any tail after a placeholder from an older redactor.
+    spans = [match.span() for match in _STRINGS.finditer(text)]
+    def header(match):
+        # Quoted contents were handled recursively; never eat their closing quote.
+        if any(start < match.start() < end for start, end in spans):
+            return match.group(0)
+        return match.group(0)[:match.start(2) - match.start()] + _mask_token(match.group(2))
+    text = _HEADER.sub(header, text)
+    text = _AUTH.sub(lambda m: m.group(1) + ' ' + _mask_token(m.group(2)), text)
+    text = _URL.sub(_url_without_credentials, text)
+    replacements = []
+    for match in _KEYVAL.finditer(text):
+        _, key, _, value = match.groups()
+        if not _key_is_secret(key):
+            continue
+        # A complete auth credential was masked above; leave its scheme useful.
+        if (_normalise_key(key) in ('authorization', 'authentication', 'auth')
+                and value.lower() in ('basic', 'bearer')):
+            continue
+        if _normalise_key(key) in ('url', 'subscribe-url') and _plain_host_url(value):
+            continue
+        start, end = match.span(4)
+        # A parent secret value owns any nested credential spans.
+        if replacements and start < replacements[-1][1]:
+            continue
+        replacements.append((start, end, _mask_token(value)))
+    for start, end, value in reversed(replacements):
+        text = text[:start] + value + text[end:]
+    text = _JWT.sub(PLACEHOLDER, text)
+    return _LONG_TOKEN.sub(PLACEHOLDER, text)
+
+
+# ---------------------------------------------------------------- nft producer
+
+def _nft_parts(text):
+    """Lex strings and # comments, never evaluate nft syntax or require nft -j.
+
+    Bare nft tokens/maps are not JSON. Quoted payloads must have an unambiguous
+    supported string encoding; anything unsupported/unclosed fails without raw output.
+    """
+    parts = []
+    pos = 0
+    while pos < len(text):
+        if text[pos] == '#':
+            end = text.find('\n', pos)
+            end = len(text) if end < 0 else end
+            parts.append(('comment', pos, end, text[pos:end]))
+            pos = end
+        elif text[pos] in ('"', "'"):
+            match = _STRINGS.match(text, pos)
+            if not match:
+                raise RedactionError('nft string parse failed')
+            token = match.group(0)
+            if token[0] == '"':
+                try:
+                    decoded = json.loads(token)
+                except ValueError:
+                    raise RedactionError('nft string escape unsupported')
+            else:
+                if '\\' in token:
+                    raise RedactionError('nft string escape unsupported')
+                decoded = token[1:-1]
+            parts.append(('string', pos, match.end(), decoded))
+            pos = match.end()
+        else:
+            pos += 1
+    return parts
+
+
+def _nft_key_values(text, parts):
+    # Also bind credential-shaped quoted map keys to scalar values. Escaped/spaced
+    # names must not turn nft.txt into a bypass for the existing normalized policy.
+    for kind, _, end, key in parts:
+        if kind != 'string' or not _key_is_secret(key):
+            continue
+        colon = re.match(r'\s*:\s*', text[end:])
+        if not colon:
+            continue
+        start = end + colon.end()
+        value = re.match(_VALUE, text[start:])
+        if not value or text[start:start + 1] in ('{', '['):
+            raise RedactionError('ambiguous nft credential value')
+        finish = start + value.end()
+        if not re.match(r'[ \t]*(?:[,;}\]\r\n#]|$)', text[finish:]):
+            raise RedactionError('ambiguous nft credential value')
+        token = value.group(0)
+        decoded = _decoded_quote(token) if token[0] in ('"', "'") else token
+        yield start, finish, decoded
+
+
+def _nft_segments(text, parts):
+    previous = 0
+    for kind, start, end, _ in parts:
+        if kind == 'comment':
+            yield False, text[previous:start]
+            yield True, text[start:end]
+            previous = end
+    yield False, text[previous:]
+
+
+def redact_nft(text):
+    parts = _nft_parts(text)
+    replacements = list(_nft_key_values(text, parts))
+    for start, end, value in reversed(replacements):
+        if not _is_placeholder(value):
+            text = text[:start] + json.dumps(PLACEHOLDER, ensure_ascii=False) + text[end:]
+    # Only bare nft syntax opts out of JSON-object recognition. Every quoted scalar
+    # still recurses through strict redact_text; comments use strict text directly.
+    return ''.join(redact_text(segment, embedded=is_comment)
+                   for is_comment, segment in _nft_segments(text, _nft_parts(text)))
+
+
+def _verify_nft(filename, text):
+    # Independent checks, not a comparison to redact_nft output.
+    try:
+        parts = _nft_parts(text)
+        findings = ['%s:0: nft credential' % filename
+                    for _, _, value in _nft_key_values(text, parts)
+                    if not _is_placeholder(value)]
+        for is_comment, segment in _nft_segments(text, parts):
+            findings.extend(_verify_text(filename, segment, embedded=is_comment))
+        return findings
+    except RedactionError:
+        return ['%s:0: nft parse failed' % filename]
+
+
+# ---------------------------------------------------------------- verify
+
+def _plain_host_url(value):
+    token = value.strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ('"', "'"):
+        token = token[1:-1].strip()
+    return bool(re.match(r'(?i)^https?://[^/\s?#@]+$', token))
+
+
+def _verify_text(filename, text, depth=0, *, embedded=True):
+    """Independent classifier: never call redaction or compare against its output."""
+    if depth > _MAX_NESTING:
+        return ['%s:0: text nesting limit' % filename]
+    findings = []
+    if embedded:
+        try:
+            for _, _, node in _embedded_json(text):
+                findings.extend(_verify_tree(filename, node, depth + 1))
+        except RedactionError:
+            findings.append('%s:0: embedded json parse failed' % filename)
+    if _ambiguous_auth_folding(text):
+        findings.append('%s:0: ambiguous authorization folding' % filename)
+    # Verify full logical headers, including every SP/HTAB continuation, rather
+    # than trusting a placeholder on the first physical line.
+    spans = [match.span() for match in _STRINGS.finditer(text)]
+    for match in _HEADER.finditer(text):
+        if any(start < match.start() < end for start, end in spans):
+            continue
+        if not _is_placeholder(match.group(2)):
+            findings.append('%s:0: authorization-header' % filename)
+    for number, line in enumerate(text.split('\n'), 1):
+        if _USERINFO_ANY.search(line):
+            findings.append('%s:%d: url-userinfo' % (filename, number))
+        for match in _SECRET_QUERY.finditer(line):
+            value = re.match(_VALUE, line[match.end():])
+            if value and not _is_placeholder(value.group(0)):
+                findings.append('%s:%d: secret-query' % (filename, number))
+        if _LONG_TOKEN.search(line) or _JWT.search(line):
+            findings.append('%s:%d: long-token' % (filename, number))
+    # Key/value and auth-credential spans run over the whole buffer exactly like
+    # redaction, so a value or credential that continues on the next physical
+    # line is judged as one span and the raw form is still refused (per-line
+    # scanning would miss that fold).
+    for match in _AUTH.finditer(text):
+        if not _is_placeholder(match.group(2)):
+            number = text.count('\n', 0, match.start()) + 1
+            findings.append('%s:%d: authorization' % (filename, number))
+    for match in _KEYVAL.finditer(text):
+        _, key, _, value = match.groups()
+        if not _key_is_secret(key):
+            continue
+        if _normalise_key(key) in ('url', 'subscribe-url') and _plain_host_url(value):
+            continue
+        if value.lower() in ('basic', 'bearer'):
+            # Only a complete recognized scheme+credential is handled below.
+            tail = text[match.start(4):]
+            auth = _AUTH.match(tail)
+            if auth and _is_placeholder(auth.group(2)):
+                continue
+        if not _is_placeholder(value):
+            number = text.count('\n', 0, match.start()) + 1
+            findings.append('%s:%d: %s' % (filename, number, _normalise_key(key)))
+    for match in _STRINGS.finditer(text):
+        findings.extend(_verify_text(filename, _decoded_quote(match.group(0)), depth + 1))
+    return findings
+
+
+def _verify_tree(filename, node, depth=0):
+    if depth > _MAX_NESTING:
+        return ['%s:0: document nesting limit' % filename]
+    findings = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if _key_is_secret(key) and not (isinstance(value, str) and _is_placeholder(value)) and value is not None:
+                findings.append('%s:0: %s' % (filename, _normalise_key(key)))
+            findings.extend(_verify_tree(filename, value, depth + 1))
+    elif isinstance(node, list):
+        for value in node:
+            findings.extend(_verify_tree(filename, value, depth + 1))
+    elif isinstance(node, str):
+        findings.extend(_verify_text(filename, node, depth + 1))
+    return findings
+
+
+def _verify_uci(filename, text):
+    try:
+        records = _uci_records(text)
+    except RedactionError:
+        return ['%s:0: uci parse failed' % filename]
+    sections = {(parts[0], parts[1]): parts[2]
+                for kind, parts, _, _ in records if kind == 'section'}
+    findings = []
+    for kind, parts, prefix, values in records:
+        if kind != 'option':
+            continue
+        pkg, sec, option = parts
+        for value in values:
+            if not _uci_allowed(sections.get((pkg, sec)), option) and not _is_placeholder(value):
+                number = text[:text.find(prefix)].count('\n') + 1
+                findings.append('%s:%d: %s' % (filename, number, _normalise_key(option)))
+            findings.extend(_verify_text(filename, value))
+    return findings
+
+
+def verify_directory(directory):
+    findings = []
+    for root, dirs, files in os.walk(directory):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            relative = os.path.relpath(path, directory).replace(os.sep, '/')
+            try:
+                with open(path, 'rb') as handle:
+                    data = handle.read()
+            except OSError as exc:
+                findings.append('%s:0: unreadable (%s)' % (relative, exc.strerror or exc))
+                continue
+            text = data.decode('utf-8', 'replace')
+            if name == 'nft.txt':
+                findings.extend(_verify_nft(relative, text))
+            elif name.endswith('.uci'):
+                findings.extend(_verify_uci(relative, text))
+            elif name.endswith(('.json', '.yaml', '.yml')) and text.strip():
+                try:
+                    node = json.loads(text, object_pairs_hook=_unique_json_object) if name.endswith('.json') else yaml.safe_load(text)
+                    findings.extend(_verify_tree(relative, node))
+                except (ValueError, yaml.YAMLError, RecursionError, RedactionError):
+                    findings.append('%s:0: document parse failed' % relative)
+            else:
+                findings.extend(_verify_text(relative, text))
+    return findings
+
+
+# ---------------------------------------------------------------- main
+
+_REDACTORS = {
+    'uci': redact_uci,
+    'yaml': redact_yaml,
+    'json': redact_json,
+    'text': redact_text,
+    'nft': redact_nft,
+}
+
+

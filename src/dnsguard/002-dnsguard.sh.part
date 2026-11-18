@@ -1,0 +1,403 @@
+safe_state_restore() {
+  _restore_backup_ok=0
+  live_backup || return 1
+  if state_restore; then
+    rm -f "$_backup"
+    return 0
+  fi
+  if live_backup_restore; then
+    _restore_backup_ok=1
+  fi
+  return 1
+}
+
+# Restore the recorded TYPE, then commit and verify:
+#   list   -> delete + one add_list per value
+#   string -> set server=<value>
+#   absent -> delete server
+# strictorder is handled the same way. Values are read line by line.
+state_restore() {
+  state_values_ok || return 1
+  _type=$(state_type)
+  _current=$(dhcp_scan_live) || return 1
+  _cur_type=$(scan_field "$_current" server_type)
+  case "$_type" in
+    list)
+      if [ "$_cur_type" != absent ]; then
+        uci_live -q delete dhcp.@dnsmasq[0].server 2>/dev/null || return 1
+      fi
+      state_servers > "$STATE.values.$$" 2>/dev/null || return 1
+      while IFS= read -r _v; do
+        uci_live -q add_list "dhcp.@dnsmasq[0].server=$_v" 2>/dev/null || return 1
+      done < "$STATE.values.$$"
+      ;;
+    string)
+      _v=$(state_get_all server | head -1)
+      uci_live -q set "dhcp.@dnsmasq[0].server=$_v" 2>/dev/null || return 1
+      ;;
+    absent)
+      if [ "$_cur_type" != absent ]; then
+        uci_live -q delete dhcp.@dnsmasq[0].server 2>/dev/null || return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  _stype=$(state_stype)
+  _cur_stype=$(scan_field "$_current" strictorder_type)
+  case "$_stype" in
+    list)
+      if [ "$_cur_stype" != absent ]; then
+        uci_live -q delete dhcp.@dnsmasq[0].strictorder 2>/dev/null || return 1
+      fi
+      state_get_all strictorder > "$STATE.strict.$$" 2>/dev/null || return 1
+      while IFS= read -r _v; do
+        uci_live -q add_list "dhcp.@dnsmasq[0].strictorder=$_v" 2>/dev/null || return 1
+      done < "$STATE.strict.$$"
+      ;;
+    string)
+      _v=$(state_get_all strictorder | head -1)
+      uci_live -q set "dhcp.@dnsmasq[0].strictorder=$_v" 2>/dev/null || return 1
+      ;;
+    absent)
+      if [ "$_cur_stype" != absent ]; then
+        uci_live -q delete dhcp.@dnsmasq[0].strictorder 2>/dev/null || return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  uci_live -q commit dhcp 2>/dev/null || return 1
+  state_verify
+}
+
+# ---------------------------------------------------------------- candidate + verification
+verify_scan() {
+  _vscan=$1
+  _vwant=$2
+  _vscoped=$3
+  [ "$(scan_field "$_vscan" server_type)" = list ] || {
+    _verr="server is not a list option"
+    return 1
+  }
+  if scan_has "$_vscan" has_option_server=1; then
+    _verr="an option server line is still present"
+    return 1
+  fi
+  [ "$(scan_values "$_vscan" server)" = "$(cat "$_vwant")" ] || {
+    _verr="server values are not exactly the requested list"
+    return 1
+  }
+  [ "$(scoped_from_scan "$_vscan")" = "$(cat "$_vscoped")" ] || {
+    _verr="scoped zone entries changed"
+    return 1
+  }
+  [ "$(scan_field "$_vscan" strictorder_type)" = string ] || {
+    _verr="strictorder is not a string option"
+    return 1
+  }
+  [ "$(scan_values "$_vscan" strictorder)" = 1 ] || {
+    _verr="strictorder is not 1"
+    return 1
+  }
+  return 0
+}
+
+verify_config() {
+  _vscan=$(dhcp_scan_dir "$CAND") || { _verr="cannot read the candidate configuration"; return 1; }
+  verify_scan "$_vscan" "$NEW_VALUES" "$SCOPED_VALUES"
+}
+
+verify_live() {
+  _vscan=$(dhcp_scan_live) || { _verr="cannot read the live configuration"; return 1; }
+  verify_scan "$_vscan" "$NEW_VALUES" "$SCOPED_VALUES"
+}
+
+# Build the new list in the private copy: delete, one add_list per value, strictorder, commit,
+# then read the candidate FILE back and verify it.
+candidate_build() {
+  _cand_err=
+  _stage=
+  _cscan=$(dhcp_scan_dir "$CAND") || { _cand_err="cannot read the candidate copy"; return 1; }
+  if [ "$(scan_field "$_cscan" server_type)" != absent ]; then
+    _stage=delete
+    uci_cand -q delete dhcp.@dnsmasq[0].server 2>/dev/null || {
+      _cand_err="uci delete failed"
+      return 1
+    }
+  fi
+  _stage=add_list
+  while IFS= read -r _v; do
+    uci_cand -q add_list "dhcp.@dnsmasq[0].server=$_v" 2>/dev/null || {
+      _cand_err="uci add_list $_v failed"
+      return 1
+    }
+  done < "$NEW_VALUES"
+  _stage=set
+  uci_cand -q set dhcp.@dnsmasq[0].strictorder=1 2>/dev/null || {
+    _cand_err="uci set strictorder failed"
+    return 1
+  }
+  _stage=commit
+  uci_cand -q commit dhcp 2>/dev/null || { _cand_err="uci commit failed"; return 1; }
+  _stage=verify
+  verify_config || return 1
+  _stage=
+  return 0
+}
+
+# The live sequence is the same. `_live_stage` records how far the live file was touched:
+#   none   -> only our private delta exists, the live file is untouched
+#   commit -> a commit was attempted
+#   verify -> the commit returned 0, verification is in progress
+apply_live() {
+  _stage=
+  _live_stage=none
+  _lscan=$(dhcp_scan_live) || { _stage=read; return 1; }
+  if [ "$(scan_field "$_lscan" server_type)" != absent ]; then
+    _stage=delete
+    uci_live -q delete dhcp.@dnsmasq[0].server 2>/dev/null || return 1
+  fi
+  _stage=add_list
+  while IFS= read -r _v; do
+    uci_live -q add_list "dhcp.@dnsmasq[0].server=$_v" 2>/dev/null || return 1
+  done < "$NEW_VALUES"
+  _stage=set
+  uci_live -q set dhcp.@dnsmasq[0].strictorder=1 2>/dev/null || return 1
+  _stage=commit
+  _live_stage=commit
+  uci_live -q commit dhcp 2>/dev/null || return 1
+  _live_stage=verify
+  _stage=verify
+  verify_live || return 1
+  _live_stage=done
+  _stage=
+  return 0
+}
+
+candidate_matches_live() {
+  [ -f "$CAND/dhcp" ] || return 1
+  [ -f "$LIVE_DHCP" ] || return 1
+  [ "$(sha256sum "$LIVE_DHCP" 2>/dev/null | awk '{print $1}')" = \
+    "$(sha256sum "$CAND/dhcp" 2>/dev/null | awk '{print $1}')" ] || return 1
+  return 0
+}
+
+# A preimage from an earlier apply is stale: restoring those bytes would erase edits made
+# between the two applies. Only the snapshot this candidate was built from is byte-restorable.
+preimage_matches_base() {
+  state_preimage_ok || return 1
+  [ -f "$CAND/base" ] || return 1
+  [ "$(sha256sum "$(state_get preimage)" 2>/dev/null | awk '{print $1}')" = \
+    "$(sha256sum "$CAND/base" 2>/dev/null | awk '{print $1}')" ] || return 1
+  return 0
+}
+
+live_write_failed() {
+  _why=$1
+  live_revert
+  case "$_live_stage" in
+    none)
+      fail "$_why at the ${_stage:-unknown} stage - live config untouched"
+      ;;
+    commit|verify)
+      if candidate_matches_live; then
+        if preimage_matches_base && restore_preimage; then
+          restart_dnsmasq >/dev/null 2>&1 || true
+          fail "$_why at the ${_stage:-unknown} stage - the preimage was restored"
+        elif safe_state_restore; then
+          restart_dnsmasq >/dev/null 2>&1 || true
+          fail "$_why at the ${_stage:-unknown} stage - the recorded values were restored"
+        elif [ "${_restore_backup_ok:-0}" = 1 ]; then
+          restart_dnsmasq >/dev/null 2>&1 || true
+          fail "$_why at the ${_stage:-unknown} stage - live restored to the pre-revert state, record kept"
+        else
+          fail "$_why at the ${_stage:-unknown} stage - could not restore, check $LIVE_DHCP"
+        fi
+      else
+        fail "$_why at the ${_stage:-unknown} stage - the live file is not the one we wrote; record kept"
+      fi
+      ;;
+    *)
+      fail "$_why at the ${_stage:-unknown} stage - live config untouched"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------- probes
+# Only an answer that follows the `Name:` line counts. The first `Address:` line of BusyBox
+# nslookup is the address of the SERVER; reading it as an answer made SERVFAIL look healthy.
+resolve_local() {
+  _out=$(nslookup "$TEST_HOST" 127.0.0.1 2>/dev/null) || return 1
+  printf '%s\n' "$_out" | awk '
+    /^Name:/ { seen = 1; next }
+    seen && match($0, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) {
+      ip = substr($0, RSTART, RLENGTH)
+      if (ip != "0.0.0.0") { print ip; found = 1; exit }
+    }
+    END { exit found ? 0 : 1 }'
+}
+
+# Ask the DoH worker directly on its own port. rc 0 = it answered, 1 = it did not,
+# 2 = cannot tell (no python3). Never guess in the caller.
+doh_probe() {
+  _port=$1
+  command -v "$PROBE_PY" >/dev/null 2>&1 || return 2
+  "$PROBE_PY" - "$_port" "$TEST_HOST" <<'PY' >/dev/null 2>&1
+import random, socket, struct, sys
+port, host = int(sys.argv[1]), sys.argv[2]
+qid = random.randrange(0, 65536)
+name = b''.join(bytes([len(p)]) + p.encode() for p in host.split('.')) + b'\0'
+query = struct.pack('!HHHHHH', qid, 0x0100, 1, 0, 0, 0) + name + struct.pack('!HH', 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+try:
+    s.sendto(query, ('127.0.0.1', port))
+    data, _ = s.recvfrom(512)
+finally:
+    s.close()
+if len(data) < 12:
+    sys.exit(1)
+rid, flags, qd, an, ns, ar = struct.unpack('!HHHHHH', data[:12])
+if rid != qid or not (flags & 0x8000) or (flags & 0x000F) != 0 or an < 1:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+restart_dnsmasq() {
+  [ -x "$DNSMASQ_INIT" ] || return 1
+  "$DNSMASQ_INIT" restart >/dev/null 2>&1
+}
+
+# Undo a half-applied policy and report it. Used by every failure path in apply().
+rollback() {
+  live_revert
+  if safe_state_restore; then
+    restart_dnsmasq >/dev/null 2>&1 || true
+    fail "$1 - previous DNS settings restored"
+  elif [ "${_restore_backup_ok:-0}" = 1 ]; then
+    restart_dnsmasq >/dev/null 2>&1 || true
+    fail "$1 - live restored to the pre-revert state, record kept"
+  else
+    fail "$1 - could not restore the previous DNS settings, record kept"
+  fi
+}
+
+# ---------------------------------------------------------------- status
+status() {
+  _scan=$(dhcp_scan_live) || {
+    fail "cannot read $LIVE_DHCP"
+    return 1
+  }
+  _list=$(value_tokens "$_scan" | awk 'BEGIN { ORS = " " } { print }' | sed 's/ $//')
+  _so=$(scan_field "$_scan" strictorder)
+  _reserve=0
+  for _e in $EMERGENCY; do
+    if value_tokens "$_scan" | grep -Fqx -e "$_e"; then _reserve=1; fi
+  done
+  _resolved=0
+  resolve_local >/dev/null 2>&1 && _resolved=1
+  _doh=unknown
+  _port=$(local_doh_port "$_scan" 2>/dev/null) && {
+    doh_probe "$_port"
+    case "$?" in 0) _doh=ok ;; 1) _doh=fail ;; *) _doh=unknown ;; esac
+  }
+  _mode=off
+  if [ "$_reserve" = 1 ] && [ "$_so" = 1 ]; then
+    if [ "$_resolved" = 0 ]; then _mode=degraded
+    elif [ "$_doh" = ok ]; then _mode=strict
+    elif [ "$_doh" = fail ]; then _mode=emergency
+    else _mode=applied
+    fi
+  fi
+  printf '{"ok":true,"mode":"%s","resolution":%s,"doh_probe":"%s","reserve":%s,"strictorder":%s,"upstreams":"%s"}\n' \
+    "$_mode" "$([ "$_resolved" = 1 ] && echo true || echo false)" "$_doh" \
+    "$([ "$_reserve" = 1 ] && echo true || echo false)" \
+    "$([ "$_so" = 1 ] && echo true || echo false)" \
+    "$(json_escape "$_list")"
+}
+
+# ---------------------------------------------------------------- apply / revert
+apply() {
+  mkdir -p "$LIVE_DELTA" 2>/dev/null || true
+  live_revert
+  CAND=$(mktemp -d "${TMPDIR:-/tmp}/geomask-dnsguard.XXXXXX") || {
+    fail "cannot create a private candidate directory"
+    return 1
+  }
+  mkdir -p "$CAND/delta" 2>/dev/null || {
+    fail "cannot create the candidate delta directory"
+    return 1
+  }
+  cp -p "$LIVE_DHCP" "$CAND/dhcp" 2>/dev/null || {
+    fail "cannot read $LIVE_DHCP - nothing changed"
+    return 1
+  }
+  cp -p "$CAND/dhcp" "$CAND/base" 2>/dev/null || {
+    fail "cannot snapshot $LIVE_DHCP - nothing changed"
+    return 1
+  }
+  _scan=$(dhcp_scan_dir "$CAND") || {
+    fail "cannot parse $LIVE_DHCP - nothing changed"
+    return 1
+  }
+  _doh_port=$(local_doh_port "$_scan" 2>/dev/null) || {
+    fail "no local DoH upstream in dnsmasq - strict mode would have nothing to trust"
+    return 1
+  }
+
+  NEW_VALUES="$CAND/new.values"
+  SCOPED_VALUES="$CAND/scoped.values"
+  : > "$NEW_VALUES" || { fail "cannot create the value snapshot"; return 1; }
+  value_tokens "$_scan" | grep '^/' > "$SCOPED_VALUES" 2>/dev/null || true
+
+  # Order: DoH worker, then the emergency reserve, then anything else the owner had, without
+  # duplicates; the domain-scoped zones stay last and must survive exactly.
+  doh_values "$_scan" > "$CAND/doh.values"
+  while IFS= read -r _s; do add_new "$_s"; done < "$CAND/doh.values"
+  for _e in $EMERGENCY; do add_new "$_e"; done
+  value_tokens "$_scan" > "$CAND/all.values"
+  while IFS= read -r _s; do
+    case "$_s" in
+      127.0.0.1#*|localhost#*) continue ;;
+      /*) continue ;;
+    esac
+    is_emergency "$_s" && continue
+    add_new "$_s"
+  done < "$CAND/all.values"
+  while IFS= read -r _s; do add_new "$_s"; done < "$SCOPED_VALUES"
+
+  if ! candidate_build; then
+    fail "candidate configuration rejected at the ${_stage:-unknown} stage - live config untouched${_cand_err:+: $_cand_err}"
+    return 1
+  fi
+  # Record only after the candidate is known good, so a candidate failure leaves no record.
+  state_save "$_scan" || {
+    fail "cannot record the current DNS settings at $STATE - nothing changed; if the file is unusable run: geomask-dnsguard.sh revert --force"
+    return 1
+  }
+  if ! apply_live; then
+    live_write_failed "cannot rewrite the dnsmasq server list"
+    return 1
+  fi
+
+  restart_dnsmasq || { rollback "dnsmasq did not restart"; return 1; }
+  _i=0
+  while [ "$_i" -lt 5 ]; do
+    resolve_local >/dev/null 2>&1 && break
+    sleep 1; _i=$((_i + 1))
+  done
+  # A policy that leaves the router unable to resolve is worse than the state we found.
+  resolve_local >/dev/null 2>&1 || {
+    rollback "the resolver does not answer after the change"
+    return 1
+  }
+
+  drop_live_delta
+  doh_probe "$_doh_port"
+  case "$?" in
+    0) say '{"ok":true,"mode":"strict"}' ;;
+    1) say '{"ok":true,"mode":"emergency","warn":"DoH worker does not answer - resolution uses the emergency reserve"}' ;;
+    *) say '{"ok":true,"mode":"applied","warn":"policy applied, but the DoH worker could not be probed"}' ;;
+  esac
+}
+

@@ -1,0 +1,457 @@
+#!/bin/sh
+# geomask-routes.sh - mirror the LAN-reachable prefixes into a policy table.
+#
+# Why this file exists: the previous implementation copied EVERY non-default route from
+# `main` into table 100/101 and deleted every entry of that table that was not in `main`.
+# That made geomask the owner of routes it never created: a foreign PBR/WireGuard route was
+# removed, and a public prefix that appeared on the WAN after the first setup was mirrored
+# into the tunnel table, where longest-prefix match beats `default dev Mihomo` (leak or
+# blackhole). When `ip route show table main` failed, the empty snapshot was taken as truth
+# and every non-default route was deleted. Audit 14.11.2026, F01/F02.
+#
+# The contract now:
+#   * a route is mirrored when its device carries a LAN-zone address AND it is either
+#     connected (scope link) or reaches a gateway inside a connected LAN subnet (a second
+#     router / routed subnet behind the LAN must stay reachable);
+#   * a route through the WAN (public gateway) is never mirrored;
+#   * only routes recorded as ours (the owned file, full route lines) are replaced or
+#     removed; a foreign entry on the same prefix is left alone;
+#   * the owned file is an ownership RECORD, not a write-ahead log: it lists the routes this
+#     helper installed and that are still installed. A refused replace/delete keeps the old
+#     record, so the next sync still recognises its own route and retries it; a route that is
+#     no longer installed drops out of the record. Every phase compares ONE structural key
+#     (prefix/via/dev/src, kernel decoration ignored), so a normalised installed form is the
+#     same route for the occupant check, the delete and the record; a foreign route whose key
+#     differs is never claimed or deleted, and only the indistinguishable same-key case is the
+#     documented residual (R12).
+#
+# R05: the helper also owns the QUEUE between netifd and the writer. The ifup hotplug path
+# must never wait for the route lock (it runs inside netifd's ifup and could stall PPPoE/WAN),
+# so it only records `pending-<table>` and spawns one detached worker. The worker holds the
+# `routes-worker` lock (rank 35, single flight), takes `route-<table>` (rank 40) per attempt
+# with GM_ROUTE_LOCK_WAIT=2, and applies the default route/rules that used to live in the
+# hotplug script. A busy or unreadable table is retried a bounded number of times; a failed
+# mutation is never retried inside the worker. R12 owns ownership reconciliation: such an
+# event is parked with a `retry-<table>` marker, and the next drain turns that marker into one
+# new attempt (a stable link sends no ifup event that could re-arm it).
+#
+# Return codes of geomask_routes_sync (the reason the queue can decide retry vs park):
+#   0  the table is consistent with `desired`
+#   75 busy: another writer owns route-<table> (retryable)
+#   76 retryable read/precondition failure BEFORE any mutation (retryable)
+#   77 a mutation failed: replace/delete, the write of the owned record, the read-back of the
+#      table after a mutation, or a foreign occupant blocked ours (NOT retried)
+#   2  the lock primitive is unavailable (fail closed; the caller must refuse to mutate)
+#   4  lock order inversion (caller bug; never retried)
+# 1 is not used any more: a generic failure could not tell "retry" from "fail closed".
+#
+# State root: GM_ROUTE_STATE_DIR (default /tmp/geomask-routes), files:
+#   pending-<table>  event written by hotplug (temp file + atomic rename), never by the worker
+#   work-<table>     the event claimed by the running worker; removed only after success
+#   error-<table>    last failure/timeout text (timestamp, rc, attempts); still read by the
+#                    installer's step 7 check
+#   parked-<table>   the worker gave up after the bounded retries; a NEW pending event for the
+#                    same table re-arms it (gm_route_enqueue removes parked-<table>)
+#   retry-<table>    R12: a park with rc=77 leaves it, and the next gm_route_drain converts it
+#                    into one pending event. It is NOT a queue entry: _gm_route_has_queue
+#                    ignores it, so an ifup never spawns a worker for a marker. A success or a
+#                    new enqueue removes it.
+
+GM_ROUTE_STATE_DIR=${GM_ROUTE_STATE_DIR:-/tmp/geomask-routes}
+
+_gm_route_owned() { printf '%s/owned-%s' "$(_gm_route_dir)" "$1"; }
+
+# The queue directory is always resolved here, never captured at source time: the installer
+# and the tests inject GM_ROUTE_STATE_DIR after the helper has been sourced.
+_gm_route_dir() { printf '%s' "${GM_ROUTE_STATE_DIR:-/tmp/geomask-routes}"; }
+
+_gm_route_state_file() { printf '%s/%s-%s' "$(_gm_route_dir)" "$1" "$2"; }
+
+_gm_route_networks() { # networks of the LAN firewall zone
+  _rn=""
+  for _rz in $(uci -q show firewall 2>/dev/null | sed -n 's/^firewall\.\([^.=]*\)=zone$/\1/p'); do
+    [ "$(uci -q get "firewall.$_rz.name" 2>/dev/null)" = lan ] || continue
+    for _rnet in $(uci -q get "firewall.$_rz.network" 2>/dev/null); do
+      case " $_rn " in *" $_rnet "*) ;; *) _rn="$_rn $_rnet" ;; esac
+    done
+  done
+  printf '%s' "$_rn"
+}
+
+_gm_route_devices() { # devices that may carry a LAN address
+  _rdv=""
+  for _rnet in $(_gm_route_networks); do
+    _rdev=$(uci -q get "network.$_rnet.device" 2>/dev/null)
+    [ -n "$_rdev" ] || _rdev=$(uci -q get "network.$_rnet.ifname" 2>/dev/null)
+    case "$_rdev" in
+      '') _rdev="br-$_rnet" ;;          # a bridge is named after its network
+      *" "*) _rdev="br-$_rnet" ;;       # a list of ports is a bridge
+    esac
+    case " $_rdv " in *" $_rdev "*) ;; *) _rdv="$_rdv $_rdev" ;; esac
+  done
+  _rlan=$(uci -q get network.lan.device 2>/dev/null)
+  [ -n "$_rlan" ] || _rlan=$(uci -q get network.lan.ifname 2>/dev/null)
+  [ -n "$_rlan" ] || _rlan=br-lan
+  case " $_rdv " in *" $_rlan "*) ;; *) _rdv="$_rdv $_rlan" ;; esac
+  # WireGuard peers are remote LAN clients: their subnet must stay reachable in the table
+  # as well, or every peer loses the local network the moment the tunnel table is used.
+  if ip link show Wireguard >/dev/null 2>&1; then
+    case " $_rdv " in *" Wireguard "*) ;; *) _rdv="$_rdv Wireguard" ;; esac
+  fi
+  printf '%s' "$_rdv"
+}
+
+_gm_route_normalize() { # stdin: a.b.c.d/len -> network/len
+  awk -F'[./]' '
+    NF >= 5 {
+      a=$1*16777216+$2*65536+$3*256+$4; p=$5+0
+      if (p < 1 || p > 32) next
+      size=2^(32-p); net=int(a/size)*size
+      printf "%d.%d.%d.%d/%d\n", int(net/16777216)%256, int(net/65536)%256, int(net/256)%256, net%256, p
+    }'
+}
+
+# Connected prefixes of the LAN devices, derived from the addresses themselves. Used for the
+# gateway check and as the fallback when the routing table cannot be read: a policy table
+# with a default route must keep the LAN reachable. The line names `src` so the fallback
+# `desired` line is structurally identical to the installed form (R12 round 2: without it
+# every later sync would call our own normalised route foreign).
+_gm_route_local_lines() { # prints "<network/len> dev <device> src <address>"
+  for _rp_dev in $(_gm_route_devices); do
+    _rp_seen=""
+    for _rp in $(ip -4 addr show "$_rp_dev" 2>/dev/null \
+      | sed -n 's/.*inet \([0-9][0-9.]*\/[0-9][0-9]*\).*/\1/p'); do
+      _rnet=$(printf '%s\n' "$_rp" | _gm_route_normalize)
+      [ -n "$_rnet" ] || continue
+      # One line per prefix, with the FIRST address as src (the primary one on OpenWrt): an
+      # alias on the same prefix must not become the source address of the desired route.
+      case " $_rp_seen " in *" $_rnet "*) continue ;; esac
+      _rp_seen="$_rp_seen $_rnet"
+      printf '%s dev %s src %s\n' "$_rnet" "$_rp_dev" "${_rp%%/*}"
+    done
+  done
+}
+
+_gm_route_in_prefix() { # _gm_route_in_prefix <ip> <prefix/cidr> -> 0 when inside
+  awk -v ip="$1" -v net="$2" 'BEGIN{
+    n=split(ip,A,"."); split(net,B,"/");
+    m=split(B[1],C,"."); p=B[2]+0;
+    if (n!=4 || m!=4) exit 1;
+    for (i=1;i<=4;i++){ if (A[i]!~/^[0-9]+$/ || A[i]>255) exit 1; if (C[i]!~/^[0-9]+$/ || C[i]>255) exit 1 }
+    a=((A[1]*256+A[2])*256+A[3])*256+A[4];
+    b=((C[1]*256+C[2])*256+C[3])*256+C[4];
+    size=2^(32-p); exit ((int(a/size)==int(b/size)) ? 0 : 1)
+  }'
+}
+
+_gm_route_cleanup() { rm -f "$@" 2>/dev/null; }
+
+# One writer per table. The hotplug path and the panel can fire together (a reconnect while the
+# owner presses "apply"), and both read the owned file and then rewrite it: the slower one
+# erased the faster one's prefixes, and a prefix left in the table without an owner can never be
+# cleaned up again (review 15.11, #22). The lock is the kernel lock of geomask-lock.sh - one
+# persistent inode, no PID, no reclaim; a killed sync is released by the kernel. Waiting is
+# bounded and every caller of the QUEUE path sets GM_ROUTE_LOCK_WAIT explicitly: a busy table
+# means "try again shortly", never "work without it" and never a stalled ifup.
+GM_LOCK_LIB=${GM_LOCK_LIB:-/usr/lib/geomask/geomask-lock.sh}
+if ! command -v gm_lock_acquire >/dev/null 2>&1 && [ -r "$GM_LOCK_LIB" ]; then
+  . "$GM_LOCK_LIB"
+fi
+GM_ROUTE_LOCK_WAIT=${GM_ROUTE_LOCK_WAIT:-20}
+# Worker bounds (R05). The backoff and the deadline are environment-overridable so the
+# off-router tests can exercise the retry/park path without sleeping for half a minute; the
+# defaults are the shipped contract.
+GM_ROUTE_TUN_WAIT=${GM_ROUTE_TUN_WAIT:-20}
+GM_ROUTE_WORKER_CAP=${GM_ROUTE_WORKER_CAP:-30}
+GM_ROUTE_ATTEMPTS=${GM_ROUTE_ATTEMPTS:-5}
+GM_ROUTE_ACTIVATIONS=${GM_ROUTE_ACTIVATIONS:-3}
+GM_ROUTE_BACKOFF=${GM_ROUTE_BACKOFF:-1 2 4 8}
+GM_ROUTE_WORKER_LOCK=${GM_ROUTE_WORKER_LOCK:-routes-worker}
+GM_ROUTE_DRAIN=${GM_ROUTE_DRAIN:-0}
+
+_gm_route_lock() { # _gm_route_lock <table> -> 0, 75, 76, 77, 2 or 4 (see the header)
+  command -v gm_lock_acquire >/dev/null 2>&1 || {
+    echo "geomask-routes: lock helper missing ($GM_LOCK_LIB) - refusing to touch table $1" >&2
+    return 2
+  }
+  # A malformed budget is a caller bug, not a transient error (the helper refuses it).
+  case "${GM_ROUTE_LOCK_WAIT:-}" in
+    ''|*[!0-9]*) return 2 ;;
+  esac
+  # rc=2 has two very different meanings in the helper: the primitive is missing (terminal,
+  # fail closed) or the lock directory/file could not be created/opened (ENOSPC/EACCES: a
+  # transient condition that deserves a retry, not a park). Ask the backend first.
+  if command -v gm_lock_backend >/dev/null 2>&1; then
+    _gl_backend=$(gm_lock_backend 2>/dev/null)
+    [ -n "$_gl_backend" ] || _gl_backend=missing
+  else
+    _gl_backend=missing
+  fi
+  [ "$_gl_backend" = missing ] && return 2
+  gm_lock_acquire "route-$1" "$GM_ROUTE_LOCK_WAIT"
+  case "$?" in
+    0) return 0 ;;
+    1) return 75 ;;      # busy: another writer owns this table right now
+    4) return 4 ;;       # rank inversion: a caller bug, never retryable
+    3) return 4 ;;       # re-entrant acquire: same class of caller bug
+    *) return 76 ;;      # backend exists: directory/open failure is transient (retryable)
+  esac
+}
+
+_gm_route_unlock() { # releases only our own kernel lock; nothing is deleted
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release "route-$1"
+  return 0
+}
+
+geomask_routes_sync() { # geomask_routes_sync <table> -> rc per the header
+  _rt=$1
+  case "$_rt" in ''|*[!0-9]*) return 77 ;; esac
+  ( umask 077; mkdir -p "$(_gm_route_dir)" ) 2>/dev/null || return 76
+  _gm_route_lock "$_rt"; _rl=$?
+  [ "$_rl" = 0 ] || return "$_rl"
+  _owned=$(_gm_route_owned "$_rt")
+  _state=$(_gm_route_dir)
+  _main="$_state/main-$_rt.$$"
+  _want="$_state/want-$_rt.$$"
+  _cur="$_state/cur-$_rt.$$"
+  _occ="$_state/occ-$_rt.$$"
+  _after="$_state/after-$_rt.$$"
+  # R12: the record is written through a per-process temp and an atomic rename in the same
+  # directory, so a refused or killed write can never truncate the file that is still valid.
+  _owned_new="$_state/owned-$_rt.tmp.$$"
+  _post="$_state/post-$_rt.$$"
+  _k_owned="$_state/kown-$_rt.$$"
+  _k_want="$_state/kwant-$_rt.$$"
+  _foreign="$_state/foreign-$_rt.$$"
+  _del="$_state/del-$_rt.$$"
+
+  _devs=$(_gm_route_devices)
+  _local_lines=$(_gm_route_local_lines)
+  _locals=$(printf '%s\n' "$_local_lines" | awk 'NF >= 3 {print $1}')
+
+  : > "$_want"
+  if ip route show table main > "$_main" 2>/dev/null && [ -s "$_main" ]; then
+    while IFS= read -r _r; do
+      case "$_r" in ''|default*) continue ;; esac
+      _rdev=$(printf '%s\n' "$_r" | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+      [ -n "$_rdev" ] || continue
+      case " $_devs " in *" $_rdev "*) ;; *) continue ;; esac
+      case "$_r" in
+        *" scope link"*) printf '%s\n' "$_r" >> "$_want"; continue ;;
+      esac
+      # A route through a gateway is mirrored only when the gateway lives inside a connected
+      # LAN subnet (second router / routed subnet); a WAN gateway is not our business.
+      _rgw=$(printf '%s\n' "$_r" | sed -n 's/.* via \([^ ]*\).*/\1/p')
+      [ -n "$_rgw" ] || continue
+      for _lp in $_locals; do
+        if _gm_route_in_prefix "$_rgw" "$_lp"; then
+          printf '%s\n' "$_r" >> "$_want"
+          break
+        fi
+      done
+    done < "$_main"
+    rm -f "$_main"
+  elif [ -n "$_local_lines" ]; then
+    # No readable table: mirror at least the connected LAN prefixes, or the policy table
+    # would send the LAN into the tunnel.
+    printf '%s\n' "$_local_lines" >> "$_want"
+  else
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ"
+    _gm_route_unlock "$_rt"
+    return 76
+  fi
+  if [ ! -s "$_want" ]; then
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ"
+    _gm_route_unlock "$_rt"
+    return 76
+  fi
+
+  # What is installed now. Ownership is decided against this snapshot, and a failed read
+  # means nothing is touched at all: a blind `replace` could take a route somebody else owns.
+  if ! ip route show table "$_rt" > "$_cur" 2>/dev/null; then
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ"
+    _gm_route_unlock "$_rt"
+    return 76
+  fi
+
+  # A record that exists but cannot be read would make every occupant look foreign (no
+  # mutation, no loss) yet would also drop our entries from the reconciled file. Fail closed
+  # before the first mutation: a directory in place of the file, a broken mode.
+  if [ -e "$_owned" ] && { [ ! -f "$_owned" ] || [ ! -r "$_owned" ]; }; then
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ"
+    _gm_route_unlock "$_rt"
+    return 76
+  fi
+
+  # R12 (round 2): ONE structural key, used by every phase - not only for the read-back.
+  #   key = prefix|via|dev|src, where a missing src is "-" (so a line that carries a foreign
+  #   src never matches a line without one), the destination may follow a route type word, and
+  #   kernel decoration (proto, metric, expires, linkdown, mtu, scope, table) is not part of
+  #   the key. An occupant is ours when its key is in the record or in `desired`; a recorded
+  #   line is installed when its key is in the fresh table; the new record keeps installed
+  #   lines whose key is in the old record or in `desired`. A stale/kernel-normalised record
+  #   therefore stays useful in Phase 1 and Phase 3 as well, and a foreign route whose
+  #   prefix/via/dev/src differs is never ours, never deleted and never recorded.
+  _route_awk='
+    function key(s,   n, a, i, via, dev, src, pfx, first) {
+      n = split(s, a, " ")
+      if (n == 0) return ""
+      first = a[1]
+      pfx = first
+      if (first == "unicast" || first == "blackhole" || first == "unreachable" || first == "prohibit" || first == "throw" || first == "local" || first == "broadcast" || first == "multicast" || first == "anycast" || first == "nat") pfx = a[2]
+      via = "-"; dev = "-"; src = "-"
+      for (i = 2; i <= n; i++) {
+        if (a[i] == "via") via = a[i+1]
+        else if (a[i] == "dev") dev = a[i+1]
+        else if (a[i] == "src") src = a[i+1]
+      }
+      return pfx "|" via "|" dev "|" src
+    }
+    FILENAME == of { okeys[$0] = 1; next }
+    FILENAME == wf { wkeys[$0] = 1; next }
+    FILENAME == df { dkeys[$0] = 1; next }
+    mode == "keys" { if (NF > 0) print key($0); next }
+    mode == "foreign" { if ((key($0) in okeys) || (key($0) in wkeys)) next; print; next }
+    mode == "delete" { if (key($0) in wkeys) next; if (key($0) in okeys) print; next }
+    mode == "record" { if ((key($0) in okeys) || (key($0) in dkeys)) print; next }
+  '
+  _prep=0
+  : > "$_k_owned" 2>/dev/null || _prep=1
+  : > "$_k_want" 2>/dev/null || _prep=1
+  if [ "$_prep" = 0 ] && [ -f "$_owned" ]; then
+    awk -v mode=keys "$_route_awk" "$_owned" > "$_k_owned" 2>/dev/null || _prep=1
+  fi
+  if [ "$_prep" = 0 ]; then
+    awk -v mode=keys "$_route_awk" "$_want" > "$_k_want" 2>/dev/null || _prep=1
+  fi
+  if [ "$_prep" != 0 ]; then
+    _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ" "$_k_owned" "$_k_want"
+    _gm_route_unlock "$_rt"
+    return 76
+  fi
+
+  _fail=0
+  _wrote=""
+  # Phase 1+2 (R12): authorise the prefix, then replace it.
+  while IFS= read -r _r; do
+    [ -n "$_r" ] || continue
+    _pfx=${_r%% *}
+    # Only a route we recorded may be replaced, and the occupants of the prefix - not the
+    # desired line - decide ownership. Comparing `desired` with `owned` skipped every
+    # replacement (on A->B, B is not in `owned` yet, so B was dropped and A removed), and the
+    # removal then went by prefix, which cannot tell two entries of one prefix apart. N01.
+    # The prefix may sit at any field (`10.0.0.0/24 dev ...`, `blackhole 10.0.0.0/24`), so the
+    # match is by whole word, not by the first column; a typed route is foreign by definition.
+    awk -v p="$_pfx" '{ for (i = 1; i <= NF; i++) if ($i == p) { print; break } }' "$_cur" > "$_occ"
+    if [ -s "$_occ" ]; then
+      # An occupant is ours when its structural key is in the record OR equals a desired line:
+      # that accepts the decorated/kernel-normalised installed form of our own route (a stale
+      # raw record, a lost record after a wiped /tmp, a refused write of the record) and still
+      # refuses a route whose prefix/via/dev/src differ. The old byte-identical test missed the
+      # normalised form and called our own route foreign (R12 review, round 2).
+      : > "$_foreign"
+      _fo=0
+      awk -v mode=foreign -v of="$_k_owned" -v wf="$_k_want" "$_route_awk" \
+        "$_k_owned" "$_k_want" "$_occ" > "$_foreign" 2>/dev/null || _fo=1
+      if [ "$_fo" != 0 ] || [ -s "$_foreign" ]; then
+        # A foreign entry on this prefix stays, and our own entries on it are left alone too:
+        # rc=77, because the table is not what `desired` wants and repeating the same replace
+        # cannot fix an ownership conflict. The old record keeps our line, so a later sync
+        # still recognises it (R12: it used to drop the line and lock the prefix as foreign).
+        _fail=1
+        continue
+      fi
+    fi
+    if ip route replace table "$_rt" $_r 2>/dev/null; then
+      _wrote="$_wrote $_pfx"
+    else
+      # R12: the old line (if any) stays installed and keeps its record; the next sync sees it
+      # as ours and retries instead of declaring it foreign.
+      _fail=1
+    fi
+  done < "$_want"
+
+  # Phase 3 (R12): remove recorded routes that are no longer wanted. The delete names the line
+  # that is ACTUALLY installed (the kernel may print a decorated/normalised form) and is
+  # matched by structural key against the record, so a foreign route that only shares the
+  # prefix is not deleted. The snapshot is taken AFTER Phase 2: a successful `replace` has
+  # already changed the old line, and deleting that old text would fail on a real kernel
+  # (R12 review, round 2). A refused delete leaves the line installed; Phase 4 keeps its
+  # record, so the next sync retries the delete (it used to become a silent orphan, rc 0).
+  if [ -s "$_k_owned" ]; then
+    if ! ip route show table "$_rt" > "$_post" 2>/dev/null; then
+      _fail=1
+    else
+      : > "$_del"
+      _dbo=0
+      awk -v mode=delete -v of="$_k_owned" -v wf="$_k_want" "$_route_awk" \
+        "$_k_owned" "$_k_want" "$_post" > "$_del" 2>/dev/null || _dbo=1
+      if [ "$_dbo" != 0 ]; then
+        _fail=1
+      else
+        while IFS= read -r _d; do
+          [ -n "$_d" ] || continue
+          ip route del table "$_rt" $_d 2>/dev/null || _fail=1
+        done < "$_del"
+      fi
+    fi
+  fi
+
+  # Phase 4 (R12): the record must describe what is installed now, and only what is ours.
+  # `_new` (the lines this run managed to replace) was the old source of the record: a refused
+  # replace or delete dropped a live route from it, so the next sync declared that route
+  # foreign and never retried it (refused replace) or never removed it (refused delete).
+  #
+  # Exactly two kinds of installed lines may be recorded:
+  #   (a) a line whose structural key is in the OLD record (a refused delete leaves the line
+  #       installed; a stale or kernel-normalised record still recognises it);
+  #   (b) a line whose structural key equals a desired line (a byte-identical desired line
+  #       returns to the record even when a foreign neighbour blocked its replace).
+  # `_route_awk` is the one key used here, in Phase 1 and in Phase 3: prefix/via/dev/src with
+  # kernel decoration ignored. A prefix alone is NOT a reason to record a line - after
+  # `replace` another writer can add a route on the same prefix before the read-back, and the
+  # old `prefix in _wrote` rule recorded that foreign line (R12 review, D1). A route that
+  # disappeared on its own drops out instead of being trusted blindly.
+  if ! ip route show table "$_rt" > "$_after" 2>/dev/null; then
+    # The mutations already happened, so this is a mutation-reporting failure (77), never the
+    # retryable pre-mutation read (76): a 76 would make the caller repeat the mutations. The
+    # old record is the conservative claim and is left untouched.
+    _fail=1
+  else
+    _wf=0
+    if [ ! -s "$_after" ] && { [ -s "$_owned" ] || [ -n "$_wrote" ]; }; then
+      # A successful read that returns NOTHING while we own or wrote routes is not an empty
+      # table: recording it would erase live ownership. Keep the old record and report 77.
+      _wf=1
+    elif ! awk -v mode=record -v of="$_k_owned" -v df="$_k_want" "$_route_awk" \
+         "$_k_owned" "$_k_want" "$_after" > "$_owned_new" 2>/dev/null; then
+      _wf=1
+    fi
+    if [ "$_wf" != 0 ]; then
+      # The filtered record could not be written completely (or the read-back was empty):
+      # keep the old file - a truncated record would lose routes forever - and report 77.
+      _fail=1
+    else
+      chmod 600 "$_owned_new" 2>/dev/null
+      # A rename in the same directory is the write: the old record survives any failure,
+      # including ENOSPC/EROFS and a killed sync (R12: `cp -f` truncated it first).
+      mv -f "$_owned_new" "$_owned" 2>/dev/null || _fail=1
+    fi
+  fi
+
+  _gm_route_cleanup "$_main" "$_want" "$_cur" "$_occ" "$_post" "$_after" \
+    "$_owned_new" "$_k_owned" "$_k_want" "$_foreign" "$_del"
+  _gm_route_unlock "$_rt"
+  if [ "$_fail" = 0 ]; then
+    # R12 (D5): a successful sync proves the table is consistent again, so a retry marker left
+    # by an earlier hard failure has done its job. This also covers a direct sync from the
+    # console/panel, which never goes through the worker's own success branch.
+    rm -f "$_state/retry-$_rt" 2>/dev/null
+    return 0
+  fi
+  return 77
+}
+
+# ---------------------------------------------------------------- R05 queue and worker
+

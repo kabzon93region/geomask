@@ -1,0 +1,378 @@
+def check_geo_invariants():
+    """The routing rules that must never regress, read from the live config."""
+    text = read_text(MIHOMO_CONF)
+    details = []
+    state = 'ok'
+    providers, rules = parse_mihomo(text)
+    if not rules:
+        return 'fail', 'в конфиге нет правил', [MIHOMO_CONF]
+    if not any('RULE-SET,mtrickle,' in rule for rule in rules):
+        details.append('нет правила RULE-SET,mtrickle')
+        state = 'fail'
+    if 'RULE-SET,ytvpn,' not in text:
+        details.append('нет правила ytvpn')
+        state = 'warn' if state == 'ok' else state
+    if not providers:
+        details.append('не найдены rule-providers')
+        state = 'warn' if state == 'ok' else state
+    for name, path in sorted(providers.items()):
+        if path and not os.path.exists(path):
+            details.append('ruleset %s отсутствует: %s' % (name, path))
+            state = 'fail' if state == 'ok' else state
+    rc, _ = run(['mihomo', '-d', '/etc/mihomo', '-t'], timeout=20)
+    details.append('mihomo -t: %s' % ('конфиг валиден' if rc == 0 else 'ОШИБКА'))
+    if rc != 0:
+        state = 'fail'
+    summary = 'правила и конфиг в порядке' if state == 'ok' else 'правила требуют внимания'
+    return state, summary, details
+
+
+def check_update_state():
+    updater = load_updater()
+    index = module_index()
+    if updater is None or not index:
+        return 'warn', 'каталог модулей недоступен', []
+    state = updater.load_state()
+    selected = updater.load_selection() if hasattr(updater, 'load_selection') else None
+    report = updater.status(index, state, selected=selected)
+    pending = [item for item in report if item['state'] in ('update-available', 'incomplete')]
+    details = ['модулей в каталоге: %d' % len(report)]
+    for item in pending[:6]:
+        details.append('%s: %s' % (item['id'], item['state']))
+    if pending:
+        return 'warn', 'есть обновления или неполные модули: %d' % len(pending), details
+    return 'ok', 'все модули актуальны', details
+
+
+CHECKS = []
+
+
+def register(area, check_id, title, factory, hint='', live=False, fix=''):
+    """fix: what the owner should do when the check is not ok. Static text is enough for
+    most checks; the ones whose remedy depends on the state return it themselves."""
+    CHECKS.append({'id': check_id, 'area': area, 'title': title, 'fn': factory,
+                   'hint': hint, 'live': live, 'fix': fix})
+
+
+def build_registry():
+    if CHECKS:
+        return CHECKS
+    index = module_index()
+    names = {'core': 'ядро', 'luci': 'Админка LuCI', 'guard': 'geomask-guard',
+             'path_vpn': 'VPN-лейн', 'path_vpn_nop2p': 'VPN-noP2P',
+             'path_ai': 'AI-лейн', 'ai_dns': 'AI-DNS', 'youtube': 'YouTube',
+             'torrent': 'торренты', 'diagnostic': 'старые проверки',
+             'device_modes': 'режимы устройств', 'backup_share': 'SMB-бэкапы',
+             'self_update': 'самообновление', 'admission_service': 'служба допуска',
+             'doctor': 'диагностика'}
+    for module_id in sorted((index.get('modules') or {})):
+        register('modules', 'mod_' + module_id, 'Модуль %s' % names.get(module_id, module_id),
+                 check_module(module_id))
+    register('router', 'router_system', 'Система и аптайм', check_router_system)
+    register('router', 'router_resources', 'Ресурсы: память, диск, загрузка', check_router_resources,
+             fix='Освободите место: старые бэкапы в /root/geomask-backups, логи в /root/geomask-logs. '
+                 'При высокой загрузке посмотрите, кто её даёт: top -n1')
+    register('router', 'router_services', 'Службы роутера', check_router_services,
+             fix='Поднимите службу: /etc/init.d/<служба> restart. Если не поднимается — logread | tail -40')
+    register('router', 'router_netfilter', 'Firewall и маршрутизация', check_router_netfilter,
+             fix='Перезапустите: /etc/init.d/firewall restart, затем /etc/init.d/magitrickle restart; '
+                 'после этого sh geomask.sh --step 5')
+    register('router', 'router_backup', 'Свежесть бэкапа', check_router_backup,
+             fix='Создайте бэкап: sh geomask.sh --backup — копия ляжет в /root/geomask-backups и на ПК')
+    register('network', 'net_wan', 'WAN и маршрут по умолчанию', check_net_wan,
+             fix='Проверьте кабель и PPPoE: logread | grep -i wan, ip -4 addr show; '
+                 'перезапуск: /etc/init.d/network restart')
+    register('network', 'net_dns', 'DNS и блокировка рекламы', check_net_dns,
+             fix='Перезапустите dnsmasq: /etc/init.d/dnsmasq restart; upstream — LuCI → Сеть → DHCP/DNS')
+    register('network', 'net_internet', 'Доступ в интернет', check_net_internet,
+             fix='Проверьте WAN и текущий узел: панель → Обзор. Пустой узел — панель → Подписки → «Обновить»')
+    register('network', 'net_tunnels', 'Туннели и MTU', check_net_tunnels,
+             fix='Поднимите туннель: /etc/init.d/hev-socks5-tunnel restart; конфиги в /etc/mihomo/*.yml')
+    for check_id, group, title in PATH_GROUPS:
+        register('paths', check_id, 'Путь %s' % title, check_path(group),
+                 fix='Обновите подписку: панель → Подписки → «Обновить». Если узлов нет — проблема на стороне провайдера')
+    register('paths', 'path_egress', 'Страна выхода каждого пути', check_path_egress,
+             'делает запрос наружу, занимает несколько секунд', live=True,
+             fix='Слушатель не отвечает: проверьте узел группы в панели → Обзор; '
+                 'для VPN — слушатель torrent-direct на 192.168.0.1:7894')
+    register('paths', 'path_rules', 'Правила и валидность конфига', check_geo_invariants,
+             fix='Верните правила: sh geomask.sh --step 5 (синк) или --reinstall; проверка: mihomo -d /etc/mihomo -t')
+    register('router', 'update_state', 'Обновления модулей', check_update_state,
+             fix='Панель → Модули → «Проверить обновления», затем обновите нужные модули')
+    return CHECKS
+
+
+def find_check(check_id):
+    for check in build_registry():
+        if check['id'] == check_id:
+            return check
+    return None
+
+
+def run_check(check_id):
+    check = find_check(check_id)
+    if check is None:
+        return {'id': check_id, 'state': 'fail', 'title': check_id,
+                'summary': 'нет такой проверки', 'details': [], 'fix': ''}
+    started = time.time()
+    fix = check.get('fix') or ''
+    try:
+        outcome = check['fn']()
+        if isinstance(outcome, tuple) and len(outcome) == 4:
+            state, summary, details, fix = outcome
+        else:
+            state, summary, details = outcome
+    except Exception as exc:  # a broken check must not break the tab
+        state, summary, details = 'fail', 'проверка упала: %s' % exc, []
+    result = {
+        'id': check['id'], 'area': check['area'], 'title': check['title'],
+        'state': state, 'summary': summary, 'details': details,
+        'hint': check.get('hint') or '',
+        'fix': fix if state != 'ok' else '',
+        'took_ms': int((time.time() - started) * 1000),
+        'log': log_path(check['id']),
+    }
+    lines = ['%s' % summary] + ['  ' + item for item in details]
+    if result['fix']:
+        lines.append('  → ' + result['fix'])
+    write_log(check['id'], state, lines)
+    return result
+
+
+def verdict(checks):
+    """One line the owner can read without opening anything."""
+    counts = {'ok': 0, 'warn': 0, 'fail': 0}
+    for item in checks:
+        counts[item['state']] = counts.get(item['state'], 0) + 1
+    if counts['fail']:
+        text = 'есть проблемы: %d — откройте их, в каждой написано, что делать' % counts['fail']
+    elif counts['warn']:
+        text = 'всё работает, но %d проверок просят внимания' % counts['warn']
+    else:
+        text = 'всё в порядке'
+    return {'counts': counts, 'text': text, 'state': 'fail' if counts['fail'] else
+            ('warn' if counts['warn'] else 'ok')}
+
+
+def run_all(include_live=False):
+    """Every fast check. Live probes (external requests) run only when asked for:
+    rpcd has a call timeout, and the panel must stay responsive."""
+    results = []
+    for check in build_registry():
+        if check.get('live') and not include_live:
+            continue
+        results.append(run_check(check['id']))
+    summary = verdict(results)
+    payload = {'ok': True, 'generated': now_iso(), 'version': VERSION,
+               'verdict': summary['text'], 'verdict_state': summary['state'],
+               'counts': summary['counts'], 'checks': results}
+    try:
+        with open(CACHE + '.tmp', 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(CACHE + '.tmp', CACHE)
+    except OSError:
+        pass
+    return payload
+
+
+def list_checks():
+    cached = read_json(CACHE, {}) or {}
+    last = {item['id']: item for item in cached.get('checks') or []}
+    checks = []
+    for check in build_registry():
+        item = dict(check)
+        item.pop('fn', None)
+        previous = last.get(check['id']) or {}
+        item['last_state'] = previous.get('state', '')
+        item['last_summary'] = previous.get('summary', '')
+        item['last_fix'] = previous.get('fix', '')
+        item['last_at'] = cached.get('generated', '') if previous else ''
+        item['log'] = log_path(check['id'])
+        checks.append(item)
+    return {'ok': True, 'version': VERSION, 'generated': cached.get('generated', ''),
+            'verdict': cached.get('verdict', ''),
+            'verdict_state': cached.get('verdict_state', ''),
+            'counts': cached.get('counts') or {},
+            'checks': checks}
+
+
+# --------------------------------------------------------------------------- domain
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) geomask-doctor'
+# One budget for the whole live trace (audit B-020). The LuCI RPC timeout was observed at 20 s
+# while the trace itself took ~29 s, so the panel lost the answer entirely; 15 s keeps a margin
+# and every network step is capped by what is left, not by its own timeout.
+DOMAIN_TRACE_BUDGET = int(os.environ.get('GM_DOMAIN_TRACE_BUDGET') or 15)
+
+
+def node_delay(name, timeout=5000):
+    """Round-trip of one node in ms, or None when it does not answer at all."""
+    if not name:
+        return None
+    data = api_get('/proxies/%s/delay?timeout=%d&url=%s'
+                   % (quote(name, safe=''), timeout,
+                      quote('https://www.gstatic.com/generate_204', safe='')))
+    if isinstance(data, dict) and isinstance(data.get('delay'), int):
+        return data['delay']
+    return None
+
+
+def http_probe(domain, timeout=20, deadline=None):
+    """One HTTPS request from the router, explained instead of just "rc=28".
+
+    curl exit codes carry the answer: 28 means nothing came back in time, 6 is DNS,
+    35 is TLS, 56 is a reset. A timeout is the interesting one - it can be the exit node
+    or the site refusing that exit, and the owner needs to know which.
+
+    deadline (monotonic seconds) is the whole trace's budget: a step never runs past it, so
+    the RPC handler answers inside its own timeout and the owner gets a partial result with
+    a reason instead of an XHR timeout (audit B-020).
+    """
+    budget = timeout
+    if deadline is not None:
+        budget = int(deadline - time.monotonic())
+        if budget < 1:
+            return {'ok': False, 'code': '', 'took': '', 'ip': '', 'rc': 124,
+                    'kind': 'deadline', 'deadline': True,
+                    'detail': 'общий бюджет трассы исчерпан до HTTP-запроса'}
+        budget = min(timeout, budget)
+    connect = 8 if budget >= 8 else max(1, budget)
+    rc, out = run(['curl', '-m', str(budget), '--connect-timeout', str(connect), '-sS',
+                   '-o', '/dev/null', '-A', USER_AGENT,
+                   '-w', '%{http_code} %{time_total} %{remote_ip}', 'https://' + domain],
+                  timeout=budget + 8)
+    parts = (out or '').split()
+    code = parts[0] if parts else ''
+    took = parts[1] if len(parts) > 1 else ''
+    ip = parts[2] if len(parts) > 2 else ''
+    if rc == 0 and code and code != '000':
+        # 4xx is the site answering (a 404 on a game host is normal): the path works
+        good = code.startswith(('2', '3', '4'))
+        return {'ok': good, 'code': code, 'took': took, 'ip': ip, 'rc': 0,
+                'kind': '' if good else 'http',
+                'detail': 'HTTP %s за %s с%s' % (code, took, (', адрес ' + ip) if ip else '')}
+    kinds = {28: 'timeout', 6: 'dns', 7: 'refused', 35: 'tls', 52: 'empty', 56: 'reset',
+             60: 'cert'}
+    kind = kinds.get(rc, 'other')
+    words = {'timeout': 'нет ответа за %d с' % budget, 'dns': 'имя не разрешилось',
+             'refused': 'соединение отклонено', 'tls': 'TLS не поднялся',
+             'empty': 'сервер закрыл соединение без ответа', 'reset': 'соединение сброшено',
+             'cert': 'сертификат не проверен', 'other': 'сбой запроса'}
+    return {'ok': False, 'code': code, 'took': took, 'ip': ip, 'rc': rc, 'kind': kind,
+            'detail': '%s (curl rc=%s)' % (words.get(kind, 'сбой запроса'), rc)}
+
+
+def host_of(url):
+    """Hostname of a URL or of a bare host, '' for anything relative or non-http."""
+    url = (url or '').strip().strip('\'"')
+    match = re.match(r'^(?:https?:)?//([^/:?#]+)', url)
+    if match:
+        return match.group(1).lower().rstrip('.')
+    if re.match(r'^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:[:/?#]|$)', url, re.I):
+        return url.split('/')[0].split(':')[0].split('?')[0].lower().rstrip('.')
+    return ''
+
+
+SESSION_KINDS = {'form', 'iframe'}
+
+
+PAGE_FILE = '/tmp/geomask-doctor-page.html'
+HOPS_FILE = '/tmp/geomask-doctor-hops.txt'
+
+
+def related_hosts(domain, limit=12, deadline=None):
+    """Hosts the page itself depends on, with the kind of reference that found them.
+
+    A shop is rarely one host: the catalogue answers from one domain and the payment
+    processor from another, and the second one decides whether the page works. This finds
+    the ones the HTML and the certificate mention. Requests made later by JavaScript are
+    invisible from here - that page has to be loaded in a browser.
+
+    The kind matters: pictures and stylesheets on another path are harmless, a form or an
+    iframe on another path carries the session and can be rejected by the site.
+
+    deadline (monotonic seconds) bounds both requests, like http_probe: an exhausted budget
+    returns what the certificate already yielded and marks the rest as not checked, instead
+    of blowing past the RPC timeout (audit B-020).
+    """
+    page = PAGE_FILE
+    hops = HOPS_FILE
+
+    def remaining():
+        if deadline is None:
+            return None
+        return max(0, int(deadline - time.monotonic()))
+    # a failed request leaves the previous page behind, and the previous site's hosts were
+    # then reported as this domain's (a nonexistent host showed plati.market's six hosts)
+    for stale in (page, hops):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+    found = []
+
+    def add(host, kind):
+        host = (host or '').lower().rstrip('.')
+        if not host or host == domain or host.endswith('.' + domain):
+            return
+        if not re.match(r'^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$', host):
+            return
+        for item in found:
+            if item['host'] == host:
+                if kind not in item['kinds']:
+                    item['kinds'].append(kind)
+                return
+        found.append({'host': host, 'kinds': [kind], 'session': kind in SESSION_KINDS})
+
+    _budget = remaining()
+    if _budget is not None and _budget < 2:
+        return found[:limit]
+    _page_to = 20 if _budget is None else min(20, _budget)
+    run(['curl', '-sS', '-L', '--max-time', str(_page_to), '-A', USER_AGENT,
+         '-D', hops, '-o', page, 'https://' + domain], timeout=_page_to + 6)
+    for line in read_text(hops).splitlines():
+        if line.lower().startswith('location:'):
+            add(host_of(line.split(':', 1)[1]), 'redirect')
+    html = read_text(page)[:600000]
+    for tag in ('img', 'script', 'iframe', 'link', 'form', 'a'):
+        pattern = r'<%s\b[^>]{0,400}?(?:src|href|action)\s*=\s*["\']([^"\']{4,300})' % tag
+        for match in re.finditer(pattern, html, re.I):
+            add(host_of(match.group(1)), tag)
+    _budget = remaining()
+    if _budget is None or _budget >= 3:
+        _tls_to = 8 if _budget is None else min(8, _budget - 1)
+        rc, out = run(['sh', '-c',
+                       'echo | timeout %d openssl s_client -connect %s:443 -servername %s '
+                       '2>/dev/null | openssl x509 -noout -text 2>/dev/null'
+                       % (_tls_to, domain, domain)], timeout=_tls_to + 4)
+        for match in re.finditer(r'DNS:([^,\n]+)', out or ''):
+            name = match.group(1).strip()
+            if name.startswith('*.'):
+                continue
+            add(name, 'cert')
+    return found[:limit]
+
+
+def host_route(host, live=True):
+    """Where one host goes: group, mihomo policy and the country of that exit.
+
+    The country is only reported when it was measured: this used to answer "Россия (RU)"
+    for every DIRECT host without looking, which is wrong wherever the WAN is not in RU.
+    """
+    route = magitrickle_route(host)
+    hit = mihomo_route(host, [])
+    policy = (hit or {}).get('policy', 'GLOBAL')
+    cc = country = ''
+    if policy in ('VPN', 'VPN-noP2P', 'AI', 'GLOBAL'):
+        info = group_state(policy) or {}
+        cc, country = info.get('cc', ''), info.get('country', '')
+        if not cc and (info.get('now') or '').upper() == 'DIRECT':
+            cc = direct_country(live)
+            country = country_label(cc)
+    elif policy == 'DIRECT':
+        cc = direct_country(live)
+        country = country_label(cc)
+    return {'host': host, 'group': (route[0]['name'] if route else ''),
+            'policy': policy, 'cc': cc, 'country': country,
+            'rule': (hit or {}).get('rule', '')}
+
+

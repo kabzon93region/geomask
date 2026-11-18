@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "target": "dnsguard",
+  "parts": [
+    {
+      "path": "001-dnsguard.sh.part"
+    },
+    {
+      "path": "002-dnsguard.sh.part"
+    },
+    {
+      "path": "003-dnsguard.sh.part"
+    }
+  ]
+}

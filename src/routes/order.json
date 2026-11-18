@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "target": "routes",
+  "parts": [
+    {
+      "path": "001-routes.sh.part"
+    },
+    {
+      "path": "002-routes.sh.part"
+    },
+    {
+      "path": "003-routes.sh.part"
+    }
+  ]
+}

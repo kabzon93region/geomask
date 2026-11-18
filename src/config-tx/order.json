@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "target": "config-tx",
+  "parts": [
+    {
+      "path": "001-config-tx.py.part"
+    },
+    {
+      "path": "002-config-tx.py.part"
+    },
+    {
+      "path": "003-config-tx.py.part"
+    }
+  ]
+}

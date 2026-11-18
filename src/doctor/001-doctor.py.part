@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""geomask doctor - self-service diagnostics for the router, the network and the paths.
+
+The owner should never have to run an experiment through an assistant to answer "why does
+this site go there?" or "is that module healthy?". Every check here is deterministic,
+writes its own log file and can be run from the panel with one button.
+
+Commands:
+  list                check registry plus the results of the last run (no work)
+  run all|<id>        run one check or every non-interactive check, print JSON
+  log <id>            tail of that check's log file
+  domain <name>       full route of one domain: DNS, MagiTrickle, mihomo rule, exit
+  prune               drop log blocks older than the retention window
+
+Logs: /root/geomask-logs/<check>.log, one file per check, blocks older than 7 days are
+dropped on every write and the file is capped, so the archive cannot grow without bound.
+The panel shows the same text; nothing here changes the router's configuration.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from urllib.parse import quote
+from datetime import datetime, timedelta
+
+VERSION = '1.0.0'
+
+LOG_DIR = '/root/geomask-logs'
+LOG_RETENTION_DAYS = 7
+LOG_MAX_BYTES = 200_000
+CACHE = '/tmp/geomask-diag-last.json'
+MIHOMO_CONF = '/etc/mihomo/config.yaml'
+MIHOMO_API = 'http://127.0.0.1:9090'
+MT_CONF = '/etc/magitrickle/state/config.yaml'
+MODULE_INDEX = '/etc/geomask/modules-index.json'
+MODULE_UPDATER = '/usr/lib/geomask/geomask-module-update.py'
+MODULES_STATE = '/etc/geomask/modules.json'
+
+# Russian node names in this subscription, as the backend's _node_cc maps them. The
+# country is what the site on the other end sees, so it is worth naming it in words.
+COUNTRIES = {
+    'DE': 'Германия', 'NL': 'Нидерланды', 'FI': 'Финляндия', 'LV': 'Латвия',
+    'LT': 'Литва', 'EE': 'Эстония', 'PL': 'Польша', 'DK': 'Дания', 'SE': 'Швеция',
+    'NO': 'Норвегия', 'US': 'США', 'TR': 'Турция', 'AL': 'Албания', 'FR': 'Франция',
+    'IT': 'Италия', 'ES': 'Испания', 'AT': 'Австрия', 'CH': 'Швейцария', 'GB': 'Великобритания',
+    'RU': 'Россия', 'KZ': 'Казахстан', 'UA': 'Украина', 'CZ': 'Чехия', 'RO': 'Румыния',
+    'BG': 'Болгария', 'HU': 'Венгрия', 'MD': 'Молдова', 'RS': 'Сербия', 'GR': 'Греция',
+    'PT': 'Португалия', 'IE': 'Ирландия', 'BE': 'Бельгия', 'CA': 'Канада', 'JP': 'Япония',
+    'SG': 'Сингапур', 'HK': 'Гонконг', 'KR': 'Корея', 'IN': 'Индия', 'BR': 'Бразилия',
+    'AE': 'ОАЭ', 'IL': 'Израиль', 'AM': 'Армения', 'GE': 'Грузия', 'BY': 'Беларусь',
+}
+NODE_HINTS = (
+    ('Германия', 'DE'), ('Germany', 'DE'), ('Нидерланды', 'NL'), ('Netherlands', 'NL'),
+    ('Финляндия', 'FI'), ('Finland', 'FI'), ('Латвия', 'LV'), ('Latvia', 'LV'),
+    ('Литва', 'LT'), ('Lithuania', 'LT'), ('Эстония', 'EE'), ('Estonia', 'EE'),
+    ('Польша', 'PL'), ('Poland', 'PL'), ('Дания', 'DK'), ('Denmark', 'DK'),
+    ('Швеция', 'SE'), ('Sweden', 'SE'), ('Норвегия', 'NO'), ('Norway', 'NO'),
+    ('США', 'US'), ('USA', 'US'), ('United States', 'US'), ('Турция', 'TR'), ('Turkey', 'TR'),
+    ('Албания', 'AL'), ('Albania', 'AL'), ('Франция', 'FR'), ('France', 'FR'),
+    ('Италия', 'IT'), ('Italy', 'IT'), ('Испания', 'ES'), ('Spain', 'ES'),
+    ('Австрия', 'AT'), ('Austria', 'AT'), ('Швейцария', 'CH'), ('Switzerland', 'CH'),
+    ('Великобритания', 'GB'), ('United Kingdom', 'GB'), ('Казахстан', 'KZ'),
+    ('Россия', 'RU'), ('Russia', 'RU'),
+)
+
+
+# --------------------------------------------------------------------------- shell
+def run(cmd, timeout=8, stdin=None):
+    """Run a command, never raise: (rc, text). rc=127 means 'not available'."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout, input=stdin)
+    except FileNotFoundError:
+        return 127, ''
+    except subprocess.TimeoutExpired:
+        return 124, 'timeout'
+    except Exception as exc:  # pragma: no cover - defensive
+        return 125, str(exc)
+    out = (proc.stdout or b'').decode('utf-8', 'replace')
+    err = (proc.stderr or b'').decode('utf-8', 'replace')
+    return proc.returncode, (out + err).strip()
+
+
+def read_text(path, default=''):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as handle:
+            return handle.read()
+    except OSError:
+        return default
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def now_iso():
+    return datetime.now().astimezone().strftime('%Y-%m-%dT%H:%M:%S%z')
+
+
+# --------------------------------------------------------------------------- logs
+BLOCK = re.compile(r'^=== (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4})')
+
+
+def log_path(check_id):
+    return os.path.join(LOG_DIR, '%s.log' % check_id)
+
+
+def prune_blocks(text, days=LOG_RETENTION_DAYS):
+    """Drop blocks whose header is older than the retention window."""
+    keep = []
+    cutoff = datetime.now().astimezone() - timedelta(days=days)
+    for block in re.split(r'(?m)^(?==== )', text):
+        match = BLOCK.match(block)
+        if match:
+            try:
+                stamp = datetime.strptime(match.group(1), '%Y-%m-%dT%H:%M:%S%z')
+            except ValueError:
+                stamp = None
+            if stamp is not None and stamp < cutoff:
+                continue
+        if block.strip():
+            keep.append(block.rstrip('\n') + '\n')
+    return ''.join(keep)
+
+
+def write_log(check_id, state, lines):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = log_path(check_id)
+    body = '=== %s %s ===\n%s\n' % (now_iso(), state, '\n'.join(lines))
+    text = prune_blocks(read_text(path)) + body
+    if len(text) > LOG_MAX_BYTES:
+        text = text[-LOG_MAX_BYTES:]
+        cut = text.find('\n=== ')
+        if cut > 0:
+            text = text[cut + 1:]
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+    return path
+
+
+def log_tail(check_id, limit=120):
+    text = read_text(log_path(check_id))
+    if not text:
+        return ''
+    lines = text.rstrip('\n').split('\n')
+    return '\n'.join(lines[-limit:])
+
+
+# --------------------------------------------------------------------------- modules
+def module_index():
+    return read_json(MODULE_INDEX, {}) or {}
+
+
+def module_selection():
+    data = read_json(MODULES_STATE, None)
+    if not isinstance(data, dict) or not isinstance(data.get('selected'), list):
+        return None
+    return [str(item) for item in data['selected']]
+
+
+def load_updater():
+    """Import the per-module updater so its status logic is not duplicated here."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('module_update', MODULE_UPDATER)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- mihomo
+def mihomo_secret():
+    for line in read_text(MIHOMO_CONF).splitlines():
+        match = re.match(r'^secret:\s*(.*)$', line)
+        if match:
+            value = match.group(1).strip()
+            if value.startswith('"') and value.endswith('"') and len(value) > 1:
+                value = value[1:-1]
+            return value
+    return ''
+
+
+def api_get(path):
+    """GET the controller without putting the secret into argv."""
+    secret = mihomo_secret()
+    options = ''
+    if secret:
+        options = 'header = "Authorization: Bearer %s"\n' % secret
+    rc, out = run(['curl', '-s', '-m', '5', '--config', '-', MIHOMO_API + path],
+                  timeout=8, stdin=options.encode())
+    if rc != 0 or not out:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def flag_code(name):
+    """Country code from a flag emoji (two regional indicators encode A-Z)."""
+    letters = [ord(ch) - 0x1F1E6 for ch in (name or '') if 0x1F1E6 <= ord(ch) <= 0x1F1FF]
+    if len(letters) >= 2:
+        return ''.join(chr(ord('A') + value) for value in letters[:2])
+    return ''
+
+
+def node_country(name):
+    """Country code and human name for a subscription node, from its name."""
+    if not name:
+        return '', ''
+    code = flag_code(name)
+    if code:
+        return code, COUNTRIES.get(code, code)
+    for hint, code in NODE_HINTS:
+        if hint in name:
+            return code, COUNTRIES.get(code, code)
+    return '', ''
+
+
+def group_state(name):
+    """Current node of a proxy group plus how many nodes it has."""
+    data = api_get('/proxies/' + name.replace(' ', '%20'))
+    if not isinstance(data, dict):
+        return None
+    now = data.get('now') or ''
+    nodes = data.get('all') or []
+    cc, label = node_country(now)
+    return {'group': name, 'now': now, 'nodes': len(nodes), 'cc': cc, 'country': label}
+
+
+# --------------------------------------------------------------------------- parsers
+TUNNELED_IFACES = {'Mihomo', 'AI', 'VPN-noP2P'}
+
+ZAPRET_CONF = '/opt/zapret/config'
+ZAPRET_HOSTLIST = '/opt/zapret/ipset/zapret-hosts-user.txt'
+ZAPRET_EXCLUDE = '/opt/zapret/ipset/zapret-hosts-user-exclude.txt'
+ZAPRET_AUTO = '/opt/zapret/ipset/zapret-hosts-auto.txt'
+
+
+def plain_rule(rule):
+    """A mihomo rule line in words a person who has never read config.yaml understands."""
+    parts = [item.strip() for item in (rule or '').split(',') if item.strip()]
+    kind = parts[0].upper() if parts else ''
+    if kind == 'MATCH':
+        return 'любой другой домен'
+    if kind == 'RULE-SET':
+        return 'список %s' % (parts[1] if len(parts) > 1 else '?')
+    if kind == 'GEOSITE':
+        return 'геосписок %s' % (parts[1] if len(parts) > 1 else '?')
+    if kind == 'GEOIP':
+        return 'страна %s' % (parts[1] if len(parts) > 1 else '?')
+    if kind == 'DOMAIN-SUFFIX':
+        return 'домен и его поддомены'
+    if kind == 'DOMAIN':
+        return 'точный домен'
+    if kind.startswith('IP-CIDR'):
+        return 'диапазон адресов'
+    if kind in ('AND', 'OR', 'NOT'):
+        return 'составное правило %s' % kind
+    return rule or '?'
+
+
+def plain_iface(iface):
+    """Where a MagiTrickle group sends traffic, in words."""
+    if not iface:
+        return 'интерфейс не задан'
+    if iface == 'Mihomo':
+        return 'в mihomo (там выбирается узел VPN)'
+    if iface == 'AI':
+        return 'в AI-туннель'
+    if iface == 'VPN-noP2P':
+        return 'в VPN-туннель без P2P'
+    return 'напрямую в интернет через %s' % iface
+
+
+def _hostlist_match(domain, path):
+    """Which line of a zapret host list covers this domain, '' when none does.
+
+    zapret matches a line against the host itself and its subdomains, and the owner uses
+    that deliberately: a bare `ru` in the exclude list drops every .ru domain from the desync.
+    """
+    domain = (domain or '').lower().strip('.')
+    for raw in read_text(path).splitlines():
+        line = raw.strip().lower()
+        if not line or line.startswith('#'):
+            continue
+        line = line.lstrip('*').lstrip('.')
+        if domain == line or domain.endswith('.' + line):
+            return line
+    return ''
+
+
+def zapret_route(domain):
+    """Does zapret (nfqws) process this domain, and if not, why not.
+
+    The trace used to stop after the mihomo rule, so a domain going out directly looked like
+    it had no DPI handling at all - while the owner's wardogs host had been in zapret's
+    hostlist the whole time.
+    """
+    rc, out = run(['pidof', 'nfqws'])
+    pids = (out or '').strip() if rc == 0 else ''
+    # a running nfqws means nothing if nothing queues packets to it
+    nrc, nout = run(['nft', 'list', 'table', 'inet', 'zapret'])
+    queues = nrc == 0 and 'queue' in (nout or '')
+    mode = ''
+    for line in read_text(ZAPRET_CONF).splitlines():
+        if line.strip().startswith('MODE_FILTER='):
+            mode = line.split('=', 1)[1].strip().strip('"').strip("'")
+            break
+    return {'running': bool(pids), 'pids': pids, 'mode': mode, 'queues': queues,
+            'listed': _hostlist_match(domain, ZAPRET_HOSTLIST),
+            'excluded': _hostlist_match(domain, ZAPRET_EXCLUDE),
+            'auto': bool(_hostlist_match(domain, ZAPRET_AUTO))}
+
+
+def parse_magitrickle(text):
+    """groups: [{name, interface, enable, rules:[{type, rule, enable}]}] from config.yaml."""
+    groups = []
+    current = None
+    in_rules = False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith('#'):
+            continue
+        if line.startswith('- id:') or line.startswith('  - id:'):
+            # a group starts at column 0 (`- id:`) and a rule at two spaces
+            if line.startswith('- id:'):
+                current = {'name': '', 'interface': '', 'enable': True, 'rules': []}
+                groups.append(current)
+                in_rules = False
+                continue
+            if current is not None and in_rules:
+                current['rules'].append({'type': '', 'rule': '', 'enable': True})
+                continue
+        if current is None:
+            continue
+        stripped = line.strip()
+        if stripped == 'rules:':
+            in_rules = True
+            continue
+        if line.startswith('  ') and not line.startswith('   ') and not in_rules:
+            key, _, value = stripped.partition(':')
+            if key == 'name':
+                current['name'] = value.strip().strip('\'"')
+            elif key == 'interface':
+                current['interface'] = value.strip().strip('\'"')
+            elif key == 'enable':
+                current['enable'] = value.strip().lower() != 'false'
+            continue
+        if in_rules and stripped.startswith('type:'):
+            current['rules'][-1]['type'] = stripped.split(':', 1)[1].strip()
+            continue
+        if in_rules and stripped.startswith('rule:'):
+            value = stripped.split(':', 1)[1].strip()
+            current['rules'][-1]['rule'] = value.strip('\'"')
+            continue
+        if in_rules and stripped.startswith('enable:'):
+            current['rules'][-1]['enable'] = stripped.split(':', 1)[1].strip().lower() != 'false'
+            continue
+        if not line.startswith(' ') and stripped and not stripped.startswith('-'):
+            in_rules = False
+    return groups
+
+
+def domain_matches(domain, pattern, kind='namespace'):
+    domain = domain.lower().rstrip('.')
+    pattern = (pattern or '').lower().strip().rstrip('.')
+    kind = (kind or 'namespace').lower()
+    if not pattern:
+        return False
+    if kind in ('namespace', 'suffix', 'domain-suffix'):
+        return domain == pattern or domain.endswith('.' + pattern)
+    if kind in ('domain', 'exact'):
+        return domain == pattern
+    if kind in ('keyword', 'domain-keyword'):
+        return pattern in domain
+    if kind in ('regex',):
+        try:
+            return re.search(pattern, domain) is not None
+        except re.error:
+            return False
+    return False
+
+

@@ -1,0 +1,385 @@
+def measure(archives, sidecars):
+    """(archives, bytes): sidecar bodies belong to the budget, foreign names do not."""
+    total = 0
+    for name, st in archives.items():
+        total += st.st_size
+        shadow = sidecars.get(name)
+        if shadow is not None and stat.S_ISREG(shadow.st_mode):
+            total += shadow.st_size
+    return len(archives), total
+
+
+def _created_ns(directory, name, st):
+    """Eviction order follows the registered creation time, with mtime as fallback.
+
+    The sidecar is bounded to 64 KiB and is read without hashing: retention costs lstats
+    plus a few small JSON parses, never a sha256 pass over the archives.
+    """
+    try:
+        return read_sidecar(directory, name, digest=False)['created_ns']
+    except (Refused, OSError):
+        return st.st_mtime_ns
+
+
+def _order(directory, archives):
+    return sorted(archives, key=lambda name: (_created_ns(directory, name, archives[name]), name))
+
+
+def _unlink(directory, name):
+    """Remove one name only when it is ours and not a shared inode.
+
+    `lstat` first: a bundle or sidecar whose uid is not ours, or which has more than one
+    link, is not deleted. The spool/share can contain files created by root or a local user
+    (TMPDIR is 1777), and retention must not unlink a hardlink to somebody else's data.
+    `protected_name` still wins before any of that.
+    """
+    if protected_name(name):
+        return False
+    try:
+        st = directory.lstat(name)
+    except (OSError, Refused):
+        return False
+    if st is None or st.st_uid != EUID or st.st_nlink > 1:
+        return False
+    try:
+        directory.unlink(name)
+        return True
+    except FileNotFoundError:
+        return False
+    except (OSError, Refused):
+        return False
+
+
+def _unlink_pair(directory, name):
+    """Archive first, then its sidecar: the reverse order would hide a 2 MiB orphan."""
+    gone = _unlink(directory, name)
+    if not gone:
+        try:
+            still_there = directory.lstat(name) is not None
+        except (OSError, Refused):
+            still_there = True
+        if still_there:
+            # The archive is ours but protected (hardlink/foreign uid) or could not be
+            # removed: keep its passport as well, instead of turning the pair into an
+            # orphan.
+            return 0
+    removed = 1 if gone else 0
+    if _unlink(directory, name + '.json'):
+        removed += 1
+    return removed
+
+
+def _evict(directory, archives, sidecars, order, keep_name, grace, files, quota, now, floor=1,
+           pending=0):
+    """Evict oldest-first until both limits hold; never the registering bundle.
+
+    `pending` is the exact size of a passport that is about to be written: registration
+    must not see room for the archive alone and then exceed the quota by the sidecar.
+    """
+    removed = 0
+    while (len(archives) > files
+           or measure(archives, sidecars)[1] + pending > quota):
+        if len(archives) <= floor:
+            break
+        victim = None
+        for name in order:
+            if name not in archives or name == keep_name:
+                continue
+            if grace and now - archives[name].st_mtime < grace:
+                continue
+            victim = name
+            break
+        if victim is None:
+            break
+        gone = _unlink_pair(directory, victim)
+        if gone == 0 and directory.lstat(victim) is not None:
+            # Windows may deny unlink while another registrar is hashing the file: stop
+            # instead of spinning, and let the caller decide what does not fit.
+            break
+        removed += gone
+        archives.pop(victim, None)
+        sidecars.pop(victim, None)
+    return removed
+
+
+def _remove_tree_fd(parent_fd, name):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=parent_fd)
+    except OSError:
+        return False
+    try:
+        for child in os.listdir(fd):
+            try:
+                child_st = os.lstat(child, dir_fd=fd)
+            except OSError:
+                continue
+            if stat.S_ISDIR(child_st.st_mode):
+                _remove_tree_fd(fd, child)
+            else:
+                try:
+                    os.unlink(child, dir_fd=fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(fd)
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+        return True
+    except OSError:
+        return False
+
+
+def _remove_tree_path(path, depth=0):
+    if depth > 32:
+        return False
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return False
+    for child in names:
+        full = os.path.join(path, child)
+        try:
+            child_st = os.lstat(full)
+        except OSError:
+            continue
+        if (stat.S_ISDIR(child_st.st_mode) and not stat.S_ISLNK(child_st.st_mode)
+                and not getattr(child_st, 'st_reparse_tag', 0)):
+            _remove_tree_path(full, depth + 1)
+        else:
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+    try:
+        os.rmdir(path)
+        return True
+    except OSError:
+        return False
+
+
+def _remove_tree(directory, name):
+    """Remove one staging directory without following any link inside it."""
+    if POSIX:
+        return _remove_tree_fd(directory.fd, name)
+    return _remove_tree_path(os.path.join(directory.path, name))
+
+
+def _retain(directory, keep_hour, quota, files):
+    archives, sidecars, orphans, temps, stages = scan(directory)
+    before, _ = measure(archives, sidecars)
+    now = time.time()
+    removed = 0
+    orphaned = 0
+    # 1. Age, archive and sidecar as one pair.
+    if keep_hour:
+        for name in sorted(archives):
+            if now - archives[name].st_mtime > keep_hour * 3600:
+                gone = _unlink_pair(directory, name)
+                if gone:
+                    removed += gone
+                    archives.pop(name, None)
+                    sidecars.pop(name, None)
+    # 2. Sidecars whose archive was deleted by hand or by an earlier pass.
+    for name, st in orphans:
+        if now - st.st_mtime > ORPHAN_AGE and _unlink(directory, name):
+            removed += 1
+            orphaned += 1
+    # 3. Temporary files of a killed writer.
+    for name, st in temps:
+        if now - st.st_mtime > TEMPORARY_AGE and _unlink(directory, name):
+            removed += 1
+    # 4. Staging directories of a killed export (inside the spool only in tests; the
+    #    backend passes TMPDIR as --stage-dir, which is swept by sweep_stages()).
+    for name, st in stages:
+        if now - st.st_mtime > STAGE_AGE and _remove_tree(directory, name):
+            removed += 1
+    # 5. Count, then 6. bytes: the old goes before the merely extra.
+    order = _order(directory, archives)
+    removed += _evict(directory, archives, sidecars, order, None, 0, files, quota, now)
+    kept, total = measure(archives, sidecars)
+    return {'kept': kept, 'files': before, 'bytes': total,
+            'removed': removed, 'orphans': orphaned}
+
+
+def sweep_stages(path):
+    """Sweep geomask-console-diag.XXXXXX directories in a non-private TMPDIR."""
+    removed = 0
+    try:
+        with Spool(path, 'staging') as staging_dir:
+            with Locked(staging_dir):
+                now = time.time()
+                for name, st in scan(staging_dir)[4]:
+                    if now - st.st_mtime > STAGE_AGE and _remove_tree(staging_dir, name):
+                        removed += 1
+    except (Refused, OSError):
+        return 0
+    return removed
+
+
+def cmd_retain(path, keep_hour=None, quota=None, files=None, share=False, stage_dir=None):
+    keep_hour = KEEP_HOURS if keep_hour is None else keep_hour
+    quota = QUOTA if quota is None else quota
+    files = FILES if files is None else files
+    if type(keep_hour) is not int or not 0 <= keep_hour <= KEEP_MAXIMUM:
+        refuse('invalid keep hours')
+    if type(quota) is not int or quota < 1:
+        refuse('invalid quota')
+    if type(files) is not int or files < 1:
+        refuse('invalid files')
+    kind = 'share' if share else 'private'
+    with Spool(path, kind) as spool:
+        with Locked(spool):
+            summary = _retain(spool, keep_hour, quota, files)
+        # The staging sweep runs after the spool lock is released: with TMPDIR inside the
+        # spool the two directories are the same, and a second flock on another descriptor
+        # of that directory would deadlock (the spool pass already swept it).
+        if stage_dir and (os.path.normcase(os.path.abspath(stage_dir))
+                          != os.path.normcase(spool.path)):
+            summary['removed'] += sweep_stages(stage_dir)
+    return {'ok': True, 'kept': summary['kept'], 'files': summary['files'],
+            'bytes': summary['bytes'], 'removed': summary['removed'],
+            'orphans': summary['orphans']}
+
+
+# ------------------------------------------------------------------- share copy
+def _share_reason(exc):
+    if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+        return 'missing'
+    if getattr(exc, 'errno', None) == errno.ENOTDIR:
+        # POSIX hits this when the destination is a plain file, not a directory.
+        return 'missing'
+    if isinstance(exc, PermissionError):
+        return 'perm'
+    if getattr(exc, 'errno', None) in (errno.ENOSPC, getattr(errno, 'EDQUOT', -1),
+                                       errno.EFBIG):
+        return 'no-space'
+    return 'perm'
+
+
+def _write_all(fd, chunk):
+    view = chunk
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno.ENOSPC, 'short copy write')
+        view = view[written:]
+
+
+def _copy_share(share, source, name):
+    try:
+        source_fd = os.open(source, os.O_RDONLY | getattr(os, 'O_BINARY', 0)
+                            | getattr(os, 'O_NONBLOCK', 0)
+                            | (os.O_NOFOLLOW if POSIX else 0))
+    except FileNotFoundError:
+        raise ShareRefused('missing')
+    except PermissionError:
+        raise ShareRefused('perm')
+    temporary = '.part-' + secrets.token_hex(16)
+    target_fd = None
+    try:
+        source_st = os.fstat(source_fd)
+        if (not stat.S_ISREG(source_st.st_mode) or source_st.st_uid != EUID
+                or source_st.st_nlink != 1 or source_st.st_size <= 0
+                or source_st.st_size > CREATION_MAXIMUM):
+            raise ShareRefused('missing')
+        try:
+            target_fd = share.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            if POSIX:
+                os.fchmod(target_fd, 0o600)
+            copied = 0
+            while copied < source_st.st_size:
+                chunk = os.read(source_fd, min(COPY_CHUNK, source_st.st_size - copied))
+                if not chunk:
+                    raise OSError(errno.EIO, 'short source read')
+                _write_all(target_fd, chunk)
+                copied += len(chunk)
+            if copied != source_st.st_size or os.fstat(target_fd).st_size != source_st.st_size:
+                raise OSError(errno.ENOSPC, 'short copy')
+            os.fsync(target_fd)
+            os.close(target_fd)
+            target_fd = None
+            share.replace(temporary, name)
+            try:
+                if POSIX:
+                    os.utime(name, ns=(source_st.st_mtime_ns, source_st.st_mtime_ns),
+                             dir_fd=share.fd, follow_symlinks=False)
+                else:
+                    os.utime(os.path.join(share.path, name),
+                             ns=(source_st.st_mtime_ns, source_st.st_mtime_ns))
+            except OSError:
+                _unlink(share, name)
+                raise ShareRefused('perm')
+        except ShareRefused:
+            raise
+        except PermissionError:
+            raise ShareRefused('perm')
+        except OSError as exc:
+            raise ShareRefused(_share_reason(exc))
+    finally:
+        os.close(source_fd)
+        if target_fd is not None:
+            try:
+                os.close(target_fd)
+            except OSError:
+                pass
+        try:
+            share.unlink(temporary)
+        except OSError:
+            pass
+    return {'ok': True, 'name': name, 'bytes': source_st.st_size}
+
+
+def cmd_copy_share(source, destination, name):
+    """Copy one registered bundle into the published folder: temp -> fsync -> rename.
+
+    The reader over SMB sees either nothing or a complete 0600 file whose mtime is the
+    bundle's own, so the share and the spool expire together.
+    """
+    if not valid_name(name):
+        raise ShareRefused('missing')
+    try:
+        share = Spool(destination, 'share')
+    except NotPrivate as exc:
+        raise ShareRefused('mode' if 'writable' in str(exc) else 'missing')
+    except FileNotFoundError:
+        raise ShareRefused('missing')
+    except PermissionError:
+        raise ShareRefused('perm')
+    except Refused:
+        raise ShareRefused('missing')
+    except OSError as exc:
+        raise ShareRefused(_share_reason(exc))
+    with share:
+        try:
+            return _copy_share(share, os.path.abspath(source), name)
+        except FileNotFoundError:
+            raise ShareRefused('missing')
+        except PermissionError:
+            raise ShareRefused('perm')
+        except OSError as exc:
+            raise ShareRefused(_share_reason(exc))
+
+
+# ------------------------------------------------------------------- operations
+def cmd_init(path):
+    # Pin and validate the parent before creation; do not chmod an existing directory.
+    absolute = os.path.abspath(path)
+    parent, name = os.path.split(absolute)
+    fd = walk_directory(parent)
+    try:
+        try:
+            if POSIX:
+                os.mkdir(name, 0o700, dir_fd=fd)
+            else:
+                os.mkdir(absolute, 0o700)
+        except FileExistsError:
+            pass
+        with Spool(absolute) as spool:
+            spool.check()
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return {'ok': True, 'spool': path}
+
+

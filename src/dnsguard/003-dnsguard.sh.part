@@ -1,0 +1,66 @@
+revert() {
+  _force=${1:-}
+  mkdir -p "$LIVE_DELTA" 2>/dev/null || true
+  live_revert
+  if [ -f "$STATE" ] && ! state_values_ok; then
+    if [ "$_force" = --force ]; then
+      rm -f "$STATE" "$STATE.preimage" "$STATE.rollback" 2>/dev/null
+      say '{"ok":true,"mode":"off","note":"unusable record dropped, live config untouched"}'
+      return 0
+    fi
+    fail "the DNS record at $STATE is incomplete - nothing changed; run: geomask-dnsguard.sh revert --force to drop it"
+    return 1
+  fi
+  if ! state_values_ok; then
+    say '{"ok":true,"mode":"off","note":"no recorded policy - nothing to revert"}'
+    return 0
+  fi
+  _had_preimage=0
+  state_preimage_ok && _had_preimage=1
+  _was_v1=0
+  [ "$(state_get version)" = 1 ] && _was_v1=1
+  if ! safe_state_restore; then
+    if [ "${_restore_backup_ok:-0}" = 1 ]; then
+      fail "cannot restore the previous DNS settings - live restored to the pre-revert state, record kept"
+    else
+      fail "cannot restore the previous DNS settings - record kept"
+    fi
+    return 1
+  fi
+  restart_dnsmasq || { fail "dnsmasq did not restart - previous list written, record kept"; return 1; }
+  _i=0
+  while [ "$_i" -lt 5 ]; do
+    resolve_local >/dev/null 2>&1 && break
+    sleep 1; _i=$((_i + 1))
+  done
+  resolve_local >/dev/null 2>&1 || {
+    fail "the resolver does not answer after revert - record kept"
+    return 1
+  }
+  rm -f "$STATE" "$STATE.preimage" "$STATE.rollback" 2>/dev/null
+  drop_live_delta
+  if [ "$_was_v1" = 1 ]; then
+    say '{"ok":true,"mode":"off","note":"version 1 record upgraded and restored from its values"}'
+  elif [ "$_had_preimage" = 0 ]; then
+    say '{"ok":true,"mode":"off","note":"preimage missing - restored from the recorded values"}'
+  else
+    say '{"ok":true,"mode":"off"}'
+  fi
+}
+
+case "${1:-status}" in
+  status) status ;;
+  apply)
+    logmsg "apply start"
+    apply
+    _rc=$?
+    logmsg "apply rc=$_rc"
+    exit "$_rc" ;;
+  revert)
+    logmsg "revert start"
+    revert "${2:-}"
+    _rc=$?
+    logmsg "revert rc=$_rc"
+    exit "$_rc" ;;
+  *) say '{"ok":false,"error":"usage: geomask-dnsguard.sh status|apply|revert [--force]"}'; exit 2 ;;
+esac

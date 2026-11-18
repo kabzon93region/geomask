@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""Schema v2 state module for node-audit: independent path revisions, source bindings, events."""
+import contextlib
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+import threading
+
+# Canonical paths (defaults, can be overridden by passing explicit paths to functions)
+DEFAULT_STORE = Path(os.environ.get('GM_AUDIT_STORE', '/etc/geomask/node-audit.json'))
+DEFAULT_EVENTS = Path(os.environ.get('GM_AUDIT_EVENTS', '/etc/geomask/node-audit/events.jsonl'))
+DEFAULT_STATE_DIR = Path(os.environ.get('GM_AUDIT_STATE', '/etc/geomask/node-audit/state'))
+DEFAULT_POOLS_DIR = Path(os.environ.get('GM_AUDIT_POOLS', '/etc/geomask/node-audit/pools'))
+DEFAULT_REPORTS_DIR = Path(os.environ.get('GM_AUDIT_REPORTS', '/etc/geomask/node-audit/reports'))
+DEFAULT_SNAPSHOTS_DIR = Path(os.environ.get('GM_AUDIT_SNAPSHOTS', '/etc/geomask/node-snapshots'))
+DEFAULT_CONFIG = Path(os.environ.get('GM_AUDIT_CONFIG', '/etc/mihomo/config.yaml'))
+DEFAULT_REGISTRY = Path(os.environ.get('GM_AUDIT_REGISTRY', '/etc/geomask-subs.list'))
+
+# Retention limits
+MAX_EVENTS_PER_PATH = 20
+MAX_EVENTS_TOTAL = 200
+MAX_EVENTS_SIZE = 2 * 1024 * 1024  # 2 MiB
+
+# Immutable report retention
+MAX_REPORTS_PER_PATH = 20
+MAX_REPORTS_TOTAL = 100
+MAX_REPORTS_SIZE = 10 * 1024 * 1024  # 10 MiB
+
+# Audited node definitions are private material: root-only, one file per job, pruned.
+MAX_SNAPSHOTS_PER_PATH = 4
+# Node definitions carry endpoint credentials, so they share one bounded budget. Exhausting
+# it must fail the new operation rather than delete material an apply may still need.
+MAX_SNAPSHOTS_BYTES = int(os.environ.get('GM_AUDIT_SNAPSHOT_BUDGET', 8 * 1024 * 1024))
+
+
+SAFE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
+
+def _job_token(job_id):
+    """Validate a job id before it becomes part of a file name."""
+    if not isinstance(job_id, str) or not SAFE_ID.fullmatch(job_id):
+        raise AuditError('invalid job id')
+    return job_id
+
+def save_node_snapshot(ident, job_id, definitions, snapshots_dir=None, protect=()):
+    """Persist exactly the node definitions a job measured.
+
+    An apply must build its managed pool from measured definitions, not from a source
+    that may have moved since. Keeping this separate from the report also keeps
+    subscription payloads out of anything the panel or an export would read.
+
+    The snapshots share one byte budget. When it is exhausted the new snapshot is refused
+    and the caller fails loudly: silently deleting an older snapshot could pull the
+    definitions out from under a pending preview or an applied pool.
+    """
+    if not job_id or not definitions:
+        return None
+    job_id = _job_token(job_id)
+    directory = Path(snapshots_dir) if snapshots_dir else DEFAULT_SNAPSHOTS_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {'path_id': ident, 'job_id': job_id, 'created': stamp(), 'nodes': definitions}
+    target = directory / ('%s-%s.json' % (ident, job_id))
+    body = encode(payload)
+    used = 0
+    for existing in directory.glob('*.json'):
+        if existing.name != target.name:
+            try:
+                used += existing.stat().st_size
+            except OSError:
+                pass
+    if used + len(body) > MAX_SNAPSHOTS_BYTES:
+        raise AuditError('node snapshot budget exhausted (%d of %d bytes); '
+                         'delete an old job or raise GM_AUDIT_SNAPSHOT_BUDGET'
+                         % (used, MAX_SNAPSHOTS_BYTES))
+    atomic_write(target, body)
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    # Retention must not pull the definitions out from under a record that still points at
+    # them: an applied manifest or a report a preview can still use keeps its snapshot.
+    protected = {str(job) for job in (protect or ()) if job}
+    kept = sorted(directory.glob(ident + '-*.json'), key=lambda p: p.stat().st_mtime)
+    for old in kept[:-MAX_SNAPSHOTS_PER_PATH]:
+        if old.stem in {('%s-%s' % (ident, job)) for job in protected}:
+            continue
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return target
+
+
+def load_node_snapshot(ident, job_id, snapshots_dir=None):
+    """Read a job's audited definitions, or None when there is no snapshot."""
+    job_id = _job_token(job_id)
+    directory = Path(snapshots_dir) if snapshots_dir else DEFAULT_SNAPSHOTS_DIR
+    target = directory / ('%s-%s.json' % (ident, job_id))
+    if not target.is_file():
+        return None
+    data = strict_json(target.read_bytes())
+    if data.get('path_id') != ident or data.get('job_id') != job_id:
+        raise AuditError('snapshot does not belong to this job')
+    nodes = data.get('nodes')
+    if not isinstance(nodes, dict):
+        raise AuditError('malformed node snapshot')
+    return nodes
+
+# Node limits (from original module)
+MAX_NODES = 100
+
+PATHS = {
+    'vpn': ('VPN', ['NL', 'DE', 'FR', 'SE']),
+    'vpn_nop2p': ('VPN-noP2P', ['DE', 'PL']),
+    'ai': ('AI', ['US'])
+}
+
+_lock = threading.Lock()
+
+class AuditError(Exception):
+    pass
+
+def stamp():
+    return datetime.datetime.now().astimezone().isoformat()
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def canonical_json(obj) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+
+def encode(value) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + '\n').encode()
+
+def strict_json(data: bytes):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise AuditError('duplicate JSON key')
+            result[key] = value
+        return result
+    try:
+        return json.loads(data, object_pairs_hook=pairs)
+    except (ValueError, UnicodeError):
+        raise AuditError('invalid JSON') from None
+
+def path_id(value: str) -> str:
+    if value not in PATHS:
+        raise AuditError('invalid path')
+    return value
+
+
+class _Yaml12Loader:
+    """Marker type; the real class is built lazily by yaml12_loader()."""
+
+
+_YAML12 = None
+
+def yaml12_loader():
+    """A PyYAML loader that follows YAML 1.2 booleans, which is what mihomo uses.
+
+    PyYAML implements YAML 1.1, where `off`, `on`, `yes` and `no` are booleans. mihomo
+    writes `find-process-mode: off` and reads it as the string "off". Loading that with
+    the default resolver turns it into False, and dumping the config back produces
+    `false`, which mihomo rejects with "invalid find process mode" -- a round-trip through
+    the config silently broke it. This loader keeps only true/false as booleans.
+    """
+    global _YAML12
+    if _YAML12 is not None:
+        return _YAML12
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    resolutions = {}
+    for first, rules in yaml.SafeLoader.yaml_implicit_resolvers.items():
+        kept = [(tag, regexp) for tag, regexp in rules
+                if tag not in ('tag:yaml.org,2002:bool', 'tag:yaml.org,2002:timestamp')]
+        if kept:
+            resolutions[first] = kept
+    Loader.yaml_implicit_resolvers = resolutions
+    bool_re = re.compile(r'^(?:true|True|TRUE|false|False|FALSE)$')
+    for first in 'tTfF':
+        Loader.add_implicit_resolver('tag:yaml.org,2002:bool', bool_re, [first])
+    _YAML12 = Loader
+    return Loader
+
+def yaml12_load(raw):
+    """Parse YAML with YAML 1.2 boolean semantics."""
+    import yaml
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode('utf-8')
+    return yaml.load(raw, Loader=yaml12_loader())
+
+def countries(value: str) -> list:
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Z]{2}(?:,[A-Z]{2})*', value):
+        raise AuditError('countries must be nonempty ISO-2 codes: NL,DE')
+    values = value.split(',')
+    if len(values) != len(set(values)):
+        raise AuditError('duplicate country')
+    iso = set('AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW'.split())
+    if not set(values) <= iso:
+        raise AuditError('unknown ISO country')
+    return sorted(values)
+
+@contextlib.contextmanager
+def locked(name: str, state_dir: Path = None, nonblocking: bool = False):
+    """Advisory lock.
+
+    Unix uses flock on a persistent inode, so a killed holder releases the lock
+    automatically and a slow writer cannot block a reader by leaving a file behind.
+    Where flock is unavailable the lock degrades to an O_EXCL file, which is the best
+    that platform offers; that path is only used on non-routers (tests, Windows).
+    """
+    if state_dir is None:
+        state_dir = DEFAULT_STATE_DIR
+    lock_path = state_dir / f'.lock-{name}'
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+
+    if fcntl is not None:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+            except BlockingIOError:
+                raise AuditError(f'busy: {name} lock held') from None
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+        return
+
+    fd = None
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        yield
+    except FileExistsError:
+        raise AuditError(f'busy: {name} lock held')
+    finally:
+        if fd is not None:
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
+
+def atomic_write(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent, prefix=f'.{path.name}-', delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_name = tmp.name
+    try:
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+def ensure_dirs(store: Path = None, events: Path = None, state_dir: Path = None, pools_dir: Path = None):
+    if store: store.parent.mkdir(parents=True, exist_ok=True)
+    if events: events.parent.mkdir(parents=True, exist_ok=True)
+    if state_dir: state_dir.mkdir(parents=True, exist_ok=True)
+    if pools_dir: pools_dir.mkdir(parents=True, exist_ok=True)
+
+def load_store(store: Path = None):
+    """Load v2 store; migrate from v1 if needed. Returns (data, original_raw_for_revision)."""
+    store = store or DEFAULT_STORE
+    ensure_dirs(store=store)
+    raw = store.read_bytes() if store.exists() else b''
+    if not raw:
+        if store.exists():
+            raise AuditError('empty settings; refusing defaults reset')
+        return create_default_v2(), b''
+    data = strict_json(raw)
+    if not isinstance(data, dict):
+        raise AuditError('unsupported settings schema')
+    schema = data.get('schema')
+    # Explicitly reject boolean schema (True == 1 in Python but bool is not int)
+    if type(schema) is not int:
+        raise AuditError('schema must be integer')
+    if schema == 1:
+        # Validate v1 structure before migration
+        if not isinstance(data.get('generation'), int):
+            raise AuditError('invalid generation')
+        paths_v1 = data.get('paths')
+        if not isinstance(paths_v1, dict):
+            raise AuditError('invalid paths structure')
+        for ident, path_data in paths_v1.items():
+            if not isinstance(path_data, dict):
+                raise AuditError('invalid path data')
+            countries_allow = path_data.get('countries_allow')
+            if countries_allow is not None:
+                if not isinstance(countries_allow, list):
+                    raise AuditError('countries_allow must be a list')
+                for c in countries_allow:
+                    if not isinstance(c, str):
+                        raise AuditError('country entries must be strings')
+        # Migrate but don't auto-write; return migrated data and original raw for revision
+        migrated = migrate_v1_to_v2(data)
+        return migrated, raw
+    if schema != 2:
+        raise AuditError('unsupported settings schema')
+    # Ensure all paths exist with v2 structure
+    for ident, (label, defaults) in PATHS.items():
+        if ident not in data.get('paths', {}):
+            data.setdefault('paths', {})[ident] = create_path_v2(ident, defaults)
+    return data, raw
+
+def create_default_v2():
+    return {
+        'schema': 2,
+        'generation': 1,
+        'paths': {ident: create_path_v2(ident, defaults, configured=False) for ident, (label, defaults) in PATHS.items()},
+        'events': [],
+        'event_index': {'next_id': 1, 'truncated_before': None}
+    }
+
+def create_path_v2(ident: str, defaults: list, configured: bool = False) -> dict:
+    path_data = {
+        'countries_allow': list(defaults),
+        'path_generation': 1,
+        'path_revision': '',
+        'source_binding': None,
+        'configured': configured,
+        'schedule': {'enabled': False, 'time': '03:30', 'mode': 'check-only'},
+        'applied': {
+            'generation': 0,
+            'path_revision': '',
+            'preview_id': '',
+            'job_id': '',
+            'applied_at': '',
+            'runtime_verified': False,
+            'pool_digest': '',
+            'status': 'never'
+        }
+    }
+    path_data['path_revision'] = compute_path_revision(path_data)
+    return path_data
+
+def compute_path_revision(path_data: dict) -> str:
+    """Compute revision from semantic content only: countries + source_binding."""
+    content = {
+        'countries_allow': path_data.get('countries_allow', []),
+        'source_binding': path_data.get('source_binding')
+    }
+    # Only include source_binding if it's not None to avoid hashing null
+    if content['source_binding'] is None:
+        content.pop('source_binding')
+    return digest(canonical_json(content))
+
+def migrate_v1_to_v2(v1_data: dict) -> dict:
+    """Migrate schema v1 to v2, preserving user's chosen countries."""
+    paths_v1 = v1_data.get('paths', {})
+    v2 = {
+        'schema': 2,
+        'generation': 1,
+        'paths': {},
+        'events': [],
+        'event_index': {'next_id': 1, 'truncated_before': None}
+    }
+    max_gen = 0
+    for ident, (label, defaults) in PATHS.items():
+        v1_path = paths_v1.get(ident, {})
+        countries_allow = v1_path.get('countries_allow', defaults)
+        # Ensure consistent sorted order
+        countries_allow = sorted(countries_allow)
+        # Path is configured if it was explicitly in v1 data
+        configured = ident in paths_v1
+        path_data = create_path_v2(ident, countries_allow, configured=configured)
+        path_data['path_revision'] = compute_path_revision(path_data)
+        path_data['path_generation'] = 1
+        v2['paths'][ident] = path_data
+        max_gen = max(max_gen, 1)
+    # Preserve original generation from v1, or start at 1
+    original_gen = v1_data.get('generation', 1)
+    if isinstance(original_gen, int) and original_gen > 0:
+        v2['generation'] = original_gen
+    else:
+        v2['generation'] = max_gen + 1
+    # Do NOT auto-write; caller (save_store) will persist when appropriate
+    return v2
+

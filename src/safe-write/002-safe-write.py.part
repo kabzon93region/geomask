@@ -1,0 +1,185 @@
+def zapret_validate(content: bytes) -> Tuple[bool, str]:
+    """Each line: bare domain or CIDR, no comments in middle."""
+    for i, line in enumerate(content.decode('utf-8').splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        # Basic domain/CIDR validation
+        if '/' in line:
+            # CIDR
+            import ipaddress
+            try:
+                ipaddress.ip_network(line, strict=False)
+            except ValueError:
+                return False, f'line {i}: invalid CIDR'
+        else:
+            # Domain - basic label check
+            if not all(c.isalnum() or c in '.-' for c in line):
+                return False, f'line {i}: invalid domain chars'
+    return True, ''
+
+
+def zapret_rollback_check(pre: bytes, post: bytes) -> bool:
+    return hashlib.sha256(pre).hexdigest() == hashlib.sha256(post).hexdigest()
+
+
+# --- nodes_conf atomic pair (conf + cron) ---
+CRON_MANAGED_TAG = 'NODESCAN_TAG'
+
+def update_cron(enabled: bool, schedule: str, old_cron: str) -> str:
+    """Update cron with managed entry, preserving other lines."""
+    lines = old_cron.splitlines(keepends=True) if old_cron else []
+    lines = [l for l in lines if CRON_MANAGED_TAG not in l]
+    if enabled:
+        hr, minute = schedule.split(':')
+        hr = int(hr); minute = int(minute)
+        lines.append(f'{minute} {hr} * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 {CRON_MANAGED_TAG}\n')
+    return ''.join(lines)
+
+
+def nodes_render_candidate_with_cron(live_conf: str, live_cron: str, editable: dict) -> tuple[str, str]:
+    """Render new conf and cron from live content and editable updates."""
+    new_conf = nodes_render_candidate(live_conf, editable)
+    enabled = editable.get('enabled', '0') == '1'
+    schedule = editable.get('schedule', '03:30')
+    new_cron = update_cron(enabled, schedule, live_cron)
+    return new_conf, new_cron
+
+
+def nodes_rollback_check_with_cron(pre: dict, post: dict) -> bool:
+    """Verify rollback for both conf and cron."""
+    pre_conf = pre.get('conf', '')
+    pre_cron = pre.get('cron', '')
+    post_conf = post.get('conf', '')
+    post_cron = post.get('cron', '')
+    return (hashlib.sha256(pre_conf.encode()).hexdigest() == hashlib.sha256(post_conf.encode()).hexdigest() and
+            pre_cron == post_cron)
+
+
+def safe_write_nodes_conf(live_conf: str, live_cron: str, editable: dict, max_age_seconds: int = 300) -> tuple[int, str]:
+    """Atomic write of nodes.conf + crontab as a pair."""
+    # 1. Validate
+    ok, err = nodes_validate_request(editable)
+    if not ok:
+        return 1, err
+
+    # 2. Backup gate
+    if not backup_gate(max_age_seconds):
+        return 2, "backup gate failed"
+
+    # 3. Lock
+    lock_path = RESOURCES['nodes_conf']['lock']
+    fd = acquire_lock(lock_path)
+    if fd is None:
+        return 1, "lock timeout"
+
+    try:
+        # 4. Snapshot
+        conf_path = RESOURCES['nodes_conf']['live']
+        cron_path = Path('/etc/crontabs/root')
+        pre_conf = conf_path.read_bytes() if conf_path.exists() else b''
+        pre_cron = cron_path.read_bytes() if cron_path.exists() else b''
+
+        # 5. Render candidates
+        new_conf_bytes = nodes_render_candidate(pre_conf.decode('utf-8') if pre_conf else '', editable)
+        new_conf = new_conf_bytes.decode('utf-8')
+        enabled = editable.get('enabled', '0') == '1'
+        schedule = editable.get('schedule', '03:30')
+        new_cron = update_cron(editable.get('enabled', '0') == '1', editable.get('schedule', '03:30'),
+                               pre_cron.decode('utf-8') if pre_cron else '')
+
+        # 6. Validate conf
+        ok, err = nodes_validate_request(editable)
+        if not ok:
+            return 1, err
+
+        # 7. Trial: mihomo -t
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False) as tf:
+            tf.write(new_conf_bytes)
+            cand_path = tf.name
+        try:
+            result = subprocess.run(['mihomo', '-f', cand_path, '-d', '/etc/mihomo', '-t'],
+                                    capture_output=True, timeout=30)
+            if result.returncode != 0:
+                return 3, f"trial failed: {result.stderr.decode()[:200]}"
+        finally:
+            os.unlink(cand_path)
+
+        # 8. Atomic install both
+        # conf
+        with tempfile.NamedTemporaryFile(mode='wb', dir=conf_path.parent, delete=False) as tf:
+            tf.write(new_conf_bytes)
+            conf_cand = tf.name
+        try:
+            os.chmod(conf_cand, 0o644)
+            os.replace(conf_cand, conf_path)
+        except Exception:
+            try:
+                os.unlink(conf_cand)
+            except OSError:
+                pass
+            return 4, "conf install failed"
+
+        # cron
+        with tempfile.NamedTemporaryFile(mode='wb', dir=cron_path.parent, delete=False) as tf:
+            tf.write(new_cron.encode('utf-8'))
+            cron_cand = tf.name
+        try:
+            os.chmod(cron_cand, 0o644)
+            os.replace(cron_cand, cron_path)
+        except Exception:
+            try:
+                os.unlink(cron_cand)
+            except OSError:
+                pass
+            # Rollback conf
+            conf_path.write_bytes(pre_conf)
+            return 4, "cron install failed"
+
+        # 9. Reload cron
+        reload_result = subprocess.run(['/etc/init.d/cron', 'reload'], capture_output=True, timeout=30)
+        if reload_result.returncode != 0:
+            return 4, f"cron reload failed: {reload_result.stderr.decode()[:200]}"
+
+        # 10. Post-check
+        post_conf = conf_path.read_bytes()
+        post_cron = cron_path.read_bytes()
+        if post_conf.decode('utf-8') != new_conf or post_cron.decode('utf-8') != new_cron:
+            # Rollback
+            conf_path.write_bytes(pre_conf)
+            cron_path.write_bytes(pre_cron)
+            subprocess.run(['/etc/init.d/cron', 'reload'], capture_output=True, timeout=30)
+            return 5, "post-check failed: content mismatch"
+
+        # 11. Update revision
+        rev_path = RESOURCES['nodes_conf']['rev']
+        rev_path.write_text(sha256_file(conf_path))
+
+        return 0, new_conf
+
+    finally:
+        release_lock(fd, lock_path)
+
+
+# --- CLI for testing ---
+if __name__ == '__main__':
+    import json
+    if len(sys.argv) < 2:
+        print('Usage: safe_write.py <resource> <candidate_json> [--dry-run]', file=sys.stderr)
+        sys.exit(1)
+    resource = sys.argv[1]
+    candidate_json = sys.argv[2]
+    dry_run = '--dry-run' in sys.argv
+
+    editable = json.loads(candidate_json)
+    ok, err = nodes_validate_request(editable)
+    if not ok:
+        print(f'VALIDATION_ERROR: {err}')
+        sys.exit(1)
+
+    # Read live
+    live_path = RESOURCES[resource]['live']
+    live_content = live_path.read_bytes() if live_path.exists() else b''
+
+    cand = nodes_render_candidate(live_content, editable)
+    print(cand.decode('utf-8'), end='')

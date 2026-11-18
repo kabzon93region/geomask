@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "target": "node-scan",
+  "parts": [
+    {
+      "path": "001-node-scan.sh.part"
+    }
+  ]
+}

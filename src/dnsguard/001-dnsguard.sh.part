@@ -1,0 +1,382 @@
+#!/bin/sh
+# geomask-dnsguard.sh - strict DNS with an emergency reserve.
+#
+# Owner policy (14.11.2026): resolution goes through the local DoH worker, and a plain public
+# resolver is used ONLY when that worker fails. Two incidents shaped this:
+#   1) a DoH proxy crashed in a loop while dnsmasq knew no other upstream - every device lost
+#      DNS, which looks exactly like "the internet is gone";
+#   2) a single upstream list had no order, so dnsmasq could answer from any server and the
+#      "strict" promise was never true.
+#
+# The fallback is implemented by dnsmasq itself: `strictorder` makes it ask servers in the
+# listed order and move on only when one fails. No watchdog race, no rewriting at runtime.
+#
+#   geomask-dnsguard.sh status       -> JSON: is the policy applied, is DoH really answering
+#   geomask-dnsguard.sh apply        -> put the DoH worker first and the reserve after it
+#   geomask-dnsguard.sh revert       -> restore the exact list and strictorder that were there
+#   geomask-dnsguard.sh revert --force -> drop an unusable record, live config untouched
+#
+# Safety rules this file follows, because the first version broke all three:
+#   * the original type (list / string / absent), the ordered values, strictorder and a byte
+#     preimage of /etc/config/dhcp are recorded BEFORE the first live write and never
+#     overwritten while the policy is applied; without a usable record nothing is changed;
+#   * the new list is built and verified in a private candidate copy first; only then is the
+#     same sequence applied to the live file, and the live file itself is read back and
+#     verified (never the private delta, which can disagree with what was committed);
+#   * every failure says which stage failed. Before the live commit only our private delta is
+#     dropped: the live file was not touched and is never "restored" from a stale preimage.
+#     After a commit the preimage is only used when the live file is byte-identical to the
+#     candidate we wrote; otherwise the file belongs to someone else and is left alone;
+#   * a live restore is backed up first; if it cannot be reproduced exactly, that backup is
+#     put back and the record is kept;
+#   * "DoH is alive" is a real answer from the DoH worker, not the server's own address in
+#     nslookup output (that mistake reported SERVFAIL as healthy);
+#   * revert restores what was there, including "strictorder was not set at all" and
+#     "server was a string / did not exist", and it still understands version 1 records.
+#
+# Why the list is written entry by entry (15.11.2026): dnsmasq reads `server` with
+# config_list_foreach, so it needs server_LENGTH/server_ITEMn. `uci set ...server=...`
+# allocates ONE UCI_TYPE_STRING option, and the configured upstreams disappear.
+set -u
+# Values are read line by line; a `*` upstream must stay `*`, not become a file list.
+set -f
+
+EMERGENCY="1.1.1.1 8.8.8.8"
+STATE=${GM_DNSGUARD_STATE:-/etc/geomask/dnsguard.state}
+CONFIG_DIR=${GM_UCI_CONFIG_DIR:-/etc/config}
+LIVE_DHCP="$CONFIG_DIR/dhcp"
+LIVE_DELTA=${GM_UCI_DELTA_DIR:-/tmp/.uci.geomask-dnsguard}
+DNSMASQ_INIT=${GM_DNSMASQ_INIT:-/etc/init.d/dnsmasq}
+PROBE_PY=${GM_PROBE_PY:-python3}
+TEST_HOST=${GM_DNSGUARD_HOST:-example.com}
+CAND=
+NEW_VALUES=
+SCOPED_VALUES=
+
+say() { printf '%s\n' "$*"; }
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+# R10b (D14-D18): the DNS policy used to leave no trace in syslog, so "when was it applied
+# and did it fail" had no answer. Action and rc only - never upstream values, URLs or tokens.
+# The helper is a no-op where logger is absent (test hosts, minimal images).
+logmsg() { command -v logger >/dev/null 2>&1 && logger -t geomask-dnsguard "$*" >/dev/null 2>&1; return 0; }
+fail() { logmsg "FAIL ${_stage:-unknown}: $(printf '%s' "$1" | cut -c1-200)"; say "{\"ok\":false,\"error\":\"$(json_escape "$1")\"}"; return 1; }
+
+# The candidate and the value snapshots are private; a failed run must not leave a copy.
+cleanup_private() {
+  [ -n "${CAND:-}" ] && rm -rf "$CAND" 2>/dev/null
+  CAND=
+  rm -f "$STATE.values.$$" "$STATE.strict.$$" 2>/dev/null
+}
+trap 'cleanup_private' 0
+trap 'cleanup_private; exit 130' 1 2 15
+
+# `-c` names the config directory, `-t` the delta directory. Always pass both: without `-t`
+# the shared /tmp/.uci is used and uncommitted candidate changes can leak into a live read.
+uci_live() { uci -c "$CONFIG_DIR" -t "$LIVE_DELTA" "$@"; }
+uci_cand() { uci -c "$CAND" -t "$CAND/delta" "$@"; }
+
+live_revert() { uci_live -q revert dhcp 2>/dev/null || true; }
+drop_live_delta() { rm -rf "$LIVE_DELTA" 2>/dev/null || true; }
+
+# ---------------------------------------------------------------- config file parsing
+# Read the committed UCI file (not `uci export`, which overlays the private delta).
+# Emit normalized lines for the FIRST dnsmasq section only:
+#   server=<value> / strictorder=<value> / has_option_server=1 / server_type=... / strictorder_type=...
+# The type comes from `option` vs `list`, as libuci's parser and dnsmasq see it.
+parse_config_file() {
+  awk '
+    function decode(s,   t, q) {
+      q = sprintf("%c", 39)
+      t = s
+      sub(/^[ \t]*/, "", t)
+      if (substr(t, 1, 1) == q) {
+        t = substr(t, 2)
+        if (substr(t, length(t), 1) == q) t = substr(t, 1, length(t) - 1)
+        gsub(q "\\\\" q q, q, t)
+      } else {
+        sub(/[ \t]*$/, "", t)
+      }
+      return t
+    }
+    /^config[ \t]+dnsmasq([ \t]|$)/ { if (seen) exit; seen = 1; next }
+    seen && /^config[ \t]/ { exit }
+    seen {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line ~ /^list[ \t]+server[ \t]/) {
+        v = line; sub(/^list[ \t]+server[ \t]+/, "", v)
+        print "server=" decode(v)
+        stype = "list"
+        next
+      }
+      if (line ~ /^option[ \t]+server[ \t]/) {
+        v = line; sub(/^option[ \t]+server[ \t]+/, "", v)
+        print "server=" decode(v)
+        print "has_option_server=1"
+        if (stype == "") stype = "string"
+        next
+      }
+      if (line ~ /^list[ \t]+strictorder[ \t]/) {
+        v = line; sub(/^list[ \t]+strictorder[ \t]+/, "", v)
+        print "strictorder=" decode(v)
+        sstype = "list"
+        next
+      }
+      if (line ~ /^option[ \t]+strictorder[ \t]/) {
+        v = line; sub(/^option[ \t]+strictorder[ \t]+/, "", v)
+        print "strictorder=" decode(v)
+        if (sstype == "") sstype = "string"
+        next
+      }
+    }
+    END {
+      print "server_type=" (stype == "" ? "absent" : stype)
+      print "strictorder_type=" (sstype == "" ? "absent" : sstype)
+    }
+  '
+}
+
+dhcp_scan_file() {
+  [ -f "$1" ] || return 1
+  _dhcp_text=$(cat "$1" 2>/dev/null) || return 1
+  printf '%s\n' "$_dhcp_text" | parse_config_file
+}
+
+dhcp_scan_live() { dhcp_scan_file "$LIVE_DHCP"; }
+dhcp_scan_dir() { dhcp_scan_file "$1/dhcp"; }
+
+scan_field() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
+scan_values() { printf '%s\n' "$1" | sed -n "s/^$2=//p"; }
+scan_has() { printf '%s\n' "$1" | grep -qx "$2"; }
+scoped_from_scan() { printf '%s\n' "$1" | sed -n 's/^server=\(\/.*\)$/\1/p'; }
+
+# ---------------------------------------------------------------- DoH helpers
+# A string option from the previous release contains several whitespace-separated upstreams
+# (dnsmasq ignores strings, but the old writer used one); a list item is one value and may
+# itself contain a space, so only strings are tokenized.
+value_tokens() {
+  case "$(scan_field "$1" server_type)" in
+    string) scan_values "$1" server | awk '{ for (i = 1; i <= NF; i++) print $i }' ;;
+    *) scan_values "$1" server ;;
+  esac
+}
+
+doh_values() {
+  value_tokens "$1" | awk '/^127\.0\.0\.1#/ || /^localhost#/'
+}
+
+local_doh_port() {
+  _port=$(doh_values "$1" | awk 'NR == 1 { sub(/^[^#]*#/, ""); print; exit }')
+  [ -n "$_port" ] || return 1
+  say "$_port"
+}
+
+is_emergency() {
+  case " $EMERGENCY " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+# Append to the desired list once. The value is one line, so spaces and `*` survive.
+add_new() {
+  grep -Fqx -e "$1" "$NEW_VALUES" 2>/dev/null && return 0
+  printf '%s\n' "$1" >> "$NEW_VALUES" || return 1
+}
+
+# ---------------------------------------------------------------- recorded original state
+state_get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | head -1; }
+state_get_all() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null; }
+state_servers() { state_get_all server; }
+
+# Values only: enough to revert. A missing/corrupt preimage must not make the policy impossible
+# to turn off; the preimage is only needed for a byte-exact restore after a failed commit.
+state_values_ok() {
+  [ -f "$STATE" ] || return 1
+  [ "$(state_get saved)" = 1 ] || return 1
+  _count=$(state_get count)
+  case "$_count" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_count" = "$(state_servers | wc -l | tr -d ' ')" ] || return 1
+  # A `server=` line with an empty value would restore `list server ''`, which is not a usable
+  # upstream and not a faithful record of an option that was really there.
+  if state_servers | grep -q '^$'; then
+    return 1
+  fi
+  case "$(state_get version)" in
+    1)
+      # v1 (the previous release) recorded the values and `strictorder=absent|value`, but neither
+      # the option type nor a preimage. A complete v1 record is still a record: without it a
+      # router that already has the policy applied could never turn it off after this update.
+      # count=0 is a valid v1 record (the server option was absent).
+      _v1_so=$(state_get_all strictorder)
+      [ -n "$_v1_so" ] || return 1
+      [ "$(printf '%s\n' "$_v1_so" | wc -l | tr -d ' ')" = 1 ] || return 1
+      return 0
+      ;;
+    2)
+      _type=$(state_get type)
+      _stype=$(state_get strictorder_type)
+      case "$_type" in list|string|absent) ;; *) return 1 ;; esac
+      case "$_stype" in list|string|absent) ;; *) return 1 ;; esac
+      # Consistency between the recorded type and the count. A list is not a scalar, a string
+      # is exactly one value, and an absent option has no values at all.
+      case "$_type" in
+        list) [ "$_count" -ge 1 ] || return 1 ;;
+        string) [ "$_count" -eq 1 ] || return 1 ;;
+        absent) [ "$_count" -eq 0 ] || return 1 ;;
+      esac
+      # A list record must not carry an option-typed value marker; the normal writer never emits
+      # it, but a hand-edited/foreign record must not be trusted as a list.
+      if [ "$_type" = list ] && [ "$(state_get has_option_server)" = 1 ]; then
+        return 1
+      fi
+      # strictorder is an option: absent means no value lines, present means exactly one.
+      _strict_lines=$(state_get_all strictorder | wc -l | tr -d ' ')
+      case "$_stype" in
+        absent) [ "$_strict_lines" = 0 ] || return 1 ;;
+        *) [ "$_strict_lines" = 1 ] || return 1 ;;
+      esac
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+state_preimage_ok() {
+  [ "$(state_get version)" = 2 ] || return 1
+  _pre=$(state_get preimage)
+  [ -n "$_pre" ] && [ -f "$_pre" ] || return 1
+  _sha=$(state_get preimage_sha256)
+  [ -n "$_sha" ] || return 1
+  [ "$(sha256sum "$_pre" 2>/dev/null | awk '{print $1}')" = "$_sha" ] || return 1
+  return 0
+}
+
+# The type to restore. v1 did not record it: the original type is unrecoverable, so the safe
+# reconstruction is a real list with the recorded values (dnsmasq does not read a string option
+# at all; a list is what config_list_foreach needs). count=0 means the option did not exist.
+state_type() {
+  if [ "$(state_get version)" = 1 ]; then
+    if [ "$(state_get count)" = 0 ]; then printf 'absent\n'; else printf 'list\n'; fi
+  else
+    state_get type
+  fi
+}
+
+state_stype() {
+  if [ "$(state_get version)" = 1 ]; then
+    if [ "$(state_get strictorder)" = absent ]; then printf 'absent\n'; else printf 'string\n'; fi
+  else
+    state_get strictorder_type
+  fi
+}
+
+# Record the exact original from the snapshot `$1`: the option TYPE, ordered values, strictorder
+# type/value, and (when possible) a byte preimage with its sha256. `saved=1` is last and the state
+# file is renamed into place only after the preimage, so a partial write is not a record.
+# A values-valid record is never overwritten, with or without a preimage.
+state_save() {
+  _save_scan=$1
+  if [ -f "$STATE" ] && ! state_values_ok; then
+    return 1
+  fi
+  state_values_ok && return 0
+  _state_dir=$(dirname "$STATE")
+  mkdir -p "$_state_dir" 2>/dev/null || return 1
+  _type=$(scan_field "$_save_scan" server_type)
+  _stype=$(scan_field "$_save_scan" strictorder_type)
+  case "$_type" in list|string|absent) ;; *) return 1 ;; esac
+  case "$_stype" in list|string|absent) ;; *) return 1 ;; esac
+  _pre="$STATE.preimage"
+  _pre_tmp="$STATE.preimage.tmp.$$"
+  _sha=
+  if cp -p "$LIVE_DHCP" "$_pre_tmp" 2>/dev/null; then
+    chmod 600 "$_pre_tmp" 2>/dev/null
+    _sha=$(sha256sum "$_pre_tmp" 2>/dev/null | awk '{print $1}')
+  fi
+  [ -n "$_sha" ] || { _pre=; _sha=; rm -f "$_pre_tmp"; }
+  _tmp="$STATE.tmp.$$"
+  {
+    printf 'version=2\n'
+    printf 'type=%s\n' "$_type"
+    scan_values "$_save_scan" server | sed 's/^/server=/'
+    printf 'strictorder_type=%s\n' "$_stype"
+    scan_values "$_save_scan" strictorder | sed 's/^/strictorder=/'
+    if [ -n "$_pre" ]; then
+      printf 'preimage=%s\n' "$_pre"
+      printf 'preimage_sha256=%s\n' "$_sha"
+    fi
+    printf 'count=%s\n' "$(scan_values "$_save_scan" server | wc -l | tr -d ' ')"
+    printf 'saved=1\n'
+  } > "$_tmp" 2>/dev/null || { rm -f "$_tmp" "$_pre_tmp"; return 1; }
+  chmod 600 "$_tmp" 2>/dev/null
+  if [ -n "$_pre" ]; then
+    mv -f "$_pre_tmp" "$_pre" 2>/dev/null || { rm -f "$_tmp" "$_pre_tmp"; return 1; }
+    chmod 600 "$_pre" 2>/dev/null
+  else
+    rm -f "$_pre_tmp"
+  fi
+  mv -f "$_tmp" "$STATE" 2>/dev/null || { rm -f "$_tmp"; return 1; }
+  if state_values_ok; then
+    return 0
+  fi
+  # The new record itself is unusable (e.g. an empty upstream): do not leave it behind to block
+  # the next apply or revert with a misleading record.
+  rm -f "$STATE" "$STATE.preimage" 2>/dev/null
+  return 1
+}
+
+# Compare the live FILE with the recorded type/values. Line-based, so spaces and `*` compare
+# exactly; no word joining and no `uci export` (which would overlay the private delta).
+state_verify() {
+  state_values_ok || return 1
+  _scan=$(dhcp_scan_live) || return 1
+  [ "$(scan_field "$_scan" server_type)" = "$(state_type)" ] || return 1
+  [ "$(scan_values "$_scan" server)" = "$(state_servers)" ] || return 1
+  [ "$(scan_field "$_scan" strictorder_type)" = "$(state_stype)" ] || return 1
+  # v1 wrote the literal marker `strictorder=absent`; there is no value to compare in that case.
+  _state_strict=$(state_get_all strictorder)
+  if [ "$(state_get version)" = 1 ] && [ "$(state_stype)" = absent ]; then
+    _state_strict=
+  fi
+  [ "$(scan_values "$_scan" strictorder)" = "$_state_strict" ] || return 1
+  return 0
+}
+
+# Byte-exact restore for a failed commit. Only valid when the preimage itself is intact.
+restore_preimage() {
+  state_values_ok || return 1
+  state_preimage_ok || return 1
+  _pre=$(state_get preimage)
+  _sha=$(state_get preimage_sha256)
+  _restore_tmp="$CONFIG_DIR/.dhcp.restore.$$"
+  cp -p "$_pre" "$_restore_tmp" 2>/dev/null || { rm -f "$_restore_tmp"; return 1; }
+  [ "$(sha256sum "$_restore_tmp" 2>/dev/null | awk '{print $1}')" = "$_sha" ] || {
+    rm -f "$_restore_tmp"
+    return 1
+  }
+  mv -f "$_restore_tmp" "$LIVE_DHCP" 2>/dev/null || {
+    rm -f "$_restore_tmp"
+    return 1
+  }
+  [ "$(sha256sum "$LIVE_DHCP" 2>/dev/null | awk '{print $1}')" = "$_sha" ] || return 1
+  return 0
+}
+
+# Private backup of the live file before a live restore, and an atomic put-back. If the restore
+# cannot reproduce the record exactly, the applied policy is still there instead of a half-write.
+live_backup() {
+  _backup="$STATE.rollback"
+  cp -p "$LIVE_DHCP" "$_backup" 2>/dev/null || return 1
+  return 0
+}
+
+live_backup_restore() {
+  [ -f "$_backup" ] || return 1
+  _rb_tmp="$CONFIG_DIR/.dhcp.rollback.$$"
+  cp -p "$_backup" "$_rb_tmp" 2>/dev/null || { rm -f "$_rb_tmp"; return 1; }
+  mv -f "$_rb_tmp" "$LIVE_DHCP" 2>/dev/null || { rm -f "$_rb_tmp"; return 1; }
+  rm -f "$_backup"
+  return 0
+}
+
+# Returns 0 when the record was reproduced; on failure `_restore_backup_ok` says whether the
+# pre-restore live file was put back.

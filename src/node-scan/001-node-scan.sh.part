@@ -1,0 +1,608 @@
+#!/bin/sh
+# geomask-node-scan.sh - nightly subscription node audit (geomask v1.11.0+).
+# Downloads the VPN subscription, resolves every node SERVER through a geo db
+# (country + ASN), blocks nodes matching bad_countries/bad_asns by adding their
+# exact names to the VPN group exclude-filter, unblocks clean ones, validates
+# (mihomo -t) and hot-reloads ONLY when the filter changed. Never selects nodes,
+# never touches traffic. Config: /etc/geomask-nodes.conf.
+# OpenWrt has python3; a Windows sandbox may only expose "python" (a Store alias is not always
+# executable from sh), so fall back rather than dying at exec with "python3: not found".
+if python3 -c 'pass' >/dev/null 2>&1; then _py=python3; else _py=python; fi
+exec "$_py" - "$@" <<'PYEOF'
+import re, sys, json, time, urllib.request, urllib.parse, subprocess, os
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+# every path is env-overridable so the script can be exercised by the sandbox tests
+_E=os.environ
+CONF=_E.get('GM_NODES_CONF','/etc/geomask-nodes.conf')
+CFG=_E.get('GM_MIHOMO_CFG','/etc/mihomo/config.yaml')
+BLOCKF=_E.get('GM_NODES_BLOCK','/etc/geomask-node-block.txt')
+STATE=_E.get('GM_NODES_STATE','/tmp/geomask-nodescan.state')
+LOG=_E.get('GM_NODES_LOG','/root/geo-sync.log')
+
+def log(msg, lv='INFO'):
+    line='%s NODESCAN [%s] %s\n' % (time.strftime('%F %T'), lv, msg)
+    try:
+        with open(LOG,'a') as f: f.write(line)
+    except Exception: pass
+
+# The managed transaction (geomask-config-tx.py) owns the same config file. This scan
+# reads the file, spends minutes probing, then writes: without the SAME lock the digest check
+# is not atomic with a transaction commit and the scan silently undoes a committed apply.
+# R04: the path must be the transaction's own lock file - the old /etc/geomask/.config-tx.lock
+# was a different inode, so the two writers never met. GM_CONFIG_TX_LOCK only redirects the
+# path for injected test roots; it cannot disable the lock.
+TX_LOCK=_E.get('GM_CONFIG_TX_LOCK','/etc/geomask/node-audit/state/.config-tx.lock')
+# Per-process temp/backup names: two scans (cron 03:30 and the panel's background run) used to
+# share CFG.tmp, so one could install bytes the other was still writing (report R04).
+_PID=os.getpid()
+TMP_CFG=CFG+'.tmp.%d' % _PID
+
+def save_backup(kind, text):
+    """Keep ONE backup per kind under a fixed name, replaced atomically.
+
+    The first R04 version used CFG.bak_<kind>.<pid>: every daily and every panel scan left a
+    file behind in /etc/mihomo, i.e. unbounded overlay growth (review round 2). A fixed name
+    with an atomic replace keeps exactly one file and still never exposes a half-written one.
+    """
+    target = CFG + '.bak_' + kind
+    tmp = target + '.tmp.%d' % _PID
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(tmp, target)
+        return True
+    except Exception as e:
+        # A backup that could not be written (ENOSPC, chmod) must be visible, not swallowed:
+        # the write below still proceeds, but the operator has to learn that the pre-change
+        # bytes are not on disk.
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        try:
+            log('backup %s NOT saved: %s' % (target, e), 'WARN')
+        except Exception:
+            pass
+        return False
+# Provider ids created by the node-audit coordinator. Its groups are not ours to edit.
+MANAGED_PREFIX='audit-'
+
+class ConfigWriteRefused(Exception):
+    pass
+
+def _sha(b):
+    import hashlib
+    return hashlib.sha256(b).hexdigest()
+
+def install_config_candidate(candidate_path, expected_live):
+    """Replace the live config with candidate_path only if it still equals expected_live.
+
+    Runs under the transaction lock so a commit cannot interleave between the digest
+    check and the rename.
+    """
+    import contextlib
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+
+    @contextlib.contextmanager
+    def held():
+        if fcntl is None:
+            # Fail closed on the target: a weaker fallback (or no lock) is exactly the R04
+            # defect. Non-Linux is the Windows-hosted test host, where flock(2) does not exist.
+            if sys.platform.startswith('linux'):
+                raise ConfigWriteRefused(
+                    'the fcntl/flock primitive is missing: refusing to replace the live config unlocked')
+            yield
+            return
+        try:
+            os.makedirs(os.path.dirname(TX_LOCK), exist_ok=True)
+            fd = os.open(TX_LOCK, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        except OSError as exc:
+            raise ConfigWriteRefused('cannot open the transaction lock %s: %s' % (TX_LOCK, exc))
+        try:
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise ConfigWriteRefused('the config transaction lock is busy for 30s')
+                    time.sleep(0.1)
+            yield
+        finally:
+            try: fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError: pass
+            os.close(fd)
+
+    expected = _sha(expected_live.encode('utf-8') if isinstance(expected_live, str) else expected_live)
+    with held():
+        try:
+            with open(CFG, 'rb') as f:
+                live = f.read()
+        except OSError as e:
+            raise ConfigWriteRefused('cannot read the live config: %s' % e)
+        if _sha(live) != expected:
+            raise ConfigWriteRefused('config changed during the scan (a managed apply or a manual edit); the scan result is stale')
+        os.replace(candidate_path, CFG)
+
+cfgd={}
+try:
+    for ln in open(CONF, encoding='utf-8'):
+        ln=ln.strip()
+        if ln and not ln.startswith('#') and '=' in ln:
+            k,_,v=ln.partition('='); cfgd[k.strip()]=v.strip()
+except Exception as e:
+    log('conf read failed: %s' % e, 'ERR'); sys.exit(1)
+
+bad_countries={c.strip().upper() for c in cfgd.get('bad_countries','RU,BY').split(',') if c.strip()}
+bad_asns={('AS'+a.replace('AS','').strip().upper()) for a in cfgd.get('bad_asns','').split(',') if a.strip()}
+base_filter=cfgd.get('base_filter','Россия')
+provider=cfgd.get('sub_provider','sub')
+# v1.20.4: sub_provider=all -> scan every subscription, one child run each. Re-running the
+# wrapper per provider keeps the existing single-provider logic (and its rollback) untouched.
+_argv=sys.argv[1:]
+# testability: --list-providers runs the enumeration only (used by the sandbox tests, so a
+# broken regex cannot silently scan nothing again)
+if '--list-providers' in _argv:
+    _t=open(os.environ.get('GM_MIHOMO_CFG', CFG), encoding='utf-8', errors='replace').read()
+    try:
+        _i=_t.index('\nproxy-providers:\n')
+    except ValueError:
+        print(''); sys.exit(1)
+    _h=_t[_i:]
+    _n=re.search(r'\n(?=[a-z])', _h[1:])
+    if _n: _h=_h[:_n.start()+1]
+    print(','.join(p for p in re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', _h, re.M)
+                   if re.search(r'^  %s:\n(?:.*\n)*?\s+url:' % re.escape(p), _h, re.M)
+                   and not p.startswith(MANAGED_PREFIX)))
+    sys.exit(0)
+# v1.22.9: active OpenAI-egress guard for the AI group. A node labelled "USA" can still reach
+# OpenAI from elsewhere - un1.pro's servers resolved to US IPs but routed OpenAI traffic through
+# a Helsinki/Russia relay, so a name filter and even a server-country check both passed it. Only
+# an actual OpenAI request reveals the truth. Test every node the AI group would use through the
+# AI listener and exclude the liars by exact name. Never empties the group (if all fail, that is
+# a provider outage to investigate, not something to hide by deleting the last node).
+if '--admission-check' in _argv:
+    _adm_py='/usr/lib/geomask/admission_service.py'
+    if not os.path.isfile(_adm_py):
+        log('admission-check: admission_service.py not found', 'ERR'); sys.exit(1)
+    _path_id=cfgd.get('ai_group','AI')
+    _nodes_json='[]'
+    if '--nodes-json' in _argv:
+        _idx=_argv.index('--nodes-json')
+        if _idx+1 < len(_argv):
+            _nodes_json=_argv[_idx+1]
+    r=subprocess.run(['python3',_adm_py,_path_id,'--nodes-json',_nodes_json],capture_output=True,text=True,timeout=120)
+    sys.stdout.write(r.stdout)
+    if r.returncode!=0:
+        sys.stderr.write(r.stderr)
+    sys.exit(r.returncode)
+
+# v1.22.9: active OpenAI-egress guard for the AI group. A node labelled "USA" can still reach
+# OpenAI from elsewhere - un1.pro's servers resolved to US IPs but routed OpenAI traffic through
+# a Helsinki/Russia relay, so a name filter and even a server-country check both passed it. Only
+# an actual OpenAI request reveals the truth. Test every node the AI group would use through the
+# AI listener and exclude the liars by exact name. Never empties the group (if all fail, that is
+# a provider outage to investigate, not something to hide by deleting the last node).
+if '--ai-guard' in _argv:
+    import ssl, time as _t
+    text=open(CFG,encoding='utf-8',errors='replace').read()
+    sm=re.search(r'^secret:\s*(\S+)',text,re.M); sec=sm.group(1).strip().strip('"\'') if sm else ''
+    ai_group=cfgd.get('ai_group','AI')
+    egress_url=cfgd.get('ai_egress_url','https://chatgpt.com/cdn-cgi/trace')
+    expect=cfgd.get('ai_expect','US').strip().upper()
+    listener=cfgd.get('ai_listener','http://127.0.0.1:7891')
+    static_ex=cfgd.get('ai_exclude_base','HY2')
+    
+    # Check admission cache first
+    _adm_cache='/tmp/geomask-admission-cache.json'
+    _adm_ok=set()
+    if os.path.isfile(_adm_cache):
+        try:
+            _adm_data=json.load(open(_adm_cache,encoding='utf-8'))
+            for _nid,_nadm in _adm_data.items():
+                if _nadm.get('admitted'):
+                    _adm_ok.add(_nadm.get('node_id',''))
+        except Exception:
+            pass
+    
+    def _api(path,data=None):
+        r=urllib.request.Request('http://127.0.0.1:9090'+path,method='PUT' if data else 'GET')
+        if sec: r.add_header('Authorization','Bearer '+sec)
+        if data: r.add_header('Content-Type','application/json'); data=json.dumps(data).encode()
+        try: return json.load(urllib.request.urlopen(r,data,timeout=15))
+        except Exception as e: return {'_err':str(e)}
+    def _egress():
+        try:
+            op=urllib.request.build_opener(urllib.request.ProxyHandler({'http':listener,'https':listener}),
+                urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+            return op.open(urllib.request.Request(egress_url + ('&' if '?' in egress_url else '?') + '_=%d'%int(_t.time()),headers={'User-Agent':'curl/8'}),timeout=18).read(4000).decode('utf-8','replace')
+        except Exception: return ''
+    g=_api('/proxies/'+ai_group); members=list(g.get('all') or [])
+    if not members:
+        log('ai-guard: AI group empty or unreachable - skip', 'WARN'); sys.exit(0)
+    liars=[]
+    for m in members:
+        # Check admission cache first
+        if m in _adm_ok:
+            log('ai-guard: %s admitted via cache' % m, 'OK')
+            continue
+        _api('/proxies/'+ai_group,{'name':m}); _t.sleep(3.0)
+        b=_egress(); mm=re.search(r'(?m)^loc=(\w+)',b); loc=(mm.group(1).upper() if mm else '')
+        if loc!=expect:
+            liars.append(m); log('ai-guard: %s egress loc=%r != %s -> exclude' % (m,loc,expect), 'WARN')
+        else:
+            log('ai-guard: %s ok (loc=%s)' % (m,expect), 'OK')
+    if len(liars)>=len(members):
+        log('ai-guard: ALL %d AI nodes fail the egress test - NOT excluding (would empty the group); provider issue to investigate' % len(members), 'WARN')
+        sys.exit(0)
+    seen=set(); parts=[]
+    for p in ([x for x in static_ex.split('|') if x.strip()] if static_ex.strip() else [])+[re.escape(n) for n in sorted(liars)]:
+        p=p.strip()
+        if p and p not in seen: seen.add(p); parts.append(p)
+    new_ex='|'.join(parts)
+    mb=re.search(r'(?m)^  - name: '+re.escape(ai_group)+r'\n(?:    .*\n|\n)*?(?=^  - name:|^[a-z]|\Z)', text)
+    if not mb: log('ai-guard: AI group block not found', 'ERR'); sys.exit(1)
+    blk=mb.group(0); esc=new_ex.replace("'","''"); line="    exclude-filter: '%s'"%esc
+    if re.search(r'(?m)^\s*exclude-filter:',blk):
+        nb=re.sub(r'(?m)^\s*exclude-filter:.*$', line, blk, count=1)
+    else:
+        nb=re.sub(r"(?m)^(\s*filter:.*\n)", r"\g<0>"+line+"\n", blk, count=1)
+    if nb==blk:
+        log('ai-guard: AI exclude-filter already up to date', 'OK'); sys.exit(0)
+    out=text[:mb.start()]+nb+text[mb.end():]
+    save_backup('aiguard', text)
+    open(TMP_CFG,'w',encoding='utf-8').write(out)
+    try: rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',TMP_CFG,'-t'],capture_output=True,timeout=30).returncode
+    except Exception: rc=1
+    if rc!=0:
+        try: os.remove(TMP_CFG)
+        except Exception: pass
+        log('ai-guard: VALIDATION FAILED, config untouched (rc=%d)'%rc, 'ERR'); sys.exit(1)
+    try:
+        install_config_candidate(TMP_CFG, text)
+    except ConfigWriteRefused as e:
+        try: os.remove(TMP_CFG)
+        except Exception: pass
+        log('ai-guard: not applying - %s' % e, 'WARN')
+        sys.exit(4)
+    try:
+        r=urllib.request.Request('http://127.0.0.1:9090/configs?force=true',data=json.dumps({'path':CFG}).encode(),method='PUT',headers={'Content-Type':'application/json'})
+        if sec: r.add_header('Authorization','Bearer '+sec)
+        urllib.request.urlopen(r,timeout=8).read()
+    except Exception as e: log('ai-guard: reload failed %s'%e, 'ERR')
+    log('ai-guard: applied, excluded %d liar(s): %s' % (len(liars), ','.join(liars)), 'OK')
+    sys.exit(0)
+if '--provider' in _argv:
+    provider=_argv[_argv.index('--provider')+1]
+elif provider.strip()=='all':
+    _t=open(CFG, encoding='utf-8', errors='replace').read()
+    try:
+        _i=_t.index('\nproxy-providers:\n')
+    except ValueError:
+        log('sub_provider=all but no proxy-providers section', 'ERR'); sys.exit(1)
+    _head=_t[_i:]
+    # stop at the next top-level key so rule-providers entries cannot be mistaken for proxies
+    _nxt=re.search(r'\n(?=[a-z])', _head[1:])
+    if _nxt: _head=_head[:_nxt.start()+1]
+    # NOTE: both searches need re.M - without it "^" only matches the very start of the string
+    # and the list silently came back empty ("scanning all 0 providers").
+    _provs=[p for p in re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', _head, re.M)
+            if re.search(r'^  %s:\n(?:.*\n)*?\s+url:' % re.escape(p), _head, re.M)]
+    if not _provs:
+        log('sub_provider=all but no proxy-provider with a url was found - refusing to no-op', 'ERR')
+        sys.exit(1)
+    log('scanning all %d providers: %s' % (len(_provs), ','.join(_provs)))
+    # One provider failing must not erase the others: a blocked subscription legitimately
+    # returns a stub, and the guard refuses to rewrite the filter from that. Only fail if
+    # every single pass failed - otherwise the nightly job would glow red forever.
+    _ok=[]; _bad=[]; _skip=[]
+    for _p in _provs:
+        # capture child stdout so per-provider progress reaches the NODESCAN log
+        # (the bare line is "nodes=N blocked=N errors=N applied=..." from the child)
+        r=subprocess.run(['/bin/sh', '/usr/bin/geomask-node-scan.sh', '--provider', _p],
+                         capture_output=True, text=True)
+        _o=((r.stdout or '') + ' ' + (r.stderr or '')).strip()
+        if r.returncode==0:
+            _ok.append(_p); log('provider %s: %s' % (_p, _o or 'ok'), 'OK')
+        elif r.returncode==3:
+            _skip.append(_p); log('provider %s: skipped by design%s' % (_p, ': %s' % _o if _o else ''), 'INFO')
+        else:
+            _bad.append(_p); log('provider %s failed (rc=%d): %s' % (_p, r.returncode, _o or 'no output'), 'ERR')
+    log('all-provider pass done: ok=[%s] skipped-by-design=[%s] failed=[%s]'
+        % (','.join(_ok), ','.join(_skip), ','.join(_bad)))
+    if not _ok and not _skip:
+        log('every provider failed - nothing was updated', 'ERR'); sys.exit(1)
+    # run the AI OpenAI-egress guard once per scan (not per provider)
+    if cfgd.get('ai_guard','1').strip().lower() in ('1','true','yes','on'):
+        subprocess.run(['/bin/sh', '/usr/bin/geomask-node-scan.sh', '--ai-guard'])
+    sys.exit(0)
+# v1.13.7: the panel (Remnawave) serves a 1-node stub ("Приложение не поддерживается") to
+# unknown clients, so the scan must identify itself. clash-meta -> YAML, v2rayNG -> links.
+sub_ua=cfgd.get('sub_user_agent','clash-meta')
+
+text=open(CFG, encoding='utf-8').read()
+# Read the provider block properly: url plus EVERY header entry, in both shapes the config uses
+#   header:
+#     x-hwid: value          and          x-hwid:
+#                                            - value
+# The old single-regex attempt silently produced no header for some layouts, and without
+# x-hwid the panel answers a 1.4 KB stub ("Приложение не поддерживается") instead of the real
+# 16 KB subscription - so the scan kept refusing to update the filter on a working account.
+def provider_block(name):
+    m=re.search(r'(?m)^  %s:\n' % re.escape(name), text)
+    if not m: return None
+    rest=text[m.end():]
+    nxt=re.search(r'(?m)^  \S', rest)
+    return rest[:nxt.start()] if nxt else rest
+
+blk=provider_block(provider)
+if blk is None or 'url:' not in blk:
+    log('provider %s url not found' % provider); sys.exit(1)
+url=re.search(r'url:\s*"?([^"\n]+)"?', blk).group(1).strip()
+hdrs={}
+hsec=re.search(r'(?m)^    header:\n((?:      .*\n|\s*\n)+)', blk)
+if hsec:
+    hb=hsec.group(1)
+    key=None
+    for ln in hb.splitlines():
+        km=re.match(r'^      ([A-Za-z0-9_-]+):\s*(.*)$', ln)
+        im=re.match(r'^\s+-\s*"?([^"\n]+)"?\s*$', ln)
+        if km:
+            key=km.group(1)
+            if km.group(2).strip(): hdrs[key]=km.group(2).strip().strip('"\'')
+        elif im and key:
+            hdrs[key]=im.group(1).strip()
+log('provider %s: url ok, %d header(s): %s' % (provider, len(hdrs), ','.join(hdrs) or 'none'))
+
+raw=''
+for _try in range(3):
+    try:
+        h=dict(hdrs); h['User-Agent']=sub_ua
+        raw=urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=25).read().decode('utf-8','replace')
+        # The panel answers a tiny stub ("Приложение не поддерживается", ~1.4 KB) when it does
+        # not recognise the client or is rate-limiting; the real payload is 12-15 KB.
+        if len(raw) > 2000:
+            break
+        log('subscription looks like a stub (%d bytes), retrying' % len(raw), 'WARN')
+    except Exception as e:
+        log('subscription download failed (try %d/3): %s' % (_try+1, e), 'WARN')
+    time.sleep(5*(_try+1))
+if not raw.strip():
+    log('subscription download failed: empty response', 'ERR'); sys.exit(1)
+sub_text=raw
+# v1.13.8: only base64-decode when the body really is base64. b64decode(validate=False)
+# silently discards ':' and spaces, so feeding it a YAML config produced mojibake and the
+# parser then saw ~no nodes at all (that is how the filter lost its exact-name bans).
+_s=re.sub(r'\s', '', raw)
+if _s and re.fullmatch(r'[A-Za-z0-9+/=]+', _s) \
+   and not re.search(r'(?m)^(vless|ss|trojan|vmess|anytls|hysteria2?)://', raw):
+    try:
+        import base64
+        _dec=base64.b64decode(_s+'===').decode('utf-8','replace')
+        if _dec.strip():
+            sub_text=_dec
+    except Exception:
+        pass
+
+nodes=[]
+for ln in sub_text.splitlines():
+    ln=ln.strip()
+    mm=re.match(r'^(vless|ss|trojan|vmess|anytls|hysteria2?)://\S+', ln, re.I)
+    if not mm: continue
+    frag=''
+    if '#' in ln:
+        frag=ln.split('#',1)[1]
+        frag=urllib.parse.unquote(frag.split('|')[0]).strip()
+    srv=None
+    sm=re.search(r'@([A-Za-z0-9.\-]+):(\d+)', ln)
+    if sm: srv=sm.group(1)
+    if frag and srv and frag.lower()!='ip':
+        nodes.append((frag, srv))
+
+# yaml-style subscription: a proxy item may put server:/port: several lines AFTER its name:
+# (v1.13.6 fix - the old regex required server on the very next line and silently matched
+# almost nothing once the provider switched to a full YAML config with "type:" in between).
+def parse_yaml_items(t):
+    out=[]; name=None; srv=None
+    def close():
+        if name and srv: out.append((name, srv))
+    for ln in t.splitlines():
+        raw=ln.strip()
+        # flow style:  - {name: X, server: y, port: 443}
+        if raw.startswith('- {') or raw.startswith('{'):
+            body=raw.lstrip('- ').strip('{}')
+            kv=dict(re.findall(r'(\w+)\s*:\s*"?([^",}]+)"?', body))
+            if kv.get('name') and kv.get('server'):
+                out.append((kv['name'].strip().strip('"\''), kv['server'].strip().strip('"\'')))
+            continue
+        mn=re.match(r'^-\s*name:\s*(.+?)\s*$', raw)
+        if mn:
+            close()
+            name=mn.group(1).strip().strip('"').strip("'"); srv=None
+            continue
+        ms=re.match(r'^server:\s*(.+?)\s*$', raw)
+        if ms and name and not srv:
+            srv=ms.group(1).strip().strip('"').strip("'")
+    close()
+    return out
+
+if not nodes:
+    nodes=parse_yaml_items(sub_text)
+
+# safety net: a parse regression must not silently wipe the exact-name bans
+MIN_NODES=3
+if len(nodes) < MIN_NODES:
+    log('suspiciously few nodes parsed (%d < %d) - subscription format changed? refusing to rewrite filter'
+        % (len(nodes), MIN_NODES), 'ERR')
+    sys.exit(1)
+
+if not nodes:
+    log('no nodes parsed from subscription', 'ERR'); sys.exit(1)
+
+# geodb per unique server (cached)
+cache={}
+def lookup(host):
+    if host in cache: return cache[host]
+    r=('', '')
+    try:
+        j=json.load(urllib.request.urlopen('http://ip-api.com/json/%s?fields=status,countryCode,as' % host, timeout=10))
+        if j.get('status')=='success':
+            r=(j.get('countryCode',''), (j.get('as','').split(' ')[0]).upper())
+    except Exception:
+        r=None
+    cache[host]=r
+    return r
+
+blocked=set(); total=0; errs=0
+for name, srv in nodes:
+    total+=1
+    res=lookup(srv)
+    if res is None:
+        errs+=1
+        continue  # lookup failed: keep node as-is (do not block on doubt)
+    cc, asn = res
+    bad = (cc in bad_countries) or (asn in bad_asns)
+    if bad:
+        blocked.add(name)
+
+# compose exclude-filter: base + exact blocked names (regex-escaped), de-duplicated.
+# The previous version appended every blocked name on each run without deduplicating, so the
+# alternation grew junk like "Russia|Mobile|RF|Auto|Russia|Mobile|Auto|..." - and once it even
+# collected "USA", which emptied the AI group. Order is kept stable so the file does not churn.
+seen=set(); parts=[]
+for raw in ([base_filter.strip()] if base_filter.strip() else []) + [re.escape(n) for n in sorted(blocked)]:
+    for p in raw.split('|'):
+        p=p.strip()
+        if p and p not in seen:
+            seen.add(p); parts.append(p)
+new_filter='|'.join(parts)
+
+def group_blocks(cfgtext):
+    """yield (group_name, start, end) for every proxy-groups entry"""
+    try: i=cfgtext.index('\nproxy-groups:\n')
+    except ValueError: return
+    body_start=i+15
+    lines=cfgtext[body_start:].split('\n')
+    pos=0; name=None; start=None
+    # offsets must be ABSOLUTE: the caller slices cfgtext with them. Yielding slice-relative
+    # positions made every group read from the wrong place, so provider_of_block never matched
+    # and the scan logged "no group using provider X accepts a name filter" for a group that
+    # plainly did use it.
+    for ln in lines:
+        if ln and not ln.startswith(' '):
+            break
+        g=re.match(r'^  - name:\s*(\S.*)$', ln)
+        if g:
+            if name is not None: yield (name, body_start+start, body_start+pos)
+            name=g.group(1).strip().strip('"\''); start=pos
+        pos+=len(ln)+1
+    if name is not None: yield (name, body_start+start, body_start+pos)
+
+def provider_of_block(blk):
+    u=re.search(r'use:\n((?:[ ]{6}-\s+\S+\n?)+)', blk)
+    return re.findall(r'-\s+(\S+)', u.group(1))[0] if u else None
+
+def apply_filter_all(cfgtext, filt, prov, name_filter_groups):
+    """write the filter into every GROUP that uses this provider. Never listeners, never a
+    group that is not listed in name_filter_groups for the base part.
+
+    A group pinned to a managed provider belongs to the node-audit coordinator. Writing an
+    exclude-filter into it would silently narrow the pool that was just applied and verified,
+    so those groups are refused rather than merged -- the unified owner has to mean something.
+    """
+    if str(prov).startswith(MANAGED_PREFIX):
+        return cfgtext, False, 0, 0
+    esc=filt.replace("'", "''")
+    line="    exclude-filter: '%s'" % esc
+    out=[]; cursor=0; touched=0; matched=0
+    for name, s, e in group_blocks(cfgtext):
+        blk=cfgtext[s:e]
+        if provider_of_block(blk) != prov:
+            continue
+        if name not in name_filter_groups:
+            continue
+        matched += 1
+        cleaned='\n'.join(l for l in blk.split('\n') if 'exclude-filter' not in l)
+        # insert right after the "use:" list so the YAML stays readable
+        ul=re.search(r'(use:\n(?:[ ]{6}-\s+\S+\n)+)', cleaned)
+        ins = ul.end() if ul else len(cleaned)
+        newblk=cleaned[:ins]+line+'\n'+cleaned[ins:]
+        if newblk != blk:
+            out.append(cfgtext[cursor:s]); out.append(newblk); cursor=e; touched+=1
+    out.append(cfgtext[cursor:])
+    joined=''.join(out)
+    return joined, (joined != cfgtext), matched, touched
+
+NFG=[g.strip() for g in cfgd.get('name_filter_groups','VPN,VPN-noP2P').split(',') if g.strip()]
+out, changed, matched, touched = apply_filter_all(text, new_filter, provider, NFG)
+# "nothing to change" is a SUCCESS, not an error. The old code reported it as "no group uses
+# this provider" and exited 1, so a healthy nightly run failed every night once the filter had
+# settled - and the all-provider pass then declared that every provider had failed.
+if matched == 0:
+    # Not an error: a provider whose groups are deliberately outside name filtering (the AI
+    # subscription is USA-only) will always land here. Reporting it as "failed" made the nightly
+    # log show a broken provider every single night, which is how a guard stops being believed.
+    log('provider %s has no name-filtered group - skipped by design' % provider)
+    print('nodes=%d blocked=%d errors=%d applied=False (no name-filtered group)'
+          % (total, len(blocked), errs)); sys.exit(3)
+if not changed:
+    log('filter for provider %s already up to date across %d group(s)' % (provider, matched), 'OK')
+    print('nodes=%d blocked=%d errors=%d applied=False (already up to date)'
+          % (total, len(blocked), errs)); sys.exit(0)
+applied=False
+if changed:
+    save_backup('nodescan', text)
+    open(TMP_CFG,'w',encoding='utf-8').write(out)
+    try:
+        rc=subprocess.run(['mihomo','-d','/etc/mihomo','-f',TMP_CFG,'-t'], capture_output=True, timeout=30).returncode
+    except Exception:
+        rc=1
+    if rc==0:
+        try:
+            install_config_candidate(TMP_CFG, text)
+        except ConfigWriteRefused as e:
+            try: os.remove(TMP_CFG)
+            except Exception: pass
+            log('not applying - %s' % e, 'WARN')
+            print('nodes=%d blocked=%d errors=%d applied=False (config changed during the scan)'
+                  % (total, len(blocked), errs)); sys.exit(4)
+        try:
+            # v1.13.7: controller is protected by a secret; without Bearer the reload 401s
+            sm=re.search(r'^secret:\s*(\S+)', text, re.M)
+            sec=sm.group(1).strip().strip('"\'') if sm else ''
+            r=urllib.request.Request('http://127.0.0.1:9090/configs?force=true',
+                data=json.dumps({'path':CFG}).encode(), method='PUT',
+                headers={'Content-Type':'application/json'})
+            if sec: r.add_header('Authorization', 'Bearer '+sec)
+            urllib.request.urlopen(r, timeout=8).read()
+        except Exception as e:
+            log('reload failed: %s' % e, 'WARN')
+        log('filter updated, blocked=%d total=%d lookup-errors=%d' % (len(blocked), total, errs), 'OK')
+        applied=True
+    else:
+        try: os.remove(TMP_CFG)
+        except Exception: pass
+        log('VALIDATION FAILED - config untouched (test rc=%d)' % rc, 'ERR')
+else:
+    log('no change (blocked=%d of %d, errors=%d)' % (len(blocked), total, errs), 'OK')
+
+# remember list + state for the panel
+try:
+    with open(BLOCKF,'w',encoding='utf-8') as f:
+        f.write('\n'.join(sorted(blocked))+'\n')
+except Exception: pass
+st={'ts':time.strftime('%F %T'),'total':total,'blocked':len(blocked),'errors':errs,'changed':applied}
+try:
+    with open(STATE+'.tmp','w') as f: json.dump(st,f)
+    os.replace(STATE+'.tmp', STATE)
+except Exception: pass
+print('nodes=%d blocked=%d errors=%d applied=%s' % (total, len(blocked), errs, applied))
+PYEOF

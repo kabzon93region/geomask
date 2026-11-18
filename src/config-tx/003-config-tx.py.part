@@ -1,0 +1,217 @@
+def start_transaction(files: dict, trial_paths: list = None, require_nonempty=None,
+                      require_exactly=None, expect_sha256: str = None):
+    """Commit one whole file atomically.
+
+    ``files`` maps an absolute path (str or Path) to the exact bytes that must land
+    there. This is deliberately a file-content API: a caller that means "write this
+    YAML" must not be able to accidentally request "merge this as a config field".
+    Exactly one target is accepted; several files would not be one atomic commit.
+
+    ``trial_paths`` lists which of those files are mihomo configs to validate and
+    trial-run; it defaults to the primary mihomo config.
+
+    ``expect_sha256`` is the digest of the live bytes the caller built its candidate from.
+    The check runs INSIDE the transaction lock, after recovery and before the first mutation:
+    a concurrent commit between the caller's read and this lock is refused as STALE instead
+    of being silently overwritten (report R06, lost update).
+    """
+    if not isinstance(files, dict) or not files:
+        raise TxError('start_transaction requires a non-empty {path: bytes} mapping')
+    if len(files) > 1:
+        # Each file is replaced atomically, but several files are not one atomic commit:
+        # a crash between them can leave half the set applied. Say so instead of implying
+        # a guarantee this code does not provide. Every current caller writes one file.
+        raise TxError('start_transaction commits one file at a time; '
+                      'multi-file atomic commit is not implemented')
+    if expect_sha256 is not None:
+        expect_sha256 = str(expect_sha256).strip().lower()
+        if not re.fullmatch(r'[0-9a-f]{64}', expect_sha256):
+            raise TxError('expect_sha256 must be a hex sha256 digest')
+
+    normalised = {}
+    for path, content in files.items():
+        p = Path(path)
+        # A relative key silently resolves against the caller's working directory, which
+        # once wrote a candidate into "/" while reporting success. Refuse it outright.
+        if not p.is_absolute():
+            raise TxError('transaction target must be an absolute path: %r' % str(path))
+        if not isinstance(content, (bytes, bytearray)):
+            raise TxError('file content for %s must be bytes, got %s' % (p, type(content).__name__))
+        normalised[p] = bytes(content)
+
+    if trial_paths is None:
+        trial_paths = [DEFAULT_CONFIG] if DEFAULT_CONFIG in normalised else []
+    trials = [Path(p) for p in trial_paths]
+    for t in trials:
+        if t not in normalised:
+            raise TxError('trial path %s is not part of this transaction' % t)
+
+    tx_id = secrets.token_hex(12)
+
+    with tx_lock(), job_budget(300):
+        # Recovery belongs INSIDE the lock: running it before meant a second writer could
+        # restore the preimage of a transaction that was still live (report R05). It also runs
+        # before the transaction context, so a failed recovery is reported as such instead of
+        # being replaced by that context's own rollback error.
+        try:
+            recover_interrupted_transactions()
+        except Exception as exc:
+            raise TxError('an earlier interrupted transaction could not be recovered: %s'
+                          % str(exc)[:160]) from None
+
+        if expect_sha256 is not None:
+            for path in normalised:
+                live = path.read_bytes() if path.exists() else b''
+                if digest(live) != expect_sha256:
+                    raise TxError('config changed since it was read (STALE): %s - refusing to '
+                                  'overwrite a newer commit; re-read and retry' % path)
+
+        with ConfigTransaction(tx_id) as tx:
+            for path in normalised:
+                tx.capture_preimage(path)
+            for path, content in normalised.items():
+                tx.stage_file(path, content)
+
+            for path in trials:
+                tx.validate_candidate(path)
+                tx.run_isolated_trial(path)
+
+            # Record the intent (including preimage locations) before the first mutation,
+            # so a crash between commit and the caller's own bookkeeping stays recoverable.
+            with open(TX_JOURNAL, 'ab') as f:
+                f.write((json.dumps({
+                    'tx_id': tx.tx_id,
+                    'stage': 'prepare',
+                    'files': [str(p) for p in normalised],
+                    'preimages': {str(p): (digest(b) if b is not None else None)
+                                  for p, b in tx.preimages.items()},
+                    'timestamp': stamp(),
+                }, ensure_ascii=False) + '\n').encode('utf-8'))
+                f.flush()
+                os.fsync(f.fileno())
+
+            tx.commit(next(iter(trials), None), require_nonempty, require_exactly)
+            return {'ok': True, 'tx_id': tx.tx_id, 'config_digest': tx.config_digest_after,
+                    'files': [str(p) for p in normalised]}
+
+def recover_interrupted_transactions():
+    """Scan for incomplete transactions and rollback/recover."""
+    if not TX_JOURNAL.exists():
+        return
+    
+    journal = read_tx_journal()
+    # Find latest incomplete tx per tx_id
+    tx_states = {}
+    for entry in journal:
+        tx_id = entry.get('tx_id')
+        stage = entry.get('stage')
+        if tx_id:
+            tx_states.setdefault(tx_id, []).append(stage)
+
+    for tx_id, stages in tx_states.items():
+        if 'committed' in stages or 'rollback_complete' in stages or 'rollback_partial' in stages:
+            continue
+        if not any(s in stages for s in ('prepare', 'committing', 'staged')):
+            continue
+
+        recovered = _restore_preimages(tx_id, journal)
+        append_tx_journal({
+            'tx_id': 'recovery',
+            'stage': 'recovery_complete' if recovered else 'recovery_failed',
+            'original_tx_id': tx_id,
+            'stages': stages,
+            'timestamp': stamp(),
+        })
+        if recovered:
+            try:
+                ConfigTransaction(tx_id).reload_mihomo(DEFAULT_CONFIG)
+            except Exception as exc:
+                append_tx_journal({'tx_id': 'recovery', 'stage': 'recovery_reload_failed',
+                                   'original_tx_id': tx_id, 'error': str(exc),
+                                   'timestamp': stamp()})
+
+def _restore_preimages(tx_id, journal):
+    """Put every file of an interrupted transaction back to its recorded preimage."""
+    entries = [entry for entry in journal
+               if entry.get('tx_id') == tx_id and entry.get('stage') == 'preimage']
+    if not entries:
+        # Without preimage records nothing can be restored, and claiming success would leave
+        # a half-applied config reported as recovered.
+        return False
+    ok = True
+    for entry in entries:
+        target = Path(entry.get('path') or '')
+        if not entry.get('path'):
+            continue
+        if not entry.get('existed'):
+            try:
+                if target.exists():
+                    target.unlink()
+            except OSError:
+                ok = False
+            continue
+        source = Path(entry.get('preimage_file') or '')
+        if not source.is_file():
+            ok = False
+            continue
+        data = source.read_bytes()
+        if digest(data) != entry.get('digest'):
+            ok = False
+            continue
+        try:
+            atomic_write(target, data)
+            fsync_dir(target.parent)
+        except OSError:
+            ok = False
+    return ok
+
+def main(argv=None):
+    """Command line for the shell: `--commit <path>` / `--recover`, self-test without args.
+
+    The console switch used to copy the live config by hand before touching it, so a failed
+    reload left the patched file in place. It now hands the candidate bytes to this CLI, which
+    runs the same transaction the rest of the backend uses: preimage, mihomo -t, isolated
+    trial, atomic write, reload, rollback. The answer is one JSON line and rc 0/1 - a caller
+    must never have to parse a traceback to learn that the switch did not happen.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        # No arguments keeps the historical self-test.
+        print('Config transaction module loaded OK')
+        print(f'DEFAULT_CONFIG={DEFAULT_CONFIG}')
+        print(f'TX_JOURNAL={TX_JOURNAL}')
+        return 0
+    try:
+        if args[0] == '--commit':
+            expect = None
+            if '--expect-sha256' in args:
+                _i = args.index('--expect-sha256')
+                if _i + 1 >= len(args):
+                    raise TxError('--expect-sha256 needs a digest')
+                expect = args[_i + 1]
+                del args[_i:_i + 2]
+            if len(args) != 2:
+                raise TxError('--commit takes exactly one target path')
+            data = sys.stdin.buffer.read()
+            if not data:
+                # Replacing the live config with nothing is never a switch: refuse it.
+                raise TxError('refusing to commit an empty payload')
+            result = start_transaction({args[1]: data}, expect_sha256=expect)
+            answer = {'ok': True, 'tx_id': result.get('tx_id')}
+        elif args[0] == '--recover':
+            # Recovery mutates the live config: it runs under the very same lock as a commit,
+            # never beside it (report R05).
+            with tx_lock():
+                recover_interrupted_transactions()
+            answer = {'ok': True, 'recovered': True}
+        else:
+            raise TxError('unknown argument: %s' % args[0])
+    except Exception as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)[:400]}, ensure_ascii=False))
+        return 1
+    print(json.dumps(answer, ensure_ascii=False))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

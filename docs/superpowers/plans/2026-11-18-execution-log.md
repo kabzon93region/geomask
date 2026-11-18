@@ -38,6 +38,34 @@
 - Осталось: slot→TX на живом mihomo (стенд), `_rs_restore_cron`-подобный CAS для
   restart-preimage (I04, вторая половина).
 
+## Партия 13 — этап 0г: остальные крупные исходники в parts
+
+- Перенесены механически (байт-в-байт) 13 кандидатов из инвентаря: `doctor` (5 частей),
+  `spool` (3), `config-tx` (3), `node-audit` (3), `routes` (3), `dnsguard` (3), `apply` (2),
+  `diag-redact` (3), `module-update` (3), `audit-state` (2), `node-scan` (1, исключение —
+  весь код в одном embedded heredoc, резать его нельзя), `module-manifest` (2),
+  `safe-write` (2). Мягкий предел 500 строк соблюдён у всех частей, кроме `node-scan`
+  (608 — объяснённое исключение).
+- `tools/compose_sources.py`: `TARGETS` расширен до 16 целей; `build.py` компонует все цели
+  перед сборкой, `check_build --verify-only` проверяет их композицию и падает на расхождении.
+  `compose --check` — ok для всех 16, `build.py` даёт прежний `geomask.sh` (sha256
+  `ecdb81065121fe82`), `gen-geo-rpc --check` зелёный.
+- Попутно найден и исправлен дефект гигиены: у `assets/geomask-apply.py` рабочая копия была
+  в CRLF при LF в индексе (`git ls-files --eol`), из-за чего первая нарезка не совпала.
+  Байты восстановлены из индекса, перенарезка дала точный паритет — это ровно тот класс
+  ошибок, который ловит композиционная проверка.
+- `tools/repo_check.py`: добавлены объяснённые исключения (`geomask-guard.sh` — security
+  entrypoint, `geo-rpc.json` — data-манифест). Итог: 0 authored-файлов сверх предела,
+  2 объяснённых исключения, 17 generated view. В strict-режиме объяснённые исключения не
+  валят проверку, а необъяснённый oversize — валит.
+- Доказательства: `test_source_composition` 26 (предел распространён на все цели с
+  исключением node-scan), `test_repo_check` 6 → 7 (strict с исключениями = 0, необъяснённый
+  oversize = 1). Прогнаны профильные наборы: install_safety 49, module_index 7, docs_claims 4,
+  pycheck 7, module_update 67 (1 posix-only skip), doctor 73, dnsguard 44, routes 32,
+  console_diag 30 — зелёные.
+- Осталось по этапу 0: gate этапа 0 на изолированной машине (Linux/BusyBox/real runtime) —
+  локальный паритет и проверки это не заменяют.
+
 ## Партия 12 — этап 0д: advisory repo-check
 
 - `tools/repo_check.py`: находит authored-файлы больше 500 строк и отдельно называет

@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "target": "module-manifest",
+  "parts": [
+    {
+      "path": "001-module-manifest.py.part"
+    },
+    {
+      "path": "002-module-manifest.py.part"
+    }
+  ]
+}

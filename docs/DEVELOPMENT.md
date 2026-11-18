@@ -27,11 +27,17 @@ python tools/check_build.py         # geomask.sh == сборка из исход
 С 18.11.2026 три крупных authored-файла разделены на упорядоченные части, а прежние пути
 поставки стали **generated compatibility views** (имя и байты те же):
 
-| Цель | Parts (authoritative) | Generated view |
-|---|---|---|
-| installer | `src/installer/*.sh.part` + `order.json` | `geomask.sh.in` |
-| backend | `src/backend/*.sh.part` + `order.json` | `assets/geo-backend.sh` |
-| panel | `src/panel/*.js.part` + `order.json` | `assets/geo-sync-page.js` |
+Все крупные authored-файлы разделены на упорядоченные части в `src/<target>/` (манифест
+`order.json`), а прежние пути поставки стали generated view:
+
+| Группа | Targets (`src/<target>/`) |
+|---|---|
+| delivery | `installer` → `geomask.sh.in`, `backend` → `assets/geo-backend.sh`, `panel` → `assets/geo-sync-page.js` |
+| Python-модули | `doctor`, `spool`, `config-tx`, `node-audit`, `apply`, `diag-redact`, `module-update`, `audit-state`, `module-manifest`, `safe-write` |
+| Shell-модули | `routes`, `dnsguard`, `node-scan` |
+
+Исключения (осознанно один файл, с причиной в `tools/repo_check.py`): `assets/geomask-guard.sh`
+(security entrypoint) и `tools/geo-rpc.json` (data-манифест RPC).
 
 - Править нужно **part**, а не delivery-файл: композиция — чистая конкатенация частей в
   порядке `order.json`, без разделителей, wrappers и source-map, поэтому граница части

@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Independent desired country filters and isolated service-egress observations.
+Schema v2: independent path revisions, source bindings, events, immutable pools.
+Never applies filters to production. Unknown service geography is not admission.
+"""
+import argparse
+import contextlib
+import datetime
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+# Load state module
+import importlib.util
+STATE_MODULE_PATH = Path(__file__).with_name('geomask-audit-state.py')
+_state_spec = importlib.util.spec_from_file_location('audit_state', STATE_MODULE_PATH)
+_state = importlib.util.module_from_spec(_state_spec)
+_state_spec.loader.exec_module(_state)
+
+# Path constants (can be patched by tests)
+STORE = Path(os.environ.get('GM_AUDIT_STORE', '/etc/geomask/node-audit.json'))
+STATE = Path(os.environ.get('GM_AUDIT_STATE', '/etc/geomask/node-audit/state'))
+STATE = STATE  # alias for backward compat
+CONFIG = Path(os.environ.get('GM_AUDIT_CONFIG', '/etc/mihomo/config.yaml'))
+RECEIPT = Path(os.environ.get('GM_AUDIT_RECEIPT', '/tmp/geomask-node-audit-receipt.json'))
+EVENTS = Path(os.environ.get('GM_AUDIT_EVENTS', '/etc/geomask/node-audit/events.jsonl'))
+POOLS_DIR = Path(os.environ.get('GM_AUDIT_POOLS', '/etc/geomask/node-audit/pools'))
+MAX_NODES = _state.MAX_NODES
+REGISTRY = Path(os.environ.get('GM_AUDIT_REGISTRY', '/etc/geomask-subs.list'))
+
+# Re-export from state module
+PATHS = _state.PATHS
+
+# Backward compat: atomic function
+atomic = _state.atomic_write
+
+AuditError = _state.AuditError
+stamp = _state.stamp
+_save_node_snapshot = _state.save_node_snapshot
+load_node_snapshot = _state.load_node_snapshot
+digest = _state.digest
+encode = _state.encode
+canonical_json = _state.canonical_json
+strict_json = _state.strict_json
+path_id = _state.path_id
+countries = _state.countries
+locked = _state.locked
+atomic_write = _state.atomic_write
+
+# State module functions with explicit path parameters
+def _load_store():
+    return _state.load_store(STORE)
+
+def _save_store(data):
+    return _state.save_store(data, STORE)
+
+def _append_event(event):
+    return _state.append_event(event, EVENTS)
+
+def _get_events(path=None, before=None, limit=50):
+    return _state.get_events(path, before, limit, EVENTS)
+
+def _load_pool(path_id, generation):
+    return _state.load_pool(path_id, generation, POOLS_DIR)
+
+def _save_pool(path_id, generation, pool_data):
+    return _state.save_pool(path_id, generation, pool_data, POOLS_DIR)
+
+def _resolve_source_binding(config, ident, providers=None):
+    return _state.resolve_source_binding(config, ident, providers)
+
+def _compute_path_revision(path_data):
+    return _state.compute_path_revision(path_data)
+
+# Backward compat: expose load_store
+load_store = _load_store
+
+# Reports directory
+REPORTS_DIR = Path(os.environ.get('GM_AUDIT_REPORTS', '/etc/geomask/node-audit/reports'))
+
+# State module functions with explicit path parameters
+def _save_report(report):
+    return _state.save_report(report, REPORTS_DIR)
+
+def _list_reports(path_id=None, limit=50):
+    return _state.list_reports(path_id, limit, REPORTS_DIR)
+
+# Legacy constants for backward compatibility
+REVISION_KEY = 'revision'  # whole-store digest for legacy RPC
+
+def boot_id():
+    return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+def render_save(data, ident, allow):
+    """Legacy render for backward compatibility with prepare-save."""
+    result = json.loads(json.dumps(data))
+    result['paths'].setdefault(ident, {})['countries_allow'] = allow
+    result['generation'] = result.get('generation', 0) + 1
+    return encode(result)
+
+def prepare_save(ident, value, expected):
+    """Legacy prepare-save: validates countries, returns candidate info using path_revision."""
+    ident, allow = path_id(ident), countries(value)
+    data, original_raw = _load_store()
+    # Legacy: expected is whole-store revision, but we now use path_revision
+    # Compute current whole-store digest for backward compat
+    current_revision = digest(original_raw) if original_raw else digest(encode(data))
+    if expected != current_revision:
+        raise AuditError('STALE: reload settings before saving')
+    # Check if change would actually modify anything
+    current_allow = data['paths'].get(ident, {}).get('countries_allow', PATHS[ident][1])
+    changed = current_allow != allow
+    candidate = render_save(data, ident, allow) if changed else None
+    return {'ok': True, 'before_sha256': current_revision,
+            'candidate_sha256': digest(candidate) if candidate else '',
+            'boot_id': boot_id(), 'path_id': ident, 'changed': changed}
+
+def save(ident, value, expected):
+    """Save countries for a path using path_revision (v2) or whole-store revision (legacy)."""
+    ident, allow = path_id(ident), countries(value)
+    with locked('settings'):
+        data, original_raw = _load_store()
+        # Check revision: try path_revision first, fall back to whole-store for legacy
+        current_revision = digest(original_raw) if original_raw else digest(encode(data))
+        path_rev = data['paths'].get(ident, {}).get('path_revision', '')
+        
+        revision_ok = False
+        if expected == path_rev:
+            revision_ok = True
+        elif expected == current_revision:
+            # Legacy whole-store revision
+            revision_ok = True
+        if not revision_ok:
+            raise AuditError('STALE: reload settings before saving')
+        
+        # No-op check
+        current_allow = data['paths'].get(ident, {}).get('countries_allow', PATHS[ident][1])
+        if current_allow == allow:
+            return {'ok': True, 'changed': False, 'revision': path_rev or current_revision, 'applied': False}
+        
+        # Update path data
+        data['paths'][ident]['countries_allow'] = allow
+        data['paths'][ident]['path_revision'] = _compute_path_revision(data['paths'][ident])
+        data['paths'][ident]['path_generation'] = data['paths'][ident].get('path_generation', 0) + 1
+        data['paths'][ident]['configured'] = True
+        
+        _save_store(data)
+        _append_event({
+            'path': ident,
+            'actor': 'luci',
+            'action': 'save',
+            'old_countries': current_allow,
+            'new_countries': allow,
+            'path_revision': data['paths'][ident]['path_revision'],
+            'path_generation': data['paths'][ident]['path_generation'],
+            'result': 'success'
+        })
+        return {'ok': True, 'changed': True, 'revision': data['paths'][ident]['path_revision'], 'applied': False}
+
+def yaml_load(raw):
+    import yaml
+    try:
+        value = _state.yaml12_load(raw)
+        if not isinstance(value, dict):
+            raise AuditError('expected YAML mapping')
+        return value
+    except yaml.YAMLError:
+        raise AuditError('invalid YAML source') from None
+
+def resolve_source(config, ident):
+    """Legacy: returns group_name and provider_ids."""
+    group_name = PATHS[path_id(ident)][0]
+    matches = [g for g in config.get('proxy-groups', []) if g.get('name') == group_name]
+    if len(matches) != 1:
+        raise AuditError('missing or duplicate target group')
+    providers = matches[0].get('use')
+    if not isinstance(providers, list) or not 1 <= len(providers) <= 3 or any(not isinstance(p, str) for p in providers):
+        raise AuditError('target group requires provider use list')
+    registry = config.get('proxy-providers') or {}
+    if any(p not in registry for p in providers):
+        raise AuditError('target provider missing')
+    return group_name, list(dict.fromkeys(providers))
+
+MANAGED_PREFIX = 'audit-'
+
+def resolve_audit_source(config, ident, path_data=None, previous_report=None):
+    """Resolve the subscription this path audits, even while it is applied.
+
+    An apply replaces the group's source with a managed file provider. Resolving naively
+    would then point the next check at our own frozen pool, so an applied path could never
+    be audited again -- and the nightly run would fail on it forever. The original
+    providers are recorded at apply time and in the last report; use those.
+    """
+    group_name, providers = resolve_source(config, ident)
+    managed = [p for p in providers if p.startswith(MANAGED_PREFIX)]
+    if not managed:
+        return group_name, providers
+
+    recorded = ((path_data or {}).get('applied') or {}).get('previous_use') or []
+    if not recorded and previous_report:
+        recorded = [p for p in (previous_report.get('providers') or [])
+                    if not str(p).startswith(MANAGED_PREFIX)]
+    registry = config.get('proxy-providers') or {}
+    usable = [p for p in recorded if p in registry]
+    if not usable:
+        raise AuditError('path is applied to a managed pool and its original source is not '
+                         'recorded in the mihomo config; refusing to audit the frozen pool')
+    return group_name, list(dict.fromkeys(usable))
+
+def get():
+    """Get all paths with v2 state: path_revision, source_binding, schedule, applied."""
+    data, original_raw = _load_store()
+    current_source = None
+    config = {}
+    try:
+        current_raw = CONFIG.read_bytes()
+        current_source = digest(current_raw)
+        config = yaml_load(current_raw)
+    except (OSError, AuditError):
+        pass
+
+    # The revision handed to the UI must be the same value save() compares against,
+    # otherwise an un-migrated store can never be written.
+    revision = digest(original_raw) if original_raw else digest(encode(data))
+
+    result = []
+    for ident, (label, defaults) in PATHS.items():
+        path_data = data['paths'].get(ident, {})
+        configured = path_data.get('configured', False)
+
+        report = None
+        state_file = STATE / (ident + '.json')
+        if state_file.exists():
+            try:
+                report = strict_json(state_file.read_bytes())
+            except (AuditError, OSError):
+                report = {'status': 'error', 'error': 'unreadable report'}
+
+        try:
+            # Resolve the subscription this path audits, not our own frozen pool.
+            _, providers = resolve_audit_source(config, ident, path_data, report)
+            binding = _resolve_source_binding(config, ident, providers)
+            source_revision = binding.get('source_fingerprint') if binding else None
+        except AuditError:
+            providers = []
+            binding = None
+            source_revision = None
+
+        if report and report.get('status') != 'error':
+            stale = False
+            if report.get('settings_revision') != path_data.get('path_revision', ''):
+                stale = True
+            if current_source and report.get('source_revision') != current_source:
+                stale = True
+            if stale:
+                report = dict(report, stale=True)
+
+        applied = path_data.get('applied', {})
+        applied_bool = applied.get('status') in ('applied', 'applying')
+        result.append({
+            'id': ident,
+            'label': label,
+            'providers': providers,
+            'source_binding': binding,
+            'source_revision': source_revision,
+            'configured': configured,
+            'countries_allow': path_data.get('countries_allow', defaults),
+            'path_revision': path_data.get('path_revision', ''),
+            'path_generation': path_data.get('path_generation', 0),
+            'schedule': path_data.get('schedule', {'enabled': False, 'time': '03:30',
+                                                   'mode': 'check-only'}),
+            'applied': applied_bool,
+            'applied_detail': {
+                'generation': applied.get('generation', 0),
+                'path_revision': applied.get('path_revision', ''),
+                'runtime_verified': applied.get('runtime_verified', False),
+                'status': applied.get('status', 'never'),
+                'applied_at': applied.get('applied_at', ''),
+                'node_count': applied.get('node_count', 0),
+                'pool_digest': applied.get('pool_digest', ''),
+                'acting_countries': applied.get('acting_countries') or [],
+                'provider_id': applied.get('provider_id', ''),
+            },
+            'report': report,
+        })
+
+    return {
+        'ok': True,
+        'api_schema': 2,
+        'revision': revision,
+        'paths': result,
+        'apply_supported': True,
+        'scope': 'desired filters, isolated observations, and explicit per-path apply',
+    }
+
+def fetch_nodes(provider):
+    url = provider.get('url', '')
+    if not isinstance(url, str) or urllib.parse.urlsplit(url).scheme != 'https':
+        raise AuditError('provider must use HTTPS for the isolated audit')
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise AuditError('invalid provider endpoint')
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+            raise AuditError('non-public subscription endpoint is not supported')
+    except OSError:
+        raise AuditError('subscription hostname could not be resolved') from None
+    headers = {'User-Agent': 'clash-meta'}
+    for key, value in (provider.get('header') or {}).items():
+        headers[key] = str(value[0] if isinstance(value, list) else value)
+    headers['User-Agent'] = 'clash-meta'
+    try:
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+                raise AuditError('subscription redirect refused; no credentials forwarded')
+        opener = urllib.request.build_opener(NoRedirect)
+        with opener.open(urllib.request.Request(url, headers=headers), timeout=30) as response:
+            raw = response.read(2_000_001)
+        if len(raw) > 2_000_000:
+            raise AuditError('subscription too large')
+        nodes = yaml_load(raw).get('proxies')
+    except Exception as exc:
+        if isinstance(exc, AuditError):
+            raise
+        raise AuditError('subscription request failed (' + type(exc).__name__ + ')') from None
+    if not isinstance(nodes, list) or not 3 <= len(nodes) <= MAX_NODES:
+        raise AuditError('unexpected subscription node count (expected 3..100)')
+    names = set()
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get('name'), str) or not node.get('server'):
+            raise AuditError('malformed subscription node')
+        name = node['name']
+        if name in names or any(ord(char) < 32 for char in name):
+            raise AuditError('duplicate or invalid node name')
+        names.add(name)
+    return nodes, digest(raw)
+
+# AI admission criterion, decided by the owner on 09.11.2026: a node is judged by the
+# services whose geography it can actually report. Google does not disclose a country in any
+# machine-readable form -- a real SERP fetched through a verified node carried no uule, no
+# region/countryCode/country/gl field, no data-country and no "Google offered in" -- so
+# requiring it would block every node forever while proving nothing about where it exits.
+AI_REQUIRED_SERVICES = ['cloudflare', 'chatgpt']
+# Probed and recorded, never used as a gate. The report says "unmeasurable", not "failed".
+AI_INFORMATIONAL_SERVICES = ['google']
+
+# Bumped when the measuring method changes; a report carries it so a later reader can tell
+# which findings were produced by which method instead of comparing unlike numbers.
+PROBE_VERSION = 'service-egress-2'
+
+def classify(ident, allow, probes):
+    required = AI_REQUIRED_SERVICES if ident == 'ai' else ['cloudflare']
+    reasons = []
+    unknown = False
+    failed = False
+    for service in required:
+        probe = probes.get(service, {})
+        country = probe.get('country')
+        if probe.get('status') != 'ok' or not country:
+            unknown = True
+            reasons.append(service + ': geography unknown or probe failed')
+        elif country not in allow:
+            failed = True
+            reasons.append(service + ': ' + country + ' not allowed')
+    status = 'excluded' if failed else 'unknown' if unknown else 'eligible'
+    result = {'status': status, 'reasons': reasons, 'admitted': status == 'eligible'}
+    if ident == 'ai':
+        # Recorded so the panel can say what is known and what simply cannot be measured.
+        informational = {}
+        for service in AI_INFORMATIONAL_SERVICES:
+            probe = probes.get(service) or {}
+            country = probe.get('country')
+            informational[service] = {
+                'measured': bool(country),
+                'country': country or None,
+                'policy': 'not-required',
+            }
+        result['informational'] = informational
+    return result
+

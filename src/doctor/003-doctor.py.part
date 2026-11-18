@@ -1,0 +1,392 @@
+def check_router_netfilter():
+    """Firewall and routing as they actually are, not as one particular version wrote them."""
+    details = []
+    state = 'ok'
+    rc, tables = run(['nft', 'list', 'tables'])
+    if rc == 127:
+        return 'warn', 'nft недоступен', ['команда nft не найдена']
+    has_fw4 = 'inet fw4' in tables
+    details.append('таблица inet fw4: %s' % ('есть' if has_fw4 else 'НЕТ'))
+    if not has_fw4:
+        state = 'fail'
+    # MagiTrickle lives in table ip mangle as MT_<group> chains plus geomask-excl bypasses
+    rc, mangle = run(['nft', 'list', 'table', 'ip', 'mangle'])
+    chains = len(re.findall(r'jump MT_[0-9a-f]+', mangle)) if rc == 0 else 0
+    bypass = len(re.findall(r'geomask-excl', mangle)) if rc == 0 else 0
+    if chains:
+        details.append('MagiTrickle: %d цепочек MT_ в table ip mangle' % chains)
+    else:
+        details.append('MagiTrickle: цепочек MT_ нет (mangle)')
+        if state == 'ok':
+            state = 'fail'
+    if bypass:
+        details.append('исключения устройств (geomask-excl): %d' % bypass)
+    rc, rules = run(['ip', '-4', 'rule', 'show'])
+    if rc != 0:
+        details.append('ip rule недоступен')
+        if state == 'ok':
+            state = 'fail'
+    else:
+        lookups = sorted({int(m) for m in re.findall(r'lookup (\d+)', rules)})
+        marks = len(re.findall(r'fwmark', rules))
+        details.append('таблиц в ip rule: %s' % (', '.join(str(x) for x in lookups) or 'нет'))
+        details.append('правил по метке: %d' % marks)
+        if not lookups:
+            if state == 'ok':
+                state = 'fail'
+    summary = ('фильтрация и маршрутизация на месте' if state == 'ok'
+               else 'в netfilter не хватает таблиц')
+    return state, summary, details
+
+
+def check_router_backup():
+    newest = None
+    folder = '/root/geomask-backups'
+    try:
+        for name in os.listdir(folder):
+            if name.startswith('router-backup-') and name.endswith('.tar.gz'):
+                path = os.path.join(folder, name)
+                stamp = os.path.getmtime(path)
+                if newest is None or stamp > newest[0]:
+                    newest = (stamp, name, os.path.getsize(path))
+    except OSError:
+        return 'warn', 'каталог бэкапов недоступен', [folder]
+    if newest is None:
+        return 'warn', 'бэкапов нет', ['создайте: sh geomask.sh --backup']
+    age_days = (time.time() - newest[0]) / 86400.0
+    details = ['последний: %s (%.1f МБ)' % (newest[1], newest[2] / 1048576.0),
+               'возраст: %.1f дн.' % age_days]
+    if age_days > 30:
+        return 'warn', 'бэкап давно не обновлялся', details
+    return 'ok', 'бэкап свежий', details
+
+
+def check_net_wan():
+    details = []
+    state = 'ok'
+    data = None
+    rc, out = run(['ubus', 'call', 'network.interface.wan', 'status'])
+    if rc == 0 and out:
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = None
+    if isinstance(data, dict):
+        up = data.get('up')
+        device = data.get('l3_device') or data.get('device') or ''
+        addresses = [item.get('address') for item in data.get('ipv4-address') or []
+                     if isinstance(item, dict) and item.get('address')]
+        details.append('интерфейс WAN: %s, %s' % (device or '?', 'поднят' if up else 'ОПУЩЕН'))
+        details.append('адрес: %s' % (', '.join(addresses) or 'нет'))
+        if not up or not addresses:
+            state = 'fail'
+    else:
+        rc, out = run(['ip', '-4', 'route', 'get', '1.1.1.1'])
+        details.append('WAN через ubus недоступен, маршрут: %s' % (out.splitlines()[0] if out else '?'))
+        if rc != 0:
+            state = 'fail'
+    rc, out = run(['ip', '-4', 'route', 'show', 'default'])
+    if rc == 0 and out:
+        details.append('маршрут по умолчанию: %s' % out.splitlines()[0])
+    else:
+        details.append('маршрут по умолчанию отсутствует')
+        state = 'fail'
+    summary = 'WAN в порядке' if state == 'ok' else 'WAN требует внимания'
+    return state, summary, details
+
+
+def check_net_dns():
+    details = []
+    state = 'ok'
+    probe = resolve('ya.ru')
+    if probe['ips']:
+        details.append('ya.ru → %s' % ', '.join(probe['ips'][:4]))
+    else:
+        details.append('ya.ru не разрешается через 127.0.0.1')
+        state = 'fail'
+    ad = resolve('doubleclick.net')
+    if ad['blocked']:
+        details.append('doubleclick.net заблокирован (0.0.0.0) — adblock работает')
+    elif ad['ips']:
+        details.append('doubleclick.net разрешается в %s — adblock не фильтрует'
+                       % ', '.join(ad['ips'][:2]))
+    rc, out = run(['pgrep', '-f', 'adblock'])
+    details.append('служба adblock: %s' % ('работает' if rc == 0 else 'не запущена'))
+    summary = 'DNS в порядке' if state == 'ok' else 'DNS не отвечает'
+    return state, summary, details
+
+
+def check_net_internet():
+    rc, out = run(['curl', '-m', '6', '-s', '-o', '/dev/null', '-w', '%{http_code} %{time_total}',
+                   'http://www.gstatic.com/generate_204'], timeout=10)
+    if rc != 0:
+        return 'fail', 'нет доступа в интернет', ['curl rc=%s %s' % (rc, out[:200])]
+    parts = out.split()
+    code = parts[0] if parts else ''
+    took = parts[1] if len(parts) > 1 else '?'
+    details = ['generate_204: HTTP %s за %s с' % (code, took)]
+    if code != '204':
+        return 'fail', 'интернет отвечает нештатно (HTTP %s)' % code, details
+    return 'ok', 'интернет доступен (%.2f с)' % float(took or 0), details
+
+
+def check_net_tunnels():
+    details = []
+    state = 'ok'
+    for device in ('Mihomo', 'AI', 'VPN-noP2P', 'Wireguard'):
+        rc, out = run(['ip', '-4', 'addr', 'show', device])
+        if rc != 0 or not out:
+            if device in ('Mihomo',):
+                details.append('%s: НЕТ' % device)
+                state = 'fail'
+            else:
+                details.append('%s: нет (не обязателен)' % device)
+            continue
+        mtu = re.search(r'mtu (\d+)', out)
+        address = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', out)
+        details.append('%s: адрес %s, mtu %s' % (device, address.group(1) if address else '?',
+                                                mtu.group(1) if mtu else '?'))
+        if device == 'Mihomo' and mtu and int(mtu.group(1)) > 1400:
+            state = 'warn' if state == 'ok' else state
+            details.append('mtu Mihomo больше 1400 — возможна фрагментация')
+    summary = 'туннели на месте' if state == 'ok' else 'туннели требуют внимания'
+    return state, summary, details
+
+
+PATH_GROUPS = (
+    ('path_vpn', 'VPN', 'основной VPN-лейн'),
+    ('path_vpn_nop2p', 'VPN-noP2P', 'лейн без P2P'),
+    ('path_ai', 'AI', 'AI-лейн'),
+)
+
+
+def check_path(group):
+    def probe():
+        info = group_state(group)
+        if info is None:
+            return 'fail', 'группа %s не отвечает в mihomo' % group, ['проверьте mihomo и контроллер 9090']
+        details = ['узлов в группе: %d' % info['nodes'],
+                   'текущий узел: %s' % (info['now'] or '—')]
+        if info['country']:
+            details.append('страна выхода: %s (%s)' % (info['country'], info['cc']))
+        else:
+            details.append('страна выхода: не определена по имени узла')
+        if not info['nodes']:
+            return 'fail', 'группа %s пуста' % group, details
+        if not info['now']:
+            return 'warn', 'группа %s не выбрала узел' % group, details
+        return 'ok', '%s: %s' % (group, info['now']), details
+    return probe
+
+
+def parse_listeners(text):
+    """listeners: [{name, listen, port, proxy}] in either YAML style.
+
+    The panel writes them in flow style and the installer in block style; the address is
+    not always loopback (torrent-direct listens on the LAN address), so the probe has to
+    read it instead of assuming 127.0.0.1.
+    """
+    listeners = []
+    section = ''
+    current = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith('#'):
+            continue
+        if not line.startswith(' '):
+            match = re.match(r'^([A-Za-z0-9_-]+):', line)
+            if match:
+                section = match.group(1)
+                current = None
+                continue
+        if section != 'listeners':
+            continue
+        match = re.match(r'^\s*-\s*name:\s*(\S+)\s*$', line)
+        if match:
+            current = {'name': match.group(1), 'listen': '', 'port': '', 'proxy': ''}
+            listeners.append(current)
+            continue
+        if current is None:
+            continue
+        for key in ('listen', 'port', 'proxy'):
+            match = re.match(r'^\s+%s:\s*(\S+)\s*$' % key, line)
+            if match:
+                current[key] = match.group(1).strip('\'"')
+    return listeners
+
+
+_DIRECT_CACHE = {}
+
+
+def mihomo_tun_device():
+    """The TUN device mihomo creates, from its config (empty when unknown).
+
+    A quoted `device: "Mihomo"` is valid YAML and was ignored by the old unquoted regex, so a
+    default route through the tunnel looked like the provider exit. A config without a `tun:`
+    block is normal when an external hev creates the device - then nothing is known here.
+    """
+    inside = False
+    for line in read_text(MIHOMO_CONF).splitlines():
+        if re.match(r'^tun:\s*$', line):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if line and not line[0].isspace():
+            break
+        match = re.match(r'^[ \t]+device:\s*["\']?([A-Za-z0-9._-]+)["\']?\s*(?:#.*)?$', line)
+        if match:
+            return match.group(1)
+    return ''
+
+
+def _physical_wan(device, tun):
+    """True when `device` can be the provider exit (not a tunnel/TUN)."""
+    if not device:
+        return False
+    if tun and device == tun:
+        return False
+    return not device.startswith(('wg', 'tun', 'tap'))
+
+
+def wan_iface():
+    """The device that carries the provider exit: the physical default route.
+
+    The uci name is not the device: on PPPoE `network.wan.device` is `wan` while the
+    traffic leaves through `pppoe-wan`, and `curl --interface wan` simply fails. netifd is
+    asked first; the routing table is a fallback that skips tunnels, and an unverifiable
+    answer is returned as empty instead of guessing (audit 14.11.2026, F17).
+    """
+    tun = mihomo_tun_device()
+    rc, out = run(['ubus', 'call', 'network.interface.wan', 'status'], timeout=5)
+    if rc == 0 and out:
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            payload = {}
+        device = str(payload.get('l3_device') or '') if isinstance(payload, dict) else ''
+        if _physical_wan(device, tun):
+            return device
+    rc, out = run(['ip', 'route', 'show', 'default'], timeout=5)
+    for match in re.finditer(r'\bdev\s+([A-Za-z0-9._-]+)', out or ''):
+        device = match.group(1)
+        if _physical_wan(device, tun):
+            return device
+    for key in ('network.wan.device', 'network.wan.ifname', 'network.wan6.device'):
+        rc, out = run(['uci', '-q', 'get', key], timeout=5)
+        candidate = (out or '').strip()
+        if rc == 0 and candidate and _physical_wan(candidate, tun):
+            # `wan` is the interface name, not a device: only accept one that exists
+            rc2, _ = run(['ip', 'link', 'show', candidate], timeout=5)
+            if rc2 == 0:
+                return candidate
+    return ''
+
+
+def direct_country(live):
+    """Country of the provider exit, measured **through the WAN interface**.
+
+    A plain curl follows the router's routing table, which on a policy-routed box is the
+    VPN tunnel: the trace then reported the VPN's country as the provider's. The request is
+    bound to the WAN device, and the answer is cached for this run.
+    """
+    if not live:
+        return ''
+    if 'cc' in _DIRECT_CACHE:
+        return _DIRECT_CACHE['cc']
+    device = wan_iface()
+    code = fetch_country('', interface=device) if device else ''
+    _DIRECT_CACHE['cc'] = code
+    return code
+
+
+def zapret_path_label(zap):
+    """One phrase for the route summary that matches what the check just concluded."""
+    if zap.get('queues'):
+        return 'zapret (запрос маскируется)'
+    return 'zapret (в списке, очереди не подтверждены)'
+
+
+def country_label(code):
+    if not code:
+        return ''
+    return '%s (%s)' % (COUNTRIES.get(code, code), code)
+
+
+def exit_country_text(code):
+    if not code:
+        return 'страна выхода не измерялась (включите живую проверку)'
+    return 'страна %s — измерено с роутера' % country_label(code)
+
+
+EGRESS_ENDPOINTS = (
+    ('https://ipinfo.io/json', ('country',)),
+    ('https://api.myip.com', ('country', 'cc')),
+    ('https://ifconfig.co/json', ('country_iso', 'country')),
+)
+
+
+def country_from_payload(payload, keys):
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and re.match(r'^[A-Za-z]{2}$', value):
+            return value.upper()
+    return ''
+
+
+def fetch_country(proxy, interface=''):
+    """Country of the exit behind this proxy, from whichever geo service answers.
+
+    One service is not enough: a lane's exit IP is often a datacenter range and the
+    service answers 403 (observed on the AI lane), which says nothing about the route.
+    """
+    for url, keys in EGRESS_ENDPOINTS:
+        cmd = ['curl', '-m', '8', '-s']
+        if proxy:
+            cmd += ['--proxy', proxy]
+        if interface:
+            cmd += ['--interface', interface]
+        cmd.append(url)
+        rc, out = run(cmd, timeout=12)
+        if rc != 0 or not out:
+            continue
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            code = country_from_payload(payload, keys)
+            if code:
+                return code
+    return ''
+
+
+def check_path_egress():
+    """Live: which country each lane's exit looks like to the internet."""
+    details = []
+    state = 'ok'
+    probes = [('по умолчанию', None)]
+    for item in parse_listeners(read_text(MIHOMO_CONF)):
+        proxy = item.get('proxy') or ''
+        if not proxy or proxy.upper() == 'DIRECT':
+            continue
+        host = item.get('listen') or '127.0.0.1'
+        if host in ('0.0.0.0', '::', '[::]'):
+            host = '127.0.0.1'
+        port = item.get('port') or ''
+        if port:
+            probes.append((proxy, 'http://%s:%s' % (host, port)))
+    if len(probes) == 1:
+        details.append('в конфиге нет слушателей с фиксированной группой')
+    for label, proxy in probes:
+        country = fetch_country(proxy)
+        if country:
+            details.append('%s: выход %s (%s)' % (label, COUNTRIES.get(country, country), country))
+        else:
+            details.append('%s: выход не определён (нет ответа)' % label)
+            if label == 'по умолчанию':
+                state = 'warn'
+    summary = 'выходы определены' if state == 'ok' else 'часть выходов не отвечает'
+    return state, summary, details
+
+

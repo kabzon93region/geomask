@@ -41,6 +41,20 @@ TARGETS = {
     'installer': {'output': 'geomask.sh.in', 'parts': 'src/installer'},
     'backend': {'output': 'assets/geo-backend.sh', 'parts': 'src/backend'},
     'panel': {'output': 'assets/geo-sync-page.js', 'parts': 'src/panel'},
+    # 0g: the remaining oversized implementation files, each split next to its responsibility.
+    'doctor': {'output': 'assets/geomask-doctor.py', 'parts': 'src/doctor'},
+    'spool': {'output': 'assets/geomask-diag-spool.py', 'parts': 'src/spool'},
+    'config-tx': {'output': 'assets/geomask-config-tx.py', 'parts': 'src/config-tx'},
+    'node-audit': {'output': 'assets/geomask-node-audit.py', 'parts': 'src/node-audit'},
+    'routes': {'output': 'assets/geomask-routes.sh', 'parts': 'src/routes'},
+    'dnsguard': {'output': 'assets/geomask-dnsguard.sh', 'parts': 'src/dnsguard'},
+    'apply': {'output': 'assets/geomask-apply.py', 'parts': 'src/apply'},
+    'diag-redact': {'output': 'assets/geomask-diag-redact.py', 'parts': 'src/diag-redact'},
+    'module-update': {'output': 'assets/geomask-module-update.py', 'parts': 'src/module-update'},
+    'audit-state': {'output': 'assets/geomask-audit-state.py', 'parts': 'src/audit-state'},
+    'node-scan': {'output': 'assets/geomask-node-scan.sh', 'parts': 'src/node-scan'},
+    'module-manifest': {'output': 'tools/module_manifest.py', 'parts': 'src/module-manifest'},
+    'safe-write': {'output': 'tools/safe_write.py', 'parts': 'src/safe-write'},
 }
 
 # The authored sources the plan's inventory calls oversized (>=500 lines) or generated.

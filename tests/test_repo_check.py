@@ -38,15 +38,26 @@ class RepoCheckTests(unittest.TestCase):
         self.assertFalse([p for p in paths if p.startswith('src/')],
                          'a part is counted per part, not as a monolith')
 
-    def test_advisory_mode_exits_zero_and_strict_mode_fails(self):
+    def test_advisory_and_strict_agree_when_only_exceptions_remain(self):
+        """After 0g every oversized file is either split or an explained exception."""
         advisory = subprocess.run([sys.executable, '-B', 'tools/repo_check.py'],
                                   cwd=str(ROOT), capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(advisory.returncode, 0, advisory.stdout + advisory.stderr)
         self.assertIn('advisory during stage 0', advisory.stdout)
+        self.assertIn('explained exception', advisory.stdout)
         strict = subprocess.run([sys.executable, '-B', 'tools/repo_check.py', '--strict'],
                                 cwd=str(ROOT), capture_output=True, text=True, encoding='utf-8')
-        self.assertEqual(strict.returncode, 1)
-        self.assertIn('oversized', strict.stdout)
+        self.assertEqual(strict.returncode, 0,
+                         'an explained exception must not fail strict mode: ' + strict.stdout)
+
+    def test_an_unexplained_oversized_file_fails_strict_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / 'big.sh').write_text('x\n' * 600, encoding='utf-8')
+            strict = subprocess.run([sys.executable, '-B', 'tools/repo_check.py', '--strict',
+                                     '--root', tmp], cwd=str(ROOT), capture_output=True,
+                                    text=True, encoding='utf-8')
+            self.assertEqual(strict.returncode, 1)
+            self.assertIn('oversized', strict.stdout)
 
     def test_a_clean_small_tree_is_green_in_strict_mode(self):
         with tempfile.TemporaryDirectory() as tmp:

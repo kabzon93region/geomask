@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "target": "doctor",
+  "parts": [
+    {
+      "path": "001-doctor.py.part"
+    },
+    {
+      "path": "002-doctor.py.part"
+    },
+    {
+      "path": "003-doctor.py.part"
+    },
+    {
+      "path": "004-doctor.py.part"
+    },
+    {
+      "path": "005-doctor.py.part"
+    }
+  ]
+}

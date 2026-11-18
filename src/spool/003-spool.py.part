@@ -1,0 +1,235 @@
+def cmd_register(path, archive, quota=None, files=None, grace=None):
+    quota = QUOTA if quota is None else quota
+    files = FILES if files is None else files
+    grace = GRACE if grace is None else grace
+    if type(quota) is not int or quota < 1:
+        refuse('invalid quota')
+    if type(files) is not int or files < 1:
+        refuse('invalid files')
+    absolute = os.path.abspath(archive)
+    if os.path.normcase(os.path.dirname(absolute)) != os.path.normcase(os.path.abspath(path)):
+        refuse('archive is not directly inside spool')
+    name = os.path.basename(absolute)
+    if not valid_name(name):
+        refuse('not a diagnostic bundle name')
+    with Spool(path) as spool:
+        fd = spool.open(name)
+        try:
+            before = os.fstat(fd)
+            check_file(before, 'bundle')
+            # Registration is bounded too; never hash arbitrary-size input into memory.
+            if before.st_size > CREATION_MAXIMUM:
+                refuse('bundle exceeds %s-byte creation/registration cap' % CREATION_MAXIMUM)
+            digest, total, _ = read_all(fd, before.st_size)
+            if total != before.st_size or signature(before) != signature(os.fstat(fd)):
+                refuse('bundle changed during registration')
+            record = dict(schema=SCHEMA, name=name, dev=before.st_dev, ino=before.st_ino,
+                          bytes=total, uid=before.st_uid, sha256=digest, created=int(time.time()),
+                          created_ns=time.time_ns())
+        finally:
+            os.close(fd)
+        # The passport is written after the quota decision, so its exact serialized size is
+        # part of that decision. The same helper builds the bytes write_sidecar stores, so
+        # the estimate cannot drift from the real file by a field or a newline.
+        sidecar_bytes = len(sidecar_payload(record))
+        # Quota is enforced here and only here: the archive is closed and hashed, and the
+        # whole measure -> evict -> accept step runs under one lock, so a parallel exporter
+        # cannot slip between "there is room" and "write the sidecar" (R08).
+        with Locked(spool):
+            archives, sidecars, _, _, _ = scan(spool)
+            if name not in archives:
+                refuse('bundle changed during registration')
+            # A re-registered bundle may already have a passport counted by measure(); only
+            # the growth of the replacement counts as pending bytes.
+            pending = sidecar_bytes
+            shadow = sidecars.get(name)
+            if shadow is not None and stat.S_ISREG(shadow.st_mode):
+                pending = max(0, sidecar_bytes - shadow.st_size)
+            _evict(spool, archives, sidecars, _order(spool, archives), name, grace,
+                   files, quota, time.time(), pending=pending)
+            count, taken = measure(archives, sidecars)
+            if count > files:
+                _unlink_pair(spool, name)
+                refuse('архив не помещается: квота %d файлов, свежие архивы защищены %d с'
+                       % (files, grace))
+            if taken + pending > quota:
+                _unlink_pair(spool, name)
+                refuse('архив %d байт и паспорт %d байт не помещаются в квоту %d'
+                       % (record['bytes'], sidecar_bytes, quota))
+            try:
+                write_sidecar(spool, name, record)
+            except BaseException:
+                # ENOSPC here must not leave a registered-looking pair behind: the archive
+                # is removed as well (its sidecar temp is cleaned by write_sidecar).
+                _unlink_pair(spool, name)
+                raise
+            spool.check()
+    return {'ok': True, 'name': name, 'bytes': record['bytes'], 'sha256': digest}
+
+
+def _open_registered(spool, record):
+    """Open the archive and prove identity/size. None means 'candidate is gone'."""
+    try:
+        fd = spool.open(record['name'])
+    except (FileNotFoundError, Refused):
+        return None
+    try:
+        st = os.fstat(fd)
+        if (identity(st) != (record['dev'], record['ino']) or st.st_uid != record['uid']
+                or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1
+                or st.st_size != record['bytes'] or st.st_size <= 0):
+            os.close(fd)
+            return None
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _newest_valid(spool):
+    """Newest structurally valid registered bundle; an orphan sidecar is skipped."""
+    candidates = []
+    for entry in spool.names():
+        if not entry.endswith('.json'):
+            continue
+        base = entry[:-5]
+        if not valid_name(base):
+            continue
+        try:
+            candidates.append(read_sidecar(spool, base))
+        except (Refused, OSError):
+            continue
+    for record in sorted(candidates, key=lambda item: (item['created_ns'], item['name']),
+                         reverse=True):
+        fd = _open_registered(spool, record)
+        if fd is not None:
+            return record, fd
+    refuse('архива нет: no registered bundle')
+
+
+def cmd_get(path, name, maximum, ttl):
+    maximum = MAXIMUM if maximum is None else maximum
+    if type(maximum) is not int or maximum < 0:
+        refuse('invalid maximum')
+    if ttl is not None and (not math.isfinite(ttl) or ttl < 0):
+        refuse('invalid ttl')
+    with Spool(path) as spool:
+        if not name:
+            record, fd = _newest_valid(spool)
+            name = record['name']
+        else:
+            if not valid_name(name):
+                refuse('not a diagnostic bundle name')
+            record = read_sidecar(spool, name)
+            try:
+                fd = spool.open(name)
+            except FileNotFoundError:
+                refuse('архива нет: файл удалён')
+        try:
+            before = os.fstat(fd)
+            check_file(before, 'bundle')
+            if identity(before) != (record['dev'], record['ino']) or before.st_uid != record['uid']:
+                refuse('bundle identity changed')
+            if before.st_size != record['bytes']:
+                refuse('bundle size changed')
+            if ttl is not None and record['created'] + ttl * 3600 < time.time():
+                refuse('архив просрочен: старше %g ч — соберите новый' % ttl)
+            if before.st_size > maximum:
+                refuse('bundle is %s bytes, over the %s-byte download cap' % (before.st_size, maximum))
+            digest, total, payload = read_all(fd, before.st_size)
+            after = os.fstat(fd)
+            check_file(after, 'bundle')
+            if total != before.st_size or signature(before) != signature(after):
+                refuse('bundle changed while read')
+            if digest != record['sha256']:
+                refuse('bundle sha256 mismatch')
+            spool.check()
+            return dict(ok=True, name=name, bytes=total, sha256=digest,
+                        data=base64.b64encode(payload).decode('ascii'))
+        finally:
+            os.close(fd)
+
+
+def _option_uint(text, what, minimum=1):
+    if not isinstance(text, str) or not text.isdigit():
+        refuse('invalid ' + what)
+    value = int(text)
+    if value < minimum:
+        refuse('invalid ' + what)
+    return value
+
+
+def _options(pairs, allowed):
+    values = {}
+    if len(pairs) % 2:
+        refuse('invalid options')
+    for key, value in zip(pairs[::2], pairs[1::2]):
+        if key not in allowed:
+            refuse('unknown option')
+        values[key] = value
+    return values
+
+
+def cli(args):
+    if len(args) == 2 and args[0] == 'init':
+        return cmd_init(args[1])
+    if len(args) >= 3 and args[0] == 'register':
+        values = _options(args[3:], ('--quota', '--files'))
+        quota = _option_uint(values['--quota'], 'quota') if '--quota' in values else None
+        files = _option_uint(values['--files'], 'files') if '--files' in values else None
+        return cmd_register(args[1], args[2], quota, files)
+    if len(args) >= 2 and args[0] == 'retain':
+        options = list(args[2:])
+        keep_hour, quota, files, share, stage_dir = None, None, None, False, None
+        index = 0
+        while index < len(options):
+            key = options[index]
+            if key == '--share':
+                share = True
+                index += 1
+                continue
+            if index + 1 >= len(options):
+                refuse('invalid options')
+            value = options[index + 1]
+            if key == '--keep-h':
+                keep_hour = _option_uint(value, 'keep hours', 0)
+            elif key == '--quota':
+                quota = _option_uint(value, 'quota')
+            elif key == '--files':
+                files = _option_uint(value, 'files')
+            elif key == '--stage-dir':
+                stage_dir = value
+            else:
+                refuse('unknown option')
+            index += 2
+        return cmd_retain(args[1], keep_hour, quota, files, share, stage_dir)
+    if len(args) == 4 and args[0] == 'copy-share':
+        return cmd_copy_share(args[1], args[2], args[3])
+    if len(args) >= 3 and args[0] == 'get':
+        maximum, ttl = MAXIMUM, 24.0
+        values = _options(args[3:], ('--max', '--ttl'))
+        if '--max' in values:
+            maximum = int(values['--max'])
+        if '--ttl' in values:
+            ttl = float(values['--ttl'])
+        return cmd_get(args[1], args[2], maximum, ttl)
+    refuse('usage: init spool | register spool path [--quota N] [--files N] '
+           '| get spool name [--max N] [--ttl H] '
+           '| retain dir [--keep-h H] [--quota N] [--files N] [--share] [--stage-dir D] '
+           '| copy-share src dir name')
+
+
+def main():
+    try:
+        answer = cli(sys.argv[1:])
+        rc = 0
+    except ShareRefused as exc:
+        answer, rc = {'ok': False, 'reason': exc.reason}, 1
+    except (Refused, OSError, ValueError) as exc:
+        answer, rc = {'ok': False, 'error': str(exc)}, 1
+    sys.stdout.buffer.write((json.dumps(answer, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8'))
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main())

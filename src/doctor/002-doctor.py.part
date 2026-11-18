@@ -1,0 +1,385 @@
+def magitrickle_route(domain):
+    """Which MagiTrickle group owns the domain, and through which interface."""
+    groups = parse_magitrickle(read_text(MT_CONF))
+    best = None
+    for group in groups:
+        if not group.get('enable', True):
+            continue
+        for rule in group.get('rules') or []:
+            if not rule.get('enable', True):
+                continue
+            kind = (rule.get('type') or 'namespace').lower()
+            if kind == 'subnet':
+                continue
+            if domain_matches(domain, rule.get('rule'), kind):
+                # the most specific namespace wins, as MagiTrickle resolves it
+                length = len(rule.get('rule') or '')
+                if best is None or length > best[2]:
+                    best = (group, rule, length)
+    return best
+
+
+def magitrickle_disabled(domain):
+    """A group that lists the domain but with the rule switched off, if any.
+
+    This is the case the owner hit with plati.market: the domain was in a group all along,
+    the rule just had `enable: false`, so the trace said "not in any group" and sent them
+    looking for a missing list instead of a checkbox.
+    """
+    for group in parse_magitrickle(read_text(MT_CONF)):
+        for rule in group.get('rules') or []:
+            if rule.get('enable', True):
+                continue
+            kind = (rule.get('type') or 'namespace').lower()
+            if kind == 'subnet':
+                continue
+            if domain_matches(domain, rule.get('rule'), kind):
+                return group, rule
+    return None, None
+
+
+def parse_mihomo(text):
+    """(rule_providers {name: path}, rules [text]) from the mihomo config.
+
+    The installer writes block style (`  - RULE,...`); mihomo and the panel rewrite the
+    file in flow style (`- RULE,...` at column 0), so both spellings must be read.
+    """
+    providers = {}
+    rules = []
+    section = ''
+    provider = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith('#'):
+            continue
+        if not line.startswith(' '):
+            match = re.match(r'^([A-Za-z0-9_-]+):', line)
+            if match:
+                section = match.group(1)
+                provider = None
+                continue
+        if section == 'rule-providers':
+            match = re.match(r'^(\s+)([A-Za-z0-9_-]+):\s*$', line)
+            if match:
+                provider = match.group(2)
+                providers[provider] = ''
+                continue
+            match = re.match(r'^\s+path:\s*(\S+)\s*$', line)
+            if match and provider:
+                providers[provider] = match.group(1).strip('\'"')
+            continue
+        if section == 'rules':
+            match = re.match(r'^\s*- (.+)$', line)
+            if match:
+                rules.append(match.group(1).strip())
+    return providers, rules
+
+
+def split_rule(rule):
+    """Split a mihomo rule on top-level commas (AND/OR carry commas in parentheses)."""
+    parts = []
+    depth = 0
+    current = ''
+    for char in rule:
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth = max(0, depth - 1)
+        if char == ',' and depth == 0:
+            parts.append(current)
+            current = ''
+            continue
+        current += char
+    parts.append(current)
+    return [part.strip() for part in parts]
+
+
+def ruleset_payload(path):
+    """Payload lines of a classical ruleset file."""
+    entries = []
+    for raw in read_text(path).splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#') or line == 'payload:':
+            continue
+        if line.startswith('- '):
+            entries.append(line[2:].strip())
+    return entries
+
+
+# G02 (audit 18.11.2026): the walk used `any()` for AND and OR alike, and an unevaluable
+# condition returned False - so NETWORK/DST-PORT/PROCESS conditions silently became "does not
+# match" and an AND rule was reported as matching on one true sub-condition. Conditions now
+# return one of three verdicts, and the caller distinguishes "certain", "may match, cannot be
+# checked here" and "does not match".
+TRUE, FALSE, UNKNOWN, UNRESOLVED = 'true', 'false', 'unknown', 'unresolved'
+
+
+def match_condition(condition, domain, ips, providers=None):
+    """Verdict for one rule condition: (TRUE|FALSE|UNKNOWN, note)."""
+    parts = split_rule(condition)
+    kind = (parts[0] or '').upper()
+    if kind in ('DOMAIN-SUFFIX', 'DOMAIN', 'DOMAIN-KEYWORD'):
+        target = parts[1] if len(parts) > 1 else ''
+        ok = domain_matches(domain, target, kind)
+        return (TRUE if ok else FALSE), '%s,%s' % (kind, target)
+    if kind in ('IP-CIDR', 'IP-CIDR6'):
+        target = parts[1] if len(parts) > 1 else ''
+        if not ips:
+            # "no address to compare" is not "address does not match", but it also does not
+            # stop the walk: the domain trace continues and the skipped check is reported.
+            return UNRESOLVED, 'IP-CIDR,%s (адрес не разрешён)' % target
+        for ip in ips:
+            if ip_in_cidr(ip, target):
+                return TRUE, 'IP-CIDR,%s ← %s' % (target, ip)
+        return FALSE, 'IP-CIDR,%s' % target
+    if kind == 'RULE-SET':
+        name = parts[1] if len(parts) > 1 else ''
+        path = (providers or {}).get(name, '')
+        if not path:
+            return UNKNOWN, 'RULE-SET,%s (файл неизвестен)' % name
+        for entry in ruleset_payload(path):
+            verdict, note = match_condition(entry, domain, ips, providers)
+            if verdict == TRUE:
+                return TRUE, '%s в списке %s' % (note, name)
+        return FALSE, 'RULE-SET,%s' % name
+    if kind in ('NETWORK', 'DST-PORT', 'SRC-PORT', 'PROCESS-NAME', 'PROCESS-PATH',
+                'SRC-IP-CIDR', 'SRC-IP-CIDR6', 'IN-PORT', 'IN-TYPE', 'IN-USER', 'IN-NAME',
+                'DST-PORT-RANGE', 'SRC-PORT-RANGE', 'UID', 'DSCP', 'IP-SUFFIX'):
+        # Decided by the packet, the process or the kernel - not by the doctor's inputs.
+        return UNKNOWN, '%s — не проверяется' % (','.join(parts[:-1]) if len(parts) > 1 else kind)
+    return UNKNOWN, '%s — неизвестное условие' % (kind or condition)
+
+
+def ip_in_cidr(ip, cidr):
+    try:
+        import ipaddress
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+
+
+def mihomo_route(domain, ips):
+    """Walk the rule list in order and return the first matching rule."""
+    providers, rules = parse_mihomo(read_text(MIHOMO_CONF))
+    skipped = []
+    for index, rule in enumerate(rules, 1):
+        if rule.upper().startswith('MATCH'):
+            parts = split_rule(rule)
+            hit = {'index': index, 'rule': rule,
+                   'policy': parts[1] if len(parts) > 1 else 'GLOBAL'}
+            if skipped:
+                hit['note'] = 'не проверено: %s' % '; '.join(skipped)
+            return hit
+        if rule.upper().startswith(('AND,', 'OR,')):
+            is_and = rule.upper().startswith('AND,')
+            inner = rule[rule.find('(') + 1:rule.rfind(')')]
+            conditions = [c.strip().strip('()') for c in split_rule(inner)]
+            hits = [match_condition(c, domain, ips, providers) for c in conditions]
+            parts = split_rule(rule)
+            policy = parts[-1] if len(parts) > 1 else ''
+            if is_and:
+                if any(verdict == FALSE for verdict, _ in hits):
+                    continue
+                undecided = [note for verdict, note in hits
+                             if verdict in (UNKNOWN, UNRESOLVED)]
+                if not undecided:
+                    return {'index': index, 'rule': rule, 'policy': policy,
+                            'note': '; '.join(note for _, note in hits)}
+                return {'index': index, 'rule': rule, 'policy': policy, 'conditional': True,
+                        'note': 'сработает при: %s' % '; '.join(undecided)}
+            winners = [note for verdict, note in hits if verdict == TRUE]
+            if winners:
+                return {'index': index, 'rule': rule, 'policy': policy,
+                        'note': '; '.join(winners)}
+            undecided = [note for verdict, note in hits
+                         if verdict in (UNKNOWN, UNRESOLVED)]
+            if undecided:
+                return {'index': index, 'rule': rule, 'policy': policy, 'conditional': True,
+                        'note': 'возможно при: %s' % '; '.join(undecided)}
+            continue
+        parts = split_rule(rule)
+        kind = (parts[0] or '').upper()
+        if kind == 'RULE-SET':
+            name = parts[1] if len(parts) > 1 else ''
+            policy = parts[2] if len(parts) > 2 else ''
+            path = providers.get(name, '')
+            for entry in ruleset_payload(path):
+                verdict, note = match_condition(entry, domain, ips, providers)
+                if verdict == TRUE:
+                    return {'index': index, 'rule': rule, 'policy': policy,
+                            'note': 'строка «%s» в списке %s' % (note, name), 'ruleset': path}
+            continue
+        verdict, note = match_condition(rule, domain, ips, providers)
+        if verdict == UNRESOLVED:
+            skipped.append('№%d %s' % (index, note))
+            continue
+        if verdict == TRUE:
+            policy = parts[-1] if len(parts) > 1 else ''
+            return {'index': index, 'rule': rule, 'policy': policy, 'note': note}
+        if verdict == UNKNOWN:
+            # The rule may decide this traffic and only the router can tell: "unknown" must not
+            # be walked past as if it were false (G02).
+            return {'index': index, 'rule': rule, 'policy': parts[-1] if len(parts) > 1 else '',
+                    'conditional': True, 'note': note}
+    return None
+
+
+def resolve(domain):
+    """A records for the domain via the router's own resolver."""
+    rc, out = run(['nslookup', domain, '127.0.0.1'], timeout=8)
+    ips = []
+    blocked = False
+    for line in out.splitlines():
+        match = re.search(r'^Address(?: \d+)?:\s*(\S+)\s*$', line)
+        if not match:
+            continue
+        value = match.group(1)
+        if value in ('127.0.0.1', '::1'):
+            continue
+        if value in ('0.0.0.0', '::'):
+            blocked = True
+            continue
+        if re.match(r'^\d+\.\d+\.\d+\.\d+$', value):
+            ips.append(value)
+    lowered = out.lower()
+    nxdomain = 'nxdomain' in lowered or "can't find" in lowered or 'not found' in lowered
+    return {'ips': ips, 'blocked': blocked, 'nxdomain': nxdomain, 'raw': out}
+
+
+# --------------------------------------------------------------------------- checks
+def _state(ok, warn=False):
+    if not ok:
+        return 'fail'
+    return 'warn' if warn else 'ok'
+
+
+def check_module(module_id):
+    """File integrity of one module, straight from the updater's status()."""
+    def probe():
+        updater = load_updater()
+        index = module_index()
+        if updater is None or not index:
+            return 'warn', 'каталог модулей недоступен', ['нет %s или %s' % (MODULE_UPDATER, MODULE_INDEX)]
+        state = updater.load_state()
+        selected = updater.load_selection() if hasattr(updater, 'load_selection') else None
+        report = updater.status(index, state, module_id, selected=selected)
+        if not report:
+            return 'warn', 'модуль не описан в каталоге', []
+        item = report[0]
+        details = ['версия %s → %s' % (item['installed_version'], item['available_version']),
+                   'файлов: %s' % item['files']]
+        for path in (item.get('missing') or [])[:5]:
+            details.append('нет файла: %s' % path)
+        for path in (item.get('modified') or [])[:5]:
+            details.append('изменён: %s' % path)
+        names = {'current': 'актуален', 'update-available': 'есть обновление',
+                 'modified': 'изменён локально', 'incomplete': 'неполный',
+                 'not-selected': 'не выбран на этом роутере'}
+        states = {'current': 'ok', 'update-available': 'warn', 'modified': 'warn',
+                  'incomplete': 'fail', 'not-selected': 'ok'}
+        fixes = {
+            'update-available': 'Обновите модуль: панель → Модули → «Обновить».',
+            'modified': 'Вернуть каталожную версию: панель → Модули → «Перезаписать».',
+            'incomplete': 'Файлов не хватает: панель → Модули → «Обновить»; если не помогло — переустановка.',
+            'not-selected': 'Модуль не выбран при установке. Включить: sh geomask.sh --modules=core,path_vpn,%s.' % module_id,
+        }
+        return (states.get(item['state'], 'warn'), names.get(item['state'], item['state']),
+                details, fixes.get(item['state'], ''))
+    return probe
+
+
+def check_router_system():
+    model = read_text('/tmp/sysinfo/model').strip() or 'неизвестно'
+    release = ''
+    for line in read_text('/etc/openwrt_release').splitlines():
+        if line.startswith('DISTRIB_RELEASE='):
+            release = line.split('=', 1)[1].strip('\'"')
+    rc, kernel = run(['uname', '-r'])
+    rc, up = run(['cat', '/proc/uptime'])
+    hours = 0
+    if up:
+        try:
+            hours = int(float(up.split()[0]) // 3600)
+        except (ValueError, IndexError):
+            hours = 0
+    details = ['модель: %s' % model,
+               'OpenWrt: %s, ядро %s' % (release or '?', kernel.strip() or '?'),
+               'аптайм: %s ч' % hours]
+    return 'ok', 'роутер работает', details
+
+
+def check_router_resources():
+    details = []
+    state = 'ok'
+    rc, loadavg = run(['cat', '/proc/loadavg'])
+    load1 = 0.0
+    if loadavg:
+        try:
+            load1 = float(loadavg.split()[0])
+        except (ValueError, IndexError):
+            load1 = 0.0
+        details.append('load average: %s' % loadavg.split()[0])
+    mem = {}
+    for line in read_text('/proc/meminfo').splitlines():
+        key, _, rest = line.partition(':')
+        match = re.search(r'(\d+)', rest)
+        if match:
+            mem[key] = int(match.group(1))
+    total = mem.get('MemTotal') or 0
+    avail = mem.get('MemAvailable') or mem.get('MemFree') or 0
+    if total:
+        free_pct = 100.0 * avail / total
+        details.append('память свободна: %.0f%% (%d МБ из %d МБ)'
+                       % (free_pct, avail // 1024, total // 1024))
+        if free_pct < 12:
+            state = 'fail'
+            details.append('критически мало памяти')
+        elif free_pct < 22:
+            state = 'warn'
+    for label, path in (('overlay', '/'), ('/tmp', '/tmp')):
+        rc, out = run(['df', '-m', path])
+        if rc != 0:
+            continue
+        parts = out.splitlines()[-1].split()
+        if len(parts) >= 4 and parts[3].isdigit():
+            free = int(parts[3])
+            details.append('%s свободно: %d МБ' % (label, free))
+            if label == 'overlay' and free < 8:
+                state = 'fail'
+                details.append('overlay почти заполнен')
+            elif label == 'overlay' and free < 25 and state == 'ok':
+                state = 'warn'
+    if load1 > 4:
+        state = 'fail' if load1 > 8 else ('warn' if state == 'ok' else state)
+        details.append('высокая загрузка: %.1f' % load1)
+    summary = 'ресурсы в норме' if state == 'ok' else 'ресурсы требуют внимания'
+    return state, summary, details
+
+
+SERVICES = (
+    ('dnsmasq', 'dnsmasq', True),
+    ('mihomo', 'mihomo', True),
+    ('MagiTrickle', 'magitrickled', True),
+    ('hev-socks5-tunnel', 'hev-socks5-tunnel', True),
+    ('rpcd', 'rpcd', True),
+)
+
+
+def check_router_services():
+    details = []
+    state = 'ok'
+    for label, pid, critical in SERVICES:
+        rc, _ = run(['pidof', pid])
+        if rc == 0:
+            details.append('%s: работает' % label)
+        else:
+            details.append('%s: НЕ работает' % label)
+            state = 'fail' if critical else ('warn' if state == 'ok' else state)
+    rc, _ = run(['pgrep', '-f', 'geomask-syncd.sh'])
+    details.append('geomask-syncd: %s' % ('работает' if rc == 0 else 'не запущен'))
+    if rc != 0 and state == 'ok':
+        state = 'warn'
+    summary = 'все службы работают' if state == 'ok' else 'есть остановленные службы'
+    return state, summary, details
+
+

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "target": "spool",
+  "parts": [
+    {
+      "path": "001-spool.py.part"
+    },
+    {
+      "path": "002-spool.py.part"
+    },
+    {
+      "path": "003-spool.py.part"
+    }
+  ]
+}

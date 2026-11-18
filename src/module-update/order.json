@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "target": "module-update",
+  "parts": [
+    {
+      "path": "001-module-update.py.part"
+    },
+    {
+      "path": "002-module-update.py.part"
+    },
+    {
+      "path": "003-module-update.py.part"
+    }
+  ]
+}

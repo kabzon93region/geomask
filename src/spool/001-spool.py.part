@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Registered diagnostic downloads: private spool, retention, quota and share copies.
+
+Linux uses pinned, no-follow directory descriptors. Windows tests exercise content,
+identity, quota, retention and share-copy algorithms - not Linux kernel, 0700, flock(2),
+fsync, fs-error or ksmbd guarantees. No fallback exporter may reopen a verified archive
+by pathname.
+"""
+import base64
+import errno
+import hashlib
+import json
+import math
+import os
+import re
+import secrets
+import stat
+import sys
+import threading
+import time
+
+try:
+    import fcntl
+except ImportError:  # Windows test hosts have no flock(2); see Locked.
+    fcntl = None
+
+EUID = os.geteuid() if hasattr(os, 'geteuid') else 0
+PREFIX = 'geomask-console-diag-'
+SUFFIX = '.tar.gz'
+SIDECAR_LIMIT = 65536
+# Fixed creation/registration bound, independent of configurable get --max transport cap.
+# Larger archives are refused and removed by the collector before any SMB copy.
+CREATION_MAXIMUM = 2097152
+MAXIMUM = CREATION_MAXIMUM  # Default transport limit; get --max may be lower or higher.
+SCHEMA = 1
+POSIX = os.name == 'posix'
+
+# Retention/quota defaults (R08). The shell clamps its environment into these ranges and
+# passes the result on the command line; the helper only rejects impossible values, so the
+# algorithm stays testable with tiny fixtures.
+QUOTA = 8 * 1024 * 1024
+FILES = 4
+SHARE_QUOTA = 6 * 1024 * 1024
+SHARE_FILES = 3
+KEEP_HOURS = 24
+KEEP_MAXIMUM = 720
+QUOTA_MINIMUM = 2 * 1024 * 1024
+QUOTA_MAXIMUM = 64 * 1024 * 1024
+FILES_MAXIMUM = 32
+SHARE_FILES_MAXIMUM = 16
+# Age windows in seconds.
+GRACE = 120            # a just-created bundle is not a candidate for eviction
+ORPHAN_AGE = 300       # sidecar whose archive is gone
+TEMPORARY_AGE = 3600   # .sidecar-<hex> / .part-<hex> left by a killed writer
+STAGE_AGE = 7200       # geomask-console-diag.XXXXXX staging directory
+STAGE_PATTERN = re.compile(r'^geomask-console-diag\.[A-Za-z0-9]{6}$')
+TEMPORARY_PREFIXES = ('.sidecar-', '.part-')
+PROTECTED_PREFIXES = ('router-backup-',)
+COPY_CHUNK = 262144
+_LOCK = threading.RLock()
+
+
+class Refused(Exception):
+    """Fail closed with a JSON error."""
+
+
+class NotPrivate(Refused):
+    """Refusal that is a permission policy decision, not a missing target."""
+
+
+class ShareRefused(Exception):
+    """A share copy that did not happen; the caller only needs the machine reason."""
+
+    def __init__(self, reason):
+        Exception.__init__(self, reason)
+        self.reason = reason
+
+
+def refuse(message):
+    raise Refused(message)
+
+
+def identity(st):
+    return st.st_dev, st.st_ino
+
+
+def signature(st):
+    return (st.st_dev, st.st_ino, st.st_size, st.st_uid, st.st_nlink,
+            st.st_mtime_ns, st.st_ctime_ns)
+
+
+def valid_name(name):
+    return (isinstance(name, str) and name.startswith(PREFIX) and name.endswith(SUFFIX)
+            and len(name) > len(PREFIX) + len(SUFFIX) and '..' not in name
+            and all(c in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-'
+                    for c in name))
+
+
+def protected_name(name):
+    """Names retention must never touch, even if a future pattern would match them."""
+    return isinstance(name, str) and name.startswith(PROTECTED_PREFIXES)
+
+
+def private(st):
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != EUID:
+        refuse('spool is not private: not our directory')
+    if POSIX and stat.S_IMODE(st.st_mode) & 0o077:
+        refuse('spool is not private: group/other permissions')
+
+
+def shared(st):
+    """The backup folder may be 0755: it is published by ksmbd. Group/other write is not."""
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != EUID:
+        refuse('share is not our directory')
+    if POSIX and stat.S_IMODE(st.st_mode) & 0o022:
+        raise NotPrivate('share is group/other writable')
+
+
+def staging(st):
+    """TMPDIR is 1777 on OpenWrt: only the strict name pattern makes a child ours."""
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != EUID:
+        refuse('staging directory is not ours')
+
+
+def walk_directory(path):
+    """Never follow any ancestor symlink. Return a pinned Linux directory fd."""
+    path = os.path.abspath(path)
+    if POSIX:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open('/', flags)
+        try:
+            for part in path.split('/')[1:]:
+                if not part:
+                    continue
+                other = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = other
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+    # Windows has no openat/O_NOFOLLOW; this is not a POSIX privacy proof.
+    current = os.path.splitdrive(path)[0] + os.sep
+    for part in path[len(current):].split(os.sep):
+        if not part:
+            continue
+        current = os.path.join(current, part)
+        st = os.lstat(current)
+        if stat.S_ISLNK(st.st_mode) or getattr(st, 'st_reparse_tag', 0):
+            refuse('spool ancestor is a symlink/reparse point')
+        if not stat.S_ISDIR(st.st_mode):
+            refuse('spool ancestor is not a directory')
+    return None
+
+
+class Spool:
+    """A pinned directory: the 0700 spool, the published share or a staging folder."""
+
+    POLICIES = {'private': private, 'share': shared, 'staging': staging}
+
+    def __init__(self, path, kind='private'):
+        if kind not in self.POLICIES:
+            refuse('unknown directory kind')
+        self.kind = kind
+        self.path = os.path.abspath(path)
+        self.fd = walk_directory(self.path)
+        try:
+            self.st = os.fstat(self.fd) if POSIX else os.lstat(self.path)
+            self.POLICIES[kind](self.st)
+        except BaseException:
+            if self.fd is not None:
+                os.close(self.fd)
+            raise
+
+    def __enter__(self):
+        return self
+
+    def check(self):
+        fd = walk_directory(self.path)
+        try:
+            st = os.fstat(fd) if POSIX else os.lstat(self.path)
+            self.POLICIES[self.kind](st)
+            if identity(st) != identity(self.st):
+                refuse('spool identity changed')
+            if POSIX:
+                self.POLICIES[self.kind](os.fstat(self.fd))
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def __exit__(self, *unused):
+        if self.fd is not None:
+            os.close(self.fd)
+
+    def open(self, name, flags=os.O_RDONLY, mode=0o600):
+        self.check()
+        flags |= getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NONBLOCK', 0)
+        if POSIX:
+            return os.open(name, flags | os.O_NOFOLLOW, mode, dir_fd=self.fd)
+        path = os.path.join(self.path, name)
+        before = None
+        if not flags & os.O_CREAT:
+            before = os.lstat(path)
+            if stat.S_ISLNK(before.st_mode) or getattr(before, 'st_reparse_tag', 0):
+                refuse('file is a symlink/reparse point')
+        fd = os.open(path, flags, mode)
+        try:
+            if before and identity(before) != identity(os.fstat(fd)):
+                refuse('file identity changed at open')
+            self.check()
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def names(self):
+        self.check()
+        return os.listdir(self.fd if POSIX else self.path)
+
+    def lstat(self, name):
+        try:
+            if POSIX:
+                return os.lstat(name, dir_fd=self.fd)
+            return os.lstat(os.path.join(self.path, name))
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+
+    def replace(self, source, target):
+        self.check()
+        if POSIX:
+            os.replace(source, target, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        else:
+            os.replace(os.path.join(self.path, source), os.path.join(self.path, target))
+
+    def unlink(self, name):
+        if POSIX:
+            os.unlink(name, dir_fd=self.fd)
+        else:
+            os.unlink(os.path.join(self.path, name))
+
+
+class Locked:
+    """Serialise inventory -> evict -> register on the pinned directory descriptor.
+
+    POSIX takes flock(2) on the directory descriptor, so two backend processes cannot both
+    see room for their bundle. Windows test hosts have no fcntl: the module mutex keeps the
+    same algorithm linear there, which is the only guarantee claimed off Linux.
+    """
+
+    def __init__(self, spool):
+        self.spool = spool
+        self.flocked = False
+
+    def __enter__(self):
+        _LOCK.acquire()
+        try:
+            if fcntl is not None and POSIX and self.spool.fd is not None:
+                fcntl.flock(self.spool.fd, fcntl.LOCK_EX)
+                self.flocked = True
+        except BaseException:
+            _LOCK.release()
+            raise
+        return self
+
+    def __exit__(self, *unused):
+        try:
+            if self.flocked:
+                fcntl.flock(self.spool.fd, fcntl.LOCK_UN)
+        finally:
+            _LOCK.release()
+
+
+def check_file(st, what):
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != EUID or st.st_nlink != 1:
+        refuse('%s must be our regular single-link file' % what)
+    if st.st_size <= 0:
+        refuse('%s is empty' % what)
+
+
+def read_all(fd, maximum, digest=True):
+    """Read at most maximum+1 bytes even if a same-inode writer grows the file."""
+    chunks = []
+    total = 0
+    hasher = hashlib.sha256() if digest else None
+    while True:
+        chunk = os.read(fd, min(262144, maximum - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > maximum:
+            refuse('file exceeds bounded read limit')
+        if hasher is not None:
+            hasher.update(chunk)
+        chunks.append(chunk)
+    return (hasher.hexdigest() if hasher is not None else None), total, b''.join(chunks)
+
+
+def read_sidecar(spool, name, digest=True):
+    try:
+        fd = spool.open(name + '.json')
+    except FileNotFoundError:
+        refuse('архива нет: not a registered bundle')
+    try:
+        before = os.fstat(fd)
+        check_file(before, 'sidecar')
+        if before.st_size > SIDECAR_LIMIT:
+            refuse('sidecar is oversized')
+        _, total, payload = read_all(fd, before.st_size, digest)
+        if total != before.st_size or signature(before) != signature(os.fstat(fd)):
+            refuse('sidecar changed while read')
+    finally:
+        os.close(fd)
+    try:
+        record = json.loads(payload)
+    except (ValueError, UnicodeDecodeError):
+        refuse('malformed sidecar')
+    if (not isinstance(record, dict) or type(record.get('schema')) is not int
+            or record['schema'] != SCHEMA or record.get('name') != name):
+        refuse('invalid sidecar schema/name')
+    for key in ('dev', 'ino', 'bytes', 'uid', 'created', 'created_ns'):
+        if type(record.get(key)) is not int or not 0 <= record[key] < 2 ** 64:
+            refuse('invalid sidecar ' + key)
+    digest = record.get('sha256')
+    if (record['bytes'] <= 0 or not isinstance(digest, str) or len(digest) != 64
+            or any(c not in '0123456789abcdef' for c in digest)):
+        refuse('invalid sidecar size/hash')
+    return record
+
+
+def sidecar_payload(record):
+    """The exact bytes write_sidecar stores; the quota uses the same function."""
+    return (json.dumps(record, separators=(',', ':')) + '\n').encode('utf-8')
+
+
+def write_sidecar(spool, name, record):
+    temporary = '.sidecar-' + secrets.token_hex(16)
+    fd = spool.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    try:
+        if POSIX:
+            os.fchmod(fd, 0o600)
+        payload = sidecar_payload(record)
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0:
+                refuse('short sidecar write')
+            payload = payload[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        spool.replace(temporary, name + '.json')
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            spool.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+# --------------------------------------------------------------- retention inventory
+def scan(directory):
+    """lstat-only inventory. Never hashes, never opens a bundle, never follows a link.
+
+    Returns (archives, sidecars, orphans, temps, stages):
+      archives  name -> lstat of a regular file with a valid bundle name;
+      sidecars  bundle name -> lstat of its .json (any type: read_sidecar still decides);
+      orphans   [(sidecar name, lstat)] whose archive is not a regular file here;
+      temps     [(name, lstat)] .sidecar-* / .part-* leftovers;
+      stages    [(name, lstat)] geomask-console-diag.XXXXXX directories owned by this euid.
+    Foreign names (router-backup-*.tar.gz, notes.txt, ...) stay out of every list. A
+    staging directory with our name mask but another uid is not ours: TMPDIR is 1777, so
+    any local user can create such a directory and a root sweep must not delete it.
+    """
+    entries = {}
+    for name in directory.names():
+        st = directory.lstat(name)
+        if st is not None:
+            entries[name] = st
+    archives, sidecars, stages, temps = {}, {}, [], []
+    for name in sorted(entries):
+        st = entries[name]
+        if valid_name(name) and stat.S_ISREG(st.st_mode):
+            archives[name] = st
+        elif name.endswith('.json') and valid_name(name[:-5]):
+            sidecars[name[:-5]] = st
+        elif (STAGE_PATTERN.match(name) and stat.S_ISDIR(st.st_mode)
+              and st.st_uid == EUID):
+            stages.append((name, st))
+        elif name.startswith(TEMPORARY_PREFIXES) and not stat.S_ISDIR(st.st_mode):
+            temps.append((name, st))
+    orphans = [(name + '.json', st) for name, st in sidecars.items() if name not in archives]
+    return archives, sidecars, orphans, temps, stages
+
+

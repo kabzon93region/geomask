@@ -1,0 +1,269 @@
+def create_path_ai_manifest() -> ModuleManifest:
+    """AI path module with admission control."""
+    return ModuleManifest(
+        id="path_ai",
+        name="AI Path",
+        version="1.0.0",
+        type=ModuleType.PATH,
+        description="AI path with US-only admission control",
+        dependencies=[
+            ModuleDependency("core", True, "1.0.0"),
+            ModuleDependency("subscription:sub", True, "1.0.0", "AI borrows main subscription"),
+            ModuleDependency("admission_service", True, "1.0.0", "Admission proof required"),
+        ],
+        provides=["path:ai", "filter:ai_filter"],
+        owned_resources=[
+            ModuleOwnedResource("config", "/etc/geomask/policies.yaml#path:ai"),
+            ModuleOwnedResource("filter", "/etc/mihomo/ruleset/ai.yaml"),
+        ],
+        config_files=["/etc/geomask/policies.yaml"],
+        services=["mihomo"],
+        state=ModuleState.ENABLED,
+        enabled=True,
+    )
+
+
+def create_diagnostic_manifest() -> ModuleManifest:
+    """Diagnostic UI and services."""
+    return ModuleManifest(
+        id="diagnostic",
+        name="Diagnostic Services",
+        version="1.0.0",
+        type=ModuleType.DIAGNOSTIC,
+        description="Morning check, DNS check, VPN watch, admission proof service",
+        dependencies=[
+            ModuleDependency("core", True, "1.0.0"),
+        ],
+        provides=["rpc:diag_explain", "rpc:admission_cache_get", "rpc:policy_preview"],
+        owned_resources=[
+            ModuleOwnedResource("file", "/usr/lib/geomask/diag_status.py"),
+            ModuleOwnedResource("file", "/usr/lib/geomask/admission_service.py"),
+            ModuleOwnedResource("file", "/usr/lib/geomask/policy_preview.py"),
+            ModuleOwnedResource("cron", "morning-check"),
+            ModuleOwnedResource("cron", "dnscheck"),
+            ModuleOwnedResource("cron", "vpnwatch"),
+        ],
+        config_files=["/etc/geomask/policies.yaml"],
+        services=["ai-doh", "dnsmasq-ai"],
+        cron_jobs=["morning-check", "dnscheck", "vpnwatch"],
+        rpc_methods=["diag_explain", "admission_cache_get", "policy_preview", "policy_get", "policy_apply"],
+        state=ModuleState.ENABLED,
+        enabled=True,
+    )
+
+
+def create_youtube_manifest() -> ModuleManifest:
+    """YouTube edge watchdog module."""
+    return ModuleManifest(
+        id="youtube",
+        name="YouTube Edge Watchdog",
+        version="1.0.0",
+        type=ModuleType.FEATURE,
+        description="YouTube stalled-edge detection and pinning",
+        dependencies=[
+            ModuleDependency("core", True, "1.0.0"),
+            ModuleDependency("path_vpn", False, "1.0.0", "Optional: pins go to VPN"),
+        ],
+        provides=["ytwatch", "pinned_edges"],
+        owned_resources=[
+            ModuleOwnedResource("file", "/usr/bin/geomask-ytwatch.sh"),
+            ModuleOwnedResource("file", "/usr/lib/geomask/geomask-ytwatch.conf"),
+            ModuleOwnedResource("cron", "ytwatch"),
+            ModuleOwnedResource("filter", "/etc/mihomo/ruleset/ytvpn.yaml"),
+        ],
+        config_files=["/etc/geomask-ytwatch.conf"],
+        cron_jobs=["ytwatch"],
+        state=ModuleState.ENABLED,
+        enabled=True,
+    )
+
+
+def create_torrent_manifest() -> ModuleManifest:
+    """Torrent admin module."""
+    return ModuleManifest(
+        id="torrent",
+        name="Torrent Admin",
+        version="1.0.0",
+        type=ModuleType.FEATURE,
+        description="Torrent tracker ruleset and DIRECT listener",
+        dependencies=[
+            ModuleDependency("core", True, "1.0.0"),
+            ModuleDependency("path_vpn", False, "1.0.0", "Optional: torrent over VPN"),
+        ],
+        provides=["torrent_rules", "torrent_listener"],
+        owned_resources=[
+            ModuleOwnedResource("file", "/usr/bin/geomask-torrent.sh"),
+            ModuleOwnedResource("filter", "/etc/mihomo/ruleset/torrentdirect.yaml"),
+            ModuleOwnedResource("filter", "/etc/mihomo/ruleset/torrentsites.yaml"),
+        ],
+        config_files=["/etc/geomask/torrent.conf"],
+        cron_jobs=["torrent_refresh"],
+        state=ModuleState.ENABLED,
+        enabled=True,
+    )
+
+
+def create_device_modes_manifest() -> ModuleManifest:
+    """Device modes module."""
+    return ModuleManifest(
+        id="device_modes",
+        name="Device Modes",
+        version="1.0.0",
+        type=ModuleType.FEATURE,
+        description="Per-device routing modes (AI, VPN, VPN-noP2P, Bypass, Direct)",
+        dependencies=[
+            ModuleDependency("core", True, "1.0.0"),
+        ],
+        provides=["device_routing", "mode_switch"],
+        owned_resources=[
+            ModuleOwnedResource("file", "/etc/geo-devices.list"),
+            ModuleOwnedResource("cron", "device_sync"),
+            ModuleOwnedResource("nft", "geomask_excl"),
+            ModuleOwnedResource("ip_rule", "table 100/101"),
+        ],
+        config_files=["/etc/geo-devices.list"],
+        services=["dnsmasq"],
+        cron_jobs=["device_sync"],
+        rpc_methods=["dev_add", "dev_del", "device_get"],
+        state=ModuleState.ENABLED,
+        enabled=True,
+    )
+
+
+def create_ai_dns_manifest() -> ModuleManifest:
+    """AI DNS module."""
+    return ModuleManifest(
+        id="ai_dns",
+        name="AI DNS-over-HTTPS",
+        version="1.0.0",
+        type=ModuleType.FEATURE,
+        description="AI-mode DNS via DoH through AI tunnel",
+        dependencies=[
+            ModuleDependency("core", True, "1.0.0"),
+            ModuleDependency("path_ai", True, "1.0.0", "Requires AI path for SOCKS5h"),
+        ],
+        provides=["ai_doh", "dnsmasq_ai"],
+        owned_resources=[
+            ModuleOwnedResource("service", "ai-doh"),
+            ModuleOwnedResource("service", "dnsmasq-ai"),
+            ModuleOwnedResource("file", "/etc/init.d/ai-doh"),
+            ModuleOwnedResource("file", "/etc/init.d/dnsmasq-ai"),
+            ModuleOwnedResource("nft", "geomask_ai_dns"),
+        ],
+        config_files=["/etc/init.d/ai-doh", "/etc/init.d/dnsmasq-ai"],
+        services=["ai-doh", "dnsmasq-ai"],
+        state=ModuleState.ENABLED,
+        enabled=True,
+    )
+
+
+def create_backup_share_manifest() -> ModuleManifest:
+    """Backup share module."""
+    return ModuleManifest(
+        id="backup_share",
+        name="Backup SMB Share",
+        version="1.0.0",
+        type=ModuleType.SERVICE,
+        description="SMB share for geomask backups (read-only)",
+        dependencies=[
+            ModuleDependency("core", True, "1.0.0"),
+        ],
+        provides=["smb_share:geomask-backups"],
+        owned_resources=[
+            ModuleOwnedResource("service", "ksmbd"),
+            ModuleOwnedResource("file", "/etc/ksmbd/ksmbd.conf"),
+        ],
+        config_files=["/etc/ksmbd/ksmbd.conf"],
+        services=["ksmbd"],
+        state=ModuleState.ENABLED,
+        enabled=True,
+    )
+
+
+def create_self_update_manifest() -> ModuleManifest:
+    """Self-update module."""
+    return ModuleManifest(
+        id="self_update",
+        name="Self Update",
+        version="1.0.0",
+        type=ModuleType.SERVICE,
+        description="Automatic update from GitHub releases",
+        dependencies=[
+            ModuleDependency("core", True, "1.0.0"),
+        ],
+        provides=["updater"],
+        owned_resources=[
+            ModuleOwnedResource("file", "/tmp/geomask-upd/"),
+            ModuleOwnedResource("cron", "upd_check"),
+        ],
+        config_files=[],
+        cron_jobs=["upd_check"],
+        rpc_methods=["upd_check", "upd_status", "upd_apply"],
+        state=ModuleState.ENABLED,
+        enabled=True,
+    )
+
+
+def create_admission_service_manifest() -> ModuleManifest:
+    """Admission proof service."""
+    return ModuleManifest(
+        id="admission_service",
+        name="AI Admission Service",
+        version="1.0.0",
+        type=ModuleType.SERVICE,
+        description="AI node admission proof via multi-service verification",
+        dependencies=[
+            ModuleDependency("core", True, "1.0.0"),
+        ],
+        provides=["admission_proof", "admission_cache"],
+        owned_resources=[
+            ModuleOwnedResource("file", "/usr/lib/geomask/admission_service.py"),
+            ModuleOwnedResource("cache", "/tmp/geomask-admission-cache.json"),
+        ],
+        config_files=[],
+        services=[],
+        rpc_methods=["admission_cache_get"],
+        state=ModuleState.ENABLED,
+        enabled=True,
+    )
+
+
+def create_all_manifests() -> Dict[str, ModuleManifest]:
+    """Create all standard module manifests."""
+    return {
+        "core": create_core_manifest(),
+        "path_vpn": create_path_vpn_manifest(),
+        "path_vpn_nop2p": create_path_vpn_nop2p_manifest(),
+        "path_ai": create_path_ai_manifest(),
+        "diagnostic": create_diagnostic_manifest(),
+        "youtube": create_youtube_manifest(),
+        "torrent": create_torrent_manifest(),
+        "device_modes": create_device_modes_manifest(),
+        "ai_dns": create_ai_dns_manifest(),
+        "backup_share": create_backup_share_manifest(),
+        "self_update": create_self_update_manifest(),
+        "admission_service": create_admission_service_manifest(),
+    }
+
+
+def save_all_manifests(registry_path: Path = Path('Y:/openwrt/geomask/modules')):
+    """Save all standard manifests to registry."""
+    manifests = create_all_manifests()
+    registry_path = Path(registry_path)
+    registry_path.mkdir(parents=True, exist_ok=True)
+    
+    for module_id, module in create_all_manifests().items():
+        path = registry_path / f'{module_id}.json'
+        module.save(path)
+        print(f"Saved {module_id} to {path}")
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == '--save':
+        save_all_manifests()
+        print("All manifests saved to /etc/geomask/modules/")
+    else:
+        manifests = create_all_manifests()
+        for mid, m in manifests.items():
+            print(f"{mid}: {m.name} v{m.version} [{m.type.value}] state={m.state.value} deps={[d.module_id for d in m.dependencies]}")

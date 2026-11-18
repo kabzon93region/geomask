@@ -42,7 +42,7 @@
   "test_migration.py": 4,
   "test_mihomo_config_writer.py": 6,
   "test_module_index.py": 7,
-  "test_module_update.py": 64,
+  "test_module_update.py": 67,
   "test_network_safety.py": 27,
   "test_node_audit.py": 30,
   "test_node_audit_lifecycle.py": 9,

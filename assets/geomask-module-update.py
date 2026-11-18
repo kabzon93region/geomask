@@ -135,6 +135,13 @@ def capability_ready(dependency):
     return name == 'de5' and 'sub' in providers
 BACKUP_ROOT = '/tmp/geomask-module-backup'
 LOCK_PATH = '/tmp/geomask-module-update.lock'
+# P03 (audit 18.11.2026): the updater had its own serialisation but nothing stopped it from
+# replacing files while the installer/reinstall held `maintenance` - a mixed tree. The kernel
+# lock is the same file the shell helper uses, so both sides see one lock (rank: maintenance is
+# outermost, so it is taken first and released last).
+LOCK_DIR = os.environ.get('GM_LOCK_DIR') or '/tmp/geomask-locks'
+MAINTENANCE_LOCK = (os.environ.get('GM_MAINTENANCE_LOCK')
+                    or os.path.join(LOCK_DIR, 'maintenance.lock'))
 RAW = 'https://raw.githubusercontent.com/{repo}/{ref}/{path}'
 INDEX_PATH = 'modules/index.json'
 TTL = 3600
@@ -650,6 +657,64 @@ def install_lock(path=None):
             handle.close()
 
 
+@contextlib.contextmanager
+def maintenance_lock(path=None):
+    """Refuse to write while the installer owns the lane; never queue behind it.
+
+    A blocking wait would let an update start against a tree the installer is rebuilding, and
+    a reinstall can take minutes. The try-lock is the honest contract: the caller gets
+    `ok:false` with the reason and the owner retries.
+    """
+    path = path or MAINTENANCE_LOCK
+    if fcntl is None:
+        yield
+        return
+    if _LOCK_DEPTH.get(path):
+        _LOCK_DEPTH[path] += 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH[path] -= 1
+        return
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        handle = open(path, 'a+')
+    except OSError as exc:
+        raise UpdateError('could not open the maintenance lock %s (%s)'
+                          % (path, type(exc).__name__)) from None
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise UpdateError('the installer owns the maintenance lock - refusing to change files '
+                          '(retry when the install/reinstall has finished)') from None
+    _LOCK_DEPTH[path] = 1
+    try:
+        yield
+    finally:
+        _LOCK_DEPTH.pop(path, None)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            handle.close()
+
+
+def activation_required(staged):
+    """What has to restart before the new bytes are live (P03 activation contract)."""
+    for item in staged or []:
+        path = item.get('path') if isinstance(item, dict) else ''
+        if not isinstance(path, str):
+            continue
+        if path.startswith('/etc/init.d/') or path.endswith('.init'):
+            return 'restart-required'
+    return 'none'
+
+
 def preflight_staged(staged, force=False):
     """Refuse a commit whose world changed after staging, before the first write.
 
@@ -870,6 +935,7 @@ def run_command(args):
         print(json.dumps({'ok': True, 'module': args.module, 'changed': True,
                           'version': module.get('version'), 'files': len(staged),
                           'backup': backup, 'source': source,
+                          'activation': activation_required(staged),
                           'skipped': skipped}, ensure_ascii=False))
         return 0
     return 2
@@ -894,8 +960,9 @@ def main(argv=None):
         # take the lock BEFORE their first read; read-only ones never take it, so the panel's
         # poll cannot queue behind a long download.
         if args.command in ('seed', 'update'):
-            with install_lock():
-                return run_command(args)
+            with maintenance_lock():
+                with install_lock():
+                    return run_command(args)
         return run_command(args)
     except UpdateError as exc:
         print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))

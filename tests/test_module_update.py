@@ -48,6 +48,7 @@ def keep_writes_in(test, root):
     sandbox test declares its own temporary root as both.
     """
     for name, value in (('LOCK_PATH', str(root / 'install.lock')),
+                        ('MAINTENANCE_LOCK', str(root / 'maintenance.lock')),
                         ('BACKUP_ROOT', str(root / 'backups')),
                         ('CACHE_ROOT', str(root)),
                         ('CACHE', str(root / 'index-cache.json')),
@@ -444,12 +445,13 @@ class ModuleUpdateTests(unittest.TestCase):
         events = []
 
         class FakeFcntl:
-            LOCK_EX = 'lock'
-            LOCK_UN = 'unlock'
+            LOCK_EX = 1
+            LOCK_UN = 2
+            LOCK_NB = 4
 
             @staticmethod
             def flock(_fd, operation):
-                events.append(operation)
+                events.append('unlock' if operation & 2 else 'lock')
 
         real_write_json = updater.write_json
 
@@ -613,12 +615,13 @@ class UpdateLockScopeTests(unittest.TestCase):
 
     def fake_fcntl(self, events):
         class FakeFcntl:
-            LOCK_EX = 'lock'
-            LOCK_UN = 'unlock'
+            LOCK_EX = 1
+            LOCK_UN = 2
+            LOCK_NB = 4
 
             @staticmethod
             def flock(_fd, operation):
-                events.append(operation)
+                events.append('unlock' if operation & 2 else 'lock')
         return FakeFcntl
 
     def common_argv(self, command):
@@ -657,6 +660,44 @@ class UpdateLockScopeTests(unittest.TestCase):
         self.assertIn('state-read', events)
         self.assertLess(events.index('lock'), events.index('state-read'))
         self.assertEqual(events[-1], 'unlock')
+
+    def test_the_writer_takes_the_maintenance_lane_first(self):
+        """P03: an update must not replace files under an installer that owns `maintenance`."""
+        events = []
+        rc, _out = self.run_main(['seed', '--index-file', str(self.index_path)] +
+                                 self.common_argv('seed')[1:], events,
+                                 readers={'load_state': self.recording_read_state(events),
+                                          'load_selection': lambda path=None: None})
+        self.assertEqual(rc, 0)
+        locks = [index for index, event in enumerate(events) if event == 'lock']
+        self.assertGreaterEqual(len(locks), 2,
+                                'the updater did not take the maintenance lane: %r' % (events,))
+        self.assertLess(locks[0], events.index('state-read'))
+
+    @unittest.skipIf(updater.fcntl is None, 'posix-only')
+    def test_the_maintenance_lock_refuses_instead_of_queueing(self):
+        path = self.root / 'lane.lock'
+        holder = open(path, 'a+')
+        updater.fcntl.flock(holder.fileno(), updater.fcntl.LOCK_EX)
+        try:
+            with self.assertRaises(updater.UpdateError) as caught:
+                with updater.maintenance_lock(path=str(path)):
+                    pass
+            self.assertIn('maintenance lock', str(caught.exception))
+        finally:
+            updater.fcntl.flock(holder.fileno(), updater.fcntl.LOCK_UN)
+            holder.close()
+        with updater.maintenance_lock(path=str(path)):
+            pass
+
+    def test_the_activation_contract_names_a_restart(self):
+        self.assertEqual(updater.activation_required([]), 'none')
+        self.assertEqual(updater.activation_required([{'path': '/usr/lib/geomask/x.py'}]),
+                         'none')
+        self.assertEqual(updater.activation_required(
+            [{'path': '/usr/lib/geomask/x.py'}, {'path': '/etc/init.d/geomask-syncd'}]),
+            'restart-required',
+            'a module that ships an init script must not be reported as live')
 
     def test_a_read_only_command_never_waits_for_the_lock(self):
         # `status` is the panel's poll: if it queued behind an update, the panel would freeze

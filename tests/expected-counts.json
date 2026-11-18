@@ -64,6 +64,7 @@
   "test_reinstall_preflight.py": 23,
   "test_release_tooling.py": 5,
   "test_reload_state.py": 10,
+  "test_repo_check.py": 6,
   "test_report_method_retention.py": 7,
   "test_resource_bounds.py": 5,
   "test_route_queue.py": 25,

@@ -38,6 +38,23 @@
 - Осталось: slot→TX на живом mihomo (стенд), `_rs_restore_cron`-подобный CAS для
   restart-preimage (I04, вторая половина).
 
+## Партия 12 — этап 0д: advisory repo-check
+
+- `tools/repo_check.py`: находит authored-файлы больше 500 строк и отдельно называет
+  generated-артефакты (сам установщик `geomask.sh` и view'ы трёх перенесённых целей), которые
+  за размер не считаются. Части (`src/**`) учитываются по частям, а не как исходный монолит.
+- По плану на этапе 0 проверка **advisory**: обычный запуск печатает отчёт и выходит 0,
+  `--strict` — 1 (для будущего включения в CI после переноса остальных кандидатов).
+  Сейчас отчёт: 15 authored-файлов >500 строк (doctor, spool, config-tx, node-audit, routes,
+  dnsguard, apply, redact, module-update, module_manifest, audit-state, node-scan, safe_write,
+  geo-rpc.json, — плюс части installer/backend/panel не считаются) и 3 generated view.
+- Доказательства: новый `tests/test_repo_check.py` 6 (generated отделён от authored, установщик
+  не считается oversized, части не считаются монолитом, advisory=0 / strict=1, чистое дерево
+  зелёное, битый манифест — отказ без падения).
+- Осталось по этапу 0: 0г — перенос остальных кандидатов «по ответственности» (в плане он
+  привязан к их repair-задачам, а задачи 1–7 уже закрыты, поэтому это отдельное решение
+  владельца: рефакторинг без repair-повода) и gate этапа 0 на изолированной машине.
+
 ## Партия 11 — этап 0в-хвост: RPC-writer на generated part
 
 - `dispatch` (backend) и `decl` (panel) вынесены в собственные generated-части

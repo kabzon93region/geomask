@@ -1,0 +1,428 @@
+_dns_status_json() {
+  _GM_UNKNOWN=''
+  _ds_state=ok
+  _ds_desired=off
+  _ds_runtime=unknown
+  _ds_first=''
+  _ds_reserve=false
+  _ds_so=false
+  _ds_record=absent
+  if [ -f "$DNSGUARD_STATE" ]; then
+    _ds_record=present
+    if [ -r "$DNSGUARD_STATE" ]; then
+      _ds_saved=$(sed -n 's/^saved=//p' "$DNSGUARD_STATE" 2>/dev/null | head -1)
+      case "$_ds_saved" in
+        1) _ds_desired=strict ;;
+        0|'') ;;
+        *) _ds_desired=unknown; _ds_state=unknown; _gm_unknown state-record ;;
+      esac
+    else
+      _ds_desired=unknown
+      _ds_state=unknown
+      _gm_unknown state
+    fi
+  fi
+  if [ -r "$DNSGUARD_DHCP" ]; then
+    _ds_all=$(_dns_section_values "$DNSGUARD_DHCP" server)
+    _ds_first=$(printf '%s\n' "$_ds_all" | head -1)
+    _ds_so_value=$(_dns_section_values "$DNSGUARD_DHCP" strictorder | head -1)
+    [ "$_ds_so_value" = 1 ] && _ds_so=true
+    _ds_res=1
+    printf '%s\n' "$_ds_all" | grep -Fxq '1.1.1.1' || _ds_res=0
+    printf '%s\n' "$_ds_all" | grep -Fxq '8.8.8.8' || _ds_res=0
+    [ "$_ds_res" = 1 ] && _ds_reserve=true
+    _ds_doh=0
+    case "$_ds_first" in
+      127.0.0.1#*)
+        _ds_port=${_ds_first#*#}
+        case "$_ds_port" in ''|*[!0-9]*) ;; *) _ds_doh=1 ;; esac
+        ;;
+    esac
+    if [ "$_ds_doh" = 1 ] && [ "$_ds_res" = 1 ] && [ "$_ds_so" = true ]; then
+      _ds_runtime=strict
+    else
+      _ds_runtime=off
+    fi
+  else
+    _ds_state=unknown
+    _gm_unknown dhcp-config
+  fi
+  if [ "$_ds_state" != unknown ]; then
+    case "$_ds_desired:$_ds_runtime" in
+      strict:strict|off:off) _ds_state=ok ;;
+      *) _ds_state=drift ;;
+    esac
+  fi
+  printf '{"scope":"strict DNS policy recorded by geomask-dnsguard (no probe)","desired":{"mode":"%s","record":"%s"},"runtime":{"mode":"%s","first":"%s","reserve":%s,"strictorder":%s},"unknown":[%s],"state":"%s"}' \
+    "$_ds_desired" "$_ds_record" "$_ds_runtime" "$(json_esc "$_ds_first")" \
+    "$_ds_reserve" "$_ds_so" "$_GM_UNKNOWN" "$_ds_state"
+}
+
+_status_attach_health() { # <base JSON> -> base + request-level ok + guard/dns objects
+  _sah_guard=$(_guard_status_json)
+  _sah_dns=$(_dns_status_json)
+  case "$1" in
+    *'}' ) printf '%s,"ok":true,"guard":%s,"dns":%s}\n' "${1%?}" "$_sah_guard" "$_sah_dns" ;;
+    * ) printf '%s\n' "$1" ;;
+  esac
+}
+
+cmd_status() {
+  _migrate
+  VPN_NODE=$(_grp_node VPN)          # slot VPN: P2P-tolerant tunnel (may be absent)
+  VPNNP_NODE=$(_grp_node VPN-noP2P)  # slot VPN-noP2P: the subscription whose provider forbids P2P
+  AI_NODE=$(_grp_node AI)
+  GLOBAL=$(controller_curl -s -m3 "$MIHOMO_API/proxies/GLOBAL" | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//; s/"$//')
+  if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then LCRON=1; else LCRON=0; fi
+  if [ -f /etc/sysctl.d/99-disable-ipv6.conf ]; then V6=0;
+    elif [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then V6=0; else V6=1; fi
+  DOH=$(uci -q get https-dns-proxy.@https-dns-proxy[0].resolver_url || echo '')
+  AI_RC=$(_count_rules "$AI_RULES")
+  MT_RC=$(_count_rules "$MT_RULES")
+  GOOGLE_CC=$(cat /tmp/geo-google 2>/dev/null || echo '')
+  SYNC_AT=$(cat /tmp/geo-sync-at 2>/dev/null || echo '')
+  DEV_LIST='['
+  FIRST=1
+  if [ -f "$DEVICES" ]; then
+    while read -r dip dmode dname; do
+      case "$dip" in ''|'#'*) continue ;; esac
+      [ "$FIRST" = 1 ] || DEV_LIST="$DEV_LIST,"
+      DEV_LIST="$DEV_LIST{\"ip\":\"$dip\",\"mode\":\"$dmode\",\"name\":\"$(json_esc "${dname:-}")\"}"
+      FIRST=0
+    done < "$DEVICES"
+  fi
+  DEV_LIST="$DEV_LIST]"
+  BYPASS=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"bypass"' | wc -l | tr -d ' ')
+  REALTZ=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"realtz"' | wc -l | tr -d ' ')
+  N_AI=$(printf '%s' "$DEV_LIST" | grep -o '"mode":"ai"' | wc -l | tr -d ' ')
+  # grep -c always prints its count; appending '|| echo 0' used to yield "0\n0" and
+  # produced invalid JSON whenever no rule matched.
+  RULES=$(ip rule show 2>/dev/null | grep -c 'lookup main')
+  RULES=${RULES:-0}
+  _sub2u=$(_url_of_provider "$(_prov_of_group VPN)")
+  _subu=$(_url_of_provider "$(_prov_of_group VPN-noP2P)")
+  _aiu=$(_url_of_provider "$(_prov_of_group AI)")
+  VPN_SUB_ID=$(_sub_id_by_url "$_sub2u" 2>/dev/null || echo '')
+  VPNNP_SUB_ID=$(_sub_id_by_url "$_subu" 2>/dev/null || echo '')
+  AI_SUB_ID=$(_sub_id_by_url "$_aiu" 2>/dev/null || echo '')
+  if ip link show "$AI_TUN_DEV" >/dev/null 2>&1; then AI_TUN=1; else AI_TUN=0; fi
+  if netstat -lntp 2>/dev/null | grep -q ':7891'; then AI_LST=1; else AI_LST=0; fi
+  # AI-DNS (no DNS leak for AI devices): 0=off/absent, 1=working, 2=partial
+  # "working" means the CLIENT DNS is redirected to the computed address, the marked sockets
+  # route into the AI tunnel and the listener exists. The old check hard-coded one owner's
+  # 192.168.0.53 and ignored the DNAT rule entirely (audit 14.11.2026, F08).
+  if [ -f "$AIDNS_OFF_FILE" ] || [ ! -f "$AIDNS_UID_FILE" ]; then AIDNS=0
+  else
+    _aip=$(_gm_aidns_ip)
+    _atbl=$(nft list table inet geomask_ai_dns 2>/dev/null)
+    _aiips=$(awk '$2=="ai" && $1 !~ /^#/ {print $1}' "$DEVICES" 2>/dev/null)
+    if [ -z "$_aip" ]; then AIDNS=2
+    elif ! ip route get 1.1.1.1 mark 0x64 2>/dev/null | grep -q 'dev AI'; then AIDNS=2
+    elif ! netstat -ltnpu 2>/dev/null | grep -q "$_aip:$AIDNS_DNS_PORT "; then AIDNS=2
+    elif [ -n "$_aiips" ] && ! printf '%s' "$_atbl" | grep -q "dnat ip to $_aip:$AIDNS_DNS_PORT"; then AIDNS=2
+    elif printf '%s' "$_atbl" | grep -q 'counter reject' && [ -n "$_aiips" ]; then AIDNS=2
+    else AIDNS=1; fi
+  fi
+  # The assignment badges used to be derived here from config text with a regex that
+  # expected `  - name:` and a quoted URL. Applying a pool re-serialises the config with
+  # PyYAML, so every path lost its badge at once. The resolver reads the same three files
+  # structurally and also links a managed pool back to its recorded subscription.
+  _STATUS_JSON=$(printf '{"vpn_node":"%s","vpn_cc":"%s","vpn_nop2p_node":"%s","vpn_nop2p_cc":"%s","ai_node":"%s","ai_cc":"%s","global":"%s","lcron":%s,"ipv6":%s,"doh":"%s","ai_rules":%s,"mt_rules":%s,"google":"%s","sync_at":"%s","devices":%s,"n_bypass":%s,"n_realtz":%s,"rules_ok":%s,"n_ai":%s,"ai_tun":%s,"ai_listener":%s,"vpn_sub":"%s","ai_sub":"%s","vpn_nop2p_sub":"%s","vpn_url":"%s","ai_url":"%s","vpn_nop2p_url":"%s","aidns":%s}' \
+    "$(json_esc "$VPN_NODE")" "$(_node_cc "$VPN_NODE")" \
+    "$(json_esc "$VPNNP_NODE")" "$(_node_cc "$VPNNP_NODE")" \
+    "$(json_esc "$AI_NODE")" "$(_node_cc "$AI_NODE")" \
+    "$(json_esc "$GLOBAL")" "$LCRON" "$V6" "$(json_esc "$DOH")" \
+    "$AI_RC" "$MT_RC" "$(json_esc "$GOOGLE_CC")" "$(json_esc "$SYNC_AT")" \
+    "$DEV_LIST" "$BYPASS" "$REALTZ" "$RULES" \
+    "$N_AI" "$AI_TUN" "$AI_LST" "$(json_esc "$VPN_SUB_ID")" "$(json_esc "$AI_SUB_ID")" "$(json_esc "$VPNNP_SUB_ID")" \
+    "$(json_esc "$(_mask_url "$_sub2u")")" "$(json_esc "$(_mask_url "$_aiu")")" "$(json_esc "$(_mask_url "$_subu")")" "$AIDNS")
+  if [ -f "$SUB_STATUS_PY" ]; then
+    _MERGED=$(printf '%s' "$_STATUS_JSON" | "$SUB_STATUS_PYTHON" -B "$SUB_STATUS_PY" status 2>/dev/null)
+    case "$_MERGED" in
+      '{'*'}') _STATUS_JSON=$_MERGED ;;
+    esac
+  fi
+  # `rules_ok` above stays as a legacy counter. Health is these separate objects: `ok` only
+  # says the request was executed, so a caller must read guard.state / dns.state.
+  _STATUS_JSON=$(_status_attach_health "$_STATUS_JSON")
+  printf '%s\n' "$_STATUS_JSON"
+}
+
+# country fragment from a node name (flag emoji or RU word) - coarse, for display
+_node_cc() {
+  n="$1"
+  case "$n" in
+    *Германия*|*Germany*|*🇩🇪*) echo DE ;;
+    *Нидерланды*|*Netherlands*|*🇳🇱*) echo NL ;;
+    *Финляндия*|*Finland*|*🇫🇮*) echo FI ;;
+    *Латвия*|*Latvia*|*🇱🇻*) echo LV ;;
+    *Литва*|*Lithuania*|*🇱🇹*) echo LT ;;
+    *Эстония*|*Estonia*|*🇪🇪*) echo EE ;;
+    *Польша*|*Poland*|*🇵🇱*) echo PL ;;
+    *Дания*|*Denmark*|*🇩🇰*) echo DK ;;
+    *Швеция*|*Sweden*|*🇸🇪*) echo SE ;;
+    *Норвегия*|*Norway*|*🇳🇴*) echo NO ;;
+    *США*|*USA*|*🇺🇸*) echo US ;;
+    *Турция*|*Turkey*|*🇹🇷*) echo TR ;;
+    *Албания*|*Albania*|*🇦🇱*) echo AL ;;
+    *Франция*|*France*|*🇫🇷*) echo FR ;;
+    *Италия*|*Italy*|*🇮🇹*) echo IT ;;
+    *Испания*|*Spain*|*🇪🇸*) echo ES ;;
+    *Австрия*|*Austria*|*🇦🇹*) echo AT ;;
+    *Швейцария*|*Switzerland*|*🇨🇭*) echo CH ;;
+    *Великобритания*|*UK*|*🇬🇧*) echo GB ;;
+    *) echo '' ;;
+  esac
+}
+
+cmd_leases() {
+  printf '{"leases":['
+  [ -f /tmp/dhcp.leases ] || { printf ']}'; return; }
+  FIRST=1
+  while read -r ts mac ip name rest; do
+    [ -n "$ip" ] || continue
+    [ $FIRST -eq 1 ] || printf ','
+    printf '{"ip":"%s","mac":"%s","name":"%s"}' "$ip" "$mac" "$(json_esc "${name:-}")"
+    FIRST=0
+  done < /tmp/dhcp.leases
+  printf ']}'
+}
+
+cmd_log() {
+  # A subscription URL may end up in a log line: mask the token before it reaches the page.
+  _logtail=$(tail -30 "$LOG" 2>/dev/null \
+    | sed -E 's#(https?://[^/[:space:]]+/?)[^[:space:]]*#\1…#g')
+  printf '{"log":"%s"}' "$(json_esc "$_logtail")"
+}
+
+# manual list sync (magitrickle -> mihomo rulesets), runs the cron script immediately
+cmd_sync_lists() {
+  OUT=$(sh "$SYNCLISTS" 2>&1)
+  date '+%F %T' > /tmp/geo-sync-at
+  echo "$(date +%FT%T) SYNC_LISTS manual" >> "$LOG"
+  AI_RC=$(_count_rules "$AI_RULES")
+  MT_RC=$(_count_rules "$MT_RULES")
+  printf '{"ai_rules":%s,"mt_rules":%s,"output":"%s"}' "$AI_RC" "$MT_RC" "$(json_esc "$OUT")"
+}
+
+# quick Google geo-check: country of the exit that Google traffic actually uses.
+# Google/AI domains are routed to group AI (ai.yaml), so asking an IP-geo service
+# through the AI listener (mihomo listeners: proxy=AI) reports exactly what Google sees.
+cmd_google() {
+  CC=$(curl -s -m15 -x "http://127.0.0.1:$AI_SOCKS_PORT" \
+    'https://ipinfo.io/country' 2>/dev/null | tr -d '[:space:]')
+  case "$CC" in [A-Z][A-Z]) ;; *) CC='' ;; esac
+  [ -n "$CC" ] && printf '%s\n' "$CC" > /tmp/geo-google
+  AI_NODE=$(_grp_node AI)
+  printf '{"google":"%s","ai_node":"%s"}' "$(json_esc "$CC")" "$(json_esc "$AI_NODE")"
+}
+
+cmd_global() {
+  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    direct) NAME=DIRECT ;;
+    vpn)    NAME=VPN ;;
+    *) printf '{"error":"bad arg"}'; return 1 ;;
+  esac
+  controller_curl -s -m5 -X PUT "$MIHOMO_API/proxies/GLOBAL" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$NAME\"}" >/dev/null
+  cmd_status
+}
+
+# IPv6 off/on. geomask tunnels IPv4 only: `ip rule`, table 100, `default dev Mihomo` and the
+# AI-DNS DNAT all match IPv4 addresses, so a global IPv6 address on the router or on the LAN
+# leaves straight out of the WAN and shows the real address and country. IPv6 is therefore
+# OFF by default (owner decision 14.11.2026); `on` restores exactly what was there before.
+#
+# The original values are recorded ONCE, on the way out. The first version of this code called
+# the recorder on both paths, so `off` -> `on` recorded our own `ip6assign=0` and restored it:
+# the original prefix size was lost (audit G04).
+IPV6_STATE=/etc/geomask/ipv6.state
+IPV6_NFT=/etc/nftables.d/99-geomask-no-v6.nft
+IPV6_SYSCTL=/etc/sysctl.d/99-disable-ipv6.conf
+IPV6_PROC=/proc/sys/net/ipv6/conf
+# ip6assign lives in network.lan, the rest in dhcp.lan (odhcpd). All four are restored.
+# The record also carries the kernel switch (`sysctl_all`/`sysctl_default`) and whether our nft
+# guard file was there: without them `on` assumed "IPv6 was on before geomask" and wrote 0 over
+# a router that had it disabled for another reason (review 15.11, point 19).
+IPV6_KEYS="ip6assign ra dhcpv6 ndp"
+
+_ipv6_state_get() { # recorded value for one key ('' when the record has no such line)
+  sed -n "s/^$1=//p" "$IPV6_STATE" 2>/dev/null | head -1
+}
+
+# C06/P06 (audit 18.11.2026): the restore used to hardcode network.lan/dhcp.lan. A router whose
+# LAN section is named differently (`lan1`) got its IPv6 enabled on an interface that never had
+# it, while the real one stayed recorded nowhere. Every interface that carries a value is
+# recorded separately and restored by name.
+_ipv6_interfaces() {
+  uci -q show network 2>/dev/null \
+    | sed -n 's/^network\.\([A-Za-z0-9_]*\)\.ip6assign=.*/\1/p' | sort -u
+}
+
+_ipv6_record_ok() { # a complete record is what makes `on` possible; a partial one is garbage
+  [ -f "$IPV6_STATE" ] || return 1
+  for _k in $IPV6_KEYS; do
+    [ -n "$(_ipv6_state_get "$_k")" ] || return 1
+  done
+  return 0
+}
+
+_ipv6_read_kernel() { # kernel switch and guard presence, one `key=value` per line
+  for _kd in all default; do
+    _kv=$(cat "$IPV6_PROC/$_kd/disable_ipv6" 2>/dev/null | tr -dc '01')
+    [ -n "$_kv" ] || _kv=unset
+    printf '%s=%s\n' "sysctl_$_kd" "$_kv"
+  done
+  if [ -f "$IPV6_NFT" ]; then printf 'nft=present\n'; else printf 'nft=absent\n'; fi
+}
+
+_ipv6_save() { # record the current values once; never overwrite a valid record
+  # A record that already carries the original prefix must stay untouched: a second `off`
+  # would otherwise replace the owner's 56 with our own 0 and `on` could never go back (G04).
+  [ -s "$IPV6_STATE" ] && [ -n "$(_ipv6_state_get ip6assign)" ] && return 0
+  mkdir -p "$(dirname "$IPV6_STATE")" 2>/dev/null || return 1
+  _tmp="$IPV6_STATE.tmp"
+  : > "$_tmp" 2>/dev/null || return 1
+  for _k in $IPV6_KEYS; do
+    _v=$(uci -q get "network.lan.$_k" 2>/dev/null)
+    [ -n "$_v" ] || _v=$(uci -q get "dhcp.lan.$_k" 2>/dev/null)
+    [ -n "$_v" ] || _v=unset
+    printf '%s=%s\n' "$_k" "$_v" >> "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
+  done
+  # Per-interface values (C06/P06), one line per name so a renamed LAN section is restored by
+  # name instead of being replaced with `lan`.
+  for _if in $(_ipv6_interfaces); do
+    _iv=$(uci -q get "network.$_if.ip6assign" 2>/dev/null)
+    printf 'ifv|%s|ip6assign|%s\n' "$_if" "${_iv:-unset}" >> "$_tmp" 2>/dev/null \
+      || { rm -f "$_tmp"; return 1; }
+    for _k in ra dhcpv6 ndp; do
+      _dv=$(uci -q get "dhcp.$_if.$_k" 2>/dev/null)
+      [ -n "$_dv" ] || continue
+      printf 'ifv|%s|%s|%s\n' "$_if" "$_k" "$_dv" >> "$_tmp" 2>/dev/null \
+        || { rm -f "$_tmp"; return 1; }
+    done
+  done
+  _ipv6_read_kernel >> "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
+  chmod 600 "$_tmp" 2>/dev/null
+  mv -f "$_tmp" "$IPV6_STATE" 2>/dev/null || { rm -f "$_tmp"; return 1; }
+}
+
+_ipv6_restore() { # restore the recorded values; no record at all -> nothing to restore
+  [ -f "$IPV6_STATE" ] || return 0
+  _ipv6_record_ok || return 1
+  for _k in $IPV6_KEYS; do
+    _v=$(_ipv6_state_get "$_k")
+    case "$_k" in
+      ip6assign)
+        case "$_v" in
+          ''|unset) uci -q delete network.lan.ip6assign 2>/dev/null ;;
+          *[!0-9]*) return 1 ;;
+          *) uci set network.lan.ip6assign="$_v" 2>/dev/null || return 1 ;;
+        esac
+        ;;
+      *)
+        case "$_v" in
+          ''|unset) uci -q delete "dhcp.lan.$_k" 2>/dev/null ;;
+          *) uci set "dhcp.lan.$_k=$_v" 2>/dev/null || return 1 ;;
+        esac
+        ;;
+    esac
+  done
+  # Per-interface values by name. An interface that no longer exists is reported and skipped -
+  # restoring into a re-created section would invent configuration the owner never had.
+  while IFS='|' read -r _tag _if _k _v; do
+    [ "$_tag" = ifv ] || continue
+    [ "$_if" = lan ] && continue     # the legacy block above already restored lan
+    [ -n "$_if" ] && [ -n "$_k" ] || continue
+    _if_exists=0
+    for _probe in "network.$_if.ip6assign" "network.$_if.proto" "network.$_if.device" \
+                  "dhcp.$_if.ra" "dhcp.$_if.dhcpv6" "dhcp.$_if.ndp"; do
+      [ -n "$(uci -q get "$_probe" 2>/dev/null)" ] && { _if_exists=1; break; }
+    done
+    if [ "$_if_exists" = 0 ]; then
+      printf 'ipv6: interface %s no longer exists - its value is not restored\n' "$_if" >&2
+      continue
+    fi
+    case "$_k" in
+      ip6assign)
+        case "$_v" in
+          ''|unset) uci -q delete "network.$_if.ip6assign" 2>/dev/null ;;
+          *[!0-9]*) ;;
+          *) uci set "network.$_if.ip6assign=$_v" 2>/dev/null || return 1 ;;
+        esac
+        ;;
+      ra|dhcpv6|ndp)
+        case "$_v" in
+          ''|unset) uci -q delete "dhcp.$_if.$_k" 2>/dev/null ;;
+          *) uci set "dhcp.$_if.$_k=$_v" 2>/dev/null || return 1 ;;
+        esac
+        ;;
+    esac
+  done < "$IPV6_STATE"
+  return 0
+}
+
+# Belt and braces for the kernel switch: with IPv6 disabled there is nothing to forward, so a
+# drop rule costs nothing and still holds if a global address appears before sysctl applies.
+_ipv6_guard_install() {
+  mkdir -p "$(dirname "$IPV6_NFT")" 2>/dev/null || return 1
+  cat > "$IPV6_NFT" 2>/dev/null <<'EOF'
+table inet fw4 {
+    chain geomask_no_v6 {
+        type filter hook forward priority -10; policy accept;
+        meta nfproto ipv6 counter drop comment "geomask: IPv6 forwarding disabled"
+    }
+}
+EOF
+}
+
+_ipv6_guard_remove() { rm -f "$IPV6_NFT" 2>/dev/null; }
+
+_ipv6_kernel() { # _ipv6_kernel <0|1> - sysctl file plus every interface already up
+  if [ "$1" = 1 ]; then
+    mkdir -p "$(dirname "$IPV6_SYSCTL")" 2>/dev/null || return 1
+    printf '%s\n%s\n' 'net.ipv6.conf.all.disable_ipv6 = 1' \
+      'net.ipv6.conf.default.disable_ipv6 = 1' > "$IPV6_SYSCTL" 2>/dev/null || return 1
+    # If the kernel refuses the switch there is no point in claiming IPv6 is off.
+    sysctl -p "$IPV6_SYSCTL" >/dev/null 2>&1 || return 1
+  else
+    rm -f "$IPV6_SYSCTL" 2>/dev/null || return 1
+  fi
+  # Per-interface writes are belt and braces: `all`/`default` already cover interfaces that
+  # appear later, so a single uncooperative entry must not fail the whole switch.
+  for d in "$IPV6_PROC"/*; do echo "$1" > "$d/disable_ipv6" 2>/dev/null || true; done
+  return 0
+}
+
+_ipv6_kernel_restore() { # put the recorded kernel switch back instead of assuming "0"
+  _ra=$(_ipv6_state_get sysctl_all)
+  _rd=$(_ipv6_state_get sysctl_default)
+  case "$_ra" in 0|1) ;; *) _ra='' ;; esac
+  case "$_rd" in 0|1) ;; *) _rd='' ;; esac
+  if [ -z "$_ra" ] || [ -z "$_rd" ]; then
+    # A record written by an older build kept no kernel state. Leaving the kernel disabled
+    # would report "IPv6 restored" while nothing came back, so the documented default is on.
+    _ra=0; _rd=0
+  fi
+  for _d in "$IPV6_PROC"/*; do
+    [ -e "$_d/disable_ipv6" ] || continue
+    printf '%s\n' "$_rd" > "$_d/disable_ipv6" 2>/dev/null || return 1
+  done
+  if [ "$_ra" = 1 ] || [ "$_rd" = 1 ]; then
+    mkdir -p "$(dirname "$IPV6_SYSCTL")" 2>/dev/null || return 1
+    printf '%s\n%s\n' "net.ipv6.conf.all.disable_ipv6 = $_ra" \
+      "net.ipv6.conf.default.disable_ipv6 = $_rd" > "$IPV6_SYSCTL" 2>/dev/null || return 1
+    sysctl -p "$IPV6_SYSCTL" >/dev/null 2>&1 || return 1
+  else
+    rm -f "$IPV6_SYSCTL" 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+_ipv6_guard_restore() { # our guard file existed before geomask -> put our own copy back
+  case "$(_ipv6_state_get nft)" in
+    present) _ipv6_guard_install ;;
+    *) _ipv6_guard_remove ;;
+  esac
+}
+

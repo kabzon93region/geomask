@@ -1,0 +1,320 @@
+_console_diag_build() { # $1 = console|bundle
+  _diag_mode=${1:-console}
+  # R07: the archive lives in a private spool, never in world-writable /tmp. `init` fails
+  # closed (must be a real directory, ours, 0700) and its JSON refusal is the answer.
+  [ -f "$DIAG_SPOOL_PY" ] || {
+    printf '{"ok":false,"error":"spool is not private: helper missing"}\n'; return 1
+  }
+  _diag_init=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" init "$DIAG_SPOOL" 2>/dev/null)
+  _diag_init_rc=$?
+  if [ "$_diag_init_rc" != 0 ]; then
+    case "$_diag_init" in
+      '{"ok":false'*) printf '%s\n' "$_diag_init" ;;
+      *) printf '{"ok":false,"error":"spool is not private: init failed"}\n' ;;
+    esac
+    return 1
+  fi
+  # One private directory per request: the fixed path plus `rm -rf` let two panel clicks delete
+  # each other's half-built bundle (review 15.11, points 1 and 33).
+  _tmpd=${TMPDIR:-/tmp}
+  _dir=$(mktemp -d "$_tmpd/geomask-console-diag.XXXXXX" 2>/dev/null)
+  [ -n "$_dir" ] || { printf '{"ok":false,"error":"cannot create a private bundle directory"}\n'; return 1; }
+  chmod 700 "$_dir" 2>/dev/null
+  # Retention is one helper pass (age by mtime -> orphan sidecars -> stale temporary files
+  # -> staging directories -> count -> bytes), not two `find -mmin` sweeps: the pair used to
+  # diverge on the window boundary and leave a sidecar whose archive was already gone. The
+  # helper only lstats (no hashing), never follows a link, and never touches foreign names
+  # (`router-backup-*`). A retention error must not block a fresh archive: its JSON is
+  # ignored here. Numbers are clamped before any arithmetic reaches the helper.
+  _diag_keep=$(_diag_uint "${CONSOLE_DIAG_KEEP_H:-24}" 24 1 720)
+  _diag_quota=$(( $(_diag_uint "${GM_CONSOLE_DIAG_QUOTA:-8}" 8 2 64) * 1048576 ))
+  _diag_files=$(_diag_uint "${GM_CONSOLE_DIAG_FILES:-4}" 4 1 32)
+  _diag_share_quota=$(( $(_diag_uint "${GM_CONSOLE_DIAG_SHARE_QUOTA:-6}" 6 2 64) * 1048576 ))
+  _diag_share_files=$(_diag_uint "${GM_CONSOLE_DIAG_SHARE_FILES:-3}" 3 1 16)
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$DIAG_SPOOL" \
+    --keep-h "$_diag_keep" --quota "$_diag_quota" --files "$_diag_files" \
+    --stage-dir "$_tmpd" >/dev/null 2>&1
+  # Without the redactor the bundle cannot be masked; an unmasked archive is worse than no
+  # archive at all, so the request fails closed.
+  [ -f "$DIAG_PY" ] || {
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"redaction failed: redactor missing"}\n'
+    return 1
+  }
+  _ip=$(_console_get ip)
+  {
+    printf 'geomask console diag %s\n' "$(date '+%F %T %z')"
+    printf 'backend %s\n' "$BACKEND_VERSION"
+  } > "$_dir/summary.txt" 2>/dev/null
+  [ -f /etc/geomask/version ] && cat /etc/geomask/version >> "$_dir/summary.txt" 2>&1
+  # Producers are bounded at the source (R08): the 2 MiB creation cap used to be checked only
+  # after the whole state was collected, so a router with a large nft ruleset or a long
+  # connection list rebuilt and discarded the archive on every click. Line bounds are safe for
+  # text; JSON and YAML go through a size gate with a valid placeholder, because cutting them
+  # would break their parser (and verify). Timeouts keep a broken producer from hanging the
+  # whole panel call.
+  ip -4 rule show 2>&1 | head -n 2000 > "$_dir/ip-rule.txt"
+  ip -4 route show table "$CONSOLE_TABLE" 2>&1 | head -n 2000 > "$_dir/route-table-$CONSOLE_TABLE.txt"
+  ip -4 addr show "$CONSOLE_TUN_DEV" 2>&1 | head -n 2000 > "$_dir/tun.txt"
+  _diag_run 10 uci -q show firewall 2>&1 | head -n 2000 \
+    | _console_diag_redact uci uci:firewall "$_dir/firewall.uci" || return 1
+  _diag_run 10 uci -q show network 2>&1 | head -n 2000 \
+    | _console_diag_redact uci uci:network "$_dir/network.uci" || return 1
+  _diag_run 10 nft list ruleset 2>&1 | head -n 4000 \
+    | _console_diag_redact nft nft:ruleset "$_dir/nft.txt" || return 1
+  if [ -n "$_ip" ]; then
+    if command -v timeout >/dev/null 2>&1; then
+      _diag_run 5 conntrack -L -s "$_ip" 2>&1 | head -n 2000 > "$_dir/conntrack-console.txt"
+    else
+      # An unbounded conntrack dump on a busy router is worse than a missing member: do not
+      # create the file, and say so in the summary instead of failing the whole archive.
+      printf 'conntrack: пропущено — на роутере нет утилиты timeout\n' >> "$_dir/summary.txt"
+    fi
+  fi
+  logread 2>/dev/null | grep -iE 'mihomo|hev|geomask|console' | tail -400 \
+    | awk 'length($0) > 2048 { dropped++; next }
+           { print }
+           END { if (dropped) printf "[geomask] dropped %d log lines longer than 2048 bytes\n", dropped }' \
+    | _console_diag_redact text text:logread "$_dir/logread.txt" || return 1
+  if [ -x "$CONSOLE_PY" ] && [ -f "$MIHOMO_CONF" ]; then
+    "$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" 2>/dev/null \
+      | _console_diag_redact json json:console-config "$_dir/console-config.json" || return 1
+  fi
+  # P12 (audit 18.11.2026): the controller answer was written to the overlay in full and the
+  # byte cap was applied afterwards by the redactor - a hostile or broken controller could fill
+  # /tmp before any limit was consulted. The stream is cut at cap+1, so a huge answer costs a
+  # bounded file and the size check still reports it as "response too large" (bytes = cap+1).
+  controller_curl -s -m5 "$MIHOMO_API/proxies/CONSOLE" 2>/dev/null \
+    | head -c $((65536 + 1)) > "$_dir/.raw-group.$$"
+  _console_diag_json json:group-CONSOLE "$_dir/.raw-group.$$" \
+    "$_dir/group-CONSOLE.json" 65536 || return 1
+  controller_curl -s -m5 "$MIHOMO_API/connections" 2>/dev/null \
+    | head -c $((524288 + 1)) > "$_dir/.raw-connections.$$"
+  _console_diag_json json:connections "$_dir/.raw-connections.$$" \
+    "$_dir/connections.json" 524288 || return 1
+  # The mihomo config carries subscription URLs and the controller secret. It is the one
+  # member that must not be truncated, so an oversized config becomes an explicit marker.
+  if [ -f "$MIHOMO_CONF" ]; then
+    _diag_yaml_bytes=$(wc -c < "$MIHOMO_CONF" 2>/dev/null | tr -d ' ')
+    case "$_diag_yaml_bytes" in ''|*[!0-9]*) _diag_yaml_bytes=0 ;; esac
+    if [ "$_diag_yaml_bytes" -gt 524288 ]; then
+      printf 'error: config too large\n' > "$_dir/config.masked.yaml"
+    else
+      _console_diag_redact yaml yaml:mihomo "$_dir/config.masked.yaml" \
+        < "$MIHOMO_CONF" || return 1
+    fi
+  fi
+  # R09: the shared archive also carries every saved Doctor log. Collection is read-only:
+  # `diag_list` plus the files it names, no `diag_run`, no network probe on download.
+  if [ "$_diag_mode" = bundle ]; then
+    _diag_bundle_entries || return 1
+  fi
+  # Staging budget: 1.5 MiB of text already compresses into an archive the 2 MiB creation cap
+  # accepts, so a bigger staging tree means a pathological state. Refuse before verify/tar
+  # and name the three biggest members instead of spending the work and discarding it later.
+  _diag_du=$(du -sk "$_dir" 2>/dev/null | awk '{print $1}')
+  case "$_diag_du" in ''|*[!0-9]*) _diag_du=0 ;; esac
+  if [ "$_diag_du" -gt 1536 ]; then
+    _diag_top=$(du -k "$_dir"/* 2>/dev/null | sort -rn | head -3 \
+      | awk '{printf "%s (%s KiB); ", $2, $1}')
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"состояние слишком велико для бандла: %s KiB > 1536 KiB; крупнейшие: %s"}\n' \
+      "$_diag_du" "$(json_esc "${_diag_top:-unknown}")"
+    return 1
+  fi
+  # Last gate: unknown content must not be packed. `verify` prints file:line: kind.
+  _diag_secret=$("$PYTHON_BIN" -B "$DIAG_PY" verify "$_dir" 2>&1)
+  _diag_rc=$?
+  if [ "$_diag_rc" != 0 ]; then
+    _diag_detail=$(printf '%s\n' "$_diag_secret" | head -1)
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"bundle contains a secret (%s) - nothing was packed"}\n' \
+      "$(json_esc "${_diag_detail:-verification failed}")"
+    return 1
+  fi
+  _tgz="$DIAG_SPOOL/geomask-console-diag-$(date +%Y%m%d-%H%M%S).$$.tar.gz"
+  # tar's stderr lives in TMPDIR, never in the staging directory: it is not a bundle member,
+  # and its last line is what the JSON refusal quotes (bounded to 200 bytes).
+  _tar_err="$_tmpd/geomask-tar.$$.err"
+  ( umask 077; tar -czf "$_tgz" -C "$_tmpd" "$(basename "$_dir")" >/dev/null 2>"$_tar_err" ) || {
+    _diag_tar_detail=$(tail -1 "$_tar_err" 2>/dev/null | cut -c1-200)
+    rm -rf "$_dir" 2>/dev/null
+    rm -f "$_tgz" "$_tar_err" 2>/dev/null
+    printf '{"ok":false,"error":"cannot pack the bundle: %s"}\n' \
+      "$(json_esc "${_diag_tar_detail:-tar failed}")"
+    return 1
+  }
+  # A partial write can still return 0 on BusyBox tar: the archive is accepted only after a
+  # full read-back of its table of contents (the same gate cmd_backup uses). This also catches
+  # an archive truncated through the same inode by an external process, which register would
+  # otherwise hash and hand out as a valid but broken gzip.
+  if ! tar -tzf "$_tgz" >/dev/null 2>"$_tar_err"; then
+    _diag_tar_detail=$(tail -1 "$_tar_err" 2>/dev/null | cut -c1-200)
+    rm -rf "$_dir" 2>/dev/null
+    rm -f "$_tgz" "$_tar_err" 2>/dev/null
+    printf '{"ok":false,"error":"cannot pack the bundle: %s"}\n' \
+      "$(json_esc "${_diag_tar_detail:-archive is not a valid tar.gz}")"
+    return 1
+  fi
+  rm -f "$_tar_err" 2>/dev/null
+  chmod 600 "$_tgz" 2>/dev/null
+  rm -rf "$_dir" 2>/dev/null
+  # Registration records (dev, ino, link count, size, sha256) in <archive>.json; a failure
+  # removes the archive so an unregistered bundle cannot linger in the spool.
+  # Fixed creation/registration cap: 2 MiB, checked before SMB copy. Larger archives
+  # are deleted, not left for SMB/SSH. GM_CONSOLE_DIAG_MAX only controls transport.
+  # The quota is enforced inside register (after the hash, under flock): it evicts the oldest
+  # registered bundle instead of refusing, but never the one being registered.
+  _diag_reg=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" register "$DIAG_SPOOL" "$_tgz" \
+    --quota "$_diag_quota" --files "$_diag_files" 2>/dev/null)
+  _diag_reg_rc=$?
+  if [ "$_diag_reg_rc" != 0 ]; then
+    rm -f "$_tgz" 2>/dev/null
+    case "$_diag_reg" in
+      '{"ok":false'*) printf '%s\n' "$_diag_reg" ;;
+      *) printf '{"ok":false,"error":"cannot register the bundle"}\n' ;;
+    esac
+    return 1
+  fi
+  # The helper measured the archive from its descriptor; the shell must not read it again.
+  _diag_bytes=$(printf '%s\n' "$_diag_reg" | sed -n 's/.*"bytes":\([0-9][0-9]*\).*/\1/p')
+  case "$_diag_bytes" in ''|*[!0-9]*) _diag_bytes=0 ;; esac
+  # The share is swept before and after the copy regardless of the opt-in marker: revoking it
+  # must not leave yesterday's copies on the overlay forever (R08). The helper only touches
+  # `geomask-console-diag-*` names, so `router-backup-*` and foreign files are invisible to it.
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$BACKUP_DIR" --share \
+    --keep-h "$_diag_keep" --quota "$_diag_share_quota" --files "$_diag_share_files" \
+    >/dev/null 2>&1
+  # Into the share only when the owner opted in with the marker: before this the archive was
+  # copied into a folder that may be published over SMB, without asking (review 15.11, #14).
+  # The copy itself is temp + fsync + rename inside the helper, so over SMB the owner sees
+  # either nothing or a complete 0600 file - never half a copy under the final name (R08).
+  _shared=false
+  _share_note=''
+  if [ -f "$SMB_SHARE_ENABLE" ]; then
+    _diag_copy=$("$PYTHON_BIN" -B "$DIAG_SPOOL_PY" copy-share "$_tgz" "$BACKUP_DIR" \
+      "$(basename "$_tgz")" 2>/dev/null)
+    case "$_diag_copy" in
+      *'"ok":true'*) _shared=true ;;
+      *)
+        _share_note=$(printf '%s\n' "$_diag_copy" \
+          | sed -n 's/.*"reason":"\([a-z-]*\)".*/\1/p')
+        case "$_share_note" in ''|*[!a-z-]*) _share_note=failed ;; esac
+        ;;
+    esac
+  else
+    _share_note=disabled
+  fi
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" retain "$BACKUP_DIR" --share \
+    --keep-h "$_diag_keep" --quota "$_diag_share_quota" --files "$_diag_share_files" \
+    >/dev/null 2>&1
+  if [ "$_diag_mode" = bundle ]; then
+    # R09: the tab downloads through `console_diag_get`, which needs a registered name, not a
+    # path. `checks`/`not_run` are counts from the index that was just packed.
+    printf '{"ok":true,"name":"%s","bytes":%s,"checks":%s,"not_run":%s}\n' \
+      "${_tgz##*/}" "$_diag_bytes" "${_diag_checks:-0}" "${_diag_not_run:-0}"
+  else
+    printf '{"ok":true,"file":"%s","bytes":%s,"shared":%s,"share_note":"%s"}\n' \
+      "$_tgz" "$_diag_bytes" "$_shared" "$_share_note"
+  fi
+}
+
+# Both panel buttons share `_console_diag_build`: the console card keeps the console-only
+# answer for compatibility, while the Diagnostics tab asks for the full tree. No second
+# collector, packer or download path exists.
+cmd_console_diag() { _console_diag_build console; }
+cmd_diag_bundle() { _console_diag_build bundle; }
+
+# The panel used to get only a path on the router, so the owner had to find the archive by hand
+# over SMB or SSH - and the file sat in /tmp with no way back (review 15.11, #15). The bytes now
+# travel through the same authenticated ubus call as the rest of the panel: no world-readable
+# URL, no published path. R07: the download path does not reopen the archive in shell - the
+# helper refuses a symlink, a hard link, a swapped inode and a modified body, then base64s the
+# bytes it hashed from one descriptor. GM_CONSOLE_DIAG_MAX is the configurable transport cap;
+# it does not raise the fixed 2 MiB creation cap. Only successfully registered archives can
+# remain in the spool or receive an opted-in SMB copy.
+cmd_console_diag_get() {
+  [ -f "$DIAG_SPOOL_PY" ] || {
+    printf '{"ok":false,"error":"spool helper missing"}\n'; return 1
+  }
+  "$PYTHON_BIN" -B "$DIAG_SPOOL_PY" get "$DIAG_SPOOL" "${1:-}" \
+    --max "${GM_CONSOLE_DIAG_MAX:-2097152}" \
+    --ttl "$(_diag_uint "${CONSOLE_DIAG_KEEP_H:-24}" 24 1 720)"
+  return $?
+}
+
+case "$1" in
+  # >>> geo-rpc generated:dispatch (tools/geo-rpc.json) >>>
+  status)                   cmd_status ;;
+  leases)                   cmd_leases ;;
+  log)                      cmd_log ;;
+  backups)                  cmd_backups ;;
+  stack)                    cmd_stack ;;
+  nodescan)   # kick the node audit in background (returns immediately; panel re-reads stack)
+    ( /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 & )
+    printf '{"ok":true,"started":true}\n' ;;
+  nodes_get)                cmd_nodes_get ;;
+  nodes_paths_get)          cmd_nodes_paths_get ;;
+  nodes_path_save)          cmd_nodes_path_save "$2" "$3" "$4" ;;
+  nodes_path_check)         cmd_nodes_path_check "$2" ;;
+  nodes_audit_events_get)   cmd_nodes_audit_events_get "$2" "$3" "$4" ;;
+  nodes_audit_job_get)      cmd_nodes_audit_job_get "$2" ;;
+  nodes_audit_cancel)       cmd_nodes_audit_cancel "$2" ;;
+  nodes_set)                cmd_nodes_set "$2" "$3" "$4" "$5" "$6" "$7" ;;
+  sync_set)                 cmd_sync_set "$2" ;;
+  syncd_set)                cmd_syncd_set "$2" ;;
+  pin_set)                  cmd_pin_set "$2" ;;
+  lists_get)                cmd_lists_get ;;
+  lists_seed)               cmd_lists_seed ;;
+  yt_get)                   cmd_yt_get ;;
+  yt_mode)                  cmd_yt_mode "$2" ;;
+  yt_reset)                 cmd_yt_reset ;;
+  torrent_get)              cmd_torrent_get ;;
+  torrent_refresh)          cmd_torrent_refresh ;;
+  torrent_listener)         cmd_torrent_listener "$2" ;;
+  torrent_extra)            cmd_torrent_extra "$2" ;;
+  sync_lists)               cmd_sync_lists ;;
+  aidns)                    cmd_aidns_apply ;;
+  google)                   cmd_google ;;
+  global)                   cmd_global "$2" ;;
+  ipv6)                     cmd_ipv6 "$2" ;;
+  dns_guard)                cmd_dns_guard "$2" ;;
+  dns_guard_status)         cmd_dns_guard_status ;;
+  console)                  cmd_console "$2" "$3" "$4" "$5" ;;
+  console_status)           cmd_console_status ;;
+  console_diag)             cmd_console_diag "$2" ;;
+  console_diag_get)         cmd_console_diag_get "$2" ;;
+  dev_add)                  cmd_dev_add "$2" "$3" "$4" "$5" ;;
+  dev_del)                  cmd_dev_del "$2" ;;
+  ai_sub_get)               cmd_ai_sub_get ;;
+  ai_sub_set)               cmd_ai_sub_set "$2" ;;
+  subs_list)                cmd_subs_list ;;
+  subs_seed)                cmd_subs_seed ;;
+  sub_add)                  cmd_sub_add "$2" "$3" ;;
+  sub_del)                  cmd_sub_del "$2" ;;
+  ai_sub_use)               cmd_ai_sub_use "$2" ;;
+  vpn_sub_use)              cmd_vpn_sub_use "$2" ;;
+  vpnnp_sub_use)            cmd_vpnnp_sub_use "$2" ;;
+  mod_list)                 cmd_mod_list ;;
+  mod_check)                cmd_mod_check ;;
+  mod_update)   # install one module's files from modules/index.json
+    cmd_mod_update "$2" "$3" ;;
+  diag_list)                cmd_diag_list ;;
+  diag_run)                 cmd_diag_run "$2" ;;
+  diag_log)                 cmd_diag_log "$2" ;;
+  diag_domain)              cmd_diag_domain "$2" "$3" ;;
+  diag_bundle)              cmd_diag_bundle ;;
+  upd_check)                cmd_upd_check "$2" ;;
+  upd_status)               cmd_upd_status ;;
+  upd_apply)                cmd_upd_apply ;;
+  nodes_path_preview)       cmd_nodes_path_preview "$2" "$3" "$4" "$5" ;;
+  nodes_path_apply)         cmd_nodes_path_apply "$2" "$3" "$4" ;;
+  nodes_path_revoke)        cmd_nodes_path_revoke "$2" ;;
+  nodes_path_apply_status)  cmd_nodes_path_apply_status "$2" ;;
+  mtrickle_sync)            cmd_mtrickle_sync ;;
+  nodes_audit_schedule_get) cmd_nodes_audit_schedule_get "$2" ;;
+  backup)                   cmd_backup ;;
+  nodes_audit_schedule_set) cmd_nodes_audit_schedule_set "$2" "$3" "$4" "$5" ;;
+  # <<< geo-rpc generated:dispatch <<<
+  *) printf '{"error":"usage"}'; exit 1 ;;
+esac

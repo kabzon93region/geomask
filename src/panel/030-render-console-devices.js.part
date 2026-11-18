@@ -1,0 +1,365 @@
+
+		/* ===================== Per-device geo policy ===================== */
+		var MODEINFO = {
+			bypass: { label: 'Мимо VPN', klass: 'gs-warn',
+				hint: 'Реальный IP и часовой пояс ПК. Трафик напрямую или через zapret — mihomo не используется.' },
+			realtz: { label: 'Через VPN, часовой пояс ПК свой', klass: 'gs-ok',
+				hint: 'IP маскирован через mihomo, но часовой пояс самого ПК не трогается (GeoSync.ps1 на этом ПК выключен).' },
+			ai: { label: 'Через AI-подписку', klass: 'gs-on',
+				hint: 'ВЕСЬ трафик устройства идёт через AI-подписку (сейчас: Германия). Отдельный туннель AI, VPN не прерывается.' }
+		};
+		var modeSel = E('select', { 'class': 'gs-input', 'style': 'width:220px' }, [
+			E('option', { 'value': 'bypass' }, 'Мимо VPN (реальный IP)'),
+			E('option', { 'value': 'realtz' }, 'Через VPN, часовой пояс ПК свой'),
+			E('option', { 'value': 'ai' }, 'Через AI-подписку (весь трафик)')
+		]);
+		var ipIn = E('input', { 'class': 'gs-input', 'style': 'width:130px', 'placeholder': 'IP' });
+		var nameIn = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'Имя' });
+		var leaseSel = E('select', { 'class': 'gs-input',
+			'change': function(ev) {
+				var parts = ev.target.value.split('|');
+				if (parts[0]) ipIn.value = parts[0];
+				if (parts[1]) nameIn.value = parts[2] || parts[1];
+			} },
+			[ E('option', { 'value': '' }, '— из DHCP-leases —') ].concat(
+				leases.map(function(l) { return E('option', { 'value': l.ip + '|' + l.mac + '|' + (l.name || '') }, l.ip + '  ' + (l.name || l.mac)); })));
+		var devRows = (st.devices || []).map(function(x) {
+			var mi = MODEINFO[x.mode] || { label: x.mode || '—', klass: 'gs-badge', hint: '' };
+			return E('tr', {}, [
+				E('td', {}, x.ip),
+				E('td', {}, x.name || ''),
+				E('td', {}, E('span', { 'class': 'gs-badge ' + mi.klass, 'title': mi.hint }, mi.label)),
+				E('td', {}, E('button', { 'class': 'gs-btn gs-btn-warn',
+					'click': function() { view.act(callDevDel, { ip: x.ip }); } }, 'Убрать'))
+			]);
+		});
+		var devTable = E('table', { 'class': 'gs-table' },
+			[ E('tr', {}, [ E('th', {}, 'IP'), E('th', {}, 'Имя'), E('th', {}, 'Режим'), E('th', {}, '') ]) ].concat(devRows));
+		var devCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Персональные режимы устройств'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'По умолчанию все устройства маскируются: IP идёт через mihomo, а часовой пояс каждого ПК настраивает его ОС. ' +
+				'Здесь задаются исключения: мимо VPN / через VPN / весь трафик через AI-подписку' +
+				(st.n_ai != null ? ' (сейчас через AI: ' + st.n_ai + ', туннель AI: ' + (st.ai_tun ? 'поднят' : 'нет') + ')' : '') + '.'),
+			(st.ai_tun && !st.ai_listener) ? E('div', { 'class': 'gs-hint', 'style': 'color:#d29922' },
+				'Внимание: слушатель AI-устройств (порт 7891) не активен — перезапустите mihomo один раз, когда будет удобно: sh /etc/init.d/mihomo restart. До этого устройства с режимом «Через AI» не получат трафик.') : E('div', {}),
+			devTable,
+			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ leaseSel, modeSel ]),
+			E('div', { 'class': 'gs-row' }, [ ipIn, nameIn,
+				E('button', { 'class': 'gs-btn', 'click': function() {
+					if (!ipIn.value) { ui.addNotification(null, E('p', {}, 'Укажите IP'), 'warning'); return; }
+					view.act(callDevAdd, { ip: ipIn.value, mode: modeSel.value, mac: (leaseSel.value.split('|')[1] || ''), name: nameIn.value || ipIn.value });
+					ipIn.value = ''; nameIn.value = ''; leaseSel.value = '';
+				} }, 'Добавить')
+			])
+		]);
+		panels.dev.appendChild(devCard);
+
+		/* ===================== Log ===================== */
+		var logCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Журнал'),
+			(function() {
+				/* v1.12.3: same semantic colors as the update console */
+				var box = E('pre', { 'class': 'gs-log' });
+				String(lg || '(пусто)').split('\n').forEach(function(l) {
+					var cls = 'c-dim';
+					if (/\[error\]|FAILED|FAIL\b|abort/i.test(l)) cls = 'c-err';
+					else if (/\bwarn/i.test(l)) cls = 'c-run';
+					else if (/\[done\]|updated to|SYNC changed|no change/i.test(l)) cls = 'c-done';
+					box.appendChild(E('div', { 'class': cls }, l));
+				});
+				return box;
+			})()
+		]);
+		panels.obzor.appendChild(logCard);
+
+		/* ===================== Updates (bottom - rarely used block) ===================== */
+		var updStatus = E('div', { 'class': 'gs-upd-status' });
+		var updLog = E('pre', { 'class': 'gs-console' });
+		updLog.style.display = 'none';
+		var lastLogKey = null;
+		function updLineClass(l) {
+			/* colors carry meaning: red=error, yellow=real warning, green=finished,
+			   dim=normal process step (was yellow before v1.12.3 - read as false warnings) */
+			if (/\[error\]|FAILED|fail\b/i.test(l)) return 'c-err';
+			if (/\bwarn(ing)?\b/i.test(l)) return 'c-run';
+			if (l.indexOf('[done]') >= 0 || /updated to|filter updated|no change/.test(l)) return 'c-done';
+			return 'c-dim';
+		}
+		function updRenderLines(lines) {
+			lines = lines || [];
+			var key = lines.join('\n');
+			if (key === lastLogKey) return;
+			lastLogKey = key;
+			updLog.textContent = '';
+			if (!lines.length) { updLog.style.display = 'none'; return; }
+			updLog.style.display = '';
+			lines.forEach(function(l) { updLog.appendChild(E('div', { 'class': updLineClass(l) }, l)); });
+			updLog.scrollTop = updLog.scrollHeight;
+		}
+		/* --- backups folder (SMB-shareable, v1.9.0) --- */
+		var bkBox = E('div', { 'class': 'gs-bk' });
+		function fmtSize(b) {
+			b = +b || 0;
+			return (b >= 1048576) ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+		}
+		function renderBk(b) {
+			b = b || {};
+			bkBox.textContent = '';
+			bkBox.appendChild(E('h4', {}, 'Резервные копии (папка на роутере, SMB-шар)'));
+			bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
+				E('button', { 'class': 'gs-btn', 'click': function () {
+					view.act(callBackup, {}, 'Бэкап создан');
+				} }, 'Создать бэкап сейчас'),
+				E('span', { 'class': 'gs-hint' }, 'Полный архив нужен перед любыми изменениями из панели.')
+			]));
+			if (b.share_ok === false)
+				bkBox.appendChild(E('div', { 'class': 'gs-row' }, [ E('span', { 'class': 'gs-badge gs-warn' },
+					'SMB-шара geomask-backups не публикуется — это режим по умолчанию') ]));
+			var unc = b.unc || '', smbu = b.smb || '';
+			bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Папка'),
+				E('span', { 'class': 'gs-val gs-mono' }, unc || b.dir || '—'),
+				E('span', {}, [
+					E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(unc, this); } }, 'Копировать (Windows)'),
+					E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(smbu, this); } }, 'Копировать (smb://)')
+				])
+			]));
+			var files = b.files || [];
+			if (!files.length) {
+				bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+					'Свежей копии нет — она создаётся автоматически перед каждым обновлением и при geomask --backup.'));
+			} else {
+				files.forEach(function (f) {
+					bkBox.appendChild(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-val gs-mono' }, String(f.n || '')),
+						E('span', { 'class': 'gs-upd-meta' }, fmtSize(f.s) + ' · ' + String(f.t || '')),
+						E('span', {}, E('button', { 'class': 'gs-btn', 'click': function () { copyToClipboard(unc + '\\' + String(f.n || ''), this); } }, 'Копировать путь к файлу'))
+					]));
+				});
+			}
+			bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+				'Хранится самая свежая копия (роутер экономит место); полная история — на ПК: geomask\\fetch_backup.ps1. ' +
+				'Провод Windows: Win+R → вставить скопированный путь. Восстановление: LuCI → System → Backup / Flash Firmware → Restore.'));
+			if (b.optin === false) {
+				bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+					'SMB-шара не включена: публикация — только вручную (touch /etc/geomask/backup-share.enable) ' +
+					'и именованный пользователь ksmbd (ksmbd.adduser). Пароля по умолчанию нет: архив содержит ' +
+					'ключи и токены подписок.'));
+			} else if (b.share_ok) {
+				bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+					'Вход в шару: именованный пользователь ksmbd, которого вы создали (ksmbd.adduser). ' +
+					'Пароля по умолчанию нет. Архив содержит ключи и токены подписок.'));
+			} else {
+				bkBox.appendChild(E('div', { 'class': 'gs-hint' },
+					'Автопубликация включена, но шары нет в ksmbd.conf — проверьте LuCI → ksmbd ' +
+					'(или перезапустите шаг geo). Архив содержит ключи и токены подписок.'));
+			}
+		}
+		renderBk(bks);
+		var latest = upd.latest || {}, loc = upd.local || {};
+		var stack = upd.stack || [];
+		var updErr = upd.error || null;
+		var coreV = loc.core || 'none', latV = latest.version || '',
+			latTag = (latest.tag || '').replace(/^v/, '');   /* display without the tag 'v': 1.7.3 */
+		var UPD_RUNNING = ['queued', 'backup', 'download', 'validate', 'apply'];
+
+		function verRow(label, val, hint) {
+			return E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, label),
+				E('span', { 'class': 'gs-val gs-mono' }, val || '—'),
+				hint || E('span', {})
+			]);
+		}
+
+		function updPoll() {
+			if (view._updTimer) clearInterval(view._updTimer);
+			view._updTimer = setInterval(function() {
+				callUpdStatus().then(function(s) {
+					s = s || {};
+					var ph = s.phase || 'idle';
+					updRenderLines(s.lines);
+					if (ph === 'done') {
+						clearInterval(view._updTimer); view._updTimer = null;
+						updStatus.style.color = '';
+						updStatus.textContent = '';
+						updStatus.appendChild(E('span', { 'class': 'gs-badge gs-ok' }, 'Готово: ' + (s.msg || '')));
+						updStatus.appendChild(' ');
+						updStatus.appendChild(E('button', { 'class': 'gs-btn gs-btn-primary',
+							'click': function() { location.reload(); } }, 'Обновить страницу'));
+						callBackups().then(function(b) { renderBk(b || {}); });
+					} else if (ph === 'error') {
+						clearInterval(view._updTimer); view._updTimer = null;
+						updStatus.style.color = '#f85149';
+						updStatus.textContent = 'Ошибка: ' + (s.msg || 'unknown');
+					} else if (UPD_RUNNING.indexOf(ph) >= 0) {
+						updStatus.style.color = '#d29922';
+						updStatus.textContent = (s.msg || ph) + '  [' + (s.ts || '') + ']';
+					}
+				});
+			}, 2000);
+		}
+
+		var updChildren = [
+			E('h3', {}, 'Релиз geomask: обновление целиком'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Проверка версий — при открытии страницы (кэш 1 ч) и по кнопке. ' +
+				'Обновление geomask: полный бэкап роутера → скачивание релиза с GitHub (sha256) → ' +
+				'установка модулей и панели без перезапуска сервисов → после «Готово» обнови страницу (Ctrl+F5). ' +
+				'Каждый шаг пишется отдельной строкой в консоль ниже и в общий журнал (/root/geo-sync.log). ' +
+				'Бэкап перед обновлением хранится в папке «Резервные копии» ниже (SMB-шар на роутере, ' +
+				'самая свежая копия; полная история на ПК — geomask\\fetch_backup.ps1); восстановление — ' +
+				'LuCI System → Backup / Flash Firmware → Restore.')
+		];
+		if (updErr) {
+			updChildren.push(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Проверка версий'),
+				E('span', { 'class': 'gs-badge gs-warn' }, 'ошибка'),
+				E('span', { 'class': 'gs-upd-meta' }, String(updErr))
+			]));
+		} else {
+			/* v1.30.3: show the installed release next to the GitHub one. Without it the card
+			   read as "1.25.3 - доступно обновление" on a router that already ran 1.30.0. */
+			var localRelease = loc.core || 'none';
+			var localNewer = false;
+			try {
+				var a = String(localRelease).split('.').map(Number),
+					b = String(latV).split('.').map(Number);
+				localNewer = localRelease !== 'none' && latV &&
+					(a[0] > b[0] || (a[0] === b[0] && (a[1] > b[1] ||
+					 (a[1] === b[1] && a[2] > b[2]))));
+			} catch (e) { localNewer = false; }
+			updChildren.push(verRow('Установлено', localRelease,
+				localNewer ? E('span', { 'class': 'gs-upd-meta' }, 'новее релиза на GitHub') : null));
+			updChildren.push(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Доступно на GitHub'),
+				latV ? E('span', { 'class': 'gs-val gs-upd-latest' }, latTag) : E('span', {}, '—'),
+				upd.need === true
+					? E('span', { 'class': 'gs-badge gs-warn' }, 'доступно обновление')
+					: (localNewer
+						? E('span', { 'class': 'gs-badge gs-ok' }, 'локальная новее — обновлять не нужно')
+						: E('span', { 'class': 'gs-badge gs-ok' }, 'актуально'))
+			]));
+			updChildren.push(E('div', { 'class': 'gs-hint', 'style': 'margin:2px 0 8px' },
+				'Части: панель ' + (loc.panel || '—') + ' · бэкенд ' + (loc.backend || '—') +
+				' · guard ' + (loc.guard || '—') + '. Версии модулей — в списке выше.'));
+			/* The GitHub answer is cached for an hour on purpose (unauthenticated API allows
+			   ~60 requests/hour), so a release published minutes ago stays invisible. This
+			   button forces one live poll. */
+			var btnUpdPoll = E('button', { 'class': 'gs-btn', 'click': function() {
+				btnUpdPoll.disabled = true; btnUpdPoll.textContent = 'Проверяю…';
+				callUpdCheck({ force: 'force' }).then(function() {
+					btnUpdPoll.disabled = false; btnUpdPoll.textContent = 'Проверить сейчас';
+					return view.reload();
+				}).catch(function(e) {
+					btnUpdPoll.disabled = false; btnUpdPoll.textContent = 'Проверить сейчас';
+					ui.addNotification(null, E('p', {}, 'Не удалось проверить: ' + e), 'error');
+				});
+			} }, 'Проверить сейчас');
+			updChildren.push(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-hint' }, 'опрос GitHub кэшируется на 60 мин — кнопка ниже опрашивает его напрямую'),
+				btnUpdPoll
+			]));
+			if (upd.need === true) {
+				var btnUpd = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+					if (!confirm('Обновить geomask до ' + latTag + '?\n\n' +
+						'Будет создан полный бэкап роутера, файлы модулей и панель заменятся на ' + latTag + '.\n' +
+						'Сервисы (mihomo, magitrickle и т.д.) не перезапускаются.')) return;
+					btnUpd.disabled = true; btnUpd.textContent = 'Запуск…';
+					callUpdApply().then(function(res) {
+						btnUpd.disabled = false; btnUpd.textContent = 'Обновить до ' + latTag;
+						if (res && (res.error || res.ok === false)) {
+							updStatus.style.color = '#f85149';
+							updStatus.textContent = 'Ошибка: ' + (res.error || res.err || 'отклонено');
+							return;
+						}
+						updStatus.style.color = '#d29922';
+						updStatus.textContent = 'Обновление запущено…';
+						updPoll();
+					}).catch(function(e) {
+						btnUpd.disabled = false; btnUpd.textContent = 'Обновить до ' + latTag;
+						updStatus.style.color = '#f85149';
+						updStatus.textContent = 'Ошибка: ' + e;
+					});
+				} }, 'Обновить до ' + latTag);
+				updChildren.push(E('div', { 'class': 'gs-actions' }, [ btnUpd ]));
+			}
+			updChildren.push(E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Стек (справочно)'),
+				(function() {
+					var btnCh = E('button', { 'class': 'gs-btn', 'click': function() {
+						btnCh.disabled = true; btnCh.textContent = 'Проверка…';
+						callUpdCheck({ force: '1' }).then(function() { return view.reload(); })
+							.catch(function() { btnCh.disabled = false; btnCh.textContent = 'Проверить ещё раз'; });
+					} }, 'Проверить ещё раз');
+					return btnCh;
+				})()
+			]));
+			updChildren.push(E('div', { 'class': 'gs-stack' }, stack.length
+				? stack.map(function(s) { return E('span', {}, [ E('b', {}, (s.n || '?') + ': '), String(s.v || '?') ]); })
+				: [ E('span', {}, 'нет данных') ]));
+			if (upd.checked_at) updChildren.push(E('div', { 'class': 'gs-upd-meta' },
+				'Проверено: ' + upd.checked_at + ' · источник: ' + (upd.src || '?') + (upd.need === true && latest.digest ? ' · sha256: ' + String(latest.digest).slice(0, 19) + '…' : '')));
+		}
+		updChildren.push(updStatus);
+		updChildren.push(updLog);
+		var updCard = E('div', { 'class': 'gs-card' }, updChildren);
+		/* v1.30.0: the release card lives in the module tab (appended after the list) */
+		updRenderLines((upds || {}).lines);
+		if (UPD_RUNNING.indexOf((upds || {}).phase) >= 0) {
+			updStatus.style.color = '#d29922';
+			updStatus.textContent = 'Идет обновление… подробности в консоли ниже.';
+			updPoll();
+		}
+
+		/* ===================== Backups as own tab card (v1.12.0) ===================== */
+
+		/* ===================== МОДУЛИ: отдельное обновление (v1.28.0) ===================== */
+		function modState(state) {
+			var map = {
+				'current': ['gs-on', 'актуален'],
+				'update-available': ['gs-warn', 'есть обновление'],
+				'modified': ['gs-warn', 'изменён локально'],
+				'incomplete': ['gs-off', 'неполный'],
+				'not-selected': ['gs-off', 'не выбран']
+			};
+			var it = map[state] || ['gs-off', state || '—'];
+			return E('span', { 'class': 'gs-badge ' + it[0] }, it[1]);
+		}
+		var modRows = (mods.modules || []).map(function(m) {
+			var same = !m.available_version || m.available_version === m.installed_version;
+			var label = m.state === 'modified' ? 'Перезаписать' : 'Обновить';
+			var btn = E('button', {
+				'class': 'gs-btn gs-btn-ok',
+				'disabled': (m.state === 'current' || m.state === 'incomplete'
+					|| m.state === 'not-selected' || !m.files) ? 'disabled' : null,
+				'click': function() {
+					view.act(callModUpdate, { module_id: m.id },
+						'Модуль ' + (m.name || m.id) + ' обновлён');
+				}
+			}, label);
+			return E('div', { 'class': 'gs-row', style: 'align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border-color,#30363d)' }, [
+				E('span', { 'class': 'gs-cc' }, m.id),
+				E('span', { 'style': 'flex:1' }, m.name || ''),
+				E('span', { 'class': 'gs-meta' }, same ? (m.installed_version || '—')
+					: (m.installed_version || '—') + ' → ' + m.available_version),
+				modState(m.state),
+				E('span', { 'class': 'gs-meta' }, (m.files || 0) + ' ф.'),
+				btn
+			]);
+		});
+		if (!modRows.length) modRows = [E('div', { 'class': 'gs-hint' }, 'Список модулей пуст — нажмите «Проверить обновления».')];
+		panels.mods.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Модули'),
+			E('div', { 'class': 'gs-hint' }, 'Каждый модуль обновляется отдельно и имеет собственную версию. Файлы проверяются по SHA-256, локальные правки не перезаписываются без подтверждения.'),
+			E('div', { 'class': 'gs-hint' }, 'Модуль «не выбран» не устанавливался на этот роутер — его набор задаётся при установке (sh geomask.sh --list-modules).'),
+			E('div', { 'class': 'gs-row', style: 'margin:8px 0' }, [
+				E('button', { 'class': 'gs-btn', 'click': function() {
+					view.act(callModCheck, {}, 'Индекс обновлений обновлён');
+				} }, 'Проверить обновления')
+			]),
+			E('div', {}, modRows)
+		]));
+		/* v1.30.0: the release card (former «Обновление» tab) sits right here: one place
+		   to watch and update every part of geomask - modules first, the release below. */
+		panels.mods.appendChild(updCard);

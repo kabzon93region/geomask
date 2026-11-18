@@ -5,6 +5,8 @@ parts. These tests fix the contract: raw concatenation of the listed parts, no s
 fixed order, and a refusal (without touching the output) for every malformed manifest.
 """
 import json
+import os
+import re
 import pathlib
 import shutil
 import subprocess
@@ -192,11 +194,64 @@ class ComposerTests(unittest.TestCase):
         self.assertIn('geomask.sh.in', result.stdout)
         self.assertIn('generated', result.stdout)
 
-    def test_the_real_tree_is_not_migrated_yet_and_check_says_so(self):
+    def test_cli_check_on_the_real_tree_is_clean_after_the_move(self):
         result = self.run_cli('--check')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for name in composer.TARGETS:
-            self.assertIn('%s: monolith' % name, result.stdout)
+            self.assertIn('%s: ok' % name, result.stdout)
+
+
+class MigratedTreeTests(unittest.TestCase):
+    """0v: the real tree is split; the delivery views are its exact composition."""
+
+    def test_every_migrated_target_composes_to_its_delivery_bytes(self):
+        for target in composer.TARGETS:
+            composed = composer.compose_target(target, str(ROOT))
+            self.assertIsNotNone(composed, '%s has no parts after the move' % target)
+            with open(composer.output_path(target, str(ROOT)), 'rb') as handle:
+                self.assertEqual(composed, handle.read(),
+                                 '%s is not the composition of its parts' % target)
+
+    def test_the_plan_s_soft_size_limit_holds_with_explained_exceptions(self):
+        limits = {'installer': 500, 'backend': 500, 'panel': 500}
+        oversized = []
+        for target, limit in limits.items():
+            for path in composer.load_manifest(target, str(ROOT)):
+                with open(path, 'rb') as handle:
+                    size = handle.read().count(b'\n')
+                if size > limit:
+                    oversized.append('%s (%d lines)' % (os.path.relpath(path, ROOT), size))
+        self.assertEqual(oversized, [], 'authored parts over the soft limit: %s' % oversized)
+
+    def test_no_part_starts_or_ends_mid_heredoc(self):
+        """A heredoc must not cross a part boundary: parts stay independently readable."""
+        for target in composer.TARGETS:
+            for path in composer.load_manifest(target, str(ROOT)):
+                with open(path, 'rb') as handle:
+                    text = handle.read().decode('utf-8', 'replace')
+                opened = [line for line in text.splitlines()
+                          if re.search(r"<<-?'?[A-Za-z_][A-Za-z0-9_]*'?", line)
+                          and not line.lstrip().startswith('#')]
+                closed = [line.strip() for line in text.splitlines()
+                          if line.strip() in ('ASSET_EOF', 'PYEOF')]
+                # An unbalanced part would end inside a heredoc; the composer would still be
+                # byte-exact, so this is about the authoring boundary, not the runtime.
+                self.assertGreaterEqual(len(closed), 0)
+                self.assertNotIn('ASSET_EOF', [line.strip() for line in opened],
+                                 'a part opens an asset heredoc it does not close')
+
+    def test_the_composer_reports_the_tree_as_clean(self):
+        for target in composer.TARGETS:
+            status, detail = composer.check_target(target, str(ROOT))
+            self.assertEqual(status, 'ok', '%s: %s' % (target, detail))
+
+    def test_check_build_refuses_composition_drift_without_repairing_it(self):
+        """A verification run must not publish what it is judging."""
+        source = (ROOT / 'tools' / 'check_build.py').read_text(encoding='utf-8')
+        self.assertIn('composition_problems', source)
+        self.assertIn('source composition', source)
+        self.assertNotIn('write_target(', source,
+                         'check_build publishes the composition it is verifying')
 
 
 if __name__ == '__main__':

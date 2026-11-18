@@ -1,0 +1,398 @@
+step7_check() {
+  _need=0
+  _r=$(nslookup ya.ru 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2}' | tail -1)
+  if [ -n "$_r" ] && [ "$_r" != "127.0.0.1" ]; then info "DNS normal (ya.ru -> $_r)"; else bad "DNS broken for normal domains"; _need=1; fi
+  _b=$(nslookup doubleclick.net 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2}' | tail -1)
+  case "$_b" in
+    ""|0.0.0.0|::) info "DNS adblock (doubleclick.net -> ${_b:-NXDOMAIN})" ;;
+    *) warn "adblock: doubleclick.net resolves to $_b (adblock-fast may be off)" ;;
+  esac
+  _code=$(curl -m 5 -s -o /dev/null -w '%{http_code}' http://www.gstatic.com/generate_204 2>/dev/null)
+  [ "$_code" = "204" ] && info "connectivity: 204 OK" || { bad "connectivity: HTTP ${_code:-none}"; _need=1; }
+  _step7_groups || _need=1
+  if have ubus && module_selected luci; then
+    ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
+  elif ! module_selected luci; then
+    info "geo ubus: панель (модуль luci) не выбрана - проверка пропущена"
+  fi
+  if ip rule show 2>/dev/null | grep -q "iif $(lan_iface) ipproto icmp"; then info "ICMP bypass rule: present"; else warn "ICMP bypass rule absent - LAN ping may die in TUN"; fi
+  # Routing depends on the hotplug script and its shared helper; a missing helper silently
+  # disables the tunnel policy after the next ifup (audit follow-up, N01/N02).
+  for _rf in /etc/hotplug.d/iface/99-default-vpn-route /usr/lib/geomask/geomask-routes.sh; do
+    if [ -s "$(P "$_rf")" ]; then info "routing: $_rf present"
+    else bad "routing: $_rf missing - VPN policy will not be applied on ifup"; _need=1; fi
+  done
+  # The route queue worker writes error-<table> in GM_ROUTE_STATE_DIR (default /tmp/...).
+  # step 7 keeps reporting the last failed sync, but through the injectable root (R05).
+  _rq_dir=${GM_ROUTE_STATE_DIR:-$(P /tmp/geomask-routes)}
+  if [ -f "$_rq_dir/error-100" ]; then
+    bad "routing: last route sync failed ($(cat "$_rq_dir/error-100" 2>/dev/null)) - LAN may go direct"
+    _need=1
+  fi
+  # IPv6 is not tunnelled (mihomo ipv6: false, IPv4-only policy): if the router or the LAN
+  # still has global IPv6, services see the real address. OFF is the default now, so the check
+  # reports a live leak as a failure and a merely-latent one as a warning (audit follow-up, N00).
+  _v6_global=$(ip -6 addr show scope global 2>/dev/null | grep -c 'inet6 ')
+  [ -n "$_v6_global" ] || _v6_global=0
+  _v6_assign=$(uci -q get network.lan.ip6assign 2>/dev/null)
+  _v6_ra=$(uci -q get dhcp.lan.ra 2>/dev/null)
+  if [ "$GM_IPV6" = keep ]; then
+    info "IPv6: сохранён по --ipv6=keep (глобальных адресов: $_v6_global)"
+  elif [ "$_v6_global" -gt 0 ]; then
+    bad "IPv6: $_v6_global глобальных адресов - реальный IP уходит мимо VPN (панель -> IPv6 -> Отключить)"
+    _need=1
+  elif [ "$_v6_assign" = 0 ] && [ "$_v6_ra" = disabled ]; then
+    info "IPv6: выключен (ядро + LAN + firewall)"
+  else
+    # A warning here used to be skipped by run_step ("check: ALL GOOD"), so the default
+    # "IPv6 off everywhere" was never applied on a router that had no global address yet but
+    # still handed out IPv6 on the LAN. Latent leak is still a leak: fail the check so the
+    # step actually runs.
+    bad "IPv6: глобальных адресов нет, но LAN по-прежнему раздаёт IPv6 (ip6assign=${_v6_assign:-не задан}, ra=${_v6_ra:-не задан}) - префикс появится при подъёме WAN"
+    _need=1
+  fi
+  # Console lane: while it is switched on, the rule is the only thing that keeps the console
+  # off the normal path. A missing rule looks like "the game broke", so it is a failure here.
+  _cs="$(P /etc/geomask/console.state)"
+  if [ -f "$_cs" ] && [ "$(sed -n 's/^enabled=//p' "$_cs" 2>/dev/null | head -1)" = 1 ]; then
+    _cip=$(sed -n 's/^ip=//p' "$_cs" 2>/dev/null | head -1)
+    if ip rule show 2>/dev/null | grep -q "from $_cip lookup 102" \
+       && ip route show table 102 2>/dev/null | grep -q '^default'; then
+      info "console: отдельный выход включён для $_cip"
+    else
+      bad "console: правило для $_cip пропало - консоль идёт напрямую (панель -> «Включить путь консоли»)"
+      _need=1
+    fi
+  fi
+  # AI-DNS: client DNS of AI devices must be intercepted AND exit through the AI tunnel.
+  # Checking only the fwmark route proved nothing about the clients: the DNAT rule can be
+  # absent while this line still printed "no leak" (audit 14.11.2026, F08).
+  if [ -f "$(P /etc/geomask-aidns.off)" ] || [ ! -f "$(P /etc/geomask-aidns.uid)" ]; then
+    info "AI-DNS: not installed (DNS of AI devices resolves via router - run the aidns step)"
+  else
+    _rt=$(ip route get 1.1.1.1 mark 0x64 2>/dev/null)
+    if [ -z "$_rt" ]; then
+      warn "AI-DNS: routing check returned nothing (ip route unavailable?)"
+    elif printf '%s' "$_rt" | grep -q 'dev AI'; then
+      info "AI-DNS: marked DNS exits via AI tunnel"
+    else
+      bad "AI-DNS: marked DNS does NOT route via AI tunnel (leak!)"; _need=1
+    fi
+    _aip=$(aidns_ip)
+    _aiips=$(awk '$2=="ai" && $1 !~ /^#/ {print $1}' "$(P /etc/geo-devices.list)" 2>/dev/null)
+    if [ -z "$_aip" ]; then
+      bad "AI-DNS: listen address cannot be determined - clients are not intercepted"; _need=1
+    elif [ -n "$_aiips" ]; then
+      _tbl=$(nft list table inet geomask_ai_dns 2>/dev/null)
+      if printf '%s' "$_tbl" | grep -q "dnat ip to $_aip:$AIDNS_DNS_PORT"; then
+        info "AI-DNS: client DNS for ai devices is redirected to $_aip:$AIDNS_DNS_PORT"
+      else
+        bad "AI-DNS: client DNAT to $_aip:$AIDNS_DNS_PORT is missing - ai devices use the router DNS"; _need=1
+      fi
+    fi
+  fi
+  return $_need
+}
+# Turning IPv6 off is the only writing action of the final step. It goes through the installed
+# backend so the three layers (kernel, LAN/odhcpd, forwarding guard) live in exactly one place.
+apply_ipv6_default() {
+  if [ "$GM_IPV6" = keep ]; then
+    info "IPv6: оставлен как есть (--ipv6=keep)"
+    return 0
+  fi
+  _be="$(P /usr/bin/geo-backend.sh)"
+  if [ ! -x "$_be" ]; then
+    # With --modules core,path_vpn the backend is not installed. Reporting success here made
+    # the installer believe IPv6 was handled while nothing was changed.
+    bad "IPv6: backend не установлен - выключение IPv6 не выполнено (нужен модуль luci/core с geo-backend.sh)"
+    return 1
+  fi
+  # No uci means this is not a router we can manage network settings on (a test sandbox or a
+  # broken image). Saying "not applicable" is honest; failing the whole run is not.
+  if ! command -v uci >/dev/null 2>&1; then
+    warn "IPv6: uci недоступен в этом окружении - состояние IPv6 не менялось"
+    return 0
+  fi
+  # The backend keeps its own defaults for the marker and the backup tree; hand it the paths
+  # this installer actually uses, so a prefixed/test root and the real router agree.
+  _out=$(GM_BACKUP_OK="$(P /etc/geomask/backup-ok)" GM_BACKUP_DIR="$(P $BACKUP_DIR)" \
+         "$_be" ipv6 off 2>&1)
+  case "$_out" in
+    *'"ok":true'*) info "IPv6: выключен (ядро + LAN + firewall)"; return 0 ;;
+    *) bad "IPv6: выключить не удалось: $(printf '%s' "$_out" | tail -1)"; return 1 ;;
+  esac
+}
+
+step7_apply() { apply_ipv6_default; }
+step7_verify() { step7_check; }
+
+# ============================================================ runner
+STEP_NAMES="env geo subs aidns sync services verify"
+
+step_desc() {
+  case "$1" in
+    env)      printf 'проверка окружения: версия OpenWrt, место на диске, зависимости (только чтение)' ;;
+    geo)      printf 'гео-оверлей: панель "Гео-маскировка и AI" в LuCI + бэкенд geo-sync' ;;
+    subs)     printf 'подписки: ссылки VPN/AI и группы VPN/AI в mihomo (проверка доступности)' ;;
+    aidns)    printf 'AI-DNS: DNS AI-устройств через их же туннель — нет утечки DNS (ставится по умолчанию)' ;;
+    sync)     printf 'sync: синк magitrickle→mihomo: watchdog (секунды) + cron-страховка' ;;
+    services) printf 'сервисы: mihomo, magitrickle, hev-туннели, dnsmasq, веб-интерфейс' ;;
+    verify)   printf 'сквозная проверка: выходы VPN/AI, DNS, группа AI, интернет (ничего не меняет)' ;;
+    *)        printf '' ;;
+  esac
+}
+
+step_fn() { # step_fn N action -> call stepN_action
+  _n=$1; _a=$2
+  case "$_n-$_a" in
+    1-check) step1_check ;; 1-apply) step1_apply ;; 1-verify) step1_verify ;;
+    2-check) step2_check ;; 2-apply) step2_apply ;; 2-verify) step2_verify ;;
+    3-check) step3_check ;; 3-apply) step3_apply ;; 3-verify) step3_verify ;;
+    4-check) step4_check ;; 4-apply) step4_apply ;; 4-verify) step4_verify ;;
+    5-check) step5_check ;; 5-apply) step5_apply ;; 5-verify) step5_verify ;;
+    6-check) step6_check ;; 6-apply) step6_apply ;; 6-verify) step6_verify ;;
+    7-check) step7_check ;; 7-apply) step7_apply ;; 7-verify) step7_verify ;;
+    *) bad "unknown step $_n"; return 1 ;;
+  esac
+}
+
+# I08: which steps may answer "nothing to do" from their check alone. Step 2 (panel/LuCI and the
+# /usr/lib assets) checks presence only, so an old asset passes it; save_stream compares bytes and
+# keeps unchanged ones, which makes a re-apply cheap and honest.
+step_check_is_authoritative() { # step_check_is_authoritative <n> -> 0 when check may skip apply
+  case "$1" in
+    2) return 1 ;;
+  esac
+  return 0
+}
+
+run_step() { # run_step N  (interactive/auto common logic)
+  _n=$1
+  _name=$(echo "$STEP_NAMES" | cut -d' ' -f"$_n")
+  hdr "$_n/7" "$_name"
+  _fc_before=$FAILCNT
+  if step_fn "$_n" check; then
+    if step_check_is_authoritative "$_n"; then
+      info "check: ALL GOOD"
+      PASS=$((PASS+1))
+      SKIP=$((SKIP+1))
+      return 0
+    fi
+    info "check: presence OK - apply still runs to prove the bytes are current"
+  else
+    info "check: issues found - apply needed"
+  fi
+  # A missing lock primitive (step 1 sets GM_STEP1_FATAL) is not something "apply" can fix:
+  # refuse to apply ANY step, in the interactive wizard as well as in --auto. Without this the
+  # wizard printed the step-1 error and still installed steps 2-7 into a system whose writers
+  # are all fail-closed.
+  # `--step N` and menu item 3 run a step in a fresh process where step1_check never ran, so
+  # the sticky flag alone is not enough: probe the primitive directly for every other step.
+  if [ "$_n" != 1 ] && [ "${GM_STEP1_FATAL:-0}" != 1 ]; then
+    _rs_lpm=$(lock_primitive_missing)
+    [ -z "$_rs_lpm" ] || GM_STEP1_FATAL=1
+  fi
+  if [ "${GM_STEP1_FATAL:-0}" = 1 ] && [ "$GM_CHECK_ONLY" != 1 ]; then
+    bad "step $_n: step 1 did not pass its mandatory lock-primitive check - refusing to apply"
+    return 1
+  fi
+  if [ "$GM_CHECK_ONLY" = 1 ]; then
+    info "(check-only mode: not applying)"
+    return 1
+  fi
+  if [ "$GM_AUTO" = 1 ] || [ "$GM_YES" = 1 ] || ask "Apply step $_n ($_name)?"; then
+    # every step below writes to the router: one verified full backup per run, before it.
+    # Step 1 installs packages (apk/opkg), so it is a writing step too - it used to run
+    # before any backup existed (audit 14.11.2026, F13). Step 6 starts the services, which is
+    # just as much of a change and was the only writing step without the gate (review 15.11).
+    case "$_n" in
+     1|2|3|4|5|6|7) backup_gate || return 1 ;;
+    esac
+    # v1.29.0: an installing step is the right moment to ask which modules to carry.
+    case "$_n" in 2|4|5) modules_maybe_prompt ;; esac
+    if step_fn "$_n" apply; then
+      info "--- verify ---"
+      if step_fn "$_n" verify; then
+        info "verify: PASS"
+        # check-phase failures were fixed by apply - drop them from the global count
+        FAILCNT=$_fc_before
+        return 0
+      else
+        bad "verify: FAILED after apply"
+        return 1
+      fi
+    else
+      bad "apply failed or was skipped"
+      return 1
+    fi
+  else
+    info "skipped by user"
+    SKIP=$((SKIP+1))
+    return 2
+  fi
+}
+
+# R05: the installer holds `maintenance` and applies the queued ifup route events INLINE.
+# It must not spawn a detached worker: the result has to be visible before step 7 reads
+# error-<table>, and a child would outlive the maintenance section that authorised the change.
+drain_route_queue() {
+  _dr_lib=${GM_ROUTES_LIB:-$(P /usr/lib/geomask/geomask-routes.sh)}
+  [ -r "$_dr_lib" ] || return 0
+  _dr_state=${GM_ROUTE_STATE_DIR:-$(P /tmp/geomask-routes)}
+  (
+    GM_ROUTE_STATE_DIR=$_dr_state
+    GM_ROUTE_DRAIN=1
+    GM_ROUTE_TUN_WAIT=0
+    export GM_ROUTE_STATE_DIR GM_ROUTE_DRAIN GM_ROUTE_TUN_WAIT
+    . "$_dr_lib" 2>/dev/null || exit 0
+    command -v gm_route_drain >/dev/null 2>&1 || exit 0
+    gm_route_drain
+  ) >/dev/null 2>&1
+  return $?
+}
+
+# ============================================================ terminal UI
+if [ -t 1 ]; then
+  C_R="$(printf '\033[1;31m')"; C_G="$(printf '\033[1;32m')"; C_Y="$(printf '\033[1;33m')"
+  C_B="$(printf '\033[1;36m')"; C_M="$(printf '\033[1;35m')"; C_DIM="$(printf '\033[38;5;244m')"
+  NC="$(printf '\033[0m')"
+else
+  C_R=""; C_G=""; C_Y=""; C_B=""; C_M=""; C_DIM=""; NC=""
+fi
+
+clr()   { [ -t 1 ] && command -v clear >/dev/null 2>&1 && clear; return 0; }
+PAUSE() { [ "$GM_YES" = 1 ] && return 0; [ -t 0 ] || return 0; printf '%sНажмите Enter...%s' "$C_DIM" "$NC"; read -r _p || true; echo; }
+
+_maskurl()  { printf '%s' "${1:-}" | sed 's|/[^/]*$|/...|'; }
+_row()      { printf '%s%-20s%s %s\n' "$C_Y" "$1:" "$NC" "$2"; }
+_api_node() { controller_curl -s -m2 "http://127.0.0.1:9090/proxies/$1" 2>/dev/null | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//;s/"$//'; }
+
+_svc_row() { # _svc_row <label> <initd> <pidof-name>
+  if [ ! -f "$(P /etc/init.d/$2)" ]; then _row "$1" "${C_DIM}не установлен${NC}"; return; fi
+  if pidof "${3:-$2}" >/dev/null 2>&1; then _row "$1" "${C_G}запущен${NC}"; else _row "$1" "${C_R}остановлен${NC}"; fi
+}
+
+dashboard() {
+  _model=$(cat "$(P /tmp/sysinfo/model)" 2>/dev/null)
+  _rel=$(grep '^DISTRIB_RELEASE=' "$(P /etc/openwrt_release)" 2>/dev/null | cut -d"'" -f2)
+  _row "Роутер" "${_model:-OpenWrt}${_rel:+ ${C_DIM}/ OpenWrt $_rel${NC}}"
+  _svc_row "Zapret" zapret nfqws
+  _svc_row "Mihomo" mihomo
+  _svc_row "MagiTrickle" magitrickle magitrickled
+  _svc_row "HevSocks5" hev-socks5-tunnel
+  _svc_row "Dnsmasq" dnsmasq
+  if [ -x "$(P /etc/init.d/adblock-fast)" ]; then
+    _ab=$(grep -c 'server=/' "$(P /var/run/adblock-fast/dnsmasq.servers)" 2>/dev/null)
+    _row "Adblock" "${C_G}${_ab:-0} доменов${NC}"
+  fi
+  _vpn=$(_api_node VPN); _ai=$(_api_node AI)
+  _row "VPN узел" "${_vpn:-${C_DIM}нет ответа API${NC}}"
+  _row "AI узел"  "${_ai:-${C_DIM}нет ответа API${NC}}"
+  if [ -s "$(P /usr/bin/geo-backend.sh)" ] && ubus list 2>/dev/null | grep -qx 'geo-sync'; then
+    _row "Geo LuCI" "${C_G}установлена${NC}"
+  else
+    _row "Geo LuCI" "${C_R}не установлена${NC}"
+  fi
+  if ip link show AI >/dev/null 2>&1; then _ait="${C_G}поднят${NC}"; else _ait="${C_DIM}нет${NC}"; fi
+  _naic=$(grep -c ' ai ' "$(P /etc/geo-devices.list)" 2>/dev/null)
+  _row "AI-туннель" "$_ait${_naic:+ · устройств: ${_naic:-0}}"
+  _mt=$(grep -c 'DOMAIN-SUFFIX' "$(P /etc/mihomo/ruleset/mtrickle.yaml)" 2>/dev/null)
+  _row "Sync правил" "${_mt:-0} в mtrickle.yaml"
+  if [ -f "$(P /root/.geomask-norestart)" ]; then
+    _row "VPN-рестарты" "${C_G}запрещены (pin)${NC}"
+  else
+    _row "VPN-рестарты" "${C_Y}разрешены${NC}"
+  fi
+}
+
+print_banner() {
+  printf '%s+========================================+%s\n' "$C_M" "$NC"
+  printf '%s|%s      %sGEOMASK%s  -  geo-masking stack   %s|%s\n' "$C_M" "$NC" "$C_B" "$NC" "$C_M" "$NC"
+  printf '%s+========================================+%s %sv%s%s\n' "$C_M" "$NC" "$C_DIM" "$GM_VERSION" "$NC"
+}
+
+show_menu() {
+  echo
+  printf '%s1)%s %sБыстрая диагностика%s %s(только чтение)%s\n'    "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%s2)%s %sПошаговый мастер%s %s(статус шагов, запуск любого отдельно)%s\n' "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%s3)%s %sПанель Гео%s %s(переустановить / обновить)%s\n'  "$C_B" "$NC" "$C_G" "$NC" "$C_DIM" "$NC"
+  printf '%sf)%s %sУдалить -> установить -> настроить geomask%s\n'  "$C_B" "$NC" "$C_Y" "$NC"
+  printf '%s0)%s Выход\n'                                          "$C_B" "$NC"
+}
+
+diag_quick() {
+  PASS=0; FAILCNT=0; SKIP=0
+  GM_CHECK_ONLY=1
+  for n in 1 2 3 4 5 6 7; do run_step "$n" || true; done
+  GM_CHECK_ONLY=0
+  echo
+  log "${C_DIM}== ДИАГНОСТИКА: pass=$PASS fail=$FAILCNT ==$NC"
+}
+
+# human-readable description of each step (bypasses ANY memory of "what is what")
+step_desc() {
+  case "$1" in
+    env)      printf 'проверка окружения: версия OpenWrt, место на диске, зависимости (только чтение)' ;;
+    geo)      printf 'гео-оверлей: панель "Гео-маскировка и AI" в LuCI + бэкенд geo-sync' ;;
+    subs)     printf 'подписки: ссылки VPN/AI и группы VPN/AI в mihomo (проверка доступности)' ;;
+    sync)     printf 'sync: синк magitrickle→mihomo: watchdog (секунды) + cron-страховка' ;;
+    services) printf 'сервисы: mihomo, magitrickle, hev-туннели, dnsmasq, веб-интерфейс' ;;
+    verify)   printf 'сквозная проверка: выходы VPN/AI, DNS, группа AI, интернет (ничего не меняет)' ;;
+    *)        printf '' ;;
+  esac
+}
+
+# step-by-step master: show status of every step, let the user run any single step
+menu_master() {
+  while :; do
+    _n=1
+    for _nm in $STEP_NAMES; do
+      _d=$(step_desc "$_nm")
+      if step_fn "$_n" check >/dev/null 2>&1; then
+        printf '  %s%d)%s %s%-9s%s %s — %s %sвыполнено%s\n' "$C_B" "$_n" "$NC" "$C_Y" "$_nm" "$NC" "$_d" "$C_G" "$NC"
+      else
+        printf '  %s%d)%s %s%-9s%s %s — %s %sтребует внимания%s\n' "$C_B" "$_n" "$NC" "$C_Y" "$_nm" "$NC" "$_d" "$C_R" "$NC"
+      fi
+      _n=$((_n+1))
+    done
+    echo
+    printf 'Номер шага для запуска (Enter - назад): '
+    read -r _sel || return
+    case "$_sel" in
+      ''|q|Q) return ;;
+      [1-7]) run_step "$_sel" || true; PAUSE ;;
+      *) printf '%sнет такого шага%s\n' "$C_R" "$NC"; sleep 1 ;;
+    esac
+  done
+}
+
+# prompt for a subscription URL; keeps current value on Enter; honors flags/--yes
+# A prompt belongs on the terminal: stdout is the function's return value (the URL), and the
+# installer captures stdout. Printing the question there put `VPN URL [Enter ...]: ` in front of
+# the URL (audit I06). GM_PROMPT_TTY lets a fixture exercise the interactive path without a tty.
+_prompt_tty() { [ -t 0 ] || [ "${GM_PROMPT_TTY:-}" = 1 ]; }
+
+prompt_url() { # prompt_url <label> <current> <flag-value>  -> prints url, rc=1 if none
+  _lbl="$1"; _cur="$2"; _flag="$3"
+  if [ -n "$_flag" ]; then printf '%s' "$_flag"; return 0; fi
+  if [ -n "$_cur" ]; then
+    if [ "$GM_YES" = 1 ] || ! _prompt_tty; then printf '%s' "$_cur"; return 0; fi
+    printf '%s [Enter = оставить %s]: ' "$_lbl" "$(_maskurl "$_cur")" >&2
+    read -r _v || _v=""
+    printf '%s' "${_v:-$_cur}"
+    return 0
+  fi
+  if [ "$GM_YES" = 1 ] || ! _prompt_tty; then return 1; fi
+  while :; do
+    printf '%s: ' "$_lbl" >&2
+    read -r _v || return 1
+    case "$_v" in
+      http://*|https://*) printf '%s' "$_v"; return 0 ;;
+      '') return 1 ;;
+      *) printf '  URL должен начинаться с http:// или https://\n' >&2 ;;
+    esac
+  done
+}
+
+# remove geomask parts (geo overlay, sync script, cron); keeps mihomo config
+# $1 = noreload: skip the rpcd reload (caller re-registers right after install)

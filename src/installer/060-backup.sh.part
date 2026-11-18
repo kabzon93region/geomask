@@ -1,0 +1,419 @@
+ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
+  # v1.30.15: the previous archive is no longer deleted before the new one exists, and a
+  # reduced tar is never passed off as a sysupgrade backup. Old copies are parked outside
+  # /root while sysupgrade archives /root (that nesting was the reason for the old delete),
+  # and they come back untouched if creation fails.
+  _mode="${1:-full}"
+  _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
+  _dir="$(P $BACKUP_DIR)"
+  mkdir -p "$_dir" 2>/dev/null || { _bbad "cannot create $_dir"; return 1; }
+  # A previous run may have left the only copy parked. Recover it BEFORE touching anything,
+  # and refuse to continue while it is still there: two runs in one shell used to delete the
+  # same park with `rm -rf` at the start of the next attempt (audit 14.11.2026, F03).
+  _prev=$(_backup_recovery_park)
+  if [ -n "$_prev" ]; then
+    if [ -d "$_prev" ] && ls "$_prev"/*.tar.gz >/dev/null 2>&1; then
+      if ! _backup_park_restore "$_prev" "$_dir"; then
+        _bbad "в $_prev остаётся резервная копия, вернуть её автоматически не удалось"
+        _bbad "  перенесите вручную: mv $_prev/*.tar.gz $_dir/"
+        return 1
+      fi
+      _bnote "восстановлены ранее отложенные копии из $_prev"
+    fi
+    _backup_recovery_clear
+  fi
+  # Unique park per attempt, created with mktemp: never reuse (and never remove) a directory
+  # that may still hold the last copy.
+  _park=$(mktemp -d "$(P /tmp)/geomask-bk-park-XXXXXX" 2>/dev/null) || { _bbad "cannot create a park directory"; return 1; }
+  _park_fail=0
+  for _old in "$_dir"/router-backup-*.tar.gz; do
+    [ -f "$_old" ] || continue
+    # A copy that cannot be parked stays inside /root and would end up nested in the new
+    # archive. Stop here, before anything is created: no mutation has happened yet.
+    mv -f "$_old" "$_park/" 2>/dev/null || _park_fail=1
+  done
+  if [ "$_park_fail" = 1 ]; then
+    _backup_park_restore "$_park" "$_dir" || _backup_keep_failed "$_park"
+    _bbad "не удалось убрать прежние копии из $_dir - бэкап не создавался"
+    return 1
+  fi
+  _tmp="$(P /tmp)/geomask-bk-$_ts.tar.gz"
+  rm -f "$_tmp"
+  _full=0
+  _su_err=""
+  if have sysupgrade; then
+    _su_err=$(sysupgrade -b "$_tmp" 2>&1) && archive_ok "$_tmp" && _full=1
+  else
+    _su_err="sysupgrade not found"
+  fi
+  if [ "$_full" = 0 ]; then
+    rm -f "$_tmp"
+    if [ "$_mode" = full ]; then
+      # put the parked copies back: a failed run must not cost the router its only backup
+      _backup_park_restore "$_park" "$_dir" || _backup_keep_failed "$_park"
+      _bbad "полный бэкап (sysupgrade -b) не создан"
+      [ -n "$_su_err" ] && _bnote "sysupgrade: $(printf '%s' "$_su_err" | tail -2 | tr '\n' ' ')"
+      return 1
+    fi
+    _tmp="$(P /tmp)/geomask-bk-$_ts-partial.tar.gz"
+    if ! tar czf "$_tmp" -C "$(P /)" etc root >/dev/null 2>&1 || ! archive_ok "$_tmp"; then
+      rm -f "$_tmp"
+      _backup_park_restore "$_park" "$_dir" || _backup_keep_failed "$_park"
+      _bbad "cannot create backup"
+      return 1
+    fi
+    _bwarn "полный бэкап не создан - сохранена частичная копия (etc + root)"
+  fi
+  if [ "$_full" = 1 ]; then
+    _dest="$_dir/router-backup-$_ts.tar.gz"
+  else
+    _dest="$_dir/router-backup-$_ts-partial.tar.gz"
+  fi
+  if ! mv -f "$_tmp" "$_dest" || ! archive_ok "$_dest"; then
+    rm -f "$_tmp"
+    [ -f "$_dest" ] && rm -f "$_dest"
+    _backup_park_restore "$_park" "$_dir" || _backup_keep_failed "$_park"
+    _bbad "cannot store a verified backup into $_dir"
+    return 1
+  fi
+  chmod 600 "$_dest" 2>/dev/null
+  # Record the archive as verified: the panel's write gate accepts only an archive a backup
+  # creator checked (a fresh mtime alone proves nothing).
+  mkdir -p "$(dirname "$(P /etc/geomask/backup-ok)")" 2>/dev/null
+  { printf 'file=%s\n' "$_dest"; printf 'ts=%s\n' "$(date +%s)"; } > "$(P /etc/geomask/backup-ok).tmp" 2>/dev/null \
+    && mv -f "$(P /etc/geomask/backup-ok).tmp" "$(P /etc/geomask/backup-ok)" 2>/dev/null
+  # rotation happens only now, and never touches the copy just written
+  _n=0
+  for _old in $(ls -1t "$_dir"/router-backup-*.tar.gz 2>/dev/null); do
+    _n=$((_n+1))
+    [ "$_n" -gt "$BACKUP_KEEP" ] && [ "$_old" != "$_dest" ] && rm -f "$_old"
+  done
+  rm -rf "$_park"
+  printf '%s' "$_dest"
+  return 0
+}
+
+backup_gate() { # a verified full backup before the first write of this run
+  [ "${GM_BACKUP_DONE:-0}" = 1 ] && return 0
+  _bk=$(ensure_backup full) || {
+    bad "нет полного бэкапа - изменения на роутере не начинаются"
+    info "  Причина и путь сохранённой копии напечатаны выше (stderr)."
+    info "  LuCI -> Система -> Резервная копия / Обновление прошивки -> Создать архив"
+    return 1
+  }
+  GM_BACKUP_DONE=1
+  GM_BACKUP_PATH="$_bk"
+  info "полный бэкап: $_bk"
+  return 0
+}
+
+# publish the backup folder over SMB via the existing ksmbd server. Publishing a full
+# sysupgrade archive (network passwords, keys, subscription URLs) is an explicit decision,
+# so the share is created only when the owner opted in with the marker file.
+#
+# Ownership rule (audit 14.11.2026, F04): a section is ours only when its `name` is
+# geomask-backups. Anonymous `@share[N]` references are NEVER cached across a delete - uci
+# renumbers them, so a saved index can point at a foreign share after one removal and the
+# next write would repoint that share at /root/geomask-backups. Every delete re-reads the
+# list, and sections that are not ours are never modified or removed.
+_smb_sections() { uci -q show ksmbd 2>/dev/null | sed -n 's/^\(ksmbd\.[^=]*\)=share$/\1/p'; }
+_smb_ours() { # prints our section ids, one per line
+  for _so in $(_smb_sections); do
+    [ "$(uci -q get "$_so.name" 2>/dev/null)" = "$SMB_SHARE_NAME" ] && printf '%s\n' "$_so"
+  done
+}
+
+ensure_smb_share() {
+  _init=""
+  for c in ksmbd1 ksmbd; do
+    [ -x "$(P /etc/init.d/$c)" ] && _init=$c && break
+  done
+  [ -n "$_init" ] || { info "ksmbd not installed - SMB share for backups skipped (folder still local)"; return 0; }
+  have uci || { warn "no uci - SMB share skipped"; return 0; }
+  # A new folder is private; an existing one is left as the owner made it.
+  if [ ! -d "$(P $BACKUP_DIR)" ]; then
+    mkdir -p "$(P $BACKUP_DIR)" 2>/dev/null && chmod 700 "$(P $BACKUP_DIR)" 2>/dev/null
+  fi
+  _ours=$(_smb_ours)
+  if [ ! -f "$(P $SMB_SHARE_ENABLE)" ]; then
+    # Nothing is changed here: not the share, not ksmbd, not the accounts. An old share is
+    # reported with its actual access rules instead of being silently "hardened".
+    if [ -n "$_ours" ]; then
+      _s=$(printf '%s\n' "$_ours" | head -1)
+      _go=$(uci -q get "$_s.guest_ok" 2>/dev/null)
+      _fr=$(uci -q get "$_s.force_root" 2>/dev/null)
+      info "SMB share '$SMB_SHARE_NAME': существующая шара оставлена как настроена (автопубликация выключена)"
+      case "$_go" in ''|0|no) ;; *) warn "  ВНИМАНИЕ: шара открыта для гостей (guest_ok=$_go) - закройте её в LuCI -> ksmbd" ;; esac
+      case "$_fr" in 1|yes) warn "  ВНИМАНИЕ: force_root=1 - архив читается от root, права 0600 сами по себе не защищают" ;; esac
+      warn "  Управляемая шара: touch $SMB_SHARE_ENABLE и создайте именованного пользователя ksmbd"
+    else
+      info "SMB share для бэкапов не публикуется по умолчанию (включить: touch $SMB_SHARE_ENABLE)"
+    fi
+    return 0
+  fi
+  chmod 700 "$(P $BACKUP_DIR)" 2>/dev/null
+  _changed=0
+  # Drop duplicated sections with OUR name only, re-reading after every delete so a shifted
+  # @share[N] can never address somebody else's section.
+  while :; do
+    _ours=$(_smb_ours)
+    _count=$(printf '%s\n' "$_ours" | grep -c . 2>/dev/null || echo 0)
+    [ "${_count:-0}" -gt 1 ] || break
+    _drop=$(printf '%s\n' "$_ours" | sed -n '2p')
+    [ -n "$_drop" ] || break
+    uci delete "$_drop" 2>/dev/null || break
+    uci commit ksmbd 2>/dev/null
+    _changed=1
+    info "SMB share '$SMB_SHARE_NAME': duplicate section removed"
+  done
+  _found=$(printf '%s\n' "$_ours" | head -1)
+  if [ -z "$_found" ]; then
+    _sec=$(uci add ksmbd share 2>/dev/null)
+    [ -n "$_sec" ] || { warn "uci add failed - SMB share skipped"; return 1; }
+    uci set "ksmbd.$_sec.name=$SMB_SHARE_NAME"
+    uci set "ksmbd.$_sec.path=$BACKUP_DIR"
+    uci set "ksmbd.$_sec.read_only=yes"
+    uci set "ksmbd.$_sec.guest_ok=no"
+    uci commit ksmbd 2>/dev/null || { warn "uci commit failed - SMB share skipped"; return 1; }
+    _found="ksmbd.$_sec"
+    _changed=1
+    info "SMB share '$SMB_SHARE_NAME' -> $BACKUP_DIR (read-only, аутентификация): created (section $_sec)"
+  else
+    _p=$(uci -q get "$_found.path" 2>/dev/null)
+    if [ "$_p" != "$BACKUP_DIR" ]; then
+      uci set "$_found.path=$BACKUP_DIR"
+      uci set "$_found.read_only=yes"
+      uci set "$_found.guest_ok=no"
+      uci commit ksmbd 2>/dev/null
+      _changed=1
+      info "SMB share '$SMB_SHARE_NAME': path fixed -> $BACKUP_DIR"
+    else
+      # path ok, but v1.9.0/1.9.1 may have stored quoted values ('1') - normalize to yes
+      _ro=$(uci -q get "$_found.read_only" 2>/dev/null)
+      case "$_ro" in
+        1|yes) : ;;
+        *) uci set "$_found.read_only=yes"; uci commit ksmbd 2>/dev/null; _changed=1 ;;
+      esac
+      # an opt-in share must not stay open to guests from an older release
+      _go=$(uci -q get "$_found.guest_ok" 2>/dev/null)
+      case "$_go" in
+        ''|0|no) : ;;
+        *) uci set "$_found.guest_ok=no"; uci commit ksmbd 2>/dev/null; _changed=1; info "SMB share: гостевой доступ выключен" ;;
+      esac
+    fi
+  fi
+  # v1.9.5: force user root (share under /root is unreachable for the guest uid)
+  _fr=$(uci -q get "$_found.force_root" 2>/dev/null)
+  [ "$_fr" = 1 ] || { uci set "$_found.force_root=1"; uci commit ksmbd 2>/dev/null; _changed=1; }
+  # No account is created here. A published backup needs a named ksmbd user with a password
+  # the owner chooses; `backup`/`backup` was a known credential in every geomask install.
+  if have ksmbd.adduser && ! grep -qE '^[[:space:]]*[^#[:space:]]' "$(P /etc/ksmbd/ksmbd.conf)" 2>/dev/null; then
+    info "SMB share: создайте пользователя вручную: ksmbd.adduser <имя>"
+  fi
+  if [ "$_changed" = 1 ]; then
+    # restart ONLY the file server (not the network stack); verify right away.
+    # `P` keeps this on the root the run was pointed at: a bare /etc/init.d/... restart reaches
+    # the host that executes the script, not the router tree under test (review 15.11, point 1).
+    "$(P /etc/init.d/$_init)" restart >/dev/null 2>&1 || true
+    sleep 2
+  fi
+  # a leftover share section without a name is reported, never deleted: it is not ours
+  for _s in $(_smb_sections); do
+    [ -z "$(uci -q get "$_s.name" 2>/dev/null)" ] && warn "ksmbd: безымянная секция $_s оставлена без изменений"
+  done
+  if grep -qF "[$SMB_SHARE_NAME]" "$(P /etc/ksmbd/ksmbd.conf)" 2>/dev/null; then
+    info "SMB share present in ksmbd.conf: \\\\$(lan_ip)\\$SMB_SHARE_NAME"
+  else
+    warn "share [$SMB_SHARE_NAME] not found in /etc/ksmbd/ksmbd.conf - check LuCI -> ksmbd"
+    return 1
+  fi
+  return 0
+}
+
+# dry-run: start a COPY of the mihomo config on shifted ports in a temp dir.
+# rc=0 only if mihomo actually starts with the new config. Never touches live service.
+mihomo_trial_run() {
+  _c="$(P $MIHOMO_CONF)"
+  [ -s "$_c" ] || { bad "config missing for trial"; return 1; }
+  _td="$(P /tmp)/gm-trial-$$"
+  rm -rf "$_td"; mkdir -p "$_td"
+  cp -a "$(dirname "$_c")/." "$_td/" 2>/dev/null || cp -a "$(P /etc/mihomo)" "$_td" 2>/dev/null || {
+    warn "trial: cannot copy mihomo dir"; rm -rf "$_td"; return 1; }
+  sed -i -e 's/^mixed-port:.*/mixed-port: 17890/' \
+         -e 's/^external-controller:.*/external-controller: 127.0.0.1:19090/' \
+         -e 's/^[[:space:]]*port: 7891/    port: 17901/' \
+         -e "s|path: /etc/mihomo/|path: $_td/|g" "$_td/config.yaml" 2>/dev/null
+  mihomo -d "$_td" -f config.yaml > "$_td/trial.log" 2>&1 &
+  _tp=$!
+  sleep 3
+  if kill -0 "$_tp" 2>/dev/null; then
+    info "trial run: OK (config starts, no restart done)"
+    kill "$_tp" 2>/dev/null
+    wait "$_tp" 2>/dev/null
+    rm -rf "$_td"
+    return 0
+  fi
+  bad "trial run FAILED - live mihomo NOT touched"
+  sed 's/^/    | /' "$_td/trial.log" 2>/dev/null | tail -5
+  rm -rf "$_td"
+  return 1
+}
+
+# restart mihomo and verify it really came back (pid + API). NO silent failures.
+mihomo_restart_verified() {
+  initd mihomo restart >/dev/null 2>&1
+  sleep 3
+  if ! svc_alive mihomo; then
+    bad "mihomo did NOT come back after restart!"
+    return 1
+  fi
+  if ! controller_curl -s -m3 "http://127.0.0.1:9090/version" 2>/dev/null | grep -qi 'mihomo\|meta'; then
+    bad "mihomo API not responding after restart!"
+    return 1
+  fi
+  info "mihomo restarted and verified (pid $(pidof mihomo))"
+  return 0
+}
+
+# Restore the pre-run config bytes under the transaction lock. safe_mihomo_restart runs in
+# step3 AFTER write_mihomo_config released the lock and rpcd is live, so a bare `cp` could land
+# on a newer panel commit. Fail closed when the lock cannot be taken: a refused rollback is
+# reported, not silently written unlocked.
+_mihomo_restore_preimage() { # <preimage> <live>
+  if ! command -v gm_lock_acquire >/dev/null 2>&1; then
+    bad "lock helper missing - refusing to restore the mihomo preimage"
+    return 1
+  fi
+  if ! gm_lock_acquire config-tx 30; then
+    bad "config transaction lock is busy - refusing to restore the mihomo preimage unlocked"
+    return 1
+  fi
+  _mrp_rc=0
+  cp -p "$1" "$2" 2>/dev/null || _mrp_rc=1
+  gm_lock_release config-tx
+  return $_mrp_rc
+}
+
+# full safe mihomo restart: backup -> trial -> restart -> verify -> rollback on failure
+safe_mihomo_restart() {
+  _c="$(P $MIHOMO_CONF)"
+  if [ "$GM_RESTART" != 1 ]; then
+    warn "restart skipped (no --restart); will apply at next mihomo start"
+    return 0
+  fi
+  backup_gate || return 1
+  _bk="$GM_BACKUP_PATH"
+  info "backup: $_bk"
+  # the pre-image is the file as it was BEFORE this run; copying the current file here (the
+  # old behaviour) made the "rollback" restore the candidate that had just failed
+  _pre="${GM_PRE_CONFIG:-}"
+  [ -s "$_pre" ] || _pre=$(ls -1t "$_c".bak_geomask_* 2>/dev/null | head -1)
+  if ! mihomo_trial_run; then
+    # the candidate is already on disk at this point: leaving it there means the next
+    # restart picks up a config that does not start. Put the pre-run file back.
+    if [ -n "$_pre" ] && [ -s "$_pre" ]; then
+      if _mihomo_restore_preimage "$_pre" "$_c"; then
+        info "прежний конфиг возвращён ($_pre)"
+      else
+        warn "прежний конфиг НЕ возвращён (lock/копия) - проверьте $_c вручную"
+      fi
+    else
+      warn "копии прежнего конфига нет - проверьте $_c вручную"
+    fi
+    bad "trial failed - live mihomo NOT restarted"
+    return 1
+  fi
+  if mihomo_restart_verified; then
+    info "restart verified OK"
+    return 0
+  fi
+  bad "restart FAILED - rolling back config and re-starting"
+  if [ -n "$_pre" ] && [ -s "$_pre" ]; then
+    if ! _mihomo_restore_preimage "$_pre" "$_c"; then
+      bad "config rollback could not be serialised (busy lock or copy failure) - mihomo NOT restarted on a possibly failed candidate; RESTORE FROM BACKUP: $_bk"
+      return 1
+    fi
+    /etc/init.d/mihomo restart >/dev/null 2>&1
+    sleep 3
+    if svc_alive mihomo && controller_curl -s -m3 "http://127.0.0.1:9090/version" 2>/dev/null | grep -qi 'mihomo\|meta'; then
+      info "rollback OK: предыдущий конфиг восстановлен, mihomo отвечает ($_pre)"
+    else
+      bad "rollback FAILED - RESTORE FROM BACKUP: $_bk"
+    fi
+  else
+    bad "нет копии прежнего конфига; RESTORE FROM BACKUP: $_bk"
+  fi
+  return 1
+}
+
+# ============================================================ STEP 4: AI-DNS - no DNS leak for AI devices
+# Browsing of AI-mode devices goes through the AI tunnel, but their DNS used to be
+# resolved by the router itself and left via the real ISP IP -> DNS leak: geo checkers
+# see "page from <AI country>, DNS from <ISP country>" and flag VPN usage.
+# This step puts DNS of AI-mode devices into the same AI tunnel:
+#   device DNS (any dst, port 53)
+#     --DNAT (nat priority -110; wins over ALL other DNS interception on this router)-->
+#     192.168.0.53:53 (2nd dnsmasq) -> 127.0.0.1:5055 (2nd DoH worker as user dnsai)
+#     --nft mark 0x64 (skuid)--> ip rule fwmark 0x64 table 101 -> dev AI (exit = AI node)
+# Permanent opt-out: touch /etc/geomask-aidns.off  (step becomes a no-op)
+
+AIDNS_IP=""          # discovered from the LAN (aidns_ip): 192.168.0.53 is one owner's net
+AIDNS_PORT=5055
+AIDNS_DNS_PORT=5353
+AIDNS_USER=dnsai
+AIDNS_MARK=0x64
+AIDNS_RULE_PREF=19902
+
+aidns_user_exists() { grep -q "^$AIDNS_USER:" "$(P /etc/passwd)" 2>/dev/null; }
+
+aidns_generate_nft() { # (re)write the nft include from the current ai device list
+  _uid=$(cat "$(P /etc/geomask-aidns.uid)" 2>/dev/null)
+  [ -n "$_uid" ] || _uid=$(awk -F: -v u="$AIDNS_USER" '$1==u{print $3}' "$(P /etc/passwd)" 2>/dev/null)
+  [ -n "$_uid" ] || _uid=65533
+  _ips=$(awk '$2=="ai" && $1 !~ /^#/ {print $1}' "$(P /etc/geo-devices.list)" 2>/dev/null)
+  _list=""
+  for _ip in $_ips; do _list="$_list $_ip,"; done
+  _list=${_list%,}
+  # mktemp, not the fixed /tmp/geomask-aidns.nft this function used to write: /tmp is
+  # world-writable, so a local user could plant that name and redirect root's write.
+  # P() keeps the temporary on the root the run is pointed at (the tests' GM_PREFIX).
+  _aidns_tmp=$(mktemp "$(P /tmp)/geomask-aidns.XXXXXX" 2>/dev/null) || {
+    bad "cannot create a temporary file for AI-DNS rules"
+    return 1
+  }
+  trap 'rm -f "$_aidns_tmp"' EXIT HUP INT TERM
+  {
+    printf '# geomask AI-DNS (auto-generated from /etc/geo-devices.list - do not edit)\n'
+    printf '# DNS of AI-mode devices goes into the AI tunnel: no DNS leak, no geo mismatch.\n'
+    printf '# idempotent include pattern (same as 20-https-dns-proxy-notrack.nft)\n'
+    printf 'add table inet geomask_ai_dns\n'
+    printf 'flush table inet geomask_ai_dns\n'
+    printf 'add chain inet geomask_ai_dns pre_nat { type nat hook prerouting priority -110; policy accept; }\n'
+    printf 'add chain inet geomask_ai_dns out_mark { type route hook output priority -150; policy accept; }\n'
+    printf 'add rule inet geomask_ai_dns out_mark meta skuid %s mark set %s\n' "$_uid" "$AIDNS_MARK"
+    if [ -n "$_list" ]; then
+      printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to %s:%s\n' "$_list" "$AIDNS_IP" "$AIDNS_DNS_PORT"
+    fi
+  } > "$_aidns_tmp" || {
+    rm -f "$_aidns_tmp"
+    trap - EXIT HUP INT TERM
+    bad "cannot render AI-DNS rules"
+    return 1
+  }
+  if nft -c -f "$_aidns_tmp" >/dev/null 2>&1; then
+    if save_stream /usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft 644 < "$_aidns_tmp"; then
+      rm -f "$_aidns_tmp"
+      trap - EXIT HUP INT TERM
+      return 0
+    fi
+    rm -f "$_aidns_tmp"
+    trap - EXIT HUP INT TERM
+    bad "cannot write the AI-DNS include - DNS interception is not installed"
+    return 1
+  fi
+  rm -f "$_aidns_tmp"
+  trap - EXIT HUP INT TERM
+  bad "generated AI-DNS nft rules failed syntax check"
+  return 1
+}
+

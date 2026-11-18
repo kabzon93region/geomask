@@ -1,0 +1,383 @@
+#!/bin/sh
+# geo-backend.sh - backend for LuCI "Гео-маскировка и AI" panel (geo-sync ubus object).
+# Commands:
+#   status | leases | log | sync_lists | google | backups | stack | nodescan
+#   nodes_get | nodes_set <0|1> <HH:MM> <countries> <asns> <base> <provider>
+#   sync_set <N> | syncd_set <on|off> | pin_set <on|off>   (v1.12.0 automation controls)
+#   lists_get | lists_seed   (v1.13.0 bundled MagiTrickle lists template: status + restore)
+#   global <direct|vpn> | ipv6 <on|off>
+#   dev_add <ip> <mode> [mac] [name] | dev_del <ip>
+#     modes: bypass (real IP) | realtz (VPN, own tz) | ai (FULLY via AI subscription)
+#   ai_sub_get                       (which provider the AI group rides; AI owns no subscription)
+#   subs_list | sub_add <name> <url> | sub_del <id>
+#   ai_sub_use <id> | vpn_sub_use <id>  (switch provider url from registry, no mihomo restart)
+#   upd_check [force] | upd_status | upd_apply   (self-update from GitHub releases, v1.7.0+)
+# Device modes (per-device geo policy):
+#   bypass  - device routes DIRECT (real IP), beats fwmark+Mihomo; real tz (GeoSync off on PC)
+#   realtz  - device routes via mihomo (masked IP), but PC keeps real tz (GeoSync off on PC)
+# NOTE: router timezone is NOT used for geo-masking (Google reads the PC browser tz), so no
+#       tz commands here. PC-side tz is handled by GeoSync.ps1 on each PC.
+# Output: JSON on stdout. Exit 0.
+
+DEVICES=/etc/geo-devices.list
+EXCL_OLD=/etc/geo-exclude.list   # legacy (ip name) -> migrated to DEVICES as bypass
+SUBS_FILE=/etc/geomask-subs.list # registry: id|name|url (one per line)
+BACKUP_DIR=${GM_BACKUP_DIR:-/root/geomask-backups}
+# The backup folder is published over SMB only after the owner opts in with this marker; the
+# diagnostic bundle must not land there without it (review 15.11, #14).
+SMB_SHARE_ENABLE=${GM_SMB_SHARE_ENABLE:-/etc/geomask/backup-share.enable}
+# How long a bundle may sit in the temporary spool or in the published share before it is
+# removed (hours). The value is clamped to 1..720 by _diag_uint before any arithmetic: a
+# junk value like `24h` used to abort the whole back end inside $((...)) before any JSON.
+CONSOLE_DIAG_KEEP_H=${GM_CONSOLE_DIAG_KEEP:-24}
+# Independent budgets for the two media (R08): the spool is tmpfs/RAM, the share is the
+# persistent overlay, so one may not evict the other. GM_CONSOLE_DIAG_QUOTA and
+# GM_CONSOLE_DIAG_SHARE_QUOTA are MiB (clamped 2..64), GM_CONSOLE_DIAG_FILES is the spool
+# archive count (clamped 1..32), GM_CONSOLE_DIAG_SHARE_FILES the share count (1..16).
+# Default: spool 8 MiB / 4 archives, share 6 MiB / 3 copies.
+
+DHCP_OWNED=/etc/geomask/dhcp-hosts   # id|ip|mac of host sections geomask created
+# Device/subscription lists are read-modify-written by the panel and the guard. The RMW is
+# serialised by the shared kernel `devices` lock and the temporary file is per-process, so two
+# writers cannot install a half-rewritten list or overwrite each other's temp (report R08).
+DEVICES_LOCK=${GM_DEVICES_LOCK:-/tmp/geomask-locks/devices.lock}
+AI_TUN_DEV=AI
+AI_TUN_IP=198.19.0.1
+AI_SOCKS_PORT=7891
+LOG=/root/geo-sync.log
+MIHOMO_API=http://127.0.0.1:9090
+MIHOMO_CONF=/etc/mihomo/config.yaml
+TUN=http://127.0.0.1:7890
+SYNCLISTS=/root/sync_mtrickle_mihomo.sh
+AI_RULES=/etc/mihomo/ruleset/ai.yaml
+MT_RULES=/etc/mihomo/ruleset/mtrickle.yaml
+BACKEND_VERSION="@@BACKEND_VERSION@@"
+# self-update state (panel button): check cache, status file, detached runner
+UPD_DIR=/tmp/geomask-upd
+# safe_write resources
+SAFE_WRITE_PY=/usr/bin/safe_write.py
+# Shared route-table helper (also sourced by /etc/hotplug.d/iface/99-default-vpn-route).
+GM_ROUTES_LIB=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
+# The one lock helper (R04): kernel flock on a persistent inode - route tables, the console
+# lane, crontab/devices read-modify-write, the updater and the config transaction share the
+# same primitive and the same rank order. No PID heuristics, no stale-lock reclaim.
+GM_LOCK_LIB=${GM_LOCK_LIB:-/usr/lib/geomask/geomask-lock.sh}
+if ! command -v gm_lock_acquire >/dev/null 2>&1 && [ -r "$GM_LOCK_LIB" ]; then
+  . "$GM_LOCK_LIB"
+fi
+
+# ---- write gate ------------------------------------------------------------
+# The project rule is "a full settings backup before ANY change on the router". The panel
+# used to change uci, dhcp, dns and network without one. Only an archive that a backup
+# creator verified and recorded in the marker file counts - a bare file with a fresh mtime
+# proves nothing. There is no environment bypass, so tests point GM_BACKUP_DIR at their tree.
+BACKUP_OK=${GM_BACKUP_OK:-/etc/geomask/backup-ok}
+
+_write_backup_marker() { # _write_backup_marker <verified-archive>
+  mkdir -p "$(dirname "$BACKUP_OK")" 2>/dev/null || return 1
+  { printf 'file=%s\n' "$1"; printf 'ts=%s\n' "$(date +%s)"; } > "$BACKUP_OK.tmp" 2>/dev/null || return 1
+  mv -f "$BACKUP_OK.tmp" "$BACKUP_OK" 2>/dev/null
+}
+
+_write_gate() { # _write_gate [max-age-seconds]
+  _wg_max=${1:-1800}
+  [ -f "$BACKUP_OK" ] || return 1
+  _wg_file=$(sed -n 's/^file=//p' "$BACKUP_OK" 2>/dev/null | head -1)
+  [ -n "$_wg_file" ] || return 1
+  [ -f "$_wg_file" ] || return 1
+  case "$_wg_file" in "$BACKUP_DIR"/router-backup-*.tar.gz) ;; *) return 1 ;; esac
+  _wg_m=$(stat -c %Y "$_wg_file" 2>/dev/null || echo 0)
+  case "$_wg_m" in ''|*[!0-9]*) return 1 ;; esac
+  _wg_now=$(date +%s 2>/dev/null || echo 0)
+  [ $((_wg_now - _wg_m)) -le "$_wg_max" ]
+}
+
+_require_backup() {
+  _write_gate 1800 && return 0
+  printf '{"ok":false,"error":"нужен свежий полный бэкап: нажмите «Создать бэкап» в панели (вкладка «Бэкапы»)"}\n'
+  return 1
+}
+
+# Create a full router backup from the panel. Same checks as the installer: the archive must
+# be a readable tar with the router tree, and it is recorded as verified before it counts.
+cmd_backup() {
+  mkdir -p "$BACKUP_DIR" 2>/dev/null || { printf '{"ok":false,"error":"cannot create %s"}\n' "$BACKUP_DIR"; return 1; }
+  _ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo bak)
+  _tmp="/tmp/geomask-bk-$_ts.tar.gz"
+  rm -f "$_tmp"
+  if ! sysupgrade -b "$_tmp" >/dev/null 2>&1 \
+     || ! tar -tzf "$_tmp" >/dev/null 2>&1 \
+     || ! tar -tzf "$_tmp" 2>/dev/null | grep -qE '(^|/)etc/'; then
+    rm -f "$_tmp"
+    printf '{"ok":false,"error":"sysupgrade -b не создал пригодный архив (нет tar/etc)"}\n'
+    return 1
+  fi
+  _dest="$BACKUP_DIR/router-backup-$_ts.tar.gz"
+  if ! mv -f "$_tmp" "$_dest" 2>/dev/null || [ ! -s "$_dest" ]; then
+    rm -f "$_tmp"
+    printf '{"ok":false,"error":"не удалось сохранить архив в %s"}\n' "$BACKUP_DIR"
+    return 1
+  fi
+  chmod 600 "$_dest" 2>/dev/null
+  _n=0
+  for _old in $(ls -1t "$BACKUP_DIR"/router-backup-*.tar.gz 2>/dev/null); do
+    _n=$((_n+1))
+    [ "$_n" -gt 1 ] && [ "$_old" != "$_dest" ] && rm -f "$_old"
+  done
+  _write_backup_marker "$_dest" || { printf '{"ok":false,"error":"cannot record the verified backup"}\n'; return 1; }
+  printf '%s BACKUP via panel: %s\n' "$(date +%FT%T)" "$_dest" >> "$LOG"
+  printf '{"ok":true,"file":"%s","size":%s}\n' "$_dest" "$(wc -c < "$_dest" | tr -d ' ')"
+}
+# read-only subscription-assignment resolver (config + audit state + registry, never writes)
+SUB_STATUS_PY=/usr/lib/geomask/geomask-subscription-status.py
+# Interpreter for the python helpers; GM_PYTHON only lets tests point at their own python.
+PYTHON_BIN=${GM_PYTHON:-python3}
+SUB_STATUS_PYTHON=$PYTHON_BIN
+# The one writer of the mihomo config: preimage, `mihomo -t`, isolated trial, atomic write,
+# reload and rollback all live in this CLI. Every lane that changes the file stages bytes and
+# commits them here with a CAS base - never `cp`/`mv` over the live file.
+TX_PY=${GM_TX:-/usr/lib/geomask/geomask-config-tx.py}
+
+# Digest of a file's bytes, or rc 1 when it cannot be read. Used as a CAS base before a
+# config write and to prove that a rollback really put the expected bytes back.
+_sha_file() {
+  [ -n "${1:-}" ] && [ -f "$1" ] || return 1
+  "$PYTHON_BIN" -B -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
+    "$1" 2>/dev/null | tr -d '\r\n'
+}
+UPD_CHECK=$UPD_DIR/check.json
+UPD_STATUS=$UPD_DIR/status.json
+UPD_PIDF=$UPD_DIR/pid              # legacy, read-only: the lock replaced it
+UPD_LOCK=${GM_UPD_LOCK:-/tmp/geomask-locks/updater.lock}
+UPD_TTL=3600
+
+# safe_write shell wrapper
+# usage: _safe_write <resource> <live_content> <editable_json> [backup_age_seconds]
+# returns: 0=ok, 1=validation fail, 2=backup gate fail, 3=trial fail, 4=install/reload fail, 5=rollback fail
+# stdout: new live content on success
+_safe_write() {
+    _resource="$1"
+    _live_content="$2"
+    _editable_json="$3"
+    _max_age="${4:-300}"
+
+    if [ ! -f "$SAFE_WRITE_PY" ]; then
+        printf '{"ok":false,"error":"safe_write.py not installed"}\n' >&2
+        return 1
+    fi
+
+    python3 "$SAFE_WRITE_PY" "$_resource" "$_live_content" "$_editable_json" "$_max_age"
+}
+UPD_REPO=kabzon93region/geomask
+DEPLOY_JS=/www/luci-static/resources/view/geo-sync/main.js
+DEPLOY_GUARD=/usr/bin/geomask-guard.sh
+DEPLOY_BACKEND=/usr/bin/geo-backend.sh
+
+# Keep authentication out of curl argv and diagnostics; read the active config on each call.
+controller_curl() {
+  python3 - "$MIHOMO_CONF" "$@" <<'GM_CONTROLLER_PY'
+import json, re, subprocess, sys
+
+def controller_headers(path):
+    with open(path, encoding='utf-8') as config:
+        for line in config:
+            match = re.match(r'^secret:\s*(.*)$', line.rstrip('\r\n'))
+            if not match:
+                continue
+            value = match.group(1).strip()
+            if value.startswith('"'):
+                value, end = json.JSONDecoder().raw_decode(value)
+                tail = match.group(1).strip()[end:].strip()
+                if tail and not tail.startswith('#'):
+                    raise ValueError('Invalid controller secret')
+            elif value.startswith("'"):
+                quoted = re.fullmatch(r"'((?:[^']|'')*)'\s*(?:#.*)?", value)
+                if not quoted:
+                    raise ValueError('Invalid controller secret')
+                value = quoted.group(1).replace("''", "'")
+            else:
+                value = re.split(r'\s+#', value, maxsplit=1)[0].strip()
+                if value.startswith('#'):
+                    value = ''
+                if value.startswith(('|', '>', '[', '{', '&', '*', '!')):
+                    raise ValueError('Unsupported controller secret')
+            if not isinstance(value, str) or any(ord(c) < 32 or ord(c) == 127 for c in value):
+                raise ValueError('Invalid controller secret')
+            return {'Authorization': 'Bearer ' + value} if value else {}
+    return {}
+
+try:
+    headers = controller_headers(sys.argv[1])
+    options = ''.join('header = ' + json.dumps(k + ': ' + v, ensure_ascii=False) + '\n'
+                      for k, v in headers.items())
+    result = subprocess.run(['curl', '--config', '-', *sys.argv[2:]],
+                            input=options.encode('utf-8'))
+    sys.exit(result.returncode)
+except Exception:
+    print('Controller request failed (configuration or transport error)', file=sys.stderr)
+    sys.exit(1)
+GM_CONTROLLER_PY
+}
+
+# escape a string for JSON: backslash, quote, tab; CR stripped; newline -> \n
+json_esc() {
+  printf '%s' "$1" | awk '
+    BEGIN { ORS="" }
+    {
+      gsub(/\\/, "\\\\")
+      gsub(/"/, "\\\"")
+      gsub(/\t/, "\\t")
+      gsub(/\r/, "")
+      if (NR>1) printf "\\n"
+      print
+    }
+  '
+}
+
+# current node of a mihomo group (VPN or AI)
+_grp_node() {
+  controller_curl -s -m3 "$MIHOMO_API/proxies/$1" | grep -oE '"now":"[^"]*"' | head -1 | sed 's/"now":"//; s/"$//'
+}
+
+# count rules in a rule-provider yaml (payload lines starting with "  - ")
+_count_rules() {
+  # grep -c prints 0 AND exits 1 on no match; `|| echo 0` then produced "0\n0" and the
+  # status JSON became invalid. Count with awk, which always prints one number.
+  awk 'BEGIN{c=0} /^[[:space:]]*- /{c++} END{print c}' "$1" 2>/dev/null || echo 0
+}
+
+# Diagnostics go to stderr: stdout is the RPC JSON and must stay parseable.
+warn() { printf '%s\n' "$*" >&2; printf '%s WARN %s\n' "$(date +%FT%T)" "$*" >> "$LOG" 2>/dev/null; }
+
+# migrate legacy /etc/geo-exclude.list (ip name) -> /etc/geo-devices.list (ip mode name)
+_migrate() {
+  if [ -f "$EXCL_OLD" ] && [ ! -f "$DEVICES" ]; then
+    while read -r dip dname; do
+      case "$dip" in ''|'#'*) continue ;; esac
+      echo "$dip bypass ${dname:-$dip}" >> "$DEVICES"
+    done < "$EXCL_OLD"
+    echo "$(date +%FT%T) MIGRATE exclude->devices (all bypass)" >> "$LOG"
+  fi
+}
+
+_prov_of_group() { # _prov_of_group <group> -> provider name used by that mihomo group ('' if none)
+  python3 -c '
+import re,sys
+try: t=open("/etc/mihomo/config.yaml",encoding="utf-8").read()
+except Exception: sys.exit(0)
+m=re.search(r"(?m)^[ \t]*- name: %s\s*\n(?:^(?:[ \t]+.*|\s*)\n)*" % re.escape(sys.argv[1]), t)
+if not m: sys.exit(0)
+u=re.search(r"use:\n\s+-\s+(\S+)", m.group(0))
+print(u.group(1) if u else "")
+' "$1" 2>/dev/null
+}
+
+_url_of_provider() { # _url_of_provider <provider> -> its url line
+  P="$1"
+  awk -v p="  $P:" '$0==p{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{exit}' "$MIHOMO_CONF" 2>/dev/null
+}
+
+# R10b: `status` is a READ. The old payload ended with `rules_ok` (a count of `lookup main`
+# rules) and the panel had nothing else to judge, so a router whose console/default went
+# through the WAN could still look healthy. These two sub-objects separate what the product
+# wants (desired) from what the kernel/UCI currently has (runtime), and name every check that
+# could not run (unknown). The top-level `ok` means "the request was served", never "healthy".
+_gm_unknown() { _GM_UNKNOWN="${_GM_UNKNOWN}${_GM_UNKNOWN:+,}\"$1\""; }
+
+_guard_status_json() { # the guard's base contract: device list + ip rules + table 101 default
+  _GM_UNKNOWN=''
+  _gs_state=ok
+  _gs_dev=ok
+  _gs_rules=0
+  _gs_t101=unknown
+  _gs_tun=unknown
+  _gs_lan=br-lan
+  if [ ! -e "$DEVICES" ]; then
+    _gs_dev=missing
+    _gs_state=unknown
+    _gm_unknown devices
+  elif [ ! -f "$DEVICES" ] || [ ! -r "$DEVICES" ]; then
+    _gs_dev=unreadable
+    _gs_state=unknown
+    _gm_unknown devices
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    _gs_lan=$(_gm_lan_iface 2>/dev/null)
+    [ -n "$_gs_lan" ] || _gs_lan=br-lan
+    if _gs_rules_now=$(ip rule show 2>/dev/null); then
+      _gs_rules=$(printf '%s\n' "$_gs_rules_now" | awk -v lan="$_gs_lan" '
+        {
+          line = $0
+          sub(/^[ \t]+/, "", line)
+          n = split(line, a, /[ \t]+/)
+          for (i = 1; i <= n; i++) {
+            if (a[i] == "iif" && a[i + 1] == lan && a[i + 2] == "ipproto" \
+                && a[i + 3] == "icmp" && a[i + 4] == "lookup" && a[i + 5] == "main") icmp = 1
+            if (a[i] == "fwmark" && a[i + 1] == "0x64" \
+                && (a[i + 2] == "lookup" || a[i + 2] == "table") && a[i + 3] == "101") fw = 1
+          }
+        }
+        END { print (icmp ? 1 : 0) + (fw ? 1 : 0) }
+      ')
+    else
+      _gs_state=unknown
+      _gm_unknown ip-rule
+    fi
+    if _gs_t101_now=$(ip route show table 101 2>/dev/null); then
+      _gs_t101=$(printf '%s\n' "$_gs_t101_now" | awk -v tun="$AI_TUN_DEV" '
+        $1 == "default" {
+          seen = 1
+          for (i = 2; i < NF; i++) if ($i == "dev" && $(i + 1) == tun) ours = 1
+        }
+        END {
+          if (ours) print "dev " tun
+          else if (seen) print "foreign"
+          else print "none"
+        }
+      ')
+    else
+      _gs_t101=unknown
+      _gs_state=unknown
+      _gm_unknown ip-route
+    fi
+    if ip link show "$AI_TUN_DEV" >/dev/null 2>&1; then _gs_tun=up; else _gs_tun=down; fi
+  else
+    _gs_state=unknown
+    _gm_unknown ip
+  fi
+  if [ "$_gs_state" != unknown ]; then
+    if [ "$_gs_tun" = down ]; then
+      _gs_state=down
+    elif [ "$_gs_rules" != 2 ] || [ "$_gs_t101" != "dev $AI_TUN_DEV" ]; then
+      _gs_state=drift
+    fi
+  fi
+  printf '{"scope":"base rules + table 101 (the console lane is its own object)","desired":{"devices":"regular","base_rules":2,"table101_default":"dev %s","tun":"%s"},"runtime":{"devices":"%s","base_rules":%s,"table101_default":"%s","tun":"%s"},"unknown":[%s],"state":"%s"}' \
+    "$AI_TUN_DEV" "$AI_TUN_DEV" "$_gs_dev" "$_gs_rules" "$_gs_t101" "$_gs_tun" "$_GM_UNKNOWN" "$_gs_state"
+}
+
+# Strict DNS policy recorded by geomask-dnsguard. This does NOT probe the resolver (the panel
+# calls status on every render): desired comes from the record, runtime from the live dnsmasq
+# section. A missing record means "off"; a record without the matching live list is drift.
+DNSGUARD_STATE=${GM_DNSGUARD_STATE:-/etc/geomask/dnsguard.state}
+DNSGUARD_DHCP=${GM_DNSGUARD_DHCP:-/etc/config/dhcp}
+
+_dns_section_values() { # <file> <option> -> values of the FIRST dnsmasq section, one per line
+  awk -v key="$2" '
+    /^[ \t]*config[ \t]+dnsmasq([ \t]|$)/ { if (started) exit; started = 1; next }
+    /^[ \t]*config[ \t]+/ { if (started) exit }
+    started {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line ~ ("^(option|list)[ \t]+" key "([ \t]|$)")) {
+        sub("^(option|list)[ \t]+" key "[ \t]+", "", line)
+        q = sprintf("%c", 39)
+        while (substr(line, 1, 1) == q || substr(line, 1, 1) == "\"") line = substr(line, 2)
+        while (substr(line, length(line), 1) == q || substr(line, length(line), 1) == "\"") \
+          line = substr(line, 1, length(line) - 1)
+        print line
+      }
+    }
+  ' "$1" 2>/dev/null
+}
+

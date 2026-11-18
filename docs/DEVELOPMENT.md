@@ -22,6 +22,29 @@ python tools/check_build.py         # geomask.sh == сборка из исход
 **Правило:** править `geomask.sh.in` и `assets/*`, затем пересобирать `geomask.sh`; не
 редактировать `geomask.sh` вручную.
 
+### Этап 0: небольшие source-parts
+
+С 18.11.2026 три крупных authored-файла разделены на упорядоченные части, а прежние пути
+поставки стали **generated compatibility views** (имя и байты те же):
+
+| Цель | Parts (authoritative) | Generated view |
+|---|---|---|
+| installer | `src/installer/*.sh.part` + `order.json` | `geomask.sh.in` |
+| backend | `src/backend/*.sh.part` + `order.json` | `assets/geo-backend.sh` |
+| panel | `src/panel/*.js.part` + `order.json` | `assets/geo-sync-page.js` |
+
+- Править нужно **part**, а не delivery-файл: композиция — чистая конкатенация частей в
+  порядке `order.json`, без разделителей, wrappers и source-map, поэтому граница части
+  невидима для shell/JS (globals, traps, `$0`, heredoc, fd остаются как были).
+- `python -B tools/compose_sources.py --check` — немутирующая проверка: называет первую
+  разошедшуюся часть. `--write` пересобирает view. `build.py` компонует цели с частями перед
+  сборкой, а `check_build.py --verify-only` падает на расхождении и **не** перезаписывает
+  проверяемый файл.
+- Части — только для разработки/сборки: на роутер по-прежнему уезжает один `geomask.sh`,
+  никаких runtime-imports. Часть не должна открывать heredoc, который не закрывает, и
+  мягкий предел — ~500 строк на авторскую часть.
+- Baseline для паритета после переноса: [`docs/source-split/BASELINE-0a.md`](source-split/BASELINE-0a.md).
+
 **Инвариант байтов:** установщик пишет ассет через heredoc — текст (LF) без хвостовых
 переводов строк плюс ровно один в конце. Каталог модулей хеширует те же байты; расхождение
 на один байт делает все модули «изменёнными» после обновления. Держится тестами

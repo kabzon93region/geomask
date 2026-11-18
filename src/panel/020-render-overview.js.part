@@ -1,0 +1,410 @@
+
+		var counters = E('div', { 'class': 'gs-counters' }, [
+			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.ai_rules != null ? st.ai_rules : '—')),
+				E('div', { 'class': 'gs-cap' }, 'правил ИИ-пути (ai.yaml → AI)') ]),
+			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.mt_rules != null ? st.mt_rules : '—')),
+				E('div', { 'class': 'gs-cap' }, 'правил общего пути (mtrickle.yaml → VPN)') ]),
+			E('div', { 'class': 'gs-counter' }, [ E('div', { 'class': 'gs-num' }, String(st.n_bypass != null ? st.n_bypass : (st.devices || []).length)),
+				E('div', { 'class': 'gs-cap' }, 'мимо VPN (реальный IP)') ])
+		]);
+
+		var hero = E('div', { 'class': 'gs-hero' }, [
+			E('h2', {}, 'Гео-маскировка и маршрутизация AI'),
+			E('div', { 'class': 'gs-sub' }, 'Google и ИИ-сервисы идут через AI-подписку (какую страну видит Google — показывает блок выше), всё остальное — через общую VPN.'),
+			E('div', { 'class': 'gs-duo' }, [ laneSub, aiSub, vpnSub ]),
+			counters
+		]);
+		panels.obzor.appendChild(hero);
+
+		/* ===================== Subscriptions registry ===================== */
+		function maskUrl(u) {
+			if (!u) return '—';
+			return String(u).replace(/\/[^/]*$/, '/...');
+		}
+		/* Assignment badges. The scalar *_sub fields are single-valued and were derived from
+		   the config text; after an apply re-serialises the config they were all empty at once.
+		   subscription_bindings is computed structurally and knows a managed pool's original
+		   subscription, so it wins whenever it is present - even when its list is empty. */
+		var bindings = st.subscription_bindings || null;
+		function bindingIds(pathId) {
+			if (!bindings) return null;
+			var record = bindings[pathId] || {};
+			return Array.isArray(record.subscription_ids) ? record.subscription_ids : [];
+		}
+		function hasBinding(pathId, id) {
+			var ids = bindingIds(pathId);
+			if (ids === null) return false;
+			return ids.indexOf(id) >= 0;
+		}
+		var REASON_TEXT = {
+			group_missing: 'группа пути не найдена в конфиге',
+			group_duplicate: 'в конфиге несколько групп с таким именем',
+			group_has_no_providers: 'группа не подключена к провайдеру',
+			group_bad_use: 'список провайдеров группы некорректен',
+			provider_without_url: 'у провайдера нет ссылки на подписку',
+			managed_source_unrecorded: 'не записано, из какой подписки собран проверенный пул',
+			managed_source_unverified: 'проверенный пул не подтверждён записью применения',
+			managed_source_missing: 'исходная подписка проверенного пула отсутствует в конфиге',
+			registry_has_no_match: 'ни одна запись реестра не совпала с источником',
+			config_unreadable: 'конфиг mihomo не читается',
+			state_unreadable: 'состояние проверок не читается',
+			snapshot_changed: 'конфиг менялся во время чтения',
+			unreadable_input: 'не удалось прочитать данные назначения'
+		};
+		function assignmentNotice() {
+			if (!bindings) return null;
+			var lines = [];
+			[['vpn', 'VPN'], ['vpn_nop2p', 'VPN-noP2P'], ['ai', 'AI']].forEach(function(pair) {
+				var record = bindings[pair[0]] || {};
+				if (record.status === 'partial' || record.status === 'unknown' ||
+					record.status === 'unregistered') {
+					var why = REASON_TEXT[record.reason_code] || record.reason_code || 'причина неизвестна';
+					lines.push(pair[1] + ': назначение не подтверждено (' + why + ')');
+				}
+			});
+			var known = {};
+			subs.forEach(function(s) { known[s.id] = true; });
+			var dangling = false;
+			Object.keys(bindings).forEach(function(key) {
+				((bindings[key] || {}).subscription_ids || []).forEach(function(id) {
+					if (!known[id]) dangling = true;
+				});
+			});
+			if (dangling) {
+				lines.push('данные назначений изменились — обновите страницу');
+			}
+			if (!lines.length) return null;
+			return E('div', { 'class': 'gs-hint gs-warn', style: 'margin:0 0 8px' }, lines.join(' · '));
+		}
+		function managedNote() {
+			if (!bindings) return E('span', {});
+			var notes = [];
+			[['vpn', 'VPN'], ['vpn_nop2p', 'VPN-noP2P'], ['ai', 'AI']].forEach(function(pair) {
+				var record = bindings[pair[0]] || {};
+				if (record.via === 'managed' && (record.subscription_ids || []).length) {
+					notes.push(pair[1] + ' работает на проверенном пуле — ниже его исходная подписка');
+				}
+			});
+			if (!notes.length) return E('span', {});
+			return E('div', { 'class': 'gs-hint', style: 'margin:0 0 8px' }, notes.join(' · '));
+		}
+		function subRow(s) {
+			var isVpn = bindings ? hasBinding('vpn', s.id) : !!(st.vpn_sub && st.vpn_sub === s.id);
+			var isVpnNP = bindings ? hasBinding('vpn_nop2p', s.id) : !!(st.vpn_nop2p_sub && st.vpn_nop2p_sub === s.id);
+			var isAi = bindings ? hasBinding('ai', s.id) : !!(st.ai_sub && st.ai_sub === s.id);
+			var dest = [];
+			if (isVpn)   dest.push(E('span', { 'class': 'gs-badge gs-on' }, 'VPN'));
+			if (isAi)    dest.push(E('span', { 'class': 'gs-badge gs-ok' }, 'AI'));
+			if (isVpnNP) dest.push(E('span', { 'class': 'gs-badge gs-warn' }, 'VPN-noP2P'));
+			if (!dest.length) dest = ['—'];
+			var bV = { 'class': 'gs-btn gs-btn-use' + (isVpn ? ' gs-btn-vpn-on' : ''), 'title': isVpn ? 'Эта подписка держит слот VPN (P2P разрешён)' : 'Отдать слот VPN (полоса для торрентов и IP-списков) этой подписке' };
+			bV.click = function() {
+				if (!confirm('Отдать слот VPN этой подписке?\n\nНа неё перейдут правила по IP (mtrickle_bulk), пины зависших YouTube-рёбер и ответы входящим пирам. Полоса создаётся автоматически, если её ещё нет.')) return;
+				view.act(callVpnSubUse, { id: s.id }, 'Подписка применена для VPN');
+			};
+			var bN = { 'class': 'gs-btn gs-btn-use' + (isVpnNP ? ' gs-btn-vpn-on' : ''), 'title': isVpnNP ? 'Эта подписка держит слот VPN-noP2P (провайдер запрещает торренты)' : 'Отдать слот VPN-noP2P (общий VPN по доменным спискам) этой подписке' };
+			bN.click = function() {
+				if (!confirm('Отдать слот VPN-noP2P этой подписке?\n\nНа неё останутся только доменные правила (mtrickle) и STUN. Убедитесь, что провайдер этой подписки разрешает трафик из ваших списков.')) return;
+				view.act(callVpnnpSubUse, { id: s.id }, 'Подписка применена для VPN-noP2P');
+			};
+			// v1.25.2: the "→ AI" slot switch is back. AI points at this subscription via the AI
+			// group. If AI shares its provider with VPN/VPN-noP2P, the backend creates a dedicated
+			// provider instead of silently re-pointing the shared one - other lanes never move.
+			var bA = { 'class': 'gs-btn gs-btn-use' + (isAi ? ' gs-btn-ai-on' : ''), 'title': isAi ? 'Эта подписка используется для AI-маршрутов' : 'Переключить AI-маршруты на эту подписку' };
+			bA.click = function() {
+				if (!confirm('Отдать слот AI этой подписке?\n\nПути Google/OpenAI/Claude пойдут через её узлы. Если этот провайдер уже питает VPN или VPN-noP2P, для AI будет создан собственный провайдер - чужие полосы не сдвинутся.')) return;
+				view.act(callAiSubUse, { id: s.id }, 'Подписка применена для AI');
+			};
+			var bD = { 'class': 'gs-btn gs-btn-warn', 'title': 'Убрать из реестра', 'click': function() { view.act(callSubDel, { id: s.id }, 'Подписка удалена'); } };
+			return E('tr', {}, [
+				E('td', {}, s.name || s.id),
+				E('td', { 'class': 'gs-subs-url' }, maskUrl(s.url)),
+				E('td', {}, dest),
+				E('td', { 'class': 'gs-subs-actions' }, [
+					E('button', bV, '→ VPN'),
+					E('button', bA, '→ AI'),
+					E('button', bN, '→ VPN-noP2P'),
+					E('button', bD, 'Удалить')
+				])
+			]);
+		}
+		var subNameIn = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'Например: США' });
+		var subUrlIn  = E('input', { 'class': 'gs-input', 'style': 'flex:1;min-width:260px', 'placeholder': 'https://... ссылка подписки' });
+		var btnSubAdd = E('button', { 'class': 'gs-btn gs-btn-primary',
+			'click': function() {
+				var u = (subUrlIn.value || '').trim();
+				if (!/^https?:\/\//.test(u)) {
+					ui.addNotification(null, E('p', {}, 'Ссылка должна начинаться с http:// или https://'), 'warning');
+					return;
+				}
+				btnSubAdd.disabled = true; btnSubAdd.textContent = 'Добавление…';
+				callSubAdd({ name: subNameIn.value || '', url: u }).then(function(res) {
+					btnSubAdd.disabled = false; btnSubAdd.textContent = 'Добавить';
+					if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+					subNameIn.value = ''; subUrlIn.value = '';
+					ui.addNotification(null, E('p', {}, 'Подписка добавлена в реестр'), 'info');
+					return view.reload();
+				}).catch(function(e) {
+					btnSubAdd.disabled = false; btnSubAdd.textContent = 'Добавить';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Добавить');
+		var btnSubSeed = E('button', { 'class': 'gs-btn',
+			'title': 'Импортировать текущие подписки из конфига mihomo в реестр',
+			'click': function() {
+				btnSubSeed.disabled = true; btnSubSeed.textContent = 'Импорт…';
+				callSubsSeed().then(function(res) {
+					btnSubSeed.disabled = false; btnSubSeed.textContent = 'Подтянуть текущие из конфига';
+					if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+					ui.addNotification(null, E('p', {}, 'Текущие подписки добавлены в реестр'), 'info');
+					return view.reload();
+				}).catch(function(e) {
+					btnSubSeed.disabled = false; btnSubSeed.textContent = 'Подтянуть текущие из конфига';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Подтянуть текущие из конфига');
+		var subsCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Подписки'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Реестр подписок. В колонке «Назначение» показано, чем подписка занята СЕЙЧАС. Три слота: ' +
+				'«VPN-noP2P» — общий VPN по доменным спискам (сюда нельзя торренты: провайдер это запрещает), ' +
+				'«VPN» — полоса для всего, что выглядит как P2P (правила по IP, пины зависших YouTube-рёбер, ' +
+				'ответы входящим пирам), «AI» — Google и AI-сервисы. Кнопка активного слота подсвечена. ' +
+				'Переключение — через API mihomo, без перезапуска и обрыва соединений.'),
+			assignmentNotice() || E('span', {}),
+			managedNote(),
+			E('table', { 'class': 'gs-table gs-subs' },
+				[ E('tr', {}, [ E('th', {}, 'Имя'), E('th', {}, 'Ссылка'), E('th', {}, 'Назначение'), E('th', {}, '') ]) ]
+					.concat(subs.map(subRow))),
+			E('div', { 'class': 'gs-row', 'style': 'margin-top:10px' }, [ subNameIn, subUrlIn, btnSubAdd ]),
+			E('div', { 'class': 'gs-row' }, [ btnSubSeed ])
+		]);
+		panels.subs.appendChild(subsCard);
+
+		/* ===================== ACTIONS: sync / google check ===================== */
+		var listsOut = E('div', {});
+		var btnLists = E('button', { 'class': 'gs-btn gs-btn-primary',
+			'click': function() {
+				btnLists.disabled = true; btnLists.textContent = 'Синхронизация…';
+				callLists().then(function(res) {
+					btnLists.disabled = false; btnLists.textContent = 'Синхронизировать списки сейчас';
+					var out = (res && res.output) ? res.output : '(нет вывода)';
+					listsOut.textContent = out;
+					ui.addNotification(null, E('p', {}, 'Списки синхронизированы: ИИ=' +
+						(res && res.ai_rules) + ', VPN=' + (res && res.mt_rules)), 'info');
+					return view.reload();
+				}).catch(function(e) {
+					btnLists.disabled = false; btnLists.textContent = 'Синхронизировать списки сейчас';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Синхронизировать списки сейчас');
+
+		var btnGoogle = E('button', { 'class': 'gs-btn',
+			'click': function() {
+				btnGoogle.disabled = true; btnGoogle.textContent = 'Проверка Google…';
+				callGoogle().then(function(res) {
+					btnGoogle.disabled = false; btnGoogle.textContent = 'Что видит Google?';
+					var cc = res && res.google ? res.google : '(нет ответа)';
+					ui.addNotification(null, E('p', {}, 'Google видит: ' + cc), 'info');
+					return view.reload();
+				}).catch(function(e) {
+					btnGoogle.disabled = false; btnGoogle.textContent = 'Что видит Google?';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Что видит Google?');
+
+		var btnScan = E('button', { 'class': 'gs-btn',
+			'click': function() {
+				btnScan.disabled = true; btnScan.textContent = 'Проверка…';
+				callNodescan().then(function() {
+					btnScan.textContent = 'Проверить узлы сейчас';
+					ui.addNotification(null, E('p', {}, 'Аудит узлов запущен в фоне (до ~1 минуты); итог появится в этой карточке после обновления.'), 'info');
+					setTimeout(function() { view.reload(); }, 45000);
+				}).catch(function(e) {
+					btnScan.disabled = false; btnScan.textContent = 'Проверить узлы сейчас';
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+				});
+			} }, 'Проверить узлы сейчас');
+
+		var syncCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Синхронизация и проверка'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 6px' },
+				'Событийный сторож применяет изменения списков magitrickle в mihomo за секунды после сохранения ' +
+				'(cron каждые 5 минут остался страховкой). Кнопка ниже — ручной синк "всей силы", если не доверяете автомату.'),
+			(function() {
+				var s = stk.sync || {}, rows = [];
+				var syncTxt;
+				if (stk.ok !== true) { syncTxt = 'нет данных (бэкенд stack не ответит?)'; }
+				else {
+					var last = s.ts ? (s.ts + (s.changed
+						? (' — обновлено: VPN=' + (s.mt || '?') + ', AI=' + (s.ai || '?')
+							+ (s.moved ? (', в AI по маске: ' + s.moved) : '')
+							+ ', mihomo ' + (s.reload ? 'перечитил' : 'НЕ перечитал (!)'))
+						: ' — без изменений')) : 'после загрузки синков ещё не было';
+					syncTxt = (stk.syncd ? 'сторож активен · ' : 'СТОРОЖ НЕ РАБОТАЕТ (только cron) · ') + last;
+				}
+				rows.push(E('div', { 'class': 'gs-row' }, [
+					E('span', { 'class': 'gs-label' }, 'Автосинк списков'),
+					E('span', { 'class': (stk.syncd ? 'gs-val' : 'gs-val gs-badge gs-warn') }, syncTxt)
+				]));
+				if (stk.ok === true) {
+					var ns = stk.nodescan;
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'Узлы подписки (аудит)'),
+						E('span', { 'class': 'gs-val gs-upd-meta' },
+							ns ? (ns.ts + ' · узлов ' + ns.total + ', с РФ-меткой ' + ns.blocked
+								+ (ns.changed ? ' (фильтр обновлён)' : '') + (ns.errors ? ' · сбоевlookup: ' + ns.errors : ''))
+								: 'ночной скан ещё не запускался (03:30)')
+					]));
+					var L = stk.lists || {}, H = stk.health || {};
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'DPI (zapret)'),
+						E('span', { 'class': 'gs-val gs-mono gs-upd-meta' },
+							(String(stk.strategy || '?') + ' · списки: user=' + (L.user || 0)
+								+ ' excl=' + (L.exclude || 0) + (L.nochange ? ' #nochange✓' : ' #nochange✗')
+								+ ' google=' + (L.google || 0) + ' rkn=' + (L.rkn || 0))
+						)
+					]));
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'Пины/здоровье'),
+						E('span', { 'class': 'gs-val gs-upd-meta' },
+							(stk.pin ? 'рестарты mihomo запрещены пином' : 'пинов нет')
+							+ ' · tg-прокси: ' + (H.tg || 0) + ' · лендинг: ' + (H.landing ? 'ок' : 'НЕ отвечает'))
+					]));
+					var gl = stk.guard || [];
+					rows.push(E('div', { 'class': 'gs-row', 'style': 'align-items:flex-start' }, [
+						E('span', { 'class': 'gs-label' }, 'Страж маршрутизации'),
+						E('span', { 'class': 'gs-val gs-mono gs-upd-meta', 'style': 'white-space:pre-wrap;font-size:11px' },
+							gl.length ? gl.slice(-3).join('\n') : 'тихий (последних событий нет)')
+					]));
+					var K = stk.links || {};
+					var lnk = function(t, u) { return u ? E('a', { 'href': u, 'target': '_blank', 'style': 'color:#58a6ff' }, t) : null; };
+					rows.push(E('div', { 'class': 'gs-row' }, [
+						E('span', { 'class': 'gs-label' }, 'Панели'),
+						E('span', {}, [ lnk('MagiTrickle', K.magitrickle), ' · ', lnk('Zapret DPI', K.zapret),
+							' · ', lnk('Лендинг', K.landing), ' · ', lnk('LuCI', K.luci) ] || '')
+					]));
+				}
+				return E('div', { 'style': 'margin:0 0 8px' }, rows);
+			})(),
+			E('div', { 'class': 'gs-actions' }, [ btnLists, btnGoogle, btnScan ]),
+			listsOut
+		]);
+		panels.lists.appendChild(syncCard);
+
+		/* ===================== Routing ===================== */
+		var globalSeg = E('div', { 'class': 'gs-seg' }, [
+			E('div', { 'class': st.global === 'DIRECT' ? 'gs-active' : '',
+				'click': function() { view.act(callGlobal, { mode: 'DIRECT' }); } }, 'DIRECT'),
+			E('div', { 'class': st.global === 'VPN' ? 'gs-active' : '',
+				'click': function() { view.act(callGlobal, { mode: 'VPN' }); } }, 'VPN')
+		]);
+		var routeCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Маршрутизация'),
+			E('div', { 'class': 'gs-row' }, [ E('span', { 'class': 'gs-label' }, 'Глобальный режим (трафик мимо списков)'),
+				globalSeg ]),
+			E('div', { 'class': 'gs-hint' }, 'DIRECT — мимо списков напрямую (локальные сервисы свободны). VPN — весь остаток через общую подписку.')
+		]);
+		panels.obzor.appendChild(routeCard);
+
+		/* ===================== IPv6 ===================== */
+		var v6Card = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'IPv6'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'IPv6-стек (утечка реального IP мимо VPN)'),
+				badgeKlass(st.ipv6 === 1, 'gs-warn', 'gs-ok', 'включён — УТЕЧКА', 'выключен'),
+				E('button', { 'class': 'gs-btn' + (st.ipv6 ? ' gs-btn-warn' : ''),
+					'click': function() { view.act(callIpv6, { state: st.ipv6 ? 'off' : 'on' }); } },
+					st.ipv6 ? 'Отключить' : 'Включить')
+			]),
+			E('div', { 'class': 'gs-hint' }, 'Отключение снимает глобальные IPv6-адреса с роутера и LAN-устройств, утечка закрывается полностью.')
+		]);
+		panels.obzor.appendChild(v6Card);
+
+		/* ===================== Console lane ===================== */
+		// One switch on, one switch off. Off is the promise the owner asked for: the console
+		// goes back to its old path immediately. Switching back on re-applies the config and
+		// reloads mihomo (`PUT /configs?force=true`), so it costs a few seconds - the hint says
+		// so instead of promising an instant switch.
+		var conIp = E('input', { 'class': 'gs-input', 'style': 'width:140px', 'placeholder': '192.168.1.177' });
+		var conCc = E('input', { 'class': 'gs-input', 'style': 'width:150px', 'placeholder': 'TR,DE' });
+		var conSubs = ((all[4] || {}).subs || []);
+		var conSel = E('select', { 'class': 'gs-input', 'style': 'min-width:220px' },
+			[ E('option', { 'value': '' }, '— как у VPN (по умолчанию) —') ].concat(
+				conSubs.map(function(s) {
+					return E('option', { 'value': String(s.id) },
+						(s.name || ('подписка ' + s.id)) + ' — ' + maskUrl(s.url || ''));
+				})));
+		var conState = E('div', { 'class': 'gs-hint' }, 'состояние консоли: —');
+		function conAct(action) {
+			view.act(callConsole, { action: action,
+				ip: (conIp.value || '').trim(), sub: (conSel.value || ''),
+				countries: (conCc.value || '').trim() });
+		}
+		// The card used to be empty after every reload: nothing ever asked the router what the
+		// lane is. `console_status` is read-only, so it is safe to call on each render; after a
+		// switch the reload re-renders and reads it again.
+		callConsoleStatus().then(function(cs) {
+			cs = cs || {};
+			conIp.value = cs.ip || '';
+			conCc.value = cs.countries || '';
+			conSel.value = cs.sub ? String(cs.sub) : '';
+			var cc = cs.config || {};
+			// `state` distinguishes "on and matching" from "on but traffic goes elsewhere"
+			// and from "could not check"; enabled/rule/tun stay for older backends.
+			var csState = cs.state || '—';
+			var csUnknown = (cs.unknown && cs.unknown.length)
+				? ' · не проверено: ' + cs.unknown.join(', ') : '';
+			conState.textContent = 'состояние консоли: ' + (cs.enabled ? 'включена' : 'выключена')
+				+ ' · состояние: ' + csState
+				+ ' · правило: ' + (cs.rule ? 'есть' : 'нет')
+				+ ' · туннель Console: ' + (cs.tun ? 'поднят' : 'нет')
+				+ ' · группа CONSOLE: ' + (cc.group ? 'есть' : 'нет')
+				+ ' · провайдер console: ' + (cc.provider ? 'есть' : 'нет')
+				+ csUnknown;
+		}).catch(function() {
+			// A router whose backend has no such method must still render the card.
+			conState.textContent = 'состояние консоли: нет данных';
+		});
+		// The archive is built on the router and handed back through the same authenticated ubus
+		// call as the rest of the panel: the owner gets a file, not a path in /tmp to hunt for
+		// (review 15.11, #15). The object URL is created from those bytes only - no network
+		// response is ever put into href, so a broken answer cannot navigate the panel away.
+		function saveBundle(res, statusEl) {
+			if (!res || !res.data) {
+				statusEl.textContent = 'архив не получен: ' + ((res && res.error) || 'нет данных');
+				return false;
+			}
+			var bin = atob(res.data);
+			var bytes = new Uint8Array(bin.length);
+			for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+			var blob = new Blob([bytes], { type: 'application/gzip' });
+			var url = URL.createObjectURL(blob);
+			var a = E('a', { 'href': url, 'download': res.name || 'geomask-diagnostics.tar.gz' });
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+			statusEl.textContent = 'архив сохранён: ' + (res.name || '')
+				+ ' (' + (res.bytes || 0) + ' байт)';
+			return true;
+		}
+		var conCard = E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Игровая консоль — отдельный выход'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'IP консоли'), conIp,
+				E('span', { 'class': 'gs-label' }, 'Страны выхода'), conCc
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Подписка'), conSel
+			]),
+			conState,
+			E('div', { 'class': 'gs-row' }, [
+				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() { conAct('on'); } }, 'Включить путь консоли'),
+				E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() { conAct('off'); } }, 'Вернуть как было')
+			]),
+			E('div', { 'class': 'gs-hint' }, '«Вернуть как было» снимает правило и останавливает туннель — консоль сразу идёт прежним путём. Повторное включение заново применяет конфиг и перезагружает mihomo, это занимает несколько секунд. Общий архив (состояние консоли и логи всех проверок) собирается одной кнопкой на вкладке «Диагностика».'),
+			E('div', { 'class': 'gs-hint' }, 'Пусто в «Страны выхода» — консоль идёт на любой узел подписки (это и есть сброс фильтра). Указывайте коды через запятую: TR, DE, NL.'),
+			E('div', { 'class': 'gs-hint' }, 'Пустая подписка — «как у VPN»: провайдер консоли смотрит на подписку, которой пользуется группа VPN.')
+		]);
+		panels.obzor.appendChild(conCard);

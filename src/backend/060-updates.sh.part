@@ -1,0 +1,426 @@
+cmd_upd_apply() {
+  mkdir -p "$UPD_DIR" 2>/dev/null
+  if _upd_running; then printf '{"ok":false,"err":"already running"}\n'; return 1; fi
+  _upd_check_now "" >/dev/null 2>&1 || true
+  [ -s "$UPD_CHECK" ] || { printf '{"ok":false,"err":"version source unreachable - check network"}\n'; return 1; }
+  _tag=$(sed -n 's/.*"tag":"\([^"]*\)".*/\1/p' "$UPD_CHECK" | head -1)
+  [ -n "$_tag" ] || { printf '{"ok":false,"err":"bad check cache"}\n'; return 1; }
+  # An installer runs as root: without a digest from the release API there is nothing to
+  # verify the download against, and a hash from the same source proves nothing (F22).
+  _dig=$(sed -n 's/.*"digest":"\(sha256:[0-9a-f]*\)".*/\1/p' "$UPD_CHECK" | head -1)
+  [ -n "$_dig" ] || { printf '{"ok":false,"err":"release digest unavailable - refusing to run an unverified installer"}\n'; return 1; }
+  # Single instance: the kernel lock is acquired BEFORE the runner script is written, and the
+  # detached runner inherits the descriptor, so the lock lives exactly as long as the update.
+  # The old check-then-write pid let two callers both pass the check (R10).
+  command -v gm_lock_acquire >/dev/null 2>&1 || {
+    printf '{"ok":false,"err":"lock helper missing - refusing to start an update"}\n'; return 1; }
+  gm_lock_acquire updater 0 "$UPD_LOCK" || {
+    printf '{"ok":false,"err":"already running"}\n'; return 1; }
+  cat > "$UPD_DIR/run.sh" <<'RUNEOF'
+#!/bin/sh
+# geomask self-update runner (detached): backup -> download -> validate -> reinstall
+# v1.8.0: every step appended to $D/steps.log (panel console list) + /root/geo-sync.log;
+#         check cache removed after success so the page shows real fresh versions.
+D=/tmp/geomask-upd
+ST=$D/status.json
+SL=$D/steps.log
+LOGF=/root/geo-sync.log
+say() { _t=$(date '+%F %T'); _j=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g'); printf '{"phase":"%s","msg":"%s","ts":"%s"}' "$1" "$_j" "$_t" > "$ST.tmp"; mv -f "$ST.tmp" "$ST"; printf '%s [%s] %s\n' "$_t" "$1" "$2" >> "$SL"; printf '%s GEOMASK-UPD [%s] %s\n' "$_t" "$1" "$2" >> "$LOGF"; }
+trap ':' EXIT
+TAG="$1"
+say queued "update to $TAG started"
+say backup "creating full router backup (sysupgrade -b)..."
+TS=$(date +%Y%m%d-%H%M%S)
+BKD=/root/geomask-backups
+PARK=$D/bk-park-$$
+BK=$D/router-backup-$TS.tar.gz
+# Park the previous copies instead of deleting them: they must not be inside /root while
+# sysupgrade archives it (nesting), but a failed sysupgrade must not cost the router its
+# only backup. The installer has behaved this way since v1.30.15; the updater did not.
+# Copies from /root and /tmp are parked apart: one `mv` into a single directory let a /tmp
+# file with the same name overwrite the permanent copy before the backup even started.
+mkdir -p "$BKD" "$PARK/root" "$PARK/tmp" 2>/dev/null
+_park_fail=0
+for _f in "$BKD"/router-backup-*.tar.gz; do
+  [ -f "$_f" ] || continue
+  mv -f "$_f" "$PARK/root/" 2>/dev/null || _park_fail=1
+done
+for _f in /tmp/router-backup-*.tar.gz; do
+  [ -f "$_f" ] || continue
+  mv -f "$_f" "$PARK/tmp/" 2>/dev/null || _park_fail=1
+done
+# rc=0 only when every parked copy is back; the park is never deleted on a failed restore.
+restore_old() {
+  _r=0
+  for _f in "$PARK/root"/*.tar.gz; do
+    [ -f "$_f" ] || continue
+    mv -f "$_f" "$BKD/" 2>/dev/null || _r=1
+  done
+  for _f in "$PARK/tmp"/*.tar.gz; do
+    [ -f "$_f" ] || continue
+    mv -f "$_f" /tmp/ 2>/dev/null || _r=1
+  done
+  [ "$_r" = 0 ] && rm -rf "$PARK"
+  return $_r
+}
+if [ "$_park_fail" = 1 ]; then
+  restore_old || say error "previous copies left in $PARK - move them back manually"
+  say error "backup rotation failed - update aborted (previous backup kept)"; exit 1
+fi
+# rc=0 and a non-empty file are not enough: the archive must list entries (a gzip stream of
+# arbitrary bytes passes `gzip -t` and is not a backup) and carry the router tree, or it is
+# a readable tar of one random file (audit 14.11.2026, F29).
+if ! sysupgrade -b "$BK" >/dev/null 2>&1 || ! tar -tzf "$BK" >/dev/null 2>&1 \
+   || ! tar -tzf "$BK" 2>/dev/null | grep -qE '(^|/)etc/'; then
+  rm -f "$BK"
+  restore_old || say error "previous copies left in $PARK - move them back manually"
+  say error "backup failed - update aborted (previous backup kept)"; exit 1
+fi
+SZ=$(wc -c < "$BK")
+_md=$(md5sum "$BK" 2>/dev/null | awk '{print $1}')
+BKF="$BKD/router-backup-$TS.tar.gz"
+# A copy in /tmp is not a permanent backup: a failed move must abort the update, not pretend
+# that the router still has something to restore after a reboot.
+if ! mv -f "$BK" "$BKF" 2>/dev/null || [ ! -s "$BKF" ]; then
+  rm -f "$BKF"
+  restore_old || say error "previous copies left in $PARK - move them back manually"
+  say error "cannot store backup in $BKD - update aborted (previous backup kept, new copy left at $BK)"; exit 1
+fi
+# The archive carries keys and subscription tokens: private even when the folder is shared.
+chmod 600 "$BKF" 2>/dev/null
+# the new archive is verified and in place: the parked copies are now superseded
+rm -rf "$PARK" 2>/dev/null
+echo "file=$BKF md5=$_md" > "$D/backup.info"
+LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+say backup "backup OK: $BKF ($SZ bytes, md5 $_md)"
+say backup "SMB (retention: freshest one): \\\\$LANIP\\geomask-backups\\${BKF##*/} - only when the share was opted in (touch /etc/geomask/backup-share.enable) and a named ksmbd user exists; PC history: fetch_backup.ps1"
+say download "downloading geomask $TAG..."
+rm -f "$D/geomask.sh.new"
+if ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://cdn.jsdelivr.net/gh/kabzon93region/geomask@${TAG}/geomask.sh" && \
+   ! curl -fsSL -m 90 -o "$D/geomask.sh.new" "https://github.com/kabzon93region/geomask/releases/download/${TAG}/geomask.sh"; then
+  say error "download failed (jsdelivr + github)"; exit 1
+fi
+say download "downloaded $(wc -c < "$D/geomask.sh.new") bytes"
+say validate "checking syntax (sh -n)..."
+if ! sh -n "$D/geomask.sh.new"; then say error "syntax check failed"; exit 1; fi
+NEWV=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$D/geomask.sh.new" | head -1)
+if [ -z "$NEWV" ] || [ "v$NEWV" != "$TAG" ]; then
+  say error "version mismatch (file=${NEWV:-none} tag=$TAG)"; exit 1
+fi
+DIG=$(sed -n 's/.*"digest":"\(sha256:[0-9a-f]*\)".*/\1/p' "$D/check.json" | head -1)
+if [ -z "$DIG" ]; then
+  # No digest, no run: the whole point of the check is to verify the bytes before root runs them.
+  say error "release digest missing - refusing to run an unverified installer"; exit 1
+fi
+ACT="sha256:$(sha256sum "$D/geomask.sh.new" | awk '{print $1}')"
+[ "$ACT" = "$DIG" ] || { say error "sha256 mismatch"; exit 1; }
+say validate "version $NEWV ok, sha256 matches release digest"
+say apply "installing modules and panel (no service restarts)..."
+if ! sh "$D/geomask.sh.new" --reinstall --yes >> "$D/upd.log" 2>&1; then
+  say error "install failed - see $D/upd.log"; exit 1
+fi
+cp -f "$D/geomask.sh.new" /tmp/geomask.sh 2>/dev/null && chmod +x /tmp/geomask.sh 2>/dev/null
+/etc/init.d/rpcd reload >/dev/null 2>&1 || true
+rm -f "$D/check.json"   # force fresh version check on the next page load
+sleep 1
+say done "updated to $NEWV - refresh the panel page (Ctrl+F5)"
+RUNEOF
+  printf '{"phase":"queued","msg":"starting update to %s","ts":"%s"}\n' "$_tag" "$(date '+%F %T')" > "$UPD_STATUS"
+  sh "$UPD_DIR/run.sh" "$_tag" >/dev/null 2>&1 &
+  # The runner inherited the `updater` descriptor: the lock is released by the kernel when it
+  # (and every copy of that open file description) exits. Do NOT unlock here - that would
+  # release the lock of the running update.
+  printf '{"ok":true,"to":"%s"}\n' "$_tag"
+}
+
+# ---------- v1.12.0: node audit control + automation settings ----------
+NODESCONF=/etc/geomask-nodes.conf
+NODESBLOCK=/etc/geomask-node-block.txt
+NODESCAN_TAG='# geomask-nodescan'
+SYNC_TAG='geomask-sync'
+
+# read key from nodes conf
+_nconf() { sed -n "s/^$1=//p" "$NODESCONF" 2>/dev/null | head -1; }
+
+cmd_nodes_get() {
+  _en=false
+  crontab -l 2>/dev/null | grep -q 'geomask-nodescan$' && _en=true
+  _line=$(crontab -l 2>/dev/null | grep -F "$NODESCAN_TAG" | head -1)
+  _min=$(printf '%s' "$_line" | awk '{print $1}')
+  _hr=$(printf '%s' "$_line" | awk '{print $2}')
+  [ -n "$_hr" ] || { _hr=3; _min=30; }
+  _sched=$(printf '%02d:%02d' "${_hr:-3}" "${_min:-30}" 2>/dev/null || echo '03:30')
+  _st=$(cat /tmp/geomask-nodescan.state 2>/dev/null)
+  case "$_st" in '{'*'}'*) : ;; *) _st=null ;; esac
+  _blk=$(while IFS= read -r _l; do [ -n "$_l" ] && printf '"%s",' "$(json_esc "$_l")"; done < "$NODESBLOCK" 2>/dev/null | sed 's/,$//')
+  _lastlog=$(grep NODESCAN "$LOG" 2>/dev/null | tail -3 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  # conf fields with node-scan defaults (must mirror geomask-node-scan.sh)
+  printf '{"ok":true,"enabled":%s,"schedule":"%s","state":%s,"conf":{"bad_countries":"%s","bad_asns":"%s","base_filter":"%s","sub_provider":"%s","name_filter_groups":"%s","sub_user_agent":"%s","ai_guard":"%s","ai_group":"%s","ai_egress_url":"%s","ai_expect":"%s","ai_listener":"%s","ai_exclude_base":"%s"},"blocked":[%s],"log":[%s]}\n' \
+    "$_en" "$_sched" "$_st" \
+    "$(_nconf bad_countries)" "$(_nconf bad_asns)" "$(_nconf base_filter)" "$(_nconf sub_provider)" \
+    "$(_nconf name_filter_groups)" "$(_nconf sub_user_agent)" "$(_nconf ai_guard)" \
+    "$(_nconf ai_group)" "$(_nconf ai_egress_url)" "$(_nconf ai_expect)" \
+    "$(_nconf ai_listener)" "$(_nconf ai_exclude_base)" \
+    "$_blk" "$_lastlog"
+}
+
+# args: enabled(0|1) HH:MM countries asns base provider
+# The settings file belongs to the owner: only the four editable keys may change, and the
+# file and the cron line are one transaction. The old version rewrote the whole file with a
+# four-line template (dropping ai_*, name_filter_groups, ...) and accepted a newline inside
+# base_filter, which appended an arbitrary key such as ai_guard=0 (audit 14.11.2026, F07).
+# The lock is the shared kernel `cron` lock: it serialises this file together with every
+# other read-modify-write of /etc/crontabs/root (cmd_sync_set, the installer, uninstall).
+NODES_LOCK=${GM_NODES_LOCK:-/tmp/geomask-locks/cron.lock}
+
+_nodes_lock() {
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire cron 20 "$NODES_LOCK"
+}
+
+_nodes_unlock() {
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release cron
+}
+
+_nodes_candidate() { # stdin: live conf -> stdout: candidate with the four keys replaced
+  awk -v cc="$1" -v as="$2" -v bf="$3" -v pv="$4" '
+    BEGIN{dcc=das=dbf=dpv=0}
+    /^[ \t]*#/ {print; next}
+    /^bad_countries=/ {print "bad_countries=" cc; dcc=1; next}
+    /^bad_asns=/      {print "bad_asns=" as;      das=1; next}
+    /^base_filter=/   {print "base_filter=" bf;   dbf=1; next}
+    /^sub_provider=/  {print "sub_provider=" pv;  dpv=1; next}
+    {print}
+    END{
+      if (!dcc) print "bad_countries=" cc
+      if (!das) print "bad_asns=" as
+      if (!dbf) print "base_filter=" bf
+      if (!dpv) print "sub_provider=" pv
+    }'
+}
+
+cmd_nodes_set() {
+  _en=$1; _sched=$2; _cc=$3; _as=$4; _base=$5; _prov=$6
+  case "$_en" in 0|1) : ;; *) printf '{"ok":false,"error":"bad enabled"}\n'; return 1;; esac
+  printf '%s' "$_sched" | grep -qE '^([01][0-9]|2[0-3]):[0-5][0-9]$' || { printf '{"ok":false,"error":"bad schedule (HH:MM)"}\n'; return 1; }
+  [ -z "$_cc" ] || printf '%s' "$_cc" | grep -qE '^([A-Z][A-Z],)*[A-Z][A-Z]$' || { printf '{"ok":false,"error":"bad countries (AA,BB)"}\n'; return 1; }
+  [ -z "$_as" ] || printf '%s' "$_as" | grep -qE '^(AS?[0-9]+,)*AS?[0-9]+$' || { printf '{"ok":false,"error":"bad asns"}\n'; return 1; }
+  printf '%s' "$_base" | grep -qE '["'"'"'\\]' && { printf '{"ok":false,"error":"base filter: no quotes/backslashes"}\n'; return 1; }
+  [ -z "$_prov" ] && _prov=sub
+  printf '%s' "$_prov" | grep -qE '^[a-z0-9_-]+$' || { printf '{"ok":false,"error":"bad provider name"}\n'; return 1; }
+  # No control characters anywhere: a newline in a value writes a second key into the file.
+  for _nv in "$_sched" "$_cc" "$_as" "$_base" "$_prov"; do
+    case "$_nv" in *[[:cntrl:]]*) printf '{"ok":false,"error":"control characters are not allowed"}\n'; return 1;; esac
+  done
+  _nodes_lock || { printf '{"ok":false,"error":"another settings write is running"}\n'; return 1; }
+  _ntmp=$(mktemp -d /tmp/geomask-nodes.XXXXXX 2>/dev/null) || { _nodes_unlock; printf '{"ok":false,"error":"cannot create a work directory"}\n'; return 1; }
+  _nold=0
+  if [ -f "$NODESCONF" ]; then
+    # If the previous file cannot be saved there is no rollback source: writing a four-key
+    # stub over the owner's settings would lose ai_* and every unknown field.
+    cp -p "$NODESCONF" "$_ntmp/conf.old" 2>/dev/null || {
+      rm -rf "$_ntmp"; _nodes_unlock
+      printf '{"ok":false,"error":"cannot back up %s - settings unchanged"}\n' "$NODESCONF"; return 1; }
+    _nold=1
+  fi
+  crontab -l > "$_ntmp/cron.old" 2>/dev/null || : > "$_ntmp/cron.old"
+  if [ "$_nold" = 1 ]; then
+    _nodes_candidate "$_cc" "$_as" "$_base" "$_prov" < "$NODESCONF" > "$_ntmp/conf.new" || {
+      rm -rf "$_ntmp"; _nodes_unlock; printf '{"ok":false,"error":"cannot render the settings file"}\n'; return 1; }
+  else
+    _nodes_candidate "$_cc" "$_as" "$_base" "$_prov" < /dev/null > "$_ntmp/conf.new" || {
+      rm -rf "$_ntmp"; _nodes_unlock; printf '{"ok":false,"error":"cannot render the settings file"}\n'; return 1; }
+  fi
+  _hr=${_sched%:*}; _min=${_sched#*:}
+  _hrn=$(printf '%s' "$_hr" | sed 's/^0//'); _minn=$(printf '%s' "$_min" | sed 's/^0//')
+  [ -n "$_hrn" ] || _hrn=0
+  grep -vF "$NODESCAN_TAG" "$_ntmp/cron.old" > "$_ntmp/cron.new" 2>/dev/null || : > "$_ntmp/cron.new"
+  if [ "$_en" = 1 ]; then
+    printf '%s %s * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 %s\n' "$_minn" "$_hrn" "$NODESCAN_TAG" >> "$_ntmp/cron.new"
+  fi
+  # 1) cron first: if it cannot be written nothing else has changed yet
+  if ! crontab "$_ntmp/cron.new" 2>/dev/null; then
+    rm -rf "$_ntmp"; _nodes_unlock
+    printf '{"ok":false,"error":"crontab write failed - settings unchanged"}\n'; return 1
+  fi
+  # 2) settings file, with the previous bytes kept for the rollback
+  if ! cp "$_ntmp/conf.new" "$NODESCONF" 2>/dev/null; then
+    crontab "$_ntmp/cron.old" 2>/dev/null
+    rm -rf "$_ntmp"; _nodes_unlock
+    printf '{"ok":false,"error":"cannot write %s - settings and cron restored"}\n' "$NODESCONF"; return 1
+  fi
+  chmod 644 "$NODESCONF" 2>/dev/null
+  # 3) read back: a short write must not be reported as success
+  _nbad=""
+  [ "$(_nconf bad_countries)" = "$_cc" ] || _nbad="$_nbad bad_countries"
+  [ "$(_nconf bad_asns)" = "$_as" ] || _nbad="$_nbad bad_asns"
+  [ "$(_nconf base_filter)" = "$_base" ] || _nbad="$_nbad base_filter"
+  [ "$(_nconf sub_provider)" = "$_prov" ] || _nbad="$_nbad sub_provider"
+  if [ -n "$_nbad" ]; then
+    if [ "$_nold" = 1 ]; then cp -p "$_ntmp/conf.old" "$NODESCONF" 2>/dev/null; else rm -f "$NODESCONF"; fi
+    crontab "$_ntmp/cron.old" 2>/dev/null
+    rm -rf "$_ntmp"; _nodes_unlock
+    printf '{"ok":false,"error":"settings did not survive the write:%s - restored"}\n' "$_nbad"; return 1
+  fi
+  rm -rf "$_ntmp"
+  _nodes_unlock
+  printf '%s NODESCAN cfg saved via panel (enabled=%s sched=%s)\n' "$(date '+%F %T')" "$_en" "$_sched" >> "$LOG"
+  printf '{"ok":true,"enabled":"%s","schedule":"%s"}\n' "$_en" "$_sched"
+}
+
+# sync insurance cron interval: */N minutes (N: 1,2,3,5,10,15,30)
+cmd_sync_set() {
+  case "$1" in 1|2|3|5|10|15|30) : ;; *) printf '{"ok":false,"error":"bad interval"}\n'; return 1;; esac
+  # The crontab is shared with nodes_set, the installer and uninstall: same kernel lock, so a
+  # concurrent read-modify-write can no longer drop the other writer's line.
+  _nodes_lock || { printf '{"ok":false,"error":"crontab is busy: another writer holds the lock"}\n'; return 1; }
+  _tmp=/tmp/gm-cron.$$
+  crontab -l 2>/dev/null | grep -vF "/root/sync_mtrickle_mihomo.sh" > "$_tmp" || true
+  printf '*/%s * * * * %s # %s\n' "$1" "$SYNCLISTS" "$SYNC_TAG" >> "$_tmp"
+  crontab "$_tmp" && rm -f "$_tmp" || { rm -f "$_tmp"; _nodes_unlock; printf '{"ok":false,"error":"crontab write failed"}\n'; return 1; }
+  _nodes_unlock
+  printf '%s SYNC cron set to */%s\n' "$(date '+%F %T')" "$1" >> "$LOG"
+  printf '{"ok":true,"interval":"*/%s"}\n' "$1"
+}
+
+# event watchdog on/off
+cmd_syncd_set() {
+  case "$1" in on|off) : ;; *) printf '{"ok":false,"error":"bad arg"}\n'; return 1;; esac
+  if [ "$1" = off ]; then
+    /etc/init.d/geomask-syncd stop >/dev/null 2>&1; /etc/init.d/geomask-syncd disable >/dev/null 2>&1
+  else
+    /etc/init.d/geomask-syncd enable >/dev/null 2>&1; /etc/init.d/geomask-syncd restart >/dev/null 2>&1
+  fi
+  sleep 1
+  _run=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _run=true
+  if [ "$1" = on ]; then
+    [ "$_run" = true ] || { printf '{"ok":false,"running":%s}\n' "$_run"; return 1; }
+  else
+    [ "$_run" = false ] || { printf '{"ok":false,"running":%s}\n' "$_run"; return 1; }
+  fi
+  printf '{"ok":true,"running":%s}\n' "$_run"
+}
+
+# mihomo restart pin on/off
+cmd_pin_set() {
+  case "$1" in on|off) : ;; *) printf '{"ok":false,"error":"bad arg"}\n'; return 1;; esac
+  if [ "$1" = on ]; then
+    printf 'restarts forbidden by owner - VPN must stay up\n' > /root/.geomask-norestart
+    printf '%s PIN set (mihomo --restart disabled)\n' "$(date '+%F %T')" >> "$LOG"
+  else
+    rm -f /root/.geomask-norestart
+    printf '%s PIN removed (restarts allowed; be careful)\n' "$(date '+%F %T')" >> "$LOG"
+  fi
+  _p=false; [ -e /root/.geomask-norestart ] && _p=true
+  printf '{"ok":true,"pin":%s}\n' "$_p"
+}
+
+
+# v1.13.0: lists template status (bundled MagiTrickle groups snapshot vs current config)
+cmd_lists_get() {
+  _tpl=/etc/geomask/lists/magitrickle-groups.yaml
+  _cfg=/etc/magitrickle/state/config.yaml
+  _tp=false; [ -s "$_tpl" ] && _tp=true
+  _tg=$(grep -c '^- id:' "$_tpl" 2>/dev/null); [ -n "$_tg" ] || _tg=0
+  _tr=$(grep -c '^  - id:' "$_tpl" 2>/dev/null); [ -n "$_tr" ] || _tr=0
+  _cg=$(grep -c '^- id:' "$_cfg" 2>/dev/null); [ -n "$_cg" ] || _cg=0
+  _cr=$(grep -c '^  - id:' "$_cfg" 2>/dev/null); [ -n "$_cr" ] || _cr=0
+  _run=false; pgrep -f magitrickled >/dev/null 2>&1 && _run=true
+  printf '{"ok":true,"template_present":%s,"template_version":"%s","template_groups":%s,"template_rules":%s,"current_groups":%s,"current_rules":%s,"magitrickle_running":%s}\n' \
+    "$_tp" "$BACKEND_VERSION" "$_tg" "$_tr" "$_cg" "$_cr" "$_run"
+}
+
+# v1.13.0: restore MagiTrickle groups from the template (backup config.yaml, splice, restart+sync)
+cmd_lists_seed() {
+  _tpl=/etc/geomask/lists/magitrickle-groups.yaml
+  _py=/usr/bin/geomask-seed-lists.py
+  [ -s "$_tpl" ] || { printf '{"ok":false,"error":"template missing"}\n'; return 1; }
+  [ -f "$_py" ] || { printf '{"ok":false,"error":"seeder missing"}\n'; return 1; }
+  _require_backup || return 1
+  # The daemon owns config.yaml. A failed stop means the write would race it, so nothing is
+  # written and the caller is told (audit 14.11.2026, F19).
+  if ! /etc/init.d/magitrickle stop >/dev/null 2>&1; then
+    printf '{"ok":false,"error":"cannot stop magitrickle - config not written"}\n'; return 1
+  fi
+  _w=0
+  while [ "$_w" -lt 5 ] && pgrep -f magitrickled >/dev/null 2>&1; do _w=$((_w+1)); sleep 1; done
+  if pgrep -f magitrickled >/dev/null 2>&1; then
+    /etc/init.d/magitrickle start >/dev/null 2>&1 || true
+    printf '{"ok":false,"error":"magitrickled is still running - config not written"}\n'; return 1
+  fi
+  _out=$(python3 "$_py" 2>&1); _rc=$?
+  _started=true
+  /etc/init.d/magitrickle start >/dev/null 2>&1 || _started=false
+  sleep 2
+  pgrep -f magitrickled >/dev/null 2>&1 || _started=false
+  _synced=true
+  sh /root/sync_mtrickle_mihomo.sh >/dev/null 2>&1 || _synced=false
+  controller_curl -s -X PUT http://127.0.0.1:9090/configs -H 'Content-Type: application/json' \
+    -d '{"path":"/etc/mihomo/config.yaml"}' >/dev/null 2>&1 || true
+  _ok=false
+  [ "$_rc" = 0 ] && [ "$_started" = true ] && [ "$_synced" = true ] && \
+    printf '%s' "$_out" | grep -q '^CHANGED' && _ok=true
+  printf '{"ok":%s,"rc":%s,"running":%s,"synced":%s,"result":"%s"}\n' \
+    "$_ok" "$_rc" "$_started" "$_synced" "$(json_esc "$_out")"
+  [ "$_ok" = true ]
+}
+
+# v1.14.0: youtube edge watchdog - status / mode switch / manual release
+YT_WATCH=/usr/bin/geomask-ytwatch.sh
+YT_CONF=/etc/geomask-ytwatch.conf
+
+cmd_yt_get() {
+  [ -x "$YT_WATCH" ] || { printf '{"ok":false,"error":"ytwatch not installed"}\n'; return 1; }
+  _j=$(sh "$YT_WATCH" --status 2>/dev/null)
+  case "$_j" in '{'*'}'*) : ;; *) _j='{"error":"no status"}' ;; esac
+  _mode=$(sed -n 's/^mode=//p' "$YT_CONF" 2>/dev/null | head -1)
+  printf '%s\n' "$_j" | sed "s#\"mode\":[^,]*#\"mode\":\"${_mode:-auto}\",\"ok\":true#"
+}
+
+cmd_yt_mode() {
+  case "$1" in auto|blanket) : ;; *) printf '{"ok":false,"error":"bad mode"}\n'; return 1 ;; esac
+  [ -x "$YT_WATCH" ] || { printf '{"ok":false,"error":"ytwatch not installed"}\n'; return 1; }
+  _out=$(sh "$YT_WATCH" --mode "$1" 2>&1); _rc=$?
+  printf '%s\n' "$_out" | tail -1
+  return $_rc
+}
+
+cmd_yt_reset() {
+  [ -x "$YT_WATCH" ] || { printf '{"ok":false,"error":"ytwatch not installed"}\n'; return 1; }
+  sh "$YT_WATCH" --reset >/dev/null 2>&1
+  printf '{"ok":true}\n'
+}
+
+# v1.15.0: torrent admin (tracker ruleset + DIRECT listener)
+TORRENT_SH=/usr/bin/geomask-torrent.sh
+
+_torrent_missing() { printf '{"ok":false,"error":"torrent admin not installed"}\n'; }
+
+cmd_torrent_get() {
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --status 2>/dev/null
+}
+cmd_torrent_refresh() {
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --refresh 2>/dev/null | tail -1
+}
+cmd_torrent_listener() {
+  case "$1" in on|off) : ;; *) printf '{"ok":false,"error":"bad state"}\n'; return 1 ;; esac
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --listener "$1" 2>/dev/null | tail -1
+}
+cmd_torrent_extra() {
+  [ -x "$TORRENT_SH" ] || { _torrent_missing; return 1; }
+  sh "$TORRENT_SH" --extra "$1" 2>/dev/null | tail -1
+}
+
+# Independent, report-only service-egress audit. Never calls the legacy mutating scan.
+NODE_AUDIT=${GM_NODE_AUDIT:-/usr/lib/geomask/geomask-node-audit.py}
+NODE_APPLY=${GM_NODE_APPLY:-/usr/lib/geomask/geomask-apply.py}
+cmd_nodes_paths_get() {
+  python3 "$NODE_AUDIT" get
+}
+cmd_nodes_path_save() {
+  python3 "$NODE_AUDIT" save "$1" "$2" "$3"
+}

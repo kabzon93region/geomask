@@ -1,0 +1,238 @@
+menu_reinstall() {
+  hdr "REINSTALL" "Удалить -> установить -> настроить geomask"
+  warn "Удалены и переустановлены: гео-оверлей LuCI, sync-скрипт, cron."
+  warn "Mihomo конфиг: существующий 2-подписочный сохраняется (патчатся только ссылки подписок);"
+  warn "без конфига/маркеров подписок — запись шаблоном (старый — в бэкапе)."
+  warn "Mihomo НЕ перезапускается: подписки применяются через API без обрыва VPN."
+  _c="$(P $MIHOMO_CONF)"
+  _curv=""
+  if [ -s "$_c" ]; then _curv=$(_prov_url "$_c" sub); fi
+  # Every refusal is decided BEFORE the first removal: a foreign config, no room for the
+  # snapshot, no way to reach the LAN. Nothing has been touched at this point.
+  _mihomo_guard "$_c" "reinstall" || return 1
+  _free=$(df -k "$(P /tmp)" 2>/dev/null | awk 'NR==2{print $4}')
+  case "$_free" in
+    ''|*[!0-9]*) ;;
+    *) [ "$_free" -lt 5120 ] && { bad "мало места в /tmp (${_free} КБ) - переустановка отменена"; return 1; } ;;
+  esac
+  ask "Продолжить переустановку?" || { warn "отменено"; return 1; }
+  # Ownership of the mihomo config is decided by the YAML parser: without it a geomask
+  # config looks foreign and the flow would uninstall everything and then refuse. Check
+  # BEFORE the first removal, not at step 3, and only when there is a config to judge.
+  if [ -s "$(P $MIHOMO_CONF)" ] && ! _py_yaml_ok; then
+    bad "python3 и/или python3-yaml недоступны - владение конфигом mihomo не определить"
+    info "  Установите пакеты и повторите: apk add python3 python3-yaml (или opkg install ...)"
+    return 1
+  fi
+  # R03: fail-closed preflight BEFORE the first mutation (backup_gate writes files too).
+  # The module selection decides which runtime objects are in scope, so it is settled
+  # first; then the manifest-based preflight proves dependencies - without apk/opkg -
+  # observability of every runtime object and the snapshot observers. Anything unknown
+  # refuses the reinstall with the JSON error, nothing having been touched.
+  modules_maybe_prompt
+  if ! reinstall_preflight; then
+    bad "переустановка не запущена: недоказуемое состояние (см. JSON выше)"
+    info "  Ничего не изменено. Установите недостающие зависимости вручную и повторите."
+    return 1
+  fi
+  # R04: single instance. The preflight above is read-only; from here on the run mutates
+  # save_stream targets, uci, services and crontab, so two reinstallers must not interleave.
+  # The kernel lock is a try-lock: the second run refuses immediately and nothing is
+  # unlocked on the way out (the kernel releases a killed run).
+  if ! gm_lock_acquire maintenance 0; then
+    bad "переустановка уже выполняется: второй экземпляр не запущен (блокировка maintenance)"
+    info "  Дождитесь завершения текущей переустановки или перезагрузки; ничего не изменено."
+    return 1
+  fi
+  backup_gate || { gm_lock_release maintenance; return 1; }
+  # R05: catch up on ifup events queued before the reinstall, inline under `maintenance`.
+  drain_route_queue || warn "route queue not fully applied before reinstall - see error-100"
+  _vpn=$(prompt_url "Ссылка на ОБЩУЮ VPN-подписку (AI берёт из неё USA-узлы)" "$_curv" "$GM_VPN_URL") || { bad "URL подписки не задан"; gm_lock_release maintenance; return 1; }
+  # A snapshot from an earlier failed attempt may still hold the only copy of the old
+  # components: never delete a fixed name here (same rule as the backup park, F03).
+  _snap=$(mktemp -d "$(P /tmp)/geomask-reinstall-XXXXXX" 2>/dev/null) \
+    || { bad "не удалось создать каталог снимка в /tmp"; gm_lock_release maintenance; return 1; }
+  _reinstall_snapshot "$_snap" || { bad "не удалось сохранить текущие компоненты - переустановка отменена"; rm -rf "$_snap"; gm_lock_release maintenance; return 1; }
+  if ! _reinstall_steps "$_vpn"; then
+    bad "переустановка не завершена - возвращаю прежние компоненты"
+    if ! _reinstall_restore "$_snap"; then
+      bad "rollback incomplete / recovery required: снимок сохранён в $_snap (не удаляйте его)"
+    else
+      info "откат проверен: прежние компоненты и runtime восстановлены"
+    fi
+    gm_lock_release maintenance
+    return 1
+  fi
+  # R05: the reinstall may have been preceded by ifup events that queued while the old helper
+  # was still in place; apply them with the new helper while `maintenance` is still held.
+  drain_route_queue || warn "route queue not fully applied after reinstall - see error-100"
+  rm -rf "$_snap"
+  gm_lock_release maintenance
+  log "Пересстановка geomask завершена."
+  return 0
+}
+
+menu_loop() {
+  while :; do
+    clr
+    print_banner
+    echo
+    dashboard
+    show_menu
+    printf '\n%sВыберите пункт:%s ' "$C_Y" "$NC"
+    read -r _c || exit 0
+    case "$_c" in
+      1) diag_quick; PAUSE ;;
+      2) menu_master || true; PAUSE ;;
+      3) hdr "PANEL" "Панель Гео: переустановка/обновление"
+         warn "Обновляет файлы панели (backend/rpcd/acl/страница); mihomo не трогается."
+         run_step 2 || true; PAUSE ;;
+      f|F) menu_reinstall || true; PAUSE ;;
+      0|q|Q|"") exit 0 ;;
+      *) printf '%sнеизвестный пункт%s\n' "$C_R" "$NC"; sleep 1 ;;
+    esac
+  done
+}
+
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ---- args ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --auto) GM_AUTO=1 ;;
+    --check) GM_CHECK_ONLY=1 ;;
+    --yes|-y) GM_YES=1 ;;
+    --restart) GM_RESTART=1 ;;
+    --backup) GM_BACKUP=1 ;;
+    --reinstall) GM_REINSTALL=1 ;;
+    --adopt-config) GM_ADOPT=1 ;;
+    --replace-config) GM_REPLACE=1 ;;
+    --step) shift; GM_STEP="${1:-}" ;;
+    --vpn-url) shift; GM_VPN_URL="${1:-}" ;;
+    --ai-url) shift; GM_AI_URL="${1:-}" ;;
+    --modules) shift; GM_MODULES=$(printf '%s' "${1:-}" | tr ',' ' ') ;;
+    --modules=*) GM_MODULES=$(printf '%s' "${1#--modules=}" | tr ',' ' ') ;;
+    --list-modules)
+      for _m in $GM_ALL_MODULES; do
+        if module_required "$_m"; then _tag="[обязательный]"; else _tag="[по выбору]   "; fi
+        printf "  %-18s %s %s\n" "$_m" "$_tag" "$(module_label "$_m")"
+      done
+      exit 0 ;;
+    --seed-lists) GM_SEED_LISTS=1 ;;
+    --ipv6) shift; GM_IPV6="${1:-off}" ;;
+    --ipv6=*) GM_IPV6="${1#--ipv6=}" ;;
+    --help|-h) usage; exit 0 ;;
+    *) printf 'unknown option: %s (see --help)\n' "$1"; exit 2 ;;
+  esac
+  shift
+done
+
+# validate --modules: a typo would otherwise install nothing and report success.
+# A function, not an inline block: the regression test used to re-implement this logic and
+# could pass while the installer itself was broken.
+# Dependencies the modules declare (modules/*.json). The installer cannot read the catalogue
+# before it is installed, so the edges live here; a test keeps this list and the metadata in
+# step (audit I07: ai_dns was installed without path_ai).
+module_deps() {
+  for _md_mod in "$@"; do
+    case "$_md_mod" in
+      ai_dns)  printf ' core path_ai' ;;
+      path_ai) printf ' core admission_service' ;;
+    esac
+  done
+}
+
+normalize_modules() { # normalize_modules <selection> -> validated selection with required modules
+  _sel="$1"
+  _valid=""
+  for _m in $_sel; do
+    case " $GM_ALL_MODULES " in
+      *" $_m "*) _valid="$_valid $_m" ;;
+      *) printf 'unknown module: %s (see --list-modules)\n' "$_m" >&2; return 2 ;;
+    esac
+  done
+  _sel=$(printf '%s' "$_valid" | sed 's/^ *//;s/  */ /g')
+  # Dependency closure: a selected module pulls what it needs, exactly as the manifest says.
+  _changed=1
+  while [ "$_changed" = 1 ]; do
+    _changed=0
+    for _m in $_sel; do
+      for _d in $(module_deps "$_m"); do
+        case " $_sel " in
+          *" $_d "*) ;;
+          *) _sel="$_sel $_d"; _changed=1 ;;
+        esac
+      done
+    done
+  done
+  # core and path_vpn are not optional: the interactive picker adds them, the CLI used to
+  # accept a set without them and install a product that cannot route anything.
+  for _m in $GM_REQUIRED_MODULES; do
+    case " $_sel " in *" $_m "*) ;; *) _sel="$_sel $_m" ;; esac
+  done
+  printf '%s' "$_sel" | sed 's/^ *//;s/  */ /g'
+}
+
+if [ -n "$GM_MODULES" ]; then
+  GM_MODULES=$(normalize_modules "$GM_MODULES") || exit 2
+fi
+
+# I10: the stored selection is an input to every entrypoint (check, step N, reinstall, auto).
+# A damaged file must stop the run before the first write instead of silently meaning "all".
+_msr_pre_rc=0
+modules_state_read >/dev/null || _msr_pre_rc=$?
+if [ "$_msr_pre_rc" = 2 ]; then
+  log "ERROR: $MODULES_STATE damaged - refusing to continue (fix the file, or remove it to install every module)"
+  exit 2
+fi
+if [ "$_msr_pre_rc" = 3 ]; then
+  log "NOTE: no python interpreter - the stored module selection could not be validated"
+fi
+
+case "$GM_IPV6" in
+  off|keep) ;;
+  *) printf 'unknown --ipv6 value: %s (off|keep)\n' "$GM_IPV6" >&2; exit 2 ;;
+esac
+
+# hard pin: router owner may forbid restarts permanently via flag file
+if [ "$GM_RESTART" = 1 ] && [ -f "$(P /root/.geomask-norestart)" ]; then
+  log "NOTE: /root/.geomask-norestart present - ignoring --restart (owner forbids VPN interruption)."
+  GM_RESTART=0
+fi
+
+RC=0
+# The self-update runner holds the `updater` lock and passes its descriptor to this installer.
+# Close it here: the runner still holds that lock, and no service we start below may inherit
+# the descriptor and keep the updater lock alive after the update has finished.
+if command -v gm_lock_close_inherited >/dev/null 2>&1; then gm_lock_close_inherited; fi
+if [ "$GM_BACKUP" = 1 ]; then
+  _b=$(ensure_backup full) && { info "полный бэкап: $_b"; info "SMB (свежая копия): \\\\$(lan_ip)\\geomask-backups ; история на ПК: geomask\\fetch_backup.ps1"; RC=0; } || { bad "полный бэкап не создан"; RC=1; }
+elif [ "$GM_REINSTALL" = 1 ]; then
+  menu_reinstall || RC=1
+elif [ "$GM_SEED_LISTS" = 1 ]; then
+  if backup_gate; then write_lists_assets && seed_lists force || RC=1; else RC=1; fi
+elif [ -n "$GM_STEP" ]; then
+  run_step "$GM_STEP" || RC=1
+elif [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
+  log "geomask v$GM_VERSION  mode: $([ "$GM_CHECK_ONLY" = 1 ] && echo check || echo auto)"
+  if [ "$GM_CHECK_ONLY" != 1 ] && ! preflight; then
+    bad "preflight не пройден - ничего не изменено"
+    log ""
+    log "== SUMMARY: pass=$PASS fail=$FAILCNT skipped_steps=$SKIP =="
+    exit 1
+  fi
+  for n in 1 2 3 4 5 6 7; do
+    if [ "$GM_CHECK_ONLY" = 1 ]; then
+      run_step "$n" || true
+    else
+      run_step "$n" || { [ $? -eq 1 ] && { RC=1; bad "aborting on step $n failure"; break; }; }
+    fi
+  done
+else
+  menu_loop
+fi
+
+log ""
+log "${C_DIM}== SUMMARY: pass=$PASS fail=$FAILCNT skipped_steps=$SKIP ==$NC"
+[ "$FAILCNT" -eq 0 ] || RC=1
+exit $RC

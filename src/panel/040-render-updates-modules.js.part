@@ -1,0 +1,378 @@
+
+		/* ===================== ДИАГНОСТИКА (v1.29.1) ===================== */
+		var diagData = (diag.checks || []).slice();
+		var diagSummary = E('span', { 'class': 'gs-meta' }, '');
+		var diagBundleNote = E('span', { 'class': 'gs-meta' }, '');
+		var diagVerdict = E('div', { 'class': 'gs-hint', style: 'margin:6px 0' },
+			diag.verdict || 'Проверок ещё не было — нажмите «Проверить всё».');
+		if (diag.verdict_state) {
+			diagVerdict.style.color = diag.verdict_state === 'fail' ? '#f85149'
+				: (diag.verdict_state === 'warn' ? '#d29922' : '#3fb950');
+		}
+		var diagRowsBox = E('div', {});
+		var diagLogBox = E('pre', { 'class': 'gs-log', style: 'display:none' });
+		var domInput = E('input', { 'class': 'gs-input', 'placeholder': 'example.com', style: 'min-width:240px' });
+		var domLive = E('input', { 'type': 'checkbox', style: 'margin:0 6px 0 12px' });
+		var domOut = E('pre', { 'class': 'gs-console', style: 'display:none' });
+		var domLog = E('span', { 'class': 'gs-meta' }, '');
+
+		function diagBadge(state) {
+			var map = {
+				'ok': ['gs-on', 'в порядке'],
+				'warn': ['gs-warn', 'внимание'],
+				'fail': ['gs-off', 'проблема']
+			};
+			var it = map[state] || ['gs-off', 'не проверялось'];
+			return E('span', { 'class': 'gs-badge ' + it[0] }, it[1]);
+		}
+
+		function diagMerge(checks) {
+			(checks || []).forEach(function(r) {
+				var found = false;
+				for (var i = 0; i < diagData.length; i++) {
+					if (diagData[i].id === r.id) {
+						diagData[i].last_state = r.state;
+						diagData[i].last_summary = r.summary;
+						diagData[i]._details = r.details || [];
+						diagData[i]._fix = r.fix || '';
+						found = true;
+						break;
+					}
+				}
+				if (!found) diagData.push({ id: r.id, area: r.area, title: r.title, live: r.live,
+					last_state: r.state, last_summary: r.summary, _details: r.details || [],
+					_fix: r.fix || '' });
+			});
+			diagRender();
+		}
+
+		function diagRender() {
+			while (diagRowsBox.firstChild) diagRowsBox.removeChild(diagRowsBox.firstChild);
+			if (!diagData.length) {
+				diagRowsBox.appendChild(E('div', { 'class': 'gs-hint' },
+					diag.error ? ('Диагностика недоступна: ' + diag.error) : 'Список проверок пуст.'));
+				return;
+			}
+			[['modules', 'Модули'], ['router', 'Роутер'], ['network', 'Сеть'], ['paths', 'Пути']].forEach(function(area) {
+				var items = diagData.filter(function(c) { return c.area === area[0]; });
+				if (!items.length) return;
+				diagRowsBox.appendChild(E('div', { 'class': 'gs-hint', style: 'margin-top:12px' }, area[1]));
+				items.forEach(function(c) {
+					var rows = [
+						E('span', { 'style': 'flex:1' }, c.title + (c.live ? ' · живая' : '')),
+						E('span', { 'class': 'gs-meta' }, c.last_summary || ''),
+						diagBadge(c.last_state),
+						E('button', { 'class': 'gs-btn', 'click': function(ev) { diagRun(c.id, ev.target); } }, 'Проверить'),
+						E('button', { 'class': 'gs-btn', 'click': function() { diagShowLog(c.id, c.title); } }, 'Лог'),
+						E('div', { 'class': 'gs-meta', style: 'flex-basis:100%;color:#8b949e' },
+							(c._details && c._details.length) ? c._details.join(' · ') : '')
+					];
+					if (c._fix && c.last_state !== 'ok') {
+						rows.push(E('div', { 'class': 'gs-meta', style: 'flex-basis:100%;color:#d29922' },
+							'→ ' + c._fix));
+					}
+					diagRowsBox.appendChild(E('div', { 'class': 'gs-row', style: 'flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border-color,#30363d)' }, rows));
+				});
+			});
+		}
+
+		function diagRun(id, btn) {
+			if (btn) btn.disabled = true;
+			diagSummary.textContent = 'идёт проверка…';
+			return callDiagRun(id).then(function(res) {
+				if (res && res.error) {
+					ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error');
+					return;
+				}
+				diagMerge(res && res.checks);
+				if (res && res.verdict) {
+					diagVerdict.textContent = res.verdict;
+					diagVerdict.style.color = res.verdict_state === 'fail' ? '#f85149'
+						: (res.verdict_state === 'warn' ? '#d29922' : '#3fb950');
+				}
+			}).catch(function(e) {
+				ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+			}).then(function() {
+				if (btn) btn.disabled = false;
+				diagSummary.textContent = '';
+			});
+		}
+
+		function diagShowLog(id, title) {
+			callDiagLog(id).then(function(res) {
+				diagLogBox.style.display = '';
+				diagLogBox.textContent = (title ? ('# ' + title + '\n') : '') + ((res && res.text) || 'лог пока пуст');
+			}).catch(function(e) {
+				diagLogBox.style.display = '';
+				diagLogBox.textContent = 'Ошибка чтения лога: ' + e;
+			});
+		}
+
+		// R09: ONE archive button. The backend builds the same safe bundle the console used
+		// (console state + every saved per-check log) without running a single check; the
+		// download then goes through `console_diag_get`, the same spool getter with the same
+		// ownership/NOFOLLOW checks. No path from the network answer is ever used as a link.
+		function diagBundleDownload(btn) {
+			if (btn) btn.disabled = true;
+			var localNotRun = diagData.filter(function(c) { return !c.last_state; }).length;
+			diagBundleNote.textContent = 'собираю архив…';
+			return callDiagBundle().then(function(res) {
+				res = res || {};
+				if (!res.ok) {
+					diagBundleNote.textContent = 'архив не собран: ' + (res.error || 'нет ответа');
+					return;
+				}
+				var name = String(res.name || '');
+				if (!name) {
+					diagBundleNote.textContent = 'архив не собран: сервер не вернул имя';
+					return;
+				}
+				return callConsoleDiagGet({ name: name }).then(function(got) {
+					if (!saveBundle(got, diagBundleNote)) return;
+					var total = (typeof res.checks === 'number') ? res.checks : diagData.length;
+					var skipped = (typeof res.not_run === 'number') ? res.not_run : localNotRun;
+					diagBundleNote.textContent += ' · в архиве: ' + total
+						+ ' проверок, ' + skipped + ' без запуска';
+				});
+			}).catch(function(e) {
+				diagBundleNote.textContent = 'архив не собран: ' + e;
+			}).then(function() {
+				if (btn) btn.disabled = false;
+			});
+		}
+
+		function domRun() {
+			var name = (domInput.value || '').trim();
+			if (!name) return;
+			domOut.style.display = '';
+			domOut.textContent = 'проверяю ' + name + '…';
+			domLog.textContent = '';
+			callDiagDomain(name, domLive.checked ? 'live' : '').then(function(res) {
+				if (!res || res.ok === false) {
+					domOut.textContent = 'Ошибка: ' + ((res || {}).error || 'нет ответа');
+					return;
+				}
+				domOut.textContent = (res.lines || []).join('\n');
+				domLog.textContent = 'лог: ' + (res.log || '');
+			}).catch(function(e) {
+				domOut.textContent = 'Ошибка: ' + e;
+			});
+		}
+
+		panels.diag.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Диагностика'),
+			E('div', { 'class': 'gs-hint' }, 'Проверки выполняются на роутере. У каждой свой лог, логи хранятся 7 дней.'),
+			diagVerdict,
+			E('div', { 'class': 'gs-row', style: 'margin:8px 0;gap:10px;align-items:center' }, [
+				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function(ev) { diagRun('all', ev.target); } }, 'Проверить всё'),
+				E('button', { 'class': 'gs-btn', 'click': function(ev) { diagBundleDownload(ev.target); } }, 'Скачать архив диагностики'),
+				diagSummary,
+				diagBundleNote
+			]),
+			diagRowsBox,
+			diagLogBox
+		]));
+		panels.diag.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Маршрут домена'),
+			E('div', { 'class': 'gs-hint' }, 'Введите домен — покажу DNS, группу MagiTrickle, правило mihomo, узел и страну выхода. Без ИИ и без экспериментов.'),
+			E('div', { 'class': 'gs-row', style: 'margin:8px 0;gap:8px;align-items:center;flex-wrap:wrap' }, [
+				domInput,
+				E('label', { 'class': 'gs-meta' }, [domLive, 'живая проверка (реальный запрос)']),
+				E('button', { 'class': 'gs-btn gs-btn-primary', 'click': domRun }, 'Проверить маршрут')
+			]),
+			domOut,
+			domLog
+		]));
+		diagRender();
+
+		panels.bk.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Резервные копии'),
+			bkBox
+		]));
+
+		/* ===================== Automation (lists tab) ===================== */
+		var selInt = E('select', { 'class': 'gs-input' });
+		['1', '2', '3', '5', '10', '15', '30'].forEach(function(v) {
+			var op = E('option', { value: v }, 'каждые ' + v + ' мин');
+			if (stk.sync_interval && String(stk.sync_interval).replace('*/', '') === v) op.selected = true;
+			selInt.appendChild(op);
+		});
+		var btnInt = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnInt.disabled = true;
+			callSyncSet({ interval: selInt.value }).then(function(res) {
+				btnInt.disabled = false;
+				if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+				ui.addNotification(null, E('p', {}, 'Cron-страховка синка: каждые ' + selInt.value + ' мин'), 'info');
+				return view.reload();
+			}).catch(function(e) { btnInt.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Применить');
+		var btnSyncd = stk.syncd_enabled
+			? E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+				btnSyncd.disabled = true;
+				callSyncdSet({ state: 'off' }).then(function() { view.reload(); }).catch(function() { btnSyncd.disabled = false; });
+			} }, 'Выключить сторож')
+			: E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+				btnSyncd.disabled = true;
+				callSyncdSet({ state: 'on' }).then(function() { view.reload(); }).catch(function() { btnSyncd.disabled = false; });
+			} }, 'Включить сторож');
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Автоматизация применения списков'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Событийный сторож (применяет за секунды)'),
+				E('span', { 'class': 'gs-badge ' + (stk.syncd ? 'gs-ok' : 'gs-off') }, stk.syncd ? 'работает' : 'не запущен'),
+				btnSyncd
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Cron-страховка (полный прогон)'),
+				E('span', { 'class': 'gs-val gs-mono' }, String(stk.sync_interval || '*/5')),
+				E('span', {}, [selInt, btnInt])
+			]),
+			E('div', { 'class': 'gs-hint' }, 'Сторож реагирует на сохранение списков в MagiTrickle; cron — гарантия на случай сбоя события.')
+		]));
+
+		/* ===================== Lists template (lists tab, v1.13.0) ===================== */
+		var btnSeed = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+			if (!confirm('Восстановить списки MagiTrickle из шаблона geomask? Текущие группы будут перезаписаны (config.yaml сохранится в бэкап), MagiTrickle перезапустится на несколько секунд.')) return;
+			btnSeed.disabled = true; btnSeed.textContent = 'Восстановление…';
+			callListsSeed().then(function(res) {
+				btnSeed.disabled = false; btnSeed.textContent = 'Восстановить из шаблона';
+				if (res && res.ok) ui.addNotification(null, E('p', {}, 'Списки восстановлены из шаблона'), 'info');
+				else ui.addNotification(null, E('p', {}, 'Ошибка восстановления: ' + ((res && res.result) || 'см. журнал')), 'error');
+				return view.reload();
+			}).catch(function(e) { btnSeed.disabled = false; btnSeed.textContent = 'Восстановить из шаблона'; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Восстановить из шаблона');
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Шаблоны списков (резерв восстановления)'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'geomask хранит снимок всех групп MagiTrickle (To VPN / To Not VPN / Google+AI / Geoblock / Youtube и др.) — без секретов. ' +
+				'После переустановки или сброса (инцидент B-018) кнопка ниже вернет списки к этому снимку. Тонкая правка доменов — в панели MagiTrickle (:8080).'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Шаблон'),
+				E('span', { 'class': 'gs-badge ' + (lt.template_present ? 'gs-ok' : 'gs-off') }, lt.template_present ? ('v' + (lt.template_version || '?')) : 'отсутствует'),
+				E('span', { 'class': 'gs-val gs-mono' }, 'групп ' + (lt.template_groups || 0) + ' · правил ' + (lt.template_rules || 0))
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Сейчас в MagiTrickle'),
+				E('span', { 'class': 'gs-val gs-mono' }, 'групп ' + (lt.current_groups || 0) + ' · правил ' + (lt.current_rules || 0)),
+				E('span', { 'class': 'gs-badge ' + (lt.magitrickle_running ? 'gs-ok' : 'gs-off') }, lt.magitrickle_running ? 'работает' : 'остановлен')
+			]),
+			E('div', { 'class': 'gs-row' }, [ btnSeed ])
+		]));
+
+		/* ===================== YouTube edges watchdog (lists tab, v1.14.0) ===================== */
+		var ytAuto = (yt.mode || 'auto') === 'auto';
+		var setMode = function(m, btn) {
+			btn.disabled = true;
+			callYtMode({ mode: m }).then(function(res) {
+				btn.disabled = false;
+				if (res && res.ok) ui.addNotification(null, E('p', {}, m === 'auto' ? 'Режим авто: битые рёбра уходят в VPN, остальные через запрет (DPI)' : 'Режим blanket: весь googlevideo в VPN'), 'info');
+				else ui.addNotification(null, E('p', {}, 'Не удалось переключить режим'), 'error');
+				return view.reload();
+			}).catch(function(e) { btn.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		};
+		var btnYtAuto = E('button', { 'class': 'gs-btn' + (ytAuto ? '' : ' gs-btn-primary'), 'click': function() { setMode('auto', btnYtAuto); } }, 'Авто (битые — в VPN)');
+		var btnYtAll = E('button', { 'class': 'gs-btn' + (ytAuto ? '' : ' gs-btn-primary'), 'click': function() { setMode('blanket', btnYtAll); } }, 'Весь googlevideo в VPN');
+		var btnYtRel = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+			if (!confirm('Отпустить все автотопинги? Рёбра вернутся на прямой путь через запрет (DPI).')) return;
+			btnYtRel.disabled = true;
+			callYtReset().then(function() { view.reload(); }).catch(function(e) { btnYtRel.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Отпустить пины сейчас');
+		var ytPins = yt.pinned_hosts || [];
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'YouTube: рёбра googlevideo'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Google раздаёт адреса рёбер динамически и часть из них блокируется по IP, поэтому статический список всегда отстаёт. ' +
+				'В режиме «Авто» рёбра идут напрямую через запрет (DPI), а watchdog каждые 5 минут читает ошибки соединений mihomo и ' +
+				'кладёт реально падающие хосты в группу «GoogleVideo VPN» (видно в MagiTrickle :8080). Ночью пины отпускаются. ' +
+				'Картинки (ytimg/ggpht) и сам youtube.com — всегда напрямую через запрет.'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Режим'),
+				E('span', { 'class': 'gs-badge ' + (ytAuto ? 'gs-ok' : 'gs-off') }, ytAuto ? 'авто' : 'весь в VPN'),
+				btnYtAuto, btnYtAll
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Сейчас в VPN'),
+				E('span', { 'class': 'gs-val gs-mono' }, ytPins.length ? (ytPins.length + ' ребра') : '—'),
+				E('span', { 'class': 'gs-hint' }, 'порог ' + (yt.threshold || 2) + ' ошибок за ' + (yt.window_min || 30) + ' мин, максимум ' + (yt.max_pins || 40))
+			]),
+			ytPins.length ? E('div', { 'class': 'gs-blocklist' }, ytPins.join('\n')) : null,
+			(function(){
+				var st = yt.stalled || {}, ks = Object.keys(st).sort();
+				return E('div', { 'class': 'gs-row' }, [
+					E('span', { 'class': 'gs-label' }, 'Зависшие рёбра'),
+					E('span', { 'class': 'gs-badge ' + (ks.length ? 'gs-warn' : 'gs-ok') }, ks.length ? (ks.length + ' без данных') : 'нет'),
+					E('span', { 'class': 'gs-hint' }, 'считается зависшим: живёт >' + (yt.stall_min_age || 25) + ' с и скачано <' +
+						Math.round((yt.stall_max_bytes || 10000)/1024) + ' КБ — такое ребро пинится в VPN')
+				]);
+			})(),
+			(function(){
+				var st = yt.stalled || {}, ks = Object.keys(st).sort();
+				return ks.length ? E('div', { 'class': 'gs-blocklist' }, ks.join('\n')) : null;
+			})(),
+			E('div', { 'class': 'gs-row' }, [ btnYtRel ])
+		]));
+
+		/* ===================== Torrents (lists tab, v1.15.0) ===================== */
+		var torOn = !!tor.listener_present;
+		var setListener = function(state, btn) {
+			btn.disabled = true;
+			callTorListener({ state: state }).then(function(res) {
+				btn.disabled = false;
+				if (res && res.ok) ui.addNotification(null, E('p', {}, state === 'on' ? 'Слушатель включён' : 'Слушатель выключен'), 'info');
+				else ui.addNotification(null, E('p', {}, 'Не удалось изменить (см. /root/geo-sync.log)'), 'error');
+				return view.reload();
+			}).catch(function(e) { btn.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		};
+		var btnTorOff = E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+			if (!confirm('Выключить слушатель? Клиенты, указавшие его как прокси, потеряют обход VPN-подписки и пойдут по обычным правилам.')) return;
+			setListener('off', btnTorOff);
+		} }, 'Выключить слушатель');
+		var btnTorOn = E('button', { 'class': 'gs-btn' + (torOn ? '' : ' gs-btn-primary'), 'click': function() { setListener('on', btnTorOn); } }, 'Включить слушатель');
+		var btnTorUpd = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnTorUpd.disabled = true; btnTorUpd.textContent = 'Обновляю…';
+			callTorRefresh().then(function(res) {
+				btnTorUpd.disabled = false; btnTorUpd.textContent = 'Обновить списки трекеров';
+				ui.addNotification(null, E('p', {}, (res && res.changed) ? ('Список пересобран: доменов ' + res.domains + ', IP ' + res.raw_ips) : 'Изменений нет'), 'info');
+				return view.reload();
+			}).catch(function(e) { btnTorUpd.disabled = false; btnTorUpd.textContent = 'Обновить списки трекеров'; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Обновить списки трекеров');
+		var inTorExtra = E('textarea', { 'class': 'gs-text', rows: 3, style: 'width:100%;font-family:monospace' });
+		inTorExtra.value = (tor.extras || []).join('\n');
+		var btnTorExtra = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnTorExtra.disabled = true;
+			callTorExtra({ hosts: inTorExtra.value }).then(function(res) {
+				btnTorExtra.disabled = false;
+				if (res && res.ok) ui.addNotification(null, E('p', {}, 'Сохранено, правил: ' + res.domains), 'info');
+				else ui.addNotification(null, E('p', {}, 'Отклонено: ' + ((res && res.rejected || []).join(', ') || 'ошибка')), 'error');
+				return view.reload();
+			}).catch(function(e) { btnTorExtra.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Сохранить и пересобрать');
+		panels.lists.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Торренты и трекеры'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Ни одно торрент-соединение не должно идти через обычную VPN-подписку — провайдер это ' +
+				'запрещает и 31.10 заблокировал подписку, увидев BitTorrent в туннеле. Клиент указывает ' +
+				'прокси на локальный слушатель с жёсткой политикой: торренты уходят в AI-подписку ' +
+				'(ограничений на P2P у неё нет), а AI-домены через тот же слушатель попадают в AI — ' +
+				'утечка в DIRECT исключена по построению. Дополнительно: домены трекеров закреплены ' +
+				'ruleset\'ом (DIRECT), а ответы входящим пирам — правилом SRC-PORT (AI), потому что ' +
+				'1300 IP-CIDR хостинговых групп уводят пиров на OVH/Hetzner/DO в VPN.'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Слушатель'),
+				E('span', { 'class': 'gs-badge ' + (torOn ? 'gs-ok' : 'gs-off') },
+					torOn ? ('работает :' + (tor.listener_port || 7894) + ' → ' + (tor.listener_policy || 'без политики')) : 'выключен'),
+				E('span', { 'class': 'gs-val gs-mono' }, tor.proxy_hint || ''),
+				(torOn ? btnTorOff : btnTorOn)
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Список трекеров'),
+				E('span', { 'class': 'gs-val gs-mono' }, 'доменов ' + (tor.domains || 0) + ' · IP ' + (tor.raw_ips || 0)),
+				E('span', { 'class': 'gs-badge ' + (tor.provider_loaded ? 'gs-ok' : 'gs-off') }, 'в mihomo: ' + (tor.provider_loaded || 0)),
+				btnTorUpd
+			]),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:6px 0 4px' },
+				'Свои домены (по строке). Пересобираются вместе с публичными списками: ' +
+				((tor.sources || []).join(' , ') || '—')),
+			inTorExtra,
+			E('div', { 'class': 'gs-row' }, [ btnTorExtra ])
+		]));

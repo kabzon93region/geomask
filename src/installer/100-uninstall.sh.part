@@ -1,0 +1,421 @@
+geomask_uninstall() {
+  # Every crontab rewrite below is a read-modify-write. Hold the shared `cron` lock for the
+  # whole removal so a panel nodes_set/sync_set cannot re-add a line from a stale read while
+  # the uninstall removes it (report R09). --reinstall calls this with the maintenance lock
+  # already held; the fixed order allows maintenance(10) -> cron(50).
+  _un_cron=0
+  if _cron_begin; then
+    _un_cron=1
+  else
+    warn "cron: блокировка недоступна - строки cron не трогаю"
+  fi
+  for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
+           /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
+           /usr/share/luci/menu.d/luci-app-geo-sync.json; do
+    if [ -f "$(P "$f")" ]; then rm -f "$(P "$f")"; info "removed: $f"; fi
+  done
+  rm -f "$(P /www/luci-static/resources/view/geo-sync/main.js)" 2>/dev/null || true
+  rmdir "$(P /www/luci-static/resources/view/geo-sync)" 2>/dev/null || true
+  if [ -f "$(P /root/sync_mtrickle_mihomo.sh)" ]; then rm -f "$(P /root/sync_mtrickle_mihomo.sh)"; info "removed: sync script"; fi
+  # v1.10.0: stop+remove the event sync watchdog
+  if [ -x "$(P /etc/init.d/geomask-syncd)" ]; then
+    initd geomask-syncd stop >/dev/null 2>&1 || true
+    initd geomask-syncd disable >/dev/null 2>&1 || true
+    pkill -f geomask-syncd.sh 2>/dev/null || true
+    rm -f "$(P /etc/init.d/geomask-syncd)" "$(P /usr/bin/geomask-syncd.sh)"
+    info "removed: syncd watchdog"
+  fi
+  # v1.11.0: node audit removal
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-node-scan' | crontab - 2>/dev/null || true
+  fi
+  rm -f "$(P /usr/bin/geomask-node-scan.sh)"
+  info "removed: node-scan (conf /etc/geomask-nodes.conf left for reference)"
+  # v1.14.0: youtube edge watchdog removal. Release the auto-pins ONLY on a real uninstall:
+  # --reinstall calls this too, and resetting there wiped every accumulated edge pin
+  # (observed 31.10 18:21 - a self-update dropped 10 working pins).
+  if [ -z "$1" ] && [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ]; then
+    "$(P /usr/bin/geomask-ytwatch.sh)" --reset >/dev/null 2>&1
+  fi
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'geomask-ytwatch'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-ytwatch' | crontab - 2>/dev/null || true
+  fi
+  rm -f "$(P /usr/bin/geomask-ytwatch.sh)"
+  info "removed: ytwatch (conf /etc/geomask-ytwatch.conf and /etc/geomask/ytwatch.state kept for reference)"
+  # v1.15.0: torrent admin removal (ruleset + listener left in place: they belong to mihomo config)
+  rm -f "$(P /usr/bin/geomask-torrent.sh)"
+  info "removed: torrent admin (lists in /etc/geomask/torrent and the ruleset kept for reference)"
+  # v1.18.0: vpnwatch removal (the audit log is kept - it is the evidence the operator collected)
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'geomask-vpnwatch'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-vpnwatch' | crontab - 2>/dev/null || true
+  fi
+  rm -f "$(P /usr/bin/geomask-vpnwatch.sh)"
+  rm -f "$(P /usr/bin/geomask-morning-check.sh)"
+  # The lane owns a service and a listener. Remove it ONLY on a real uninstall: --reinstall goes
+  # through this function too, and wiping the lane there silently deletes an interface the owner
+  # has assigned MagiTrickle lists to (same class of bug as the YouTube pins, fixed in v1.20.x).
+  if [ -z "$1" ] && [ -x "$(P /usr/bin/geomask-lane.sh)" ]; then
+    "$(P /usr/bin/geomask-lane.sh)" remove >/dev/null 2>&1 || warn "lane removal reported a problem"
+  fi
+  rm -f "$(P /usr/bin/geomask-lane.sh)"
+  rm -f "$(P /usr/bin/geomask-dnscheck.sh)"
+  info "removed: vpnwatch (conf /etc/geomask/vpnwatch.conf and the audit log kept)"
+  # v1.28.0: node-audit subsystem modules. The settings store (/etc/geomask/node-audit.json),
+  # its event log and the immutable report/pool directories are deliberately KEPT - they are
+  # the operator's desired policies and the evidence behind them.
+  for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
+            geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
+            geomask-sync-youtube.py geomask-audit-scheduler.py geomask-subscription-status.py \
+            geomask-slot-patch.py geomask-mihomo-adopt.py geomask-reload-state.py geomask-console.py geomask-dnsguard.sh \
+            geomask-diag-spool.py; do
+    rm -f "$(P /usr/lib/geomask/$_m)"
+  done
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'geomask-audit-schedule'; then
+    crontab -l 2>/dev/null | grep -v 'geomask-audit-schedule' | crontab - 2>/dev/null || true
+  fi
+  info "removed: node-audit modules (settings, events and reports kept under /etc/geomask)"
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
+    crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
+  fi
+  # I11 (audit 18.11.2026): the uninstall left the guard (script, hotplug hook, 5-minute cron
+  # line) and AI-DNS (two services, their init scripts and the nft table) behind, so an
+  # "uninstalled" router kept re-seating rules and answering DNS. The catalogue declares what
+  # each module owns, so exactly that is removed - the cron lock is already held here.
+  for _un_mod in guard ai_dns; do
+    modules_remove_runtime "$_un_mod" "удаление geomask" || true
+  done
+  [ "$1" = "noreload" ] || initd rpcd reload 2>/dev/null || true
+  [ "$_un_cron" = 1 ] && _cron_end
+  return 0
+}
+
+# ---- reinstall preflight and rollback ---------------------------------------
+# geomask_uninstall deletes the panel, backend, RPC registration, cron entries and helper
+# scripts. The old flow called it first and only then asked write_mihomo_config, which can
+# refuse a foreign config - the refusal arrived after the components were already gone.
+#
+# R03 phase 2b: the snapshot/rollback is built from the manifest write-set
+# (tests/reinstall_write_set.json), not from a hand-picked list. Byte objects come from the
+# same table the preflight type-checks (REINSTALL_PREFLIGHT_BYTE_FILES, cross-checked 1:1 by
+# tests/reinstall_manifest.py); shared files are restored by their managed subset only; the
+# runtime state (services, rc.d links, uci keys, cron, nft/ip rule, per-interface IPv6
+# sysctl) is recorded as data, not guessed at restore time. Every restored object is
+# verified: bytes, mode, uci values, live nft/ip-rule, enabled AND running services, sysctl.
+# An unverified or failed object keeps the snapshot and returns non-zero ("rollback
+# incomplete / recovery required"); a concurrent write after the snapshot is a conflict.
+#
+# Deliberately NOT restored (manifest restore=NR, reported honestly as NR):
+#   * mihomo provider cache / the controller API refresh - a network effect, not a file;
+#   * network/firewall reload effects - applied and then verified, not "restored";
+#   * witness logs (/root/geo-sync.log, node-audit events/pools/reports) and /tmp transients;
+#   * MagiTrickle's config.yaml is owned by magitrickled: if it changed during the run the
+#     rollback reports "incomplete" instead of pretending it was restored.
+# The GM_AUTO_LANE branch (geomask-lane.sh install) creates uci/section ids inside a callee
+# that this snapshot cannot journal; the reinstall refuses that branch before any mutation.
+REINSTALL_TRACKED=""
+REINSTALL_SHARED_APPEND="/etc/passwd|dnsai
+/etc/group|dnsai
+/opt/zapret/ipset/zapret-hosts-user-exclude.txt|zapret-block
+/opt/zapret/ipset/zapret-hosts-user.txt|zapret-force"
+REINSTALL_UCI_OBJECTS="network|lanai|section|proto,device,ipaddr,netmask
+network|lan|option|ip6assign
+dhcp|lan|option|ra,dhcpv6,ndp
+ksmbd|geomask-backups|name|name,path,read_only,guest_ok,force_root"
+REINSTALL_LIST_DIRS="/usr/bin /usr/lib/geomask /usr/libexec/rpcd /usr/share/rpcd/acl.d
+/usr/share/luci/menu.d /usr/share/nftables.d/ruleset-post /etc /etc/config /etc/init.d
+/etc/hotplug.d/iface /etc/geomask /etc/geomask/lists /etc/geomask/torrent /etc/mihomo
+/etc/mihomo/ruleset /etc/nftables.d /etc/sysctl.d /etc/magitrickle/state
+/etc/hev-socks5-tunnel /opt/zapret/ipset /root /www/luci-static/resources/view/geo-sync"
+# Temporary names our writers create next to a manifest object (save_stream, the mihomo
+# patcher, the lane). Only names that did NOT exist at snapshot time are removed: a backup
+# or temp file another writer had before the transaction is never deleted.
+REINSTALL_TEMP_SUFFIXES=".zmnew .de5rm .urlnew .tdnew .ecnew .gm.tmp"
+# R04: the installer and the scanner now name their temps per process (two writers must not
+# share one file), so a crash leaves <object>.zmnew.<pid> instead of <object>.zmnew. These
+# globs are pruned only for objects the transaction snapshotted and only for names created
+# after the snapshot; a file that was already there is in the listing and is left alone.
+# Deliberately no generic `.tmp.*`: `<object>.tmp.<pid>` may be another writer's LIVE temporary
+# (node-scan writes config.yaml.tmp.<pid> while the installer runs).
+REINSTALL_TEMP_GLOBS=".zmnew.* .de5rm.* .urlnew.* .tdnew.* .ecnew.* .bak_nodescan.* .bak_aiguard.*"
+# Objects the manifest marks restore=NR even though a byte preimage exists: the owner
+# (a daemon) rewrites them, so a rollback must NOT write stale bytes over live state.
+# They are recorded by identity+hash and the restore reports "incomplete" when they
+# changed instead of silently restoring them.
+REINSTALL_NR_STATE="/etc/magitrickle/state/config.yaml"
+
+_rs_posix_path() { # <host-path> -> POSIX absolute path (drive form normalized)
+  # Git Bash may return a native Windows path (Y:\..., //?/Y:/...) from readlink -f;
+  # the router only ever has POSIX paths. Normalize before policy/pin comparison so the
+  # decision does not depend on the test host's temp drive.
+  _rs_pv=$1
+  case "$_rs_pv" in
+    //?/[A-Za-z]:/*) _rs_pv=$(printf '%s' "$_rs_pv" | sed 's#^//?/##') ;;
+  esac
+  case "$_rs_pv" in
+    [A-Za-z]:*)
+      _rs_pd=$(printf '%s' "$_rs_pv" | cut -c1 | tr 'A-Z' 'a-z')
+      _rs_pr=${_rs_pv#??}
+      _rs_pr=$(printf '%s' "$_rs_pr" | sed 's#\\#/#g')
+      printf '/%s%s' "$_rs_pd" "$_rs_pr" ;;
+    *) printf '%s' "$_rs_pv" ;;
+  esac
+}
+
+_rs_readlink_posix() { # <abs-path> -> POSIX form of readlink -f
+  _rs_rl=$(readlink -f "$1" 2>/dev/null) || return 1
+  _rs_posix_path "$_rs_rl"
+}
+
+_rs_trusted_link() { # <resolved-target> -> 0 when the target lives under a trusted root
+  _rs_tv=$(_rs_posix_path "$1")
+  # Policy (phase 2e): a storage symlink is legitimate when it points into a stable,
+  # root-owned tree. /tmp-style trees, arbitrary mounts and user-writable roots are not.
+  case "$_rs_tv" in
+    /overlay/*|/mnt/*|/opt/*|/usr/*|/www/*|/etc/*) return 0 ;;
+  esac
+  _rs_troot=$(P / 2>/dev/null) || _rs_troot=""
+  _rs_troot=${_rs_troot%/}
+  if [ -n "${_rs_troot:-}" ] && [ "$_rs_troot" != "/" ]; then
+    # Test/prefix trees: only the same logical roots as above are trusted. A link to an
+    # arbitrary directory inside the fixture (rc-outside, init-outside) stays untrusted.
+    case "$_rs_tv" in
+      "$_rs_troot"/mnt/*|"$_rs_troot"/overlay/*|"$_rs_troot"/opt/*| \
+      "$_rs_troot"/usr/*|"$_rs_troot"/www/*|"$_rs_troot"/etc/*) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+_rs_link_ok() { # <logical> <host-path> <dir|file> - policy + pinned identity
+  _rs_lh=$(readlink -f "$2" 2>/dev/null) || return 1
+  [ -n "${_rs_lh:-}" ] || return 1
+  _rs_lr=$(_rs_posix_path "$_rs_lh")
+  if [ "$3" = dir ]; then
+    [ -d "$_rs_lh" ] || return 1
+  else
+    [ -f "$_rs_lh" ] || return 1
+  fi
+  _rs_lu=$(_rs_uid "$_rs_lh") || return 1
+  _rs_self=$(id -u 2>/dev/null || printf '0')
+  # On the router the installer runs as root, so only uid 0 is accepted. On a non-root
+  # test host the fixture owner is the runner; that keeps the policy testable without
+  # pretending a Windows temp tree is root-owned.
+  if [ "$_rs_lu" != 0 ] && [ "$_rs_lu" != "$_rs_self" ]; then return 1; fi
+  _rs_lm=$(_rs_mode "$_rs_lh") || return 1
+  if [ $((0$_rs_lm & 2)) -ne 0 ]; then return 1; fi
+  _rs_trusted_link "$_rs_lr" || return 1
+  _rs_ld=$(_rs_devino "$_rs_lh") || return 1
+  if [ "${_rs_pin_mode:-0}" = 1 ] && [ -n "${_rs_snap:-}" ]; then
+    _rs_pin=$(awk -F'|' -v l="$1" '$1==l{print $2"|"$3; exit}' \
+              "$_rs_snap/symlinks" 2>/dev/null)
+    if [ -n "${_rs_pin:-}" ]; then
+      [ "$_rs_pin" = "$_rs_lr|$_rs_ld" ] || return 1
+      return 0
+    fi
+    printf '%s|%s|%s\n' "$1" "$_rs_lr" "$_rs_ld" >> "$_rs_snap/symlinks" 2>/dev/null \
+      || return 1
+    return 0
+  fi
+  if [ "${_rs_pin_enforce:-0}" = 1 ] && [ -n "${_rs_snap:-}" ] \
+     && [ -f "$_rs_snap/symlinks" ]; then
+    _rs_pin=$(awk -F'|' -v l="$1" '$1==l{print $2"|"$3; exit}' \
+              "$_rs_snap/symlinks" 2>/dev/null)
+    [ -n "${_rs_pin:-}" ] || return 1
+    [ "$_rs_pin" = "$_rs_lr|$_rs_ld" ] || return 1
+  fi
+  return 0
+}
+
+_rs_safe_walk() { # <install-path> <dir|file|exec>
+  _rs_pp=""
+  _rs_pr=${1#/}
+  while [ -n "$_rs_pr" ]; do
+    _rs_pc=${_rs_pr%%/*}
+    if [ "$_rs_pc" = "$_rs_pr" ]; then _rs_pr=""; else _rs_pr=${_rs_pr#*/}; fi
+    _rs_pp="$_rs_pp/$_rs_pc"
+    _rs_pa="$(P "$_rs_pp")"
+    if [ -L "$_rs_pa" ]; then
+      if [ -z "$_rs_pr" ] && [ "$2" = file ]; then return 1; fi
+      _rs_want=dir
+      if [ -z "$_rs_pr" ] && [ "$2" = exec ]; then _rs_want=file; fi
+      _rs_link_ok "$_rs_pp" "$_rs_pa" "$_rs_want" || return 1
+    fi
+  done
+  return 0
+}
+
+_rs_safe_path() { # directories: a symlink component is allowed only by the policy + pin
+  _rs_safe_walk "$1" dir
+}
+
+_rs_safe_file() { # byte files: the leaf itself must never be a symlink
+  _rs_safe_walk "$1" file
+}
+
+_rs_safe_exec() { # init scripts: a trusted root-owned file symlink is legible
+  _rs_safe_walk "$1" exec
+}
+
+_rs_critical_paths_safe() { # every path the rollback writes, reads or executes through
+  for _rs_cpp in /etc /etc/init.d /etc/rc.d /etc/config /etc/config/network \
+                  /etc/config/dhcp /etc/config/ksmbd /etc/config/firewall \
+                  /etc/sysctl.d /etc/geomask /etc/mihomo /etc/nftables.d \
+                  /etc/hotplug.d/iface /etc/magitrickle/state \
+                  /usr/bin /usr/lib /usr/lib/geomask /usr/libexec/rpcd \
+                  /usr/share/nftables.d/ruleset-post /usr/share/rpcd/acl.d \
+                  /usr/share/luci/menu.d /root /opt/zapret/ipset \
+                  /www/luci-static/resources/view/geo-sync; do
+    if ! _rs_safe_path "$_rs_cpp"; then
+      bad "conflict: $_rs_cpp is behind an unsafe or unpinned symlink - refusing any write/read/exec through it"
+      return 1
+    fi
+  done
+  return 0
+}
+
+_rs_iprule_state() { # -> absent | "<pref>|<table>|<ours|foreign>;..." for EVERY same-mark rule
+  _rs_ir=$(ip rule show 2>/dev/null) || return 1
+  _rs_rows=$(printf '%s\n' "$_rs_ir" | awk -v m="$AIDNS_MARK" -v ours="$AIDNS_RULE_PREF" '
+    { hit = 0
+      for (i = 1; i < NF; i++) if ($i == "fwmark" && $(i + 1) == m) hit = 1
+      if (!hit) next
+      p = $1; sub(/:$/, "", p)
+      t = ""
+      for (i = 1; i < NF; i++) if ($i == "lookup" || $i == "table") t = $(i + 1)
+      print p "|" t "|" (p == ours ? "ours" : "foreign") }')
+  if [ -z "${_rs_rows:-}" ]; then printf 'absent'; return 0; fi
+  printf '%s' "$_rs_rows" | LC_ALL=C sort -n | tr '\n' ';' | sed 's/;$//'
+}
+
+_rs_ksmbd_live_sig() { # semantic signature of OUR ksmbd share sections (ids are unstable)
+  for _rs_ks in $(_rs_ksmbd_ours geomask-backups); do
+    uci -q show ksmbd 2>/dev/null | awk -v p="$_rs_ks." '
+      index($0, p) == 1 { print substr($0, length(p) + 1) }' | sort | tr '\n' ';'
+    printf '\n'
+  done | grep . | sort
+}
+
+_rs_ksmbd_snap_sig() { # the same signature reconstructed from the snapshot rows
+  _rs_kids=$(sed -n 's/^uci|ksmbd|\(@match[0-9]*\)|@type|share$/\1/p' "$_rs_snap/uci" 2>/dev/null | sort -u)
+  for _rs_kid in $_rs_kids; do
+    sed -n "s/^uci|ksmbd|$_rs_kid|\([^|]*\)|\(.*\)$/\1='\2'/p" "$_rs_snap/uci" 2>/dev/null \
+      | grep -v '^@type=' | sort | tr '\n' ';'
+    printf '\n'
+  done | grep . | sort
+}
+
+_rs_check_snapshot() { # _rs_check_snapshot <dir> - a damaged snapshot is refused as a whole
+  for _rs_need in objects meta listing links services uci sysctl net cron shared \
+                  symlinks nft-ai.list nft-v6.list; do
+    if [ ! -f "$_rs_snap/$_rs_need" ]; then
+      bad "rollback incomplete / recovery required: snapshot $_rs_snap is incomplete ($_rs_need missing)"
+      return 1
+    fi
+  done
+  _rs_ckv=0
+  while IFS='|' read -r _rs_ck _rs_cp _rs_ca _rs_cb _rs_cc _rs_cd _rs_ce; do
+    [ -n "${_rs_cp:-}" ] || continue
+    if [ "$_rs_ck" = file ] && [ ! -f "$_rs_snap/files$_rs_cp" ]; then
+      bad "rollback incomplete / recovery required: snapshot lost the copy of $_rs_cp"
+      _rs_ckv=1
+    fi
+  done < "$_rs_snap/objects"
+  while IFS='|' read -r _rs_sc _rs_sp _rs_si _rs_sk _rs_sh _rs_sd _rs_sm; do
+    [ -n "${_rs_sp:-}" ] || continue
+    if [ "$_rs_sk" = regular ] && [ ! -f "$_rs_snap/shared.$_rs_si.pre" ]; then
+      bad "rollback incomplete / recovery required: snapshot lost the managed preimage of shared file $_rs_sp"
+      _rs_ckv=1
+    fi
+  done < "$_rs_snap/shared"
+  return "$_rs_ckv"
+}
+
+_reinstall_save() { # _reinstall_save <snapshot-dir> <install-path> (legacy helper)
+  [ -f "$(P "$2")" ] || return 0
+  _rs_dir="$1/files$(dirname "$2")"
+  mkdir -p "$_rs_dir" 2>/dev/null || return 1
+  cp -p "$(P "$2")" "$_rs_dir/" 2>/dev/null || return 1
+  printf '%s\n' "$2" >> "$1/present"
+}
+
+_rs_type() { # _rs_type <install-path> -> regular|symlink|dir|absent|unknown
+  _rs_tp="$(P "$1")"
+  if [ -L "$_rs_tp" ]; then printf 'symlink'; return 0; fi
+  if [ -f "$_rs_tp" ]; then printf 'regular'; return 0; fi
+  if [ -d "$_rs_tp" ]; then printf 'dir'; return 0; fi
+  if [ -e "$_rs_tp" ]; then printf 'unknown'; return 0; fi
+  if ls -d "$_rs_tp" >/dev/null 2>&1; then printf 'unknown'; return 0; fi
+  printf 'absent'
+}
+
+_rs_mode() { # _rs_mode <abs-path> -> octal mode
+  _rs_mv=$(stat -c '%a' "$1" 2>/dev/null)
+  if [ -z "${_rs_mv:-}" ]; then _rs_mv=$(stat -f '%Lp' "$1" 2>/dev/null); fi
+  [ -n "${_rs_mv:-}" ] || return 1
+  printf '%s' "$_rs_mv"
+}
+
+_rs_uid() { # _rs_uid <abs-path>
+  _rs_uv=$(stat -c '%u' "$1" 2>/dev/null)
+  [ -n "${_rs_uv:-}" ] || return 1
+  printf '%s' "$_rs_uv"
+}
+
+_rs_devino() { # _rs_devino <abs-path>
+  _rs_dv=$(stat -c '%d:%i' "$1" 2>/dev/null)
+  [ -n "${_rs_dv:-}" ] || return 1
+  printf '%s' "$_rs_dv"
+}
+
+_rs_size() { # _rs_size <abs-path>
+  _rs_sv=$(stat -c '%s' "$1" 2>/dev/null)
+  [ -n "${_rs_sv:-}" ] || return 1
+  printf '%s' "$_rs_sv"
+}
+
+_rs_stat4() { # _rs_stat4 <abs-path> -> "mode|uid|dev:ino|size" in one stat call
+  _rs_p4=$(stat -c '%a|%u|%d:%i|%s' "$1" 2>/dev/null)
+  [ -n "${_rs_p4:-}" ] || return 1
+  printf '%s' "$_rs_p4"
+}
+
+_rs_hash() { # _rs_hash <abs-path> -> sha256:<hex> (md5 fallback)
+  if have sha256sum; then
+    _rs_hv=$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)
+    [ -n "${_rs_hv:-}" ] || return 1
+    printf 'sha256:%s' "$_rs_hv"
+    return 0
+  fi
+  if have md5sum; then
+    _rs_hv=$(md5sum "$1" 2>/dev/null | cut -d' ' -f1)
+    [ -n "${_rs_hv:-}" ] || return 1
+    printf 'md5:%s' "$_rs_hv"
+    return 0
+  fi
+  return 1
+}
+
+_rs_hash_stream() { # _rs_hash_stream (stdin) -> sha256:<hex> (md5 fallback)
+  if have sha256sum; then
+    printf 'sha256:%s' "$(sha256sum 2>/dev/null | cut -d' ' -f1)"
+    return 0
+  fi
+  if have md5sum; then
+    printf 'md5:%s' "$(md5sum 2>/dev/null | cut -d' ' -f1)"
+    return 0
+  fi
+  return 1
+}
+
+_rs_is_nr_state() { # _rs_is_nr_state <install-path> -> 0 when the object is restore=NR
+  for _rs_np in ${REINSTALL_NR_STATE:-}; do
+    [ "$_rs_np" = "$1" ] && return 0
+  done
+  return 1
+}
+
+_rs_in_list() { # _rs_in_list <snapshot-dir> <install-path> -> 0 when it existed at snapshot
+  [ -f "$1/listing" ] || return 1
+  grep -qxF -- "$2" "$1/listing" 2>/dev/null
+}
+

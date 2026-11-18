@@ -1,0 +1,390 @@
+step4_check() {
+  _need=0
+  mod_skipped ai_dns && return 0
+  _aip=$(aidns_ip)
+  if [ -z "$_aip" ]; then
+    bad "не определён адрес LAN - AI-DNS проверить нечем (uci show network.lan)"
+    return 1
+  fi
+  AIDNS_IP="$_aip"
+  if [ -f "$(P /etc/geomask-aidns.off)" ]; then
+    info "AI-DNS: disabled (/etc/geomask-aidns.off present)"
+    return 0
+  fi
+  aidns_user_exists && info "user $AIDNS_USER: present" || { warn "user $AIDNS_USER: missing"; _need=1; }
+  [ -x "$(P /usr/sbin/https-dns-proxy)" ] && info "https-dns-proxy: present" || { warn "https-dns-proxy: missing"; _need=1; }
+  if have netstat; then
+    netstat -ltnu 2>/dev/null | grep -q "127.0.0.1:$AIDNS_PORT " && info "AI DoH worker (:$AIDNS_PORT): listening" || { warn "AI DoH worker not listening on :$AIDNS_PORT"; _need=1; }
+    netstat -ltnu 2>/dev/null | grep -q "$AIDNS_IP:$AIDNS_DNS_PORT " && info "AI dnsmasq ($AIDNS_IP:$AIDNS_DNS_PORT): listening" || { warn "AI dnsmasq not listening on $AIDNS_IP:$AIDNS_DNS_PORT"; _need=1; }
+  else
+    warn "netstat unavailable - listener checks skipped"
+  fi
+  _lanif=$(lan_iface)
+  _alias=$(ip -4 addr show "$_lanif" 2>/dev/null)
+  if [ -z "$_alias" ]; then
+    warn "cannot read $_lanif addresses (ip unavailable?)"
+  elif printf '%s' "$_alias" | grep -q " $AIDNS_IP/"; then
+    info "alias $AIDNS_IP on $_lanif: present"
+  else
+    warn "alias $AIDNS_IP missing on $_lanif"; _need=1
+  fi
+  ip rule show 2>/dev/null | grep -q "fwmark $AIDNS_MARK" && info "ip rule fwmark $AIDNS_MARK -> table 101: present" || { warn "ip rule fwmark $AIDNS_MARK -> 101 missing"; _need=1; }
+  nft list table inet geomask_ai_dns >/dev/null 2>&1 && info "nft AI-DNS table: loaded" || { warn "nft AI-DNS table missing"; _need=1; }
+  _tbl=$(nft list table inet geomask_ai_dns 2>/dev/null)
+  # The mark rule alone only proves that dnsai's own sockets are routed; it says nothing about
+  # client DNS. Both halves are required, and the DNAT target must be the address this router
+  # actually computed (audit 14.11.2026, F08).
+  if [ -n "$_tbl" ]; then
+    printf '%s' "$_tbl" | grep -q "mark set $AIDNS_MARK" \
+      && info "AI-DNS: dnsai sockets are marked $AIDNS_MARK" \
+      || { bad "AI-DNS: mark rule for $AIDNS_MARK missing"; _need=1; }
+  fi
+  _aiips=$(awk '$2=="ai" && $1 !~ /^#/ {print $1}' "$(P /etc/geo-devices.list)" 2>/dev/null)
+  if [ -z "$_aiips" ]; then
+    info "ai-mode devices: none (nothing to DNAT)"
+  elif [ -z "$_tbl" ]; then
+    bad "AI-DNS DNAT: cannot read rules (nft list empty)"; _need=1
+  elif ! printf '%s' "$_tbl" | grep -q "dnat ip to $AIDNS_IP:$AIDNS_DNS_PORT"; then
+    # Without this rule the AI devices resolve through the ordinary dnsmasq: the leak the
+    # feature exists to prevent. Fail closed, never report "no leak" from the route alone.
+    bad "AI-DNS DNAT to $AIDNS_IP:$AIDNS_DNS_PORT missing - AI devices would use the router DNS"
+    _need=1
+  else
+    _miss=0
+    for _ip in $_aiips; do
+      printf '%s' "$_tbl" | grep -q "$_ip" || _miss=1
+    done
+    if [ "$_miss" = 0 ]; then info "AI-DNS DNAT: all ai devices covered -> $AIDNS_IP:$AIDNS_DNS_PORT"
+    else bad "AI-DNS DNAT: some ai devices missing from rules"; _need=1; fi
+  fi
+  return $_need
+}
+step4_apply() {
+  mod_skipped ai_dns && return 0
+  if [ -f "$(P /etc/geomask-aidns.off)" ]; then info "AI-DNS disabled by flag - nothing to do"; return 0; fi
+  _aip=$(aidns_ip)
+  if [ -z "$_aip" ]; then
+    bad "не определён адрес LAN - AI-DNS некуда привязать (проверьте uci show network.lan)"
+    return 1
+  fi
+  AIDNS_IP="$_aip"
+  # v1.30.7: same rule as step 1 - what is installable from the feeds is installed here,
+  # not left to the owner. https-dns-proxy is the DoH worker this step configures.
+  # R03: pkg_install refuses during a reinstall - the preflight already proved the worker
+  # present before the first mutation, so a missing one aborts instead of installing.
+  if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
+    pkg_install https-dns-proxy && info "installed: https-dns-proxy" \
+      || warn "auto-install of https-dns-proxy failed"
+  fi
+  # v1.30.15: no worker - no DNS/network rewrite. The step used to warn and continue,
+  # sending AI devices to a dnsmasq whose upstream does not exist.
+  if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
+    bad "https-dns-proxy не установлен - AI-DNS не настраивается (DNS и сеть не менялись)"
+    info "  Поставьте пакет и повторите шаг: apk add https-dns-proxy (или opkg install)"
+    info "  Либо откажитесь от AI-DNS: touch /etc/geomask-aidns.off"
+    return 1
+  fi
+  backup_gate || return 1
+  _bk="$GM_BACKUP_PATH"
+  info "backup: $_bk"
+  # Everything this step writes is recorded first, so a refusal in the middle leaves the
+  # router exactly as it was: uci network.lanai, the uid marker, the alias.
+  _prev_lanai_exists=0
+  _prev_lanai_proto=""; _prev_lanai_dev=""; _prev_lanai_ip=""; _prev_lanai_mask=""
+  if uci -q get network.lanai >/dev/null 2>&1; then
+    _prev_lanai_exists=1
+    _prev_lanai_proto=$(uci -q get network.lanai.proto 2>/dev/null)
+    _prev_lanai_dev=$(uci -q get network.lanai.device 2>/dev/null)
+    _prev_lanai_ip=$(uci -q get network.lanai.ipaddr 2>/dev/null)
+    _prev_lanai_mask=$(uci -q get network.lanai.netmask 2>/dev/null)
+  fi
+  _prev_uid_marker=$(tr -dc '0-9' < "$(P /etc/geomask-aidns.uid)" 2>/dev/null)
+  _aidns_rollback() {
+    if [ "$_prev_lanai_exists" = 1 ]; then
+      uci set network.lanai=interface 2>/dev/null
+      [ -n "$_prev_lanai_proto" ] && uci set network.lanai.proto="$_prev_lanai_proto" 2>/dev/null
+      [ -n "$_prev_lanai_dev" ] && uci set network.lanai.device="$_prev_lanai_dev" 2>/dev/null
+      [ -n "$_prev_lanai_ip" ] && uci set network.lanai.ipaddr="$_prev_lanai_ip" 2>/dev/null
+      [ -n "$_prev_lanai_mask" ] && uci set network.lanai.netmask="$_prev_lanai_mask" 2>/dev/null
+    else
+      uci -q delete network.lanai 2>/dev/null
+    fi
+    uci commit network 2>/dev/null
+    if [ -n "$_prev_uid_marker" ]; then
+      printf '%s\n' "$_prev_uid_marker" > "$(P /etc/geomask-aidns.uid)" 2>/dev/null
+    else
+      rm -f "$(P /etc/geomask-aidns.uid)" 2>/dev/null
+    fi
+    warn "AI-DNS: изменения отменены (uci network.lanai и маркер uid восстановлены)"
+  }
+  # 1) dedicated user for the AI DoH worker (sockets get marked by uid)
+  _uid=$(awk -F: -v u="$AIDNS_USER" '$1==u{print $3; exit}' "$(P /etc/passwd)" 2>/dev/null)
+  case "$_uid" in ''|*[!0-9]*) _uid="" ;; esac
+  if [ -z "$_uid" ]; then
+    _uid=65533
+    while awk -F: -v u="$_uid" '$3==u{found=1} END{exit found?0:1}' "$(P /etc/passwd)" 2>/dev/null; do _uid=$((_uid-1)); done
+    printf '%s:x:%s:%s:geomask AI-DNS:/var/run/%s:/bin/false\n' "$AIDNS_USER" "$_uid" "$_uid" "$AIDNS_USER" >> "$(P /etc/passwd)"
+    grep -q "^$AIDNS_USER:" "$(P /etc/group)" 2>/dev/null || printf '%s:x:%s:\n' "$AIDNS_USER" "$_uid" >> "$(P /etc/group)"
+    info "user $AIDNS_USER created (uid $_uid)"
+  fi
+  # The marker is the only thing the backend and hotplug read. An existing user without it
+  # (marker lost, or the user was created by hand) used to leave AI-DNS silently disabled.
+  _uid_marker=$(tr -dc '0-9' < "$(P /etc/geomask-aidns.uid)" 2>/dev/null)
+  if [ "$_uid_marker" != "$_uid" ]; then
+    save_stream /etc/geomask-aidns.uid 644 <<ASSET_EOF
+$_uid
+ASSET_EOF
+  fi
+  # 2) alias IP on the LAN interface for the AI dnsmasq (device and prefix discovered)
+  _lanif=$(lan_iface)
+  _lanprefix=$(ip -4 addr show "$_lanif" 2>/dev/null | sed -n 's/.*inet [0-9.]*\/\([0-9][0-9]*\).*/\1/p' | head -1)
+  case "$_lanprefix" in ''|*[!0-9]*) _lanprefix=24 ;; esac
+  _lanmask=$(_prefix_to_mask "$_lanprefix")
+  if ! ip -4 addr show "$_lanif" 2>/dev/null | grep -q " $AIDNS_IP/"; then
+    if ! uci -q get network.lanai >/dev/null; then uci set network.lanai=interface; fi
+    uci set network.lanai.proto='static'
+    uci set network.lanai.device="$_lanif"
+    uci set network.lanai.ipaddr="$AIDNS_IP"
+    # UCI netmask is dotted; a bare prefix is not what netifd expects for a static address.
+    uci set network.lanai.netmask="$_lanmask"
+    if ! uci commit network 2>/dev/null; then
+      _aidns_rollback; return 1
+    fi
+    /etc/init.d/network reload >/dev/null 2>&1 || warn "network reload rc!=0 - alias may need reboot"
+    sleep 1
+    if ip -4 addr show "$_lanif" | grep -q " $AIDNS_IP/"; then
+      info "alias $AIDNS_IP/$_lanprefix: up"
+    else
+      # No alias - no DNAT target. Refuse here instead of pointing AI devices at a dead DNS.
+      bad "alias $AIDNS_IP не поднялся на $_lanif - AI-DNS не настраивается"
+      _aidns_rollback
+      info "  Проверьте: uci show network.lanai; ip -4 addr show $_lanif"
+      return 1
+    fi
+  fi
+  # 3) AI DoH worker (second https-dns-proxy instance, runs as dnsai)
+  save_stream /etc/init.d/ai-doh 755 <<'ASSET_EOF'
+@@ASSET:ai-doh.init@@
+ASSET_EOF
+  # 4) AI dnsmasq (upstream = the AI DoH worker; RU-domain resolvers copied from main dnsmasq)
+  {
+    printf 'listen-address=%s\n' "$AIDNS_IP"
+    printf 'bind-interfaces\n'
+    printf 'port=%s\n' "$AIDNS_DNS_PORT"
+    printf 'no-resolv\n'
+    printf 'no-poll\n'
+    printf 'cache-size=1000\n'
+    printf 'domain-needed\n'
+    printf 'bogus-priv\n'
+    printf 'server=127.0.0.1#%s\n' "$AIDNS_PORT"
+    _s=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
+    for _e in $_s; do case "$_e" in /*) printf 'server=%s\n' "$_e" ;; esac; done
+  } > "$(P /etc/dnsmasq-ai.conf)" || { bad "cannot write /etc/dnsmasq-ai.conf"; _aidns_rollback; return 1; }
+  save_stream /etc/init.d/dnsmasq-ai 755 <<'ASSET_EOF'
+@@ASSET:dnsmasq-ai.init@@
+ASSET_EOF
+  # 5) nft rules (DNAT for ai devices + mark for dnsai sockets)
+  aidns_generate_nft || { _aidns_rollback; return 1; }
+  # 6) ip rule: marked DNS sockets go through the AI tunnel
+  ip rule show 2>/dev/null | grep -q "fwmark $AIDNS_MARK" || ip rule add pref "$AIDNS_RULE_PREF" fwmark "$AIDNS_MARK" table 101
+  # 7) services on + reload firewall to apply nft file
+  initd ai-doh enable >/dev/null 2>&1 || true
+  initd dnsmasq-ai enable >/dev/null 2>&1 || true
+  initd ai-doh restart >/dev/null 2>&1 || { warn "ai-doh did not start"; }
+  initd dnsmasq-ai restart >/dev/null 2>&1 || { warn "dnsmasq-ai did not start"; }
+  # A failed reload leaves the old ruleset in place: say so instead of claiming success.
+  if ! initd firewall reload >/dev/null 2>&1; then
+    bad "firewall reload failed - AI-DNS rules may not be active"
+    sleep 1
+    initd firewall reload >/dev/null 2>&1 || { bad "firewall reload failed again"; return 1; }
+  fi
+  sleep 1
+  return 0
+}
+step4_verify() { step4_check; }
+
+# ============================================================ STEP 5: magitrickle -> mihomo sync
+# v1.13.0: write the bundled lists template + seeder to the router (idempotent; asset injected once).
+write_lists_assets() {
+  mkdir -p "$(P /etc/geomask/lists)" 2>/dev/null || true
+  save_stream /etc/geomask/lists/magitrickle-groups.yaml 644 <<'ASSET_EOF'
+@@ASSET:MagiTrickleGroups@@
+ASSET_EOF
+  save_stream /usr/bin/geomask-seed-lists.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-seed-lists.py@@
+ASSET_EOF
+}
+
+# v1.13.0: restore MagiTrickle domain lists from the bundled template.
+#   seed_lists ""    -> auto: seed only if MagiTrickle has no groups (fresh install)
+#   seed_lists force -> overwrite current groups with the template (backup first)
+# magitrickled owns config.yaml, so it is stopped around the write, then restarted + synced.
+seed_lists() {
+  _force="${1:-}"
+  _tpl="$(P /etc/geomask/lists/magitrickle-groups.yaml)"
+  _cfg="$(P /etc/magitrickle/state/config.yaml)"
+  _py="$(P /usr/bin/geomask-seed-lists.py)"
+  [ -s "$_tpl" ] || { warn "lists template missing ($_tpl) - skip seed"; return 0; }
+  [ -f "$_py" ]  || { warn "seed script missing ($_py) - skip seed"; return 0; }
+  if [ "$_force" != force ]; then
+    # A fresh install starts magitrickle a moment before its config exists. Wait a bounded
+    # time for it: the old message promised an auto-seed later that nothing ever performed.
+    _wait=0
+    while [ ! -f "$_cfg" ] && [ "$_wait" -lt 10 ]; do
+      _wait=$((_wait+1)); sleep 2
+    done
+    if [ ! -f "$_cfg" ]; then
+      warn "lists: MagiTrickle ещё не создал конфиг - автозаполнение не выполнено (запустите --seed-lists позже)"
+      return 0
+    fi
+    python3 "$_py" --check-empty --config="$_cfg" --template="$_tpl"; _crc=$?
+    case "$_crc" in
+      0) : ;;
+      1) info "lists: MagiTrickle already configured - auto-seed skipped (use --seed-lists to restore)"; return 0 ;;
+      *) warn "lists: не удалось проверить конфиг MagiTrickle (rc=$_crc) - автозаполнение пропущено, файл не тронут"; return 0 ;;
+    esac
+  fi
+  info "lists: seeding MagiTrickle groups from template (mode=${_force:-ifempty})..."
+  _farg=""
+  [ "$_force" = force ] && _farg="--force"
+  # magitrickled owns config.yaml: writing while it runs is a race that can lose the result.
+  # A failed stop used to be ignored and the file was written anyway (audit 14.11.2026, F19).
+  _was_running=0
+  svc_alive magitrickled && _was_running=1
+  if ! initd magitrickle stop >/dev/null 2>&1; then
+    bad "lists: не удалось остановить magitrickle - конфиг не записывается (гонка с демоном)"
+    return 1
+  fi
+  _w=0
+  while [ "$_w" -lt 5 ] && svc_alive magitrickled; do _w=$((_w+1)); sleep 1; done
+  if svc_alive magitrickled; then
+    initd magitrickle start >/dev/null 2>&1 || true
+    bad "lists: magitrickled всё ещё работает - конфиг не записывается"
+    return 1
+  fi
+  _wan=$(wan_iface)
+  if [ -z "$_wan" ]; then
+    warn "lists: WAN-интерфейс не определён - direct-группы останутся с pppoe-wan из шаблона"
+    warn "  проверьте вручную: uci show network.wan; ip route show default"
+  fi
+  _out=$(python3 "$_py" $_farg --config="$_cfg" --template="$_tpl" --wan-iface="$_wan" 2>&1); _rc=$?
+  _start_ok=1
+  initd magitrickle start >/dev/null 2>&1 || _start_ok=0
+  sleep 2
+  svc_alive magitrickled || _start_ok=0
+  if [ "$_start_ok" = 0 ]; then
+    bad "lists: magitrickle не поднялся после записи"
+    [ "$_was_running" = 1 ] && info "  он работал до операции - проверьте logread | tail -20"
+  fi
+  # regenerate mihomo rulesets + hot-reload mihomo (no mihomo restart)
+  _sync_ok=1
+  sh "$(P /root/sync_mtrickle_mihomo.sh)" >/dev/null 2>&1 || _sync_ok=0
+  controller_curl -s -X PUT "http://127.0.0.1:9090/configs" -H 'Content-Type: application/json' \
+    -d '{"path":"/etc/mihomo/config.yaml"}' >/dev/null 2>&1 || true
+  printf '%s\n' "$_out" | sed 's/^/  | /'
+  if [ "$_rc" -eq 0 ] && [ "$_start_ok" = 1 ] && [ "$_sync_ok" = 1 ]; then
+    info "lists: seed applied"
+    return 0
+  fi
+  [ "$_rc" -ne 0 ] && bad "lists: seed failed rc=$_rc"
+  [ "$_sync_ok" = 0 ] && bad "lists: sync_mtrickle_mihomo.sh failed - mihomo rulesets may be stale"
+  return 1
+}
+
+# v1.28.0: the nightly audit can be owned by the per-path scheduler instead of the legacy
+# 03:30 cron. Both halves ask this: step5_apply must not add the legacy cron when a
+# schedule is active, and step5_check must not fail because the legacy cron is absent.
+nodescan_schedule_active() {
+  python3 - "$(P /usr/lib/geomask/geomask-node-audit.py)" <<'PYEOF' 2>/dev/null
+import importlib.util, sys
+try:
+    spec = importlib.util.spec_from_file_location('node_audit', sys.argv[1])
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    data, _ = mod.load_store()
+    print(1 if any((p.get('schedule') or {}).get('enabled')
+                   for p in data.get('paths', {}).values()) else 0)
+except Exception:
+    print(0)
+PYEOF
+}
+
+step5_check() {
+  _need=0
+  _s="$(P /root/sync_mtrickle_mihomo.sh)"
+  if [ -s "$_s" ]; then
+    info "sync script: present"
+    [ -x "$_s" ] || warn "sync script not executable (chmod +x on router)"
+  else
+    bad "sync script missing: /root/sync_mtrickle_mihomo.sh"; _need=1
+  fi
+  if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then info "cron */5: present"; else bad "cron entry missing"; _need=1; fi
+  # v1.10.0: event sync watchdog (service enabled + running; graceful if script absent on old installs)
+  if [ -x "$(P /etc/init.d/geomask-syncd)" ]; then
+    # A daemon that is installed but not (yet) running is a WARNING, not a failed install.
+    # This used to set _need=1, which made step5's verify abort the whole --auto run - so on any
+    # host where the daemon had not been started yet (and in the sandbox, where services cannot
+    # really run) geomask refused to finish installing. CI had been red for 40+ runs over this.
+    if pgrep -f geomask-syncd.sh >/dev/null 2>&1; then info "syncd: running"
+    else warn "syncd: installed but not running (start it: /etc/init.d/geomask-syncd start)"; fi
+    ls "$(P /etc/rc.d)" 2>/dev/null | grep -q 'geomask-syncd' && info "syncd: enabled" \
+      || warn "syncd: not enabled at boot (run: /etc/init.d/geomask-syncd enable)"
+  else
+    bad "syncd: /etc/init.d/geomask-syncd missing"; _need=1
+  fi
+  if ! mod_skipped guard; then
+    if [ -x "$(P /usr/bin/geomask-guard.sh)" ]; then info "guard: present"; else bad "guard missing: /usr/bin/geomask-guard.sh"; _need=1; fi
+    if [ -x "$(P /etc/hotplug.d/iface/99-geomask-guard)" ]; then info "guard hotplug: present"; else bad "guard hotplug missing"; _need=1; fi
+  fi
+  cron_verify guard '# geomask-guard$' 'guard cron */5'
+  # v1.11.0: node audit plumbing
+  if [ -x "$(P /usr/bin/geomask-node-scan.sh)" ] && [ -s "$(P /etc/geomask-nodes.conf)" ]; then info "node-scan: installed"
+  else bad "node-scan missing (script/conf)"; _need=1; fi
+  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then info "nodescan cron 03:30: present"
+  elif [ "$(nodescan_schedule_active)" = "1" ]; then info "nodescan: per-path scheduler is active (legacy cron retired)"
+  else bad "nodescan cron missing"; _need=1; fi
+  # v1.14.0: youtube edge watchdog
+  # v1.21.5: the VPN lane must contain ONLY subscription nodes. DIRECT as a group member was a
+  # workaround for a misdiagnosis (the real cause was provider health-check hiding every node);
+  # left in place it silently moves VPN-lane traffic onto the plain, DPI-visible path instead of
+  # failing loudly. A hard 502 is the correct behaviour when the subscription is down.
+  if grep -qE '^[[:space:]]*- name: VPN$' "$_c" 2>/dev/null; then
+    _vb=$(awk '/^[[:space:]]*- name: VPN$/{f=1;next} f&&/^[[:space:]]*- name:/{exit} f' "$_c")
+    if printf '%s' "$_vb" | grep -qE '^\s*-\s+DIRECT\s*$'; then
+      bad "the VPN group contains DIRECT - VPN-lane traffic leaks to the plain path silently when nodes fail"; _need=1
+    else
+      _vt=$(printf '%s' "$_vb" | awk '/^    type:/{sub(/^[^:]*:[[:space:]]*/,"");print;exit}')
+      info "VPN lane: ${_vt:-unknown}, subscription nodes only"
+    fi
+  fi
+  # v1.29.0: optional modules. Their pieces are only installed when the module is selected,
+  # so their checks are gated too - otherwise a minimal install fails its own verification.
+  if ! mod_skipped youtube; then
+    if [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ] && [ -s "$(P /etc/geomask-ytwatch.conf)" ]; then info "ytwatch: installed"
+    else bad "ytwatch missing (script/conf)"; _need=1; fi
+  fi
+  cron_verify youtube '# geomask-ytwatch$' 'ytwatch cron */1'
+  cron_verify youtube '# geomask-ytwatch-reset$' 'ytwatch reset cron'
+  # v1.15.0: torrent admin
+  if ! mod_skipped torrent; then
+    if [ -x "$(P /usr/bin/geomask-torrent.sh)" ] && [ -d "$(P /etc/geomask/torrent)" ]; then info "torrent admin: installed"
+    else bad "torrent admin missing (script/dir)"; _need=1; fi
+  fi
+  # v1.18.0: VPN lane audit
+  if ! mod_skipped diagnostic; then
+    if [ -x "$(P /usr/bin/geomask-vpnwatch.sh)" ] && [ -s "$(P /etc/geomask/vpnwatch.conf)" ]; then info "vpnwatch: installed"
+    else bad "vpnwatch missing (script/conf)"; _need=1; fi
+    if [ -x "$(P /usr/bin/geomask-morning-check.sh)" ]; then info "morning check: installed"
+    else bad "morning check script missing"; _need=1; fi
+  fi
+  cron_verify diagnostic '# geomask-vpnwatch$' 'vpnwatch cron */1' soft
+  cron_verify doctor '# geomask-doctor-prune$' 'doctor prune cron' soft
+  # the extra lane is optional; report it, never fail because of it
+  if [ -e "$(P /sys/class/net/VPN-noP2P)" ]; then
+    info "lane VPN-noP2P: netdev present (MagiTrickle can select it)"
+  else
+    info "lane VPN-noP2P: not installed (run: geomask-lane.sh install)"
+  fi
+  svc_alive magitrickled && info "magitrickle: running" || { bad "magitrickle not running"; _need=1; }
+  return $_need
+}

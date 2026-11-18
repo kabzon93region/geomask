@@ -1,0 +1,333 @@
+'use strict';
+'require view';
+'require rpc';
+'require ui';
+
+// >>> geo-rpc generated:decl (tools/geo-rpc.json) >>>
+var callStatus                = rpc.declare({ object: 'geo-sync', method: 'status', expect: {} });
+var callLeases                = rpc.declare({ object: 'geo-sync', method: 'leases', expect: {} });
+var callLog                   = rpc.declare({ object: 'geo-sync', method: 'log', expect: {} });
+var callBackups               = rpc.declare({ object: 'geo-sync', method: 'backups', expect: {} });
+var callStack                 = rpc.declare({ object: 'geo-sync', method: 'stack', expect: {} });
+var callNodescan              = rpc.declare({ object: 'geo-sync', method: 'nodescan', expect: {} });
+var callNodesGet              = rpc.declare({ object: 'geo-sync', method: 'nodes_get', expect: {} });
+var callNodesPathsGet         = rpc.declare({ object: 'geo-sync', method: 'nodes_paths_get', expect: {} });
+/* params as OBJECT (not array): array form expects positional args and would
+   wrap {mode:...} into {"mode":{...}} breaking rpcd json_get_var */
+var callNodesPathSave         = rpc.declare({ object: 'geo-sync', method: 'nodes_path_save', params: [ 'path_id', 'countries', 'expected_revision' ], expect: {} });
+var callNodesPathCheck        = rpc.declare({ object: 'geo-sync', method: 'nodes_path_check', params: [ 'path_id' ], expect: {} });
+var callNodesAuditEventsGet   = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_events_get', params: [ 'path_id', 'before', 'limit' ], expect: {} });
+var callNodesAuditJobGet      = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_job_get', params: [ 'job_id' ], expect: {} });
+var callNodesAuditCancel      = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_cancel', params: [ 'job_id' ], expect: {} });
+var callNodesSet              = rpc.declare({ object: 'geo-sync', method: 'nodes_set', params: { enabled: null, schedule: null, countries: null, asns: null, base: null, provider: null }, expect: {} });
+var callSyncSet               = rpc.declare({ object: 'geo-sync', method: 'sync_set', params: { interval: null }, expect: {} });
+var callSyncdSet              = rpc.declare({ object: 'geo-sync', method: 'syncd_set', params: { state: null }, expect: {} });
+var callPinSet                = rpc.declare({ object: 'geo-sync', method: 'pin_set', params: { state: null }, expect: {} });
+var callListsGet              = rpc.declare({ object: 'geo-sync', method: 'lists_get', expect: {} });
+var callListsSeed             = rpc.declare({ object: 'geo-sync', method: 'lists_seed', expect: {} });
+var callYtGet                 = rpc.declare({ object: 'geo-sync', method: 'yt_get', expect: {} });
+var callYtMode                = rpc.declare({ object: 'geo-sync', method: 'yt_mode', params: { mode: null }, expect: {} });
+var callYtReset               = rpc.declare({ object: 'geo-sync', method: 'yt_reset', expect: {} });
+var callTorGet                = rpc.declare({ object: 'geo-sync', method: 'torrent_get', expect: {} });
+var callTorRefresh            = rpc.declare({ object: 'geo-sync', method: 'torrent_refresh', expect: {} });
+var callTorListener           = rpc.declare({ object: 'geo-sync', method: 'torrent_listener', params: { state: null }, expect: {} });
+var callTorExtra              = rpc.declare({ object: 'geo-sync', method: 'torrent_extra', params: { hosts: null }, expect: {} });
+var callLists                 = rpc.declare({ object: 'geo-sync', method: 'sync_lists', expect: {} });
+var callGoogle                = rpc.declare({ object: 'geo-sync', method: 'google', expect: {} });
+var callGlobal                = rpc.declare({ object: 'geo-sync', method: 'global', params: { mode: null }, expect: {} });
+var callIpv6                  = rpc.declare({ object: 'geo-sync', method: 'ipv6', params: { state: null }, expect: {} });
+var callDnsGuard              = rpc.declare({ object: 'geo-sync', method: 'dns_guard', params: { action: null }, expect: {} });
+var callDnsGuardStatus        = rpc.declare({ object: 'geo-sync', method: 'dns_guard_status', expect: {} });
+var callConsole               = rpc.declare({ object: 'geo-sync', method: 'console', params: { action: null, ip: null, sub: null, countries: null }, expect: {} });
+var callConsoleStatus         = rpc.declare({ object: 'geo-sync', method: 'console_status', expect: {} });
+var callConsoleDiag           = rpc.declare({ object: 'geo-sync', method: 'console_diag', params: { what: null }, expect: {} });
+var callConsoleDiagGet        = rpc.declare({ object: 'geo-sync', method: 'console_diag_get', params: { name: null }, expect: {} });
+var callDevAdd                = rpc.declare({ object: 'geo-sync', method: 'dev_add', params: { ip: null, mode: null, mac: null, name: null }, expect: {} });
+var callDevDel                = rpc.declare({ object: 'geo-sync', method: 'dev_del', params: { ip: null }, expect: {} });
+var callAiSubGet              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_get', expect: {} });
+var callAiSubSet              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_set', params: { url: null }, expect: {} });
+var callSubsList              = rpc.declare({ object: 'geo-sync', method: 'subs_list', expect: {} });
+var callSubsSeed              = rpc.declare({ object: 'geo-sync', method: 'subs_seed', expect: {} });
+var callSubAdd                = rpc.declare({ object: 'geo-sync', method: 'sub_add', params: { name: null, url: null }, expect: {} });
+var callSubDel                = rpc.declare({ object: 'geo-sync', method: 'sub_del', params: { id: null }, expect: {} });
+var callAiSubUse              = rpc.declare({ object: 'geo-sync', method: 'ai_sub_use', params: { id: null }, expect: {} });
+var callVpnSubUse             = rpc.declare({ object: 'geo-sync', method: 'vpn_sub_use', params: { id: null }, expect: {} });
+var callVpnnpSubUse           = rpc.declare({ object: 'geo-sync', method: 'vpnnp_sub_use', params: { id: null }, expect: {} });
+var callModList               = rpc.declare({ object: 'geo-sync', method: 'mod_list', expect: {} });
+var callModCheck              = rpc.declare({ object: 'geo-sync', method: 'mod_check', expect: {} });
+var callModUpdate             = rpc.declare({ object: 'geo-sync', method: 'mod_update', params: [ 'module_id', 'force' ], expect: {} });
+var callDiagList              = rpc.declare({ object: 'geo-sync', method: 'diag_list', expect: {} });
+var callDiagRun               = rpc.declare({ object: 'geo-sync', method: 'diag_run', params: [ 'check' ], expect: {} });
+var callDiagLog               = rpc.declare({ object: 'geo-sync', method: 'diag_log', params: [ 'check' ], expect: {} });
+var callDiagDomain            = rpc.declare({ object: 'geo-sync', method: 'diag_domain', params: [ 'domain', 'live' ], expect: {} });
+var callDiagBundle            = rpc.declare({ object: 'geo-sync', method: 'diag_bundle', expect: {} });
+var callUpdCheck              = rpc.declare({ object: 'geo-sync', method: 'upd_check', params: { force: null }, expect: {} });
+var callUpdStatus             = rpc.declare({ object: 'geo-sync', method: 'upd_status', expect: {} });
+var callUpdApply              = rpc.declare({ object: 'geo-sync', method: 'upd_apply', expect: {} });
+var callNodesPathPreview      = rpc.declare({ object: 'geo-sync', method: 'nodes_path_preview', params: [ 'path_id', 'report_id', 'expected_path_revision', 'expected_source_revision' ], expect: {} });
+var callNodesPathApply        = rpc.declare({ object: 'geo-sync', method: 'nodes_path_apply', params: [ 'path_id', 'preview_id', 'expected_path_revision' ], expect: {} });
+var callNodesPathRevoke       = rpc.declare({ object: 'geo-sync', method: 'nodes_path_revoke', params: [ 'path_id' ], expect: {} });
+var callNodesPathApplyStatus  = rpc.declare({ object: 'geo-sync', method: 'nodes_path_apply_status', params: [ 'path_id' ], expect: {} });
+var callMtrickleSync          = rpc.declare({ object: 'geo-sync', method: 'mtrickle_sync', expect: {} });
+var callNodesAuditScheduleGet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_get', params: [ 'path_id' ], expect: {} });
+var callBackup                = rpc.declare({ object: 'geo-sync', method: 'backup', expect: {} });
+var callNodesAuditScheduleSet = rpc.declare({ object: 'geo-sync', method: 'nodes_audit_schedule_set', params: [ 'path_id', 'enabled', 'time', 'mode' ], expect: {} });
+// <<< geo-rpc generated:decl <<<
+var PANEL_VERSION = '@@PANEL_VERSION@@';
+
+/* Job observers, keyed by path id. They live outside the view because reload() builds a
+   new instance while the old timer would otherwise keep polling. */
+var POLL_TIMERS = {};
+/* Copy text to clipboard over plain http (LuCI): execCommand fallback for non-secure context. */
+function copyToClipboard(txt, btn) {
+	function flash(ok) {
+		if (!btn) return;
+		var old = btn.textContent;
+		btn.textContent = ok ? 'Скопировано ✓' : 'Не удалось';
+		setTimeout(function () { btn.textContent = old; }, 1600);
+	}
+	function fallback() {
+		var ta = document.createElement('textarea');
+		ta.value = txt;
+		ta.style.position = 'fixed'; ta.style.left = '-1000px';
+		document.body.appendChild(ta); ta.focus(); ta.select();
+		var ok = false;
+		try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+		document.body.removeChild(ta);
+		flash(ok);
+	}
+	if (window.isSecureContext && navigator.clipboard) {
+		navigator.clipboard.writeText(txt).then(function () { flash(true); }, fallback);
+	} else {
+		fallback();
+	}
+}
+
+var CCNAME = {
+	DE: 'Германия', NL: 'Нидерланды', FI: 'Финляндия', LV: 'Латвия', LT: 'Литва',
+	EE: 'Эстония', PL: 'Польша', DK: 'Дания', SE: 'Швеция', NO: 'Норвегия',
+	US: 'США', TR: 'Турция', AL: 'Албания', FR: 'Франция', IT: 'Италия',
+	ES: 'Испания', AT: 'Австрия', CH: 'Швейцария', GB: 'Великобритания'
+};
+
+var STYLE = [
+	'.gs-wrap{display:flex;flex-direction:column;gap:14px;max-width:960px}',
+	'.gs-hero{background:linear-gradient(135deg,#0d419d22,#1f6feb11);border:1px solid #1f6feb55;border-radius:12px;padding:18px}',
+	'.gs-hero h2{margin:0 0 4px;font-size:17px}',
+	'.gs-hero .gs-sub{color:#8b949e;font-size:13px}',
+	'.gs-duo{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}',
+	'.gs-sub-card{flex:1;min-width:280px;background:var(--bg-color,#161b22);border:1px solid var(--border-color,#30363d);border-radius:10px;padding:14px 16px}',
+	'.gs-sub-card .gs-ent{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#8b949e}',
+	'.gs-sub-card .gs-node{font-size:15px;font-weight:600;margin:6px 0 2px}',
+	'.gs-sub-card .gs-meta{font-size:12px;color:#8b949e}',
+	'.gs-cc{display:inline-block;min-width:30px;text-align:center;font-size:11px;font-weight:700;letter-spacing:.4px;color:#58a6ff;background:#1f6feb22;border:1px solid #1f6feb55;border-radius:6px;padding:2px 7px;margin-right:8px;vertical-align:1px}',
+	'.gs-counters{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}',
+	'.gs-counter{flex:1;min-width:150px;background:#0d1117;border:1px solid #30363d;border-radius:9px;padding:12px 14px}',
+	'.gs-counter .gs-num{font-size:26px;font-weight:700;line-height:1.1}',
+	'.gs-counter .gs-cap{font-size:12px;color:#8b949e;margin-top:3px}',
+	'.gs-card{background:var(--bg-color,#161b22);border:1px solid var(--border-color,#30363d);border-radius:10px;padding:16px}',
+	'.gs-card h3{margin:0 0 10px;font-size:15px}',
+	'.gs-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;flex-wrap:wrap}',
+	'.gs-label{color:var(--text-color,#c9d1d9)}',
+	'.gs-val{font-weight:600}',
+	'.gs-badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600}',
+	'.gs-on{background:#1f6feb33;color:#58a6ff;border:1px solid #1f6feb66}',
+	'.gs-ok{background:#23863633;color:#3fb950;border:1px solid #23863666}',
+	'.gs-off{background:#f8514922;color:#f85149;border:1px solid #f8514966}',
+	'.gs-warn{background:#d2992222;color:#d29922;border:1px solid #d2992266}',
+	'.gs-seg{display:inline-flex;border:1px solid #30363d;border-radius:8px;overflow:hidden}',
+	'.gs-seg div{padding:5px 14px;cursor:pointer;font-size:13px}',
+	'.gs-seg .gs-active{background:#1f6feb;color:#fff}',
+	'.gs-btn{padding:6px 16px;border-radius:7px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;cursor:pointer;font-size:13px}',
+	'.gs-btn:hover{background:#30363d}',
+	'.gs-btn-primary{background:#1f6feb;border-color:#1f6feb;color:#fff}',
+	'.gs-btn-primary:hover{background:#388bfd}',
+	'.gs-btn-warn{border-color:#f8514966;color:#f85149}',
+	'.gs-btn:disabled{opacity:.55;cursor:default}',
+	'.gs-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}',
+	'.gs-log{background:#0d1117;color:#8b949e;font-family:monospace;font-size:12px;padding:10px;border-radius:7px;max-height:220px;overflow:auto;white-space:pre-wrap}',
+	'.gs-table{width:100%;border-collapse:collapse;font-size:13px}',
+	'.gs-table td,.gs-table th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left}',
+	'.gs-subs{width:100%;table-layout:fixed}',
+	'.gs-subs td{overflow-wrap:anywhere;vertical-align:middle}',
+	'.gs-subs td:first-child{width:126px;font-weight:600}',
+	'.gs-subs td:nth-child(2){font-family:monospace;font-size:12px;color:#8b949e}',
+	'.gs-subs td:nth-child(3){width:104px}',
+	'.gs-subs td:nth-child(3) .gs-badge{white-space:nowrap}',
+	'.gs-subs td:last-child{width:272px;white-space:normal}',
+	'.gs-subs .gs-btn-use{background:#21262d;border-color:#30363d;color:#c9d1d9;padding:5px 9px;margin:0 4px 4px 0}',
+	'.gs-btn-vpn-on{background:#1f6feb;border-color:#58a6ff;color:#fff}',
+	'.gs-btn-vpn-on:hover{background:#388bfd}',
+	'.gs-btn-ai-on{background:#238636;border-color:#3fb950;color:#fff}',
+	'.gs-btn-ai-on:hover{background:#2ea043}',
+	'.gs-subs .gs-btn-use:hover{background:#30363d}',
+	'.gs-subs .gs-btn-warn{padding:5px 10px}',
+	'.gs-input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;font-size:13px}',
+	'.gs-hint{color:#8b949e;font-size:12px;margin-top:6px}',
+	'.gs-out{background:#0d1117;color:#8b949e;font-family:monospace;font-size:12px;padding:9px 11px;border-radius:7px;margin-top:10px;white-space:pre-wrap;max-height:130px;overflow:auto}',
+	'.gs-mono{font-family:monospace}',
+	'.gs-upd-meta{color:#8b949e;font-size:12px}',
+	'.gs-stack{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:#8b949e;margin-top:6px}',
+	'.gs-stack span b{color:#c9d1d9;font-weight:600}',
+	'.gs-upd-status{margin-top:8px;font-size:13px;min-height:18px}',
+	'.gs-console{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px 12px;margin-top:8px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.5;max-height:300px;overflow-y:auto;white-space:pre-wrap;color:#c9d1d9}',
+	'.gs-console .c-err{color:#f85149}',
+	'.gs-console .c-done{color:#3fb950}',
+	'.gs-console .c-run{color:#d29922}',
+	'.gs-console .c-dim{color:#8b949e}',
+	'.gs-log .c-err{color:#f85149}',
+	'.gs-log .c-done{color:#3fb950}',
+	'.gs-log .c-run{color:#d29922}',
+	'.gs-log .c-dim{color:#8b949e}',
+	'.gs-bk{margin-top:10px;border-top:1px solid #30363d;padding-top:6px}',
+	'.gs-bk h4{margin:2px 0 4px;font-size:13px;color:#e6edf3}',
+	'.gs-tabs{display:flex;gap:6px;flex-wrap:wrap;border-bottom:2px solid #1f6feb44;padding-bottom:0}',
+	'.gs-tab{padding:7px 16px;border:1px solid #30363d;border-bottom:none;border-radius:9px 9px 0 0;background:#161b22;color:#8b949e;cursor:pointer;font-size:13px;font-weight:600}',
+	'.gs-tab:hover{background:#1c2129}',
+	'.gs-tab.gs-tab-active{background:#0d419d33;color:#58a6ff;border-color:#1f6feb88}',
+	'.gs-panels{display:flex;flex-direction:column;gap:14px;padding-top:14px}',
+	'.gs-panel{display:flex;flex-direction:column;gap:14px}',
+	'.gs-check{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:13px}',
+	'.gs-text{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 9px;font-size:13px;font-family:monospace}',
+	'.gs-blocklist{background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:8px 11px;font-family:monospace;font-size:12px;color:#8b949e;max-height:180px;overflow:auto;white-space:pre-wrap;margin-top:6px}'
+].join('\n');
+
+function injectStyle() {
+	if (document.getElementById('gs-style')) return;
+	var s = document.createElement('style');
+	s.id = 'gs-style';
+	s.textContent = STYLE;
+	document.head.appendChild(s);
+}
+
+function badge(on, yes, no) {
+	return E('span', { 'class': 'gs-badge ' + (on ? 'gs-on' : 'gs-off') }, on ? yes : no);
+}
+
+function badgeKlass(on, okCls, offCls, yes, no) {
+	return E('span', { 'class': 'gs-badge ' + (on ? okCls : offCls) }, on ? yes : no);
+}
+
+/* Strip emoji from mihomo node names (flags, pictographs, VS16, ZWJ) - LuCI font
+   renders them as tofu boxes, so we show clean text instead. */
+function cleanName(s) {
+	if (!s) return '';
+	var out = String(s)
+		.replace(/[\u{1F1E6}-\u{1F1FF}]/gu, '')   /* regional indicators (flag halves) */
+		.replace(/[\u{1F300}-\u{1FAFF}]/gu, '')   /* pictographs: gamepad, rockets etc */
+		.replace(/[\u{2600}-\u{27BF}]/gu, '')     /* misc symbols & dingbats */
+		.replace(/[\u{FE0E}\u{FE0F}\u{200D}\u{200B}]/gu, '') /* VS15/VS16, ZWJ, ZWSP */
+		.replace(/\s{2,}/g, ' ')
+		.trim();
+	return out || String(s).trim();
+}
+
+/* Country badge as plain text (code chip) - no flag emoji, renders everywhere. */
+function flagOf(s) {
+	/* the first flag emoji in a node name, e.g. "🇦🇱 Албания-1" -> "🇦🇱" */
+	var m = String(s || '').match(/[\u{1F1E6}-\u{1F1FF}][\u{1F1E6}-\u{1F1FF}]/u);
+	return m ? m[0] : '';
+}
+
+function ccBadge(cc, name) {
+	/* cleanName() strips flags from the node text on purpose; the badge is where the flag
+	   belongs, so it is taken from the raw name and kept here (owner, 31.10: "пропали банеры") */
+	var f = flagOf(name);
+	return E('span', { 'class': 'gs-cc' }, (f ? f + ' ' : '') + (cc || '—'));
+}
+
+var E = (function(raw) {
+	return function() {
+		var a = Array.prototype.slice.call(arguments), i = a.length - 1;
+		if (i >= 1 && (typeof a[i] === 'string' || typeof a[i] === 'number')) a[i] = [ String(a[i]) ];
+		return raw.apply(null, a);
+	};
+})(window.E);
+
+return view.extend({
+	/* v1.12.2: this panel saves via its own per-card buttons (rpc -> backend), no
+	   UCI form here - hide the generic LuCI apply/save/reset footer so it cannot
+	   be mistaken for the way to commit our fields. */
+	handleSaveApply: null,
+	handleSave: null,
+	handleReset: null,
+
+	load: function() {
+		injectStyle();
+		return Promise.all([ callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(), callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList(), callDiagList() ]);
+	},
+
+	render: function(all) {
+		var st = all[0] || {}, leases = (all[1] || {}).leases || [], lg = (all[2] || {}).log || '';
+		var aicfg = all[3] || {};
+		var subs = (all[4] || {}).subs || [];
+		var upd = all[5] || {};
+		var upds = all[6] || {};
+		var bks = all[7] || {};
+		var stk = all[8] || {};
+		var nd = all[9] || {};
+		var lt = all[10] || {};
+		var yt = all[11] || {};
+		var tor = all[12] || {};
+		var pathAudit = all[13] || {};
+		var mods = all[14] || {};
+		var diag = all[15] || {};
+		var view = this;
+		if (view._updTimer) { clearInterval(view._updTimer); view._updTimer = null; }
+		var wrap = E('div', { 'class': 'gs-wrap' });
+
+		/* ===================== TABS shell (v1.12.0) ===================== */
+		var TABS = [
+			['obzor', 'Обзор'], ['dev', 'Устройства'], ['subs', 'Подписки'],
+			['lists', 'Списки и синк'], ['nodes', 'Узлы подписки'],
+			['diag', 'Диагностика'],
+			['bk', 'Бэкапы'], ['mods', 'Модули'], ['set', 'Настройки']
+		];
+		var curTab = 'obzor';
+		try { curTab = localStorage.getItem('gs-tab') || 'obzor'; } catch (e) {}
+		var panels = {}, tabBtns = [];
+		var tabbar = E('div', { 'class': 'gs-tabs' });
+		var panelBox = E('div', { 'class': 'gs-panels' });
+		TABS.forEach(function(t) {
+			var btn = E('button', { 'class': 'gs-tab', 'click': function() { showTab(t[0]); } }, t[1]);
+			tabBtns.push([t[0], btn]);
+			tabbar.appendChild(btn);
+			var p = E('div', { 'class': 'gs-panel' });
+			panels[t[0]] = p;
+			panelBox.appendChild(p);
+		});
+		function showTab(id) {
+			curTab = id;
+			try { localStorage.setItem('gs-tab', id); } catch (e) {}
+			tabBtns.forEach(function(tb) { tb[1].classList.toggle('gs-tab-active', tb[0] === id); });
+			TABS.forEach(function(t) { panels[t[0]].style.display = (t[0] === id) ? '' : 'none'; });
+		}
+		wrap.appendChild(tabbar);
+		wrap.appendChild(panelBox);
+		showTab(panels[curTab] ? curTab : 'obzor');
+
+		/* ===================== HERO: dual subscription ===================== */
+		var aiCc = st.ai_cc || '', vpnCc = st.vpn_nop2p_cc || '', laneCc = st.vpn_cc || '';
+		var aiSub = E('div', { 'class': 'gs-sub-card' }, [
+			E('div', { 'class': 'gs-ent' }, 'ИИ · Google / OpenAI / Claude → AI-подписка'),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(aiCc, st.ai_node), cleanName(st.ai_node) || '—' ]),
+			E('div', { 'class': 'gs-meta' }, 'Слот AI · выход ' + ((CCNAME[aiCc] || aiCc) ? (CCNAME[aiCc] || aiCc) : '—') +
+				(st.google ? ' · Google видит: ' + st.google : '')),
+			E('div', { 'class': 'gs-meta' }, 'DNS AI-устройств: ' + (
+				st.aidns === 1 ? 'через AI-туннель (утечки нет)' :
+				st.aidns === 2 ? 'ПРОБЛЕМА — не через туннель (проверьте шаг aidns)' : 'не настроено (утечка DNS!)'))
+		]);
+		var vpnSub = E('div', { 'class': 'gs-sub-card' }, [
+			E('div', { 'class': 'gs-ent' }, 'VPN-noP2P · доменные списки MagiTrickle'),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(vpnCc, st.vpn_nop2p_node), cleanName(st.vpn_nop2p_node) || '—' ]),
+			E('div', { 'class': 'gs-meta' }, 'Слот VPN-noP2P · выход ' + ((CCNAME[vpnCc] || vpnCc) ? (CCNAME[vpnCc] || vpnCc) : '—') +
+				' · сюда нельзя торренты'),
+			E('div', { 'class': 'gs-meta' }, 'IP-правил на этом пути: быть не должно (проверка geomask --check)')
+		]);
+		var laneSub = E('div', { 'class': 'gs-sub-card' }, [
+			E('div', { 'class': 'gs-ent' }, 'VPN · полоса для P2P и IP-списков'),
+			E('div', { 'class': 'gs-node' }, [ ccBadge(laneCc, st.vpn_node), cleanName(st.vpn_node) || 'не настроена' ]),
+			E('div', { 'class': 'gs-meta' }, 'Слот VPN · выход ' + ((CCNAME[laneCc] || laneCc) ? (CCNAME[laneCc] || laneCc) : '—')),
+			E('div', { 'class': 'gs-meta' }, 'mtrickle_bulk (IP), пины googlevideo, ответы входящим пирам')
+		]);

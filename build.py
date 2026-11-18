@@ -85,12 +85,42 @@ def load(name):
         raise SystemExit("asset %s must end with exactly one newline" % name)
     return data
 
+def compose_targets():
+    """Rebuild the delivery views from their parts before they are read (stage 0).
+
+    After 0v the authored source of a target is its parts; the delivery file is a generated
+    compatibility view with the same name and bytes. A target without parts stays authored
+    (monolith), so this is a no-op until it is migrated. Composition is exact, so the build
+    output does not change.
+    """
+    sys.path.insert(0, os.path.join(HERE, 'tools'))
+    import compose_sources
+    for target in compose_sources.TARGETS:
+        try:
+            composed = compose_sources.compose_target(target, HERE)
+        except compose_sources.ComposeError as exc:
+            raise SystemExit('source composition failed for %s: %s' % (target, exc)) from None
+        if composed is None:
+            continue
+        path = compose_sources.output_path(target, HERE)
+        try:
+            with open(path, 'rb') as handle:
+                current = handle.read()
+        except OSError:
+            current = None
+        if current != composed:
+            compose_sources.write_target(target, HERE)
+
+
 def main():
     # --out lets a verification step build into a scratch file instead of overwriting the
     # committed artifact: a checker that repairs what it checks proves nothing.
     global TARGET
     TARGET = OUT
     argv = sys.argv[1:]
+    if '--out' not in argv:
+        # A verification build must not publish the compatibility views either.
+        compose_targets()
     if argv:
         if len(argv) == 2 and argv[0] == "--out":
             TARGET = os.path.abspath(argv[1])

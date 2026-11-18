@@ -1,0 +1,423 @@
+pkg_install() { # pkg_install <pkg>... -> 0 only when the package manager reports success
+  if [ "${GM_REINSTALL_NO_PKG:-0}" = 1 ]; then
+    warn "переустановка: автоустановка пакетов запрещена ($*) - зависимость должна быть установлена заранее"
+    return 1
+  fi
+  if have apk; then
+    info "installing: $* (apk)"
+    apk update >/dev/null 2>&1 || warn "apk update failed - trying the current index"
+    apk add "$@" >/dev/null 2>&1
+  elif have opkg; then
+    info "installing: $* (opkg)"
+    opkg update >/dev/null 2>&1 || warn "opkg update failed - trying the current index"
+    opkg install "$@" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+# The runtime objects of the reinstall write-set (tests/reinstall_write_set.json).
+# Format: id|kind|f1|f2|f3 where kind decides the fields:
+#   service  -> initd-name(s, '/'-separated) | pid-or-port | mode (pidof|pgrep|port)
+#   crontab|links -> - | - | -
+#   uci      -> probe key (uci -q get) | - | -
+#   ip-rule  -> - | - | -
+#   nft-table-> table spec | - | -
+#   alias    -> uci key of the alias address | - | -
+#   sysctl   -> /proc/sys/net/ipv6/conf | - | -
+#   file|file-shared -> install path | expected (regular|regular-or-absent) | extra (seed-risk|-)
+#   dirs     -> - | - | -      dir -> probe dir | - | -
+# Tri-state enabled/running per service: enabled from /etc/rc.d links, running from
+# pidof/pgrep/netstat. Any `unknown` is an ERROR, not a maybe.
+REINSTALL_PREFLIGHT_OBJECTS="svc.dnsmasq|service|dnsmasq|dnsmasq|pidof
+svc.mihomo|service|mihomo|mihomo|pidof
+svc.magitrickle|service|magitrickle|magitrickled|pidof
+svc.hev-socks5-tunnel|service|hev-socks5-tunnel|hev-socks5-tunnel|pidof
+svc.hev-nop2p|service|hev-nop2p|hev-socks5-tunnel|pidof
+svc.rpcd|service|rpcd|rpcd|pidof
+svc.ai-doh|service|ai-doh|5055|port
+svc.dnsmasq-ai|service|dnsmasq-ai|5353|port
+svc.geomask-syncd|service|geomask-syncd|geomask-syncd.sh|pgrep
+svc.network|service|network|netifd|pidof
+svc.firewall|service|firewall|fw4|pidof
+svc.ksmbd|service|ksmbd/ksmbd1|ksmbd|pidof
+cron.user|crontab|-|-|-
+rc.d|links|-|-|-
+uci.network|uci|network.lan|-|-
+uci.dhcp|uci|dhcp.lan|-|-
+uci.ksmbd|uci|ksmbd|-|-
+net.fwmark-rule|ip-rule|-|-|-
+net.nft-ai-dns|nft-table|inet geomask_ai_dns|-|-
+net.alias-lanai|alias|network.lanai.ipaddr|-|-
+sysctl.kernel|sysctl|/proc/sys/net/ipv6/conf|-|-
+file.passwd|file-shared|/etc/passwd|regular|-
+file.group|file-shared|/etc/group|regular|-
+shared.magitrickle-config|file-shared|/etc/magitrickle/state/config.yaml|regular-or-absent|seed-risk
+shared.zapret-exclude|file-shared|/opt/zapret/ipset/zapret-hosts-user-exclude.txt|regular-or-absent|-
+shared.zapret-force|file-shared|/opt/zapret/ipset/zapret-hosts-user.txt|regular-or-absent|-
+file.mihomo-config|file|/etc/mihomo/config.yaml|regular-or-absent|-
+dir.tracked|dirs|-|-|-
+tmp.scratch|dir|/tmp|-|-"
+
+# R03 phase 2a (review G): every write-set object whose snapshot stores BYTES
+# (manifest snapshot SB/SBA/SAP - tests/reinstall_write_set.json). The preflight
+# classifies each object's type before any mutation: a symlink would be followed by
+# cp -p (it would capture and later restore the target's bytes), an unreadable file
+# captures nothing - both are refusals. Format: install-path|expected with
+# regular-or-absent or dir-or-absent. This table is cross-checked against the manifest
+# by tests/reinstall_manifest.py (check_byte_table). Documented boundary (manifest
+# meta.preflight_boundary): dynamic temp classes, snapshot=NONE transients and runtime
+# effects without a file representation are not type-classified here.
+REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-or-absent
+/usr/lib/geomask/geomask-audit-state.py|regular-or-absent
+/usr/lib/geomask/geomask-config-tx.py|regular-or-absent
+/usr/lib/geomask/geomask-config-owner.py|regular-or-absent
+/usr/lib/geomask/geomask-apply.py|regular-or-absent
+/usr/lib/geomask/geomask-lane-torrent.py|regular-or-absent
+/usr/lib/geomask/geomask-sync-youtube.py|regular-or-absent
+/usr/lib/geomask/geomask-audit-scheduler.py|regular-or-absent
+/usr/lib/geomask/geomask-subscription-status.py|regular-or-absent
+/usr/lib/geomask/geomask-slot-patch.py|regular-or-absent
+/usr/lib/geomask/geomask-mihomo-adopt.py|regular-or-absent
+/usr/lib/geomask/geomask-reload-state.py|regular-or-absent
+/usr/lib/geomask/geomask-console.py|regular-or-absent
+/usr/lib/geomask/geomask-dnsguard.sh|regular-or-absent
+/usr/lib/geomask/geomask-diag-spool.py|regular-or-absent
+/usr/lib/geomask/geomask-diag-redact.py|regular-or-absent
+/usr/lib/geomask/geomask-routes.sh|regular-or-absent
+/usr/lib/geomask/geomask-lock.sh|regular-or-absent
+/usr/lib/geomask/geomask-module-update.py|regular-or-absent
+/usr/lib/geomask/geomask-lists-edit.py|regular-or-absent
+/usr/lib/geomask/geomask-doctor.py|regular-or-absent
+/usr/lib/geomask/99-default-vpn-route.dist|regular-or-absent
+/etc/hotplug.d/iface/99-default-vpn-route|regular-or-absent
+/etc/hotplug.d/iface/99-geomask-guard|regular-or-absent
+/usr/bin/geo-backend.sh|regular-or-absent
+/usr/libexec/rpcd/geo-sync|regular-or-absent
+/usr/share/rpcd/acl.d/luci-app-geo-sync.json|regular-or-absent
+/usr/share/luci/menu.d/luci-app-geo-sync.json|regular-or-absent
+/www/luci-static/resources/view/geo-sync/main.js|regular-or-absent
+/etc/geomask/modules-index.json|regular-or-absent
+/etc/geomask/version|regular-or-absent
+/etc/geomask/modules.json|regular-or-absent
+/etc/geomask/modules-state.json|regular-or-absent
+/etc/geo-devices.list|regular-or-absent
+/root/sync_mtrickle_mihomo.sh|regular-or-absent
+/etc/mihomo/ruleset/ytdirect.yaml|regular-or-absent
+/etc/mihomo/ruleset/ytvpn.yaml|regular-or-absent
+/etc/mihomo/ruleset/torrentdirect.yaml|regular-or-absent
+/etc/mihomo/ruleset/mtrickle_bulk.yaml|regular-or-absent
+/etc/mihomo/ruleset/mtrickle.yaml|regular-or-absent
+/etc/mihomo/ruleset/ai.yaml|regular-or-absent
+/etc/mihomo/ruleset/torrentsites.yaml|regular-or-absent
+/etc/mihomo/config.yaml|regular-or-absent
+/etc/mihomo|dir-or-absent
+/etc/mihomo/ruleset|dir-or-absent
+/etc/geomask/zapret-force-keep.txt|regular-or-absent
+/etc/geomask/zapret-always-exclude.txt|regular-or-absent
+/etc/geomask/vpnwatch.conf|regular-or-absent
+/etc/geomask-nodes.conf|regular-or-absent
+/etc/geomask-ytwatch.conf|regular-or-absent
+/etc/geomask/lists/magitrickle-groups.yaml|regular-or-absent
+/usr/bin/geomask-seed-lists.py|regular-or-absent
+/usr/bin/geomask-torrent.sh|regular-or-absent
+/usr/bin/geomask-dnscheck.sh|regular-or-absent
+/usr/bin/geomask-lane.sh|regular-or-absent
+/usr/bin/geomask-morning-check.sh|regular-or-absent
+/usr/bin/geomask-vpnwatch.sh|regular-or-absent
+/usr/bin/geomask-guard.sh|regular-or-absent
+/usr/bin/geomask-node-scan.sh|regular-or-absent
+/usr/bin/geomask-ytwatch.sh|regular-or-absent
+/usr/bin/geomask-syncd.sh|regular-or-absent
+/etc/init.d/geomask-syncd|regular-or-absent
+/etc/init.d/ai-doh|regular-or-absent
+/etc/init.d/dnsmasq-ai|regular-or-absent
+/etc/dnsmasq-ai.conf|regular-or-absent
+/usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft|regular-or-absent
+/etc/geomask-aidns.uid|regular-or-absent
+/etc/passwd|regular-or-absent
+/etc/group|regular-or-absent
+/etc/magitrickle/state/config.yaml|regular-or-absent
+/opt/zapret/ipset/zapret-hosts-user-exclude.txt|regular-or-absent
+/opt/zapret/ipset/zapret-hosts-user.txt|regular-or-absent
+/etc/geomask/backup-ok|regular-or-absent
+/etc/geomask/backup-recovery|regular-or-absent
+/root/geomask-backups|dir-or-absent
+/etc/geomask|dir-or-absent
+/etc/geomask/lists|dir-or-absent
+/etc/geomask/torrent|dir-or-absent
+/etc/geomask/node-audit.json|regular-or-absent
+/etc/geomask/node-audit/state|regular-or-absent
+/etc/geomask/ipv6.state|regular-or-absent
+/etc/hev-socks5-tunnel/nop2p.yml|regular-or-absent
+/etc/init.d/hev-nop2p|regular-or-absent
+/usr/share/nftables.d/ruleset-post/99-lane-accept.nft|regular-or-absent
+/etc/mihomo/config.yaml.bak_lane|regular-or-absent
+/etc/geomask/ytwatch.state|regular-or-absent
+/etc/sysctl.d/99-disable-ipv6.conf|regular-or-absent
+/etc/nftables.d/99-geomask-no-v6.nft|regular-or-absent"
+
+PF_REASONS=""
+_pf_reason() { # collect one refusal reason (JSON later)
+  if [ -n "${PF_REASONS:-}" ]; then
+    PF_REASONS="$PF_REASONS
+$1"
+  else
+    PF_REASONS="$1"
+  fi
+}
+
+_reinstall_obj_type() { # _reinstall_obj_type <install-path> -> regular|symlink|dir|absent|unknown
+  _rot="$(P "$1")"
+  if [ -L "$_rot" ]; then printf 'symlink'; return 0; fi
+  if [ -f "$_rot" ]; then printf 'regular'; return 0; fi
+  if [ -d "$_rot" ]; then printf 'dir'; return 0; fi
+  if [ -e "$_rot" ]; then printf 'unknown'; return 0; fi    # fifo/socket/device node
+  if ls -d "$_rot" >/dev/null 2>&1; then printf 'unknown'; return 0; fi
+  printf 'absent'
+}
+
+_pf_svc_enabled() { # _pf_svc_enabled <initd-names-slash-separated> -> 0|1|unknown
+  if [ ! -d "$(P /etc/rc.d)" ] || ! ls "$(P /etc/rc.d)" >/dev/null 2>&1; then
+    printf 'unknown'; return 0
+  fi
+  for _pfe_name in $(printf '%s' "$1" | tr '/' ' '); do
+    if ls "$(P /etc/rc.d)" 2>/dev/null | grep -qE "^[SK][0-9][0-9]${_pfe_name}$"; then
+      printf '1'; return 0
+    fi
+  done
+  printf '0'    # no autostart link: a determinate "not enabled", even without init script
+}
+
+_pf_svc_running() { # _pf_svc_running <pid-or-port> <mode> -> 0|1|unknown
+  case "${2:-pidof}" in
+    pgrep)
+      have pgrep || { printf 'unknown'; return 0; }
+      pgrep -f "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      ;;
+    port)
+      if have netstat; then
+        netstat -ltnu 2>/dev/null | grep -q ":$1 " && printf '1' || printf '0'
+      else
+        printf 'unknown'
+      fi
+      ;;
+    *)
+      if have pidof; then
+        pidof "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      elif have pgrep; then
+        pgrep -x "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      else
+        printf 'unknown'
+      fi
+      ;;
+  esac
+}
+
+# Fail-closed preflight of a reinstall: run BEFORE the first mutation (backup_gate writes
+# too). The full rollback is only promised when every runtime object of the write-set
+# manifest is observable and restorable; anything unknown refuses the run. Output is one
+# JSON line on stdout:
+#   rc=0  {"ok":true,"armed":"no-package-install"}
+#   rc=1  {"ok":false,"error":"reinstall not started: unprovable state","reasons":[...]}
+# A refusal here is NOT a "rollback succeeded": nothing has been changed yet.
+reinstall_preflight() {
+  PF_REASONS=""
+  GM_REINSTALL_NO_PKG=1     # arm: from here on pkg_install refuses every package call
+  if [ -n "${GM_AUTO_LANE:-}" ]; then
+    _pf_reason "GM_AUTO_LANE is armed: geomask-lane.sh would create network/firewall uci sections and service state outside the per-object snapshot; unset GM_AUTO_LANE to reinstall"
+  fi
+  # 1) dependencies - presence only, NEVER apk/opkg
+  for _pf_d in cp mv rm mkdir chmod cmp date find sed awk grep cut tr head tail wc df \
+               mktemp tar gzip python3 curl crontab uci ip mihomo; do
+    have "$_pf_d" || _pf_reason "dependency missing: $_pf_d (auto-install is forbidden during reinstall; install it manually first)"
+  done
+  if have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    _pf_reason "dependency missing: python3-yaml (python3 -c 'import yaml' fails; auto-install is forbidden during reinstall)"
+  fi
+  # R04: lock primitive is mandatory on the target. Without it every writer (route, console,
+  # config transaction, cron) refuses to mutate; the installer must refuse first instead of
+  # installing a system whose writers all fail closed. No mkdir fallback exists on purpose.
+  if [ "$(uname -s 2>/dev/null)" = Linux ]; then
+    have flock || _pf_reason "dependency missing: flock (BusyBox applet; auto-install is forbidden during reinstall - use an image that ships it)"
+    if have python3 && ! python3 -c 'import fcntl' >/dev/null 2>&1; then
+      _pf_reason "dependency missing: python3 fcntl (the config transaction lock is fail-closed without it)"
+    fi
+  fi
+  _pf_scope_ai=0
+  module_selected ai_dns && [ ! -f "$(P /etc/geomask-aidns.off)" ] && _pf_scope_ai=1
+  if [ "$_pf_scope_ai" = 1 ]; then
+    for _pf_d in nft nslookup; do
+      have "$_pf_d" || _pf_reason "dependency missing: $_pf_d (ai_dns module in scope)"
+    done
+    if ! have https-dns-proxy && [ ! -x "$(P /usr/sbin/https-dns-proxy)" ]; then
+      _pf_reason "https-dns-proxy is missing - step 4 would need a package install, which is forbidden during reinstall"
+    fi
+  fi
+  # 2) snapshot observers must be intact (crontab/rc.d/dirs/tmp), or the snapshot cannot
+  #    capture - and later prove - the state it promises to restore.
+  if ! have pidof && ! have pgrep; then
+    _pf_reason "runtime state unobservable: neither pidof nor pgrep is available"
+  fi
+  crontab -l >/dev/null 2>&1
+  _pf_rc=$?
+  case "$_pf_rc" in
+    0|1) : ;;
+    *) _pf_reason "crontab state unobservable (crontab -l rc=$_pf_rc)" ;;
+  esac
+  if [ ! -d "$(P /etc/rc.d)" ] || ! ls "$(P /etc/rc.d)" >/dev/null 2>&1; then
+    _pf_reason "rc.d autostart links unobservable: cannot enumerate /etc/rc.d"
+  fi
+  for _pf_d in /usr/lib /usr/bin /etc/mihomo; do
+    [ -d "$(P "$_pf_d")" ] && ls "$(P "$_pf_d")" >/dev/null 2>&1 \
+      || _pf_reason "snapshot observer broken: cannot enumerate $_pf_d"
+  done
+  for _pf_d in /usr/lib/geomask /etc/mihomo/ruleset; do
+    if [ -d "$(P "$_pf_d")" ] && ! ls "$(P "$_pf_d")" >/dev/null 2>&1; then
+      _pf_reason "snapshot observer broken: cannot enumerate $_pf_d"
+    fi
+  done
+  _pf_probe=$(mktemp -d "$(P /tmp)/geomask-pf-XXXXXX" 2>/dev/null)
+  if [ -n "${_pf_probe:-}" ]; then rm -rf "$_pf_probe"; else
+    _pf_reason "snapshot observer broken: cannot create a probe directory in /tmp"
+  fi
+  # 3) every runtime object of the manifest: observable and classifiable
+  while IFS='|' read -r _pf_id _pf_kind _pf_f1 _pf_f2 _pf_f3; do
+    [ -n "${_pf_id:-}" ] || continue
+    case "$_pf_kind" in
+      service)
+        case "$_pf_id" in
+          svc.ai-doh|svc.dnsmasq-ai) [ "$_pf_scope_ai" = 1 ] || continue ;;
+          svc.hev-socks5-tunnel) module_selected path_ai || module_selected ai_dns || continue ;;
+          svc.hev-nop2p) [ -n "${GM_AUTO_LANE:-}" ] || continue ;;
+          svc.ksmbd) module_selected backup_share || continue ;;
+        esac
+        _pf_en=$(_pf_svc_enabled "$_pf_f1")
+        _pf_run=$(_pf_svc_running "$_pf_f2" "$_pf_f3")
+        [ "$_pf_en" = unknown ] && _pf_reason "runtime state unobservable: $_pf_id (enabled unknown)"
+        [ "$_pf_run" = unknown ] && _pf_reason "runtime state unobservable: $_pf_id (running unknown)"
+        ;;
+      crontab) : ;;      # checked above
+      links)   : ;;      # checked above
+      uci)
+        uci -q get "$_pf_f1" >/dev/null 2>&1
+        _pf_rc=$?
+        [ "$_pf_rc" -le 1 ] || _pf_reason "uci state unobservable: $_pf_f1 (rc=$_pf_rc)"
+        ;;
+      ip-rule)
+        ip rule show >/dev/null 2>&1 || _pf_reason "ip rule state unobservable (ip rule show failed)"
+        ;;
+      nft-table)
+        [ "$_pf_scope_ai" = 1 ] || continue
+        nft list table $_pf_f1 >/dev/null 2>&1
+        _pf_rc=$?
+        [ "$_pf_rc" -le 1 ] || _pf_reason "nft state unobservable: $_pf_f1 (rc=$_pf_rc)"
+        ;;
+      alias)
+        uci -q get "$_pf_f1" >/dev/null 2>&1
+        _pf_rc=$?
+        [ "$_pf_rc" -le 1 ] || _pf_reason "alias state unobservable: $_pf_f1 (rc=$_pf_rc)"
+        ;;
+      sysctl)
+        [ "${GM_IPV6:-off}" = keep ] && continue
+        _pf_sc="$(P "$_pf_f1")"
+        if [ ! -d "$_pf_sc" ] || ! ls "$_pf_sc" >/dev/null 2>&1; then
+          _pf_reason "kernel sysctl state unobservable: $_pf_f1"
+        else
+          for _pf_k in all default; do
+            [ -r "$_pf_sc/$_pf_k/disable_ipv6" ] \
+              || _pf_reason "kernel sysctl state unobservable: $_pf_f1/$_pf_k/disable_ipv6"
+          done
+        fi
+        ;;
+      file|file-shared)
+        _pf_t=$(_reinstall_obj_type "$_pf_f1")
+        case "$_pf_t" in
+          unknown)
+            _pf_reason "unobservable object: $_pf_f1" ;;
+          symlink)
+            _pf_reason "unrestorable object: $_pf_f1 is a symlink (the snapshot restores bytes, not links)" ;;
+          dir)
+            _pf_reason "unrestorable object: $_pf_f1 is a directory, expected $_pf_f2" ;;
+          absent)
+            [ "$_pf_f2" = regular ] \
+              && _pf_reason "unrestorable object: $_pf_f1 is absent but tracked as regular" ;;
+        esac
+        case "$_pf_kind" in
+          file-shared)
+            [ -e "$(P "$_pf_f1")" ] && [ ! -r "$(P "$_pf_f1")" ] \
+              && _pf_reason "unobservable object: $_pf_f1 is not readable" ;;
+        esac
+        if [ "$_pf_f3" = seed-risk ]; then
+          # The seeder rewrites an EMPTY MagiTrickle config; that write is not covered by a
+          # proven rollback, so it must be refused before the transaction starts.
+          if [ -f "$(P "$_pf_f1")" ] \
+             && ! grep -qE '^[[:space:]]*-[[:space:]]*name:' "$(P "$_pf_f1")" 2>/dev/null; then
+            _pf_reason "MagiTrickle state: an empty $_pf_f1 would be rewritten by the seeder - rollback unprovable"
+          fi
+        fi
+        ;;
+      dirs)
+        : ;;      # checked above
+      dir)
+        _pf_probe=$(mktemp -d "$(P "$_pf_f1")/geomask-pf-XXXXXX" 2>/dev/null)
+        if [ -n "${_pf_probe:-}" ]; then rm -rf "$_pf_probe"; else
+          _pf_reason "snapshot observer broken: probe directory in $_pf_f1"
+        fi
+        ;;
+      *)
+        _pf_reason "manifest object with unknown kind: $_pf_id ($_pf_kind)" ;;
+    esac
+  done <<EOF
+$REINSTALL_PREFLIGHT_OBJECTS
+EOF
+  # R03 phase 2a (review G): every byte-snapshot write-set object is classified by type
+  # before any mutation. A symlink would be followed by cp -p (the snapshot would capture
+  # and later restore the TARGET's bytes), an unreadable file captures nothing - both make
+  # the promised rollback unprovable and refuse the run. Absence is fine: the reinstall
+  # installs these objects itself (SBA records absent).
+  while IFS='|' read -r _pf_bp _pf_be; do
+    [ -n "${_pf_bp:-}" ] || continue
+    _pf_t=$(_reinstall_obj_type "$_pf_bp")
+    case "$_pf_t" in
+      symlink)
+        if [ "$_pf_be" = dir-or-absent ] && [ -d "$(P "$_pf_bp")" ] \
+           && _rs_safe_path "$_pf_bp"; then
+          :
+        else
+          _pf_reason "unrestorable object: $_pf_bp is a symlink (the snapshot stores bytes, not links)"
+        fi ;;
+      unknown)
+        _pf_reason "unobservable object: $_pf_bp" ;;
+      dir)
+        [ "$_pf_be" = dir-or-absent ] \
+          || _pf_reason "unrestorable object: $_pf_bp is a directory, expected $_pf_be" ;;
+      regular)
+        if [ "$_pf_be" = dir-or-absent ]; then
+          _pf_reason "unrestorable object: $_pf_bp is a regular file, expected $_pf_be"
+        elif [ ! -r "$(P "$_pf_bp")" ]; then
+          _pf_reason "unobservable object: $_pf_bp is not readable (the snapshot would capture nothing)"
+        fi ;;
+    esac
+  done <<EOF
+${REINSTALL_PREFLIGHT_BYTE_FILES:-}
+EOF
+  if [ -n "${PF_REASONS:-}" ]; then
+    _pf_json=''
+    _pf_first=1
+    while IFS= read -r _pf_line; do
+      [ -n "$_pf_line" ] || continue
+      _pf_esc=$(printf '%s' "$_pf_line" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+      if [ "$_pf_first" = 1 ]; then _pf_first=0; else _pf_json="$_pf_json,"; fi
+      _pf_json="$_pf_json\"$_pf_esc\""
+    done <<EOF
+$PF_REASONS
+EOF
+    printf '{"ok":false,"error":"reinstall not started: unprovable state","reasons":[%s]}\n' "$_pf_json"
+    return 1
+  fi
+  printf '{"ok":true,"armed":"no-package-install"}\n'
+  return 0
+}
+
+# full flow: uninstall -> install geo -> rewrite mihomo 2-subs -> sync+cron -> services -> verify

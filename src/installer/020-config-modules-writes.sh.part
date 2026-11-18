@@ -1,0 +1,429 @@
+_prov_url() {
+  _mihomo_py "$1" "$2" <<'PYEOF'
+import sys
+try:
+    import yaml
+except Exception:
+    raise SystemExit(1)
+try:
+    with open(sys.argv[1], encoding='utf-8') as fh:
+        data = yaml.safe_load(fh)
+except Exception:
+    raise SystemExit(1)
+providers = data.get('proxy-providers') if isinstance(data, dict) else None
+entry = providers.get(sys.argv[2]) if isinstance(providers, dict) else None
+url = entry.get('url') if isinstance(entry, dict) else None
+if isinstance(url, str) and url.strip():
+    print(url.strip())
+PYEOF
+}
+
+# ---- modules: which parts of geomask get installed -------------------------
+# core and path_vpn are mandatory: without the core nothing runs, without the VPN
+# lane the product has no purpose. Everything else is optional and can be left out
+# with --modules=... so a router only carries the features its owner wants.
+GM_REQUIRED_MODULES="core path_vpn"
+GM_ALL_MODULES="core luci guard path_vpn path_vpn_nop2p path_ai ai_dns youtube torrent diagnostic doctor device_modes backup_share self_update admission_service"
+GM_MODULES=""
+
+module_required() { case " $GM_REQUIRED_MODULES " in *" $1 "*) return 0 ;; esac; return 1; }
+module_selected() {
+  [ -z "$GM_MODULES" ] && return 0
+  case " $GM_MODULES " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+module_label() {
+  case "$1" in
+    core) echo "geomask (ядро): синк, node-audit, лейн, списки" ;;
+    luci) echo "Админка LuCI: панель, бэкенд, RPC" ;;
+    guard) echo "geomask-guard: сторож маршрута после ifup" ;;
+    path_vpn) echo "VPN-лейн (основной туннель)" ;;
+    path_vpn_nop2p) echo "VPN-noP2P (без торрентов)" ;;
+    path_ai) echo "AI-лейн (Google/OpenAI/Claude)" ;;
+    ai_dns) echo "DNS-over-HTTPS для AI-устройств" ;;
+    youtube) echo "YouTube: watchdog и списки доменов" ;;
+    torrent) echo "Торренты: правила и слушатель" ;;
+    diagnostic) echo "Старые проверки: dnscheck, vpnwatch, утренняя проверка" ;;
+    doctor) echo "Центр диагностики: проверки, маршруты, логи" ;;
+    device_modes) echo "Режимы устройств (исключения из туннеля)" ;;
+    backup_share) echo "SMB-шар с бэкапами" ;;
+    self_update) echo "Самообновление из GitHub" ;;
+    admission_service) echo "Служба допуска AI-устройств" ;;
+    *) echo "" ;;
+  esac
+}
+module_owns_path() { # echoes the module id that owns an install path, if any
+  GM_PATH_MODULE=""
+  case "$1" in
+@@MODULE_PATHS@@
+  esac
+  [ -n "$GM_PATH_MODULE" ] && echo "$GM_PATH_MODULE"
+}
+module_skip_path() { # true when the path belongs to a module the owner did not select
+  _m=$(module_owns_path "$1")
+  [ -n "$_m" ] || return 1
+  module_selected "$_m" && return 1
+  return 0
+}
+
+# ---- the one lock helper (R04) ----------------------------------------------
+# Single source of truth: assets/geomask-lock.sh. Injected here so the installer locks with
+# exactly the same code it installs to /usr/lib/geomask/geomask-lock.sh, and installed by the
+# save_stream below. Kernel flock(2) on a persistent inode: no PID, no reclaim, no unlink.
+# The config-transaction lock path and the lock directory are prefixed exactly like every other
+# path the installer touches. On the router P is the identity, so these are the real
+# /etc/geomask/node-audit/state/.config-tx.lock and /tmp/geomask-locks the runtime writers use;
+# a test root can never make the installer lock (or write) the host /etc or host /tmp. Both are
+# set BEFORE the helper is sourced: the helper captures the canonical path and keeps a
+# non-empty GM_LOCK_DIR provided by the caller. They are exported because the installer starts
+# child writers (uninstall calls geomask-lane.sh), which must inherit the injected paths
+# instead of falling back to the host ones.
+GM_CONFIG_TX_LOCK=${GM_CONFIG_TX_LOCK:-$(P /etc/geomask/node-audit/state/.config-tx.lock)}
+GM_LOCK_DIR=${GM_LOCK_DIR:-$(P /tmp/geomask-locks)}
+export GM_CONFIG_TX_LOCK GM_LOCK_DIR
+@@ASSET:geomask-lock.sh@@
+
+save_stream() { # save_stream <target-path> <mode>  (content on stdin)
+  if module_skip_path "$1"; then
+    cat >/dev/null 2>&1 || true
+    info "skip $1: module '$(module_owns_path "$1")' not selected"
+    return 0
+  fi
+  _t="$(P "$1")"; _m="$2"
+  mkdir -p "$(dirname "$_t")" || { SAVE_FAIL=$((SAVE_FAIL+1)); return 1; }
+  # A fixed `.zmnew` is shared by every writer: two runs interleaving on it could publish one
+  # run's bytes through the other's `mv` (audit I09). mkstemp-style unique temps remove that.
+  _tmp=$(mktemp "$_t.zmnew.XXXXXX" 2>/dev/null) || _tmp="$_t.zmnew.$$"
+  cat > "$_tmp" || { rm -f "$_tmp"; SAVE_FAIL=$((SAVE_FAIL+1)); return 1; }
+  if [ -f "$_t" ] && cmp -s "$_tmp" "$_t"; then
+    # identical bytes: keep the file, but repair a lost mode. Returning before chmod left an
+    # entrypoint non-executable forever after a restore or a botched copy.
+    chmod "$_m" "$_t" 2>/dev/null || true
+    rm -f "$_tmp"
+    info "unchanged: $1"
+    return 0
+  fi
+  _want=$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ')
+  if [ -f "$_t" ]; then
+    cp -p "$_t" "$_t.bak_geomask_$(date +%s 2>/dev/null || echo bak)" 2>/dev/null || true
+  fi
+  chmod "$_m" "$_tmp" 2>/dev/null || true
+  mv -f "$_tmp" "$_t" || { rm -f "$_tmp"; SAVE_FAIL=$((SAVE_FAIL+1)); return 1; }
+  # Trust the published bytes, not the exit of `mv`: a short write or a filesystem that
+  # silently truncated the file used to be reported as "written".
+  _got=$(wc -c < "$_t" 2>/dev/null | tr -d ' ')
+  if [ -n "${_want:-}" ] && [ "$_want" != "$_got" ]; then
+    SAVE_FAIL=$((SAVE_FAIL+1))
+    bad "written size mismatch for $1 (${_got:-?} of ${_want} bytes)"
+    return 1
+  fi
+  info "written: $1 (mode $_m)"
+  return 0
+}
+
+# ---- optional modules: gates shared by check and apply ---------------------
+# A module the owner did not select is never written, so every check that used to fail
+# the install for its missing piece asks mod_skipped first. Cron entries are the trap:
+# creation lives in step5_apply, verification in step5_check, and verification used to
+# abort the whole run - so both halves go through cron_ensure / cron_verify, which read
+# the same module flag. Never wrap only one half.
+mod_skipped() { # mod_skipped <module> -> 0 (and a note) when the module is not selected
+  module_selected "$1" && return 1
+  info "пропущен: модуль '$1' не выбран"
+  return 0
+}
+
+# Every rewrite of /etc/crontabs/root is a read-modify-write: the panel (nodes_set,
+# sync_set), the installer and uninstall must take the same kernel `cron` lock or one writer
+# silently drops the other's line (report R09). cron_ensure is used by step5 many times.
+# Nesting matters: uninstall/restore run with the `cron` lock already held by an outer caller,
+# and the kernel lock treats a second acquire as refusal (rc 3). The depth counter makes the
+# pair re-entrant inside one shell while still releasing exactly once.
+_CRON_LOCK_DEPTH=${_CRON_LOCK_DEPTH:-0}
+_cron_begin() {
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire cron 20
+  _cbl_rc=$?
+  case "$_cbl_rc" in
+    0|3) _CRON_LOCK_DEPTH=$(( ${_CRON_LOCK_DEPTH:-0} + 1 )); return 0 ;;
+  esac
+  return 1
+}
+_cron_end() {
+  [ "${_CRON_LOCK_DEPTH:-0}" -gt 0 ] || return 0
+  _CRON_LOCK_DEPTH=$(( ${_CRON_LOCK_DEPTH:-0} - 1 ))
+  [ "$_CRON_LOCK_DEPTH" -eq 0 ] || return 0
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release cron
+  return 0
+}
+
+cron_ensure() { # cron_ensure <module> <marker-ere> <cron-line>
+  mod_skipped "$1" && return 0
+  if crontab -l 2>/dev/null | grep -qE -- "$2"; then info "cron: уже есть ($2)"; return 0; fi
+  if ! _cron_begin; then
+    warn "cron: блокировка недоступна ($2) - строка не добавлена"
+    return 1
+  fi
+  ( crontab -l 2>/dev/null; printf '%s\n' "$3" ) | crontab - 2>/dev/null \
+    && info "cron: добавлен ($2)" || warn "cron: не удалось записать ($2)"
+  _cron_end
+  return 0
+}
+
+cron_verify() { # cron_verify <module> <marker-ere> <label> [soft]
+  mod_skipped "$1" && return 0
+  if crontab -l 2>/dev/null | grep -qE -- "$2"; then info "$3: present"; return 0; fi
+  if [ "${4:-hard}" = soft ]; then warn "$3: отсутствует"
+  else bad "$3: отсутствует"; _need=1; fi
+}
+
+ruleset_stub() { # ruleset_stub <module> <install-path> - keep `mihomo -t` valid without the module
+  mod_skipped "$1" >/dev/null || return 0
+  [ -s "$(P "$2")" ] && return 0
+  mkdir -p "$(dirname "$(P "$2")")" 2>/dev/null
+  printf '%s\n%s\n' "# module '$1' is not selected: ruleset kept empty" 'payload: []' > "$(P "$2")"
+  info "ruleset: $2 kept empty (module '$1' not selected)"
+}
+
+# ---- the selection is remembered on the router ------------------------------
+# /etc/geomask/modules.json is the single source of truth for "which modules does this
+# router carry": the installer writes it, the panel and the per-module updater read it.
+MODULES_STATE=/etc/geomask/modules.json
+
+modules_state_read() { # prints the stored selection; rc 1 = absent, 2 = damaged, 3 = no python
+  # A damaged file used to be indistinguishable from "no selection", and "no selection" means
+  # "install everything" - so one broken byte silently widened the install (audit I10).
+  [ -e "$(P $MODULES_STATE)" ] || return 1
+  [ -s "$(P $MODULES_STATE)" ] || return 2
+  command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1 || return 3
+  _msr=$(_mihomo_py "$(P $MODULES_STATE)" <<'PYEOF'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    raise SystemExit(1)
+selected = data.get('selected') if isinstance(data, dict) else None
+if not isinstance(selected, list) or not selected:
+    raise SystemExit(1)
+print(' '.join(str(item) for item in selected))
+PYEOF
+  ) || return 2
+  [ -n "$_msr" ] || return 2
+  printf '%s' "$_msr"
+}
+
+modules_state_write() { # modules_state_write <module>...
+  [ $# -gt 0 ] || return 0
+  mkdir -p "$(P /etc/geomask)" 2>/dev/null || true
+  # Publish atomically: the panel and the updater read this file, and a truncated write would
+  # look like a damaged selection. The temp lives next to the target for an atomic rename.
+  _msw_tmp="$(P $MODULES_STATE).tmp.$$"
+  _mihomo_py "$_msw_tmp" "$@" <<'PYEOF' || { rm -f "$_msw_tmp" 2>/dev/null; warn "modules: не удалось записать $MODULES_STATE"; return 1; }
+import json, sys
+with open(sys.argv[1], 'w', encoding='utf-8', newline='\n') as handle:
+    json.dump({'selected': sys.argv[2:]}, handle, ensure_ascii=False, indent=2)
+    handle.write('\n')
+PYEOF
+  mv -f "$_msw_tmp" "$(P $MODULES_STATE)" 2>/dev/null \
+    || { rm -f "$_msw_tmp" 2>/dev/null; warn "modules: не удалось опубликовать $MODULES_STATE"; return 1; }
+}
+
+module_effective_list() { # the modules this run installs (all, unless --modules narrowed it)
+  if [ -n "$GM_MODULES" ]; then printf '%s\n' "$GM_MODULES"; else printf '%s\n' "$GM_ALL_MODULES"; fi
+}
+
+# I11 (audit 18.11.2026): narrowing the selection used to leave the removed module's runtime
+# behind - the guard kept its hotplug hook, its 5-minute cron job and therefore kept re-seating
+# rules, AI-DNS kept its two services and its nft table - so a "subset" router went on running
+# components it no longer claimed to have. The catalogue already declares what a module owns,
+# so removal is data-driven instead of a hardcoded list that drifts from the metadata.
+module_owned_resources() { # module_owned_resources <module> -> "<type>|<path>" lines
+  _mor_idx="$(P /etc/geomask/modules-index.json)"
+  [ -s "$_mor_idx" ] || return 1
+  _mihomo_py "$_mor_idx" "$1" <<'PYEOF'
+import json, sys
+# Windows checkouts run these helpers under a Python whose stdout is CRLF; the shell `read`
+# would then carry a trailing CR into every path and `[ -e ]` would fail silently.
+try:
+    sys.stdout.reconfigure(newline='\n')
+except Exception:
+    pass
+try:
+    with open(sys.argv[1], encoding='utf-8') as fh:
+        data = json.load(fh)
+except Exception:
+    raise SystemExit(1)
+mods = data.get('modules') if isinstance(data, dict) else None
+if isinstance(mods, list):
+    mods = {item.get('id'): item for item in mods if isinstance(item, dict)}
+if not isinstance(mods, dict):
+    raise SystemExit(1)
+mod = mods.get(sys.argv[2])
+if not isinstance(mod, dict):
+    raise SystemExit(1)
+for res in mod.get('owned_resources') or []:
+    if not isinstance(res, dict):
+        continue
+    kind, path = res.get('type'), res.get('path')
+    if isinstance(kind, str) and isinstance(path, str) and kind and path:
+        print('%s|%s' % (kind, path))
+PYEOF
+}
+
+modules_remove_runtime() { # modules_remove_runtime <module> [reason] -> 0 when something was removed
+  _mrr_why=${2:-снят с выбора}
+  _mrr_res=$(module_owned_resources "$1") || {
+    warn "modules: '$1' $_mrr_why, но каталог модулей не прочитан - runtime не снят"
+    return 1
+  }
+  [ -n "$_mrr_res" ] || return 1
+  _mrr_did=0
+  while IFS='|' read -r _mrr_kind _mrr_path; do
+    _mrr_kind=${_mrr_kind%\r}
+    _mrr_path=${_mrr_path%\r}
+    [ -n "${_mrr_kind:-}" ] || continue
+    case "$_mrr_kind" in
+      service)
+        _mrr_init="$(P "/etc/init.d/$_mrr_path")"
+        if [ -f "$_mrr_init" ]; then
+          "$_mrr_init" stop >/dev/null 2>&1
+          "$_mrr_init" disable >/dev/null 2>&1
+          info "снят сервис $_mrr_path ($1: $_mrr_why)"
+          _mrr_did=1
+        fi ;;
+      file)
+        _mrr_f="$(P "$_mrr_path")"
+        if [ -e "$_mrr_f" ] || [ -L "$_mrr_f" ]; then
+          rm -f "$_mrr_f" 2>/dev/null && { info "снят файл $_mrr_path ($1: $_mrr_why)"; _mrr_did=1; }
+        fi ;;
+      cron)
+        if have crontab; then
+          _cron_begin || true
+          _mrr_cron=$(crontab -l 2>/dev/null)
+          if printf '%s\n' "$_mrr_cron" | grep -q -- "$_mrr_path"; then
+            if printf '%s\n' "$_mrr_cron" | grep -v -- "$_mrr_path" | crontab - 2>/dev/null; then
+              info "снята cron-запись $_mrr_path ($1: $_mrr_why)"
+              _mrr_did=1
+            fi
+          fi
+          _cron_end
+        fi ;;
+      nft)
+        if have nft && nft list table inet "$_mrr_path" >/dev/null 2>&1; then
+          if nft delete table inet "$_mrr_path" >/dev/null 2>&1; then
+            info "снята nft-таблица $_mrr_path ($1: $_mrr_why)"
+            _mrr_did=1
+          fi
+        fi ;;
+      *)
+        info "ресурс '$_mrr_kind $_mrr_path' модуля $1 не снят автоматически - проверьте вручную" ;;
+    esac
+  done <<EOF
+$_mrr_res
+EOF
+  [ "$_mrr_did" = 1 ]
+}
+
+modules_prune_selection() { # modules_prune_selection <old selection> <new selection>
+  _mps_did=0
+  for _mps_mod in $1; do
+    case " $2 " in
+      *" $_mps_mod "*) continue ;;
+    esac
+    modules_remove_runtime "$_mps_mod" "снят с выбора" && _mps_did=1
+  done
+  [ "$_mps_did" = 1 ]
+}
+
+modules_state_sync() { # remember the effective selection, only when it changed
+  _want=$(module_effective_list)
+  _msr_rc=0
+  _have=$(modules_state_read) || _msr_rc=$?
+  if [ "$_msr_rc" = 2 ]; then
+    # Refuse: overwriting a damaged selection would erase the owner's choice on a guess.
+    bad "modules: $MODULES_STATE повреждён - выбор не меняю (исправьте файл или удалите его для выбора всех модулей)"
+    return 1
+  fi
+  if [ "$_msr_rc" = 3 ]; then
+    warn "modules: python недоступен - сохранённый выбор не проверен"
+    return 0
+  fi
+  [ "$_want" = "$_have" ] && return 0
+  # Narrowing the selection now removes what the dropped modules own (files, services, cron
+  # entries, nft tables) instead of leaving the runtime running behind a smaller claim. Owner
+  # state and config files are not in owned_resources, so they stay.
+  modules_prune_selection "$_have" "$_want" || true
+  modules_state_write $_want
+}
+
+choose_modules() { # interactive picker; required modules are always installed
+  _cm_rc=0
+  _cur=$(modules_state_read) || _cm_rc=$?
+  if [ "$_cm_rc" = 2 ]; then
+    bad "modules: $MODULES_STATE повреждён - выбор не начинаю (исправьте файл или удалите его)"
+    return 1
+  fi
+  if [ "$_cm_rc" = 3 ]; then
+    warn "modules: python недоступен - показываю полный список"
+  fi
+  if [ "$_cm_rc" = 1 ] || [ -z "$_cur" ]; then _cur="$GM_ALL_MODULES"; fi
+  echo
+  printf '%sМодули%s: обязательные ставятся всегда, остальные — по выбору.\n' "$C_Y" "$NC"
+  _i=0
+  for _m in $GM_ALL_MODULES; do
+    _i=$((_i+1))
+    if module_required "$_m"; then _mk="обязательный"; _mc="$C_G"
+    else
+      case " $_cur " in
+        *" $_m "*) _mk="выбран"; _mc="$C_G" ;;
+        *)         _mk="по выбору"; _mc="$C_DIM" ;;
+      esac
+    fi
+    printf '  %s%2d)%s %-18s %s  %s[%s]%s\n' "$C_B" "$_i" "$NC" "$_m" "$(module_label "$_m")" "$_mc" "$_mk" "$NC"
+  done
+  printf 'Номера через запятую [Enter = оставить текущий выбор, all = все]: '
+  read -r _ans || _ans=""
+  case "$_ans" in
+    "") GM_MODULES=$_cur ;;
+    all|ALL|все|ВСЕ|Все) GM_MODULES="$GM_ALL_MODULES" ;;
+    *)
+      _sel=""
+      for _tok in $(printf '%s' "$_ans" | tr ',' ' '); do
+        case "$_tok" in
+          *[!0-9]*) warn "не номер: $_tok"; continue ;;
+        esac
+        _m=$(printf '%s\n' $GM_ALL_MODULES | sed -n "${_tok}p")
+        if [ -z "$_m" ]; then warn "нет модуля с номером $_tok"; continue; fi
+        case " $_sel " in *" $_m "*) ;; *) _sel="$_sel $_m" ;; esac
+      done
+      for _m in $GM_REQUIRED_MODULES; do
+        case " $_sel " in *" $_m "*) ;; *) _sel="$_sel $_m" ;; esac
+      done
+      GM_MODULES=$(printf '%s' "$_sel" | sed 's/^ *//;s/  */ /g')
+      ;;
+  esac
+  info "модули: $GM_MODULES"
+}
+
+modules_maybe_prompt() { # ask at most once per run, and only when the run can install
+  [ -n "$GM_MODULES" ] && return 0
+  [ "${GM_MODULES_ASKED:-0}" = 1 ] && return 0
+  # GM_MODULES_ASK=1 lets the sandbox harness drive the picker without a tty.
+  if [ "${GM_MODULES_ASK:-0}" != 1 ]; then
+    if [ "$GM_YES" = 1 ] || [ "$GM_AUTO" = 1 ] || [ "$GM_CHECK_ONLY" = 1 ]; then
+      # unattended runs keep the router's own selection; "no --modules" used to mean "all",
+      # which made an update re-install modules the owner had deliberately left out
+      _stored=$(modules_state_read 2>/dev/null || true)
+      [ -n "$_stored" ] && GM_MODULES="$_stored"
+      return 0
+    fi
+    [ -t 0 ] || return 0
+  fi
+  GM_MODULES_ASKED=1
+  choose_modules
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+svc_alive() { pidof "$1" >/dev/null 2>&1; }
+

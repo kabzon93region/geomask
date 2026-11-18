@@ -1,0 +1,403 @@
+initd() { # initd <svc> <action>  - respects GM_PREFIX for tests
+  # Never execute an init script through a symlinked component: the restore refuses unsafe
+  # paths up front, and this guard keeps every other caller fail-closed as well.
+  if command -v _rs_safe_exec >/dev/null 2>&1; then
+    if ! _rs_safe_exec "/etc/init.d/$1"; then
+      warn "initd: /etc/init.d/$1 is behind an unsafe or unpinned symlink - refusing to execute it"
+      return 1
+    fi
+  else
+    if [ -L "$(P /etc/init.d/$1)" ]; then
+      warn "initd: /etc/init.d/$1 is a symlink - refusing to execute it"
+      return 1
+    fi
+  fi
+  # Run the init script without the lock descriptors: a service that daemonizes directly (or a
+  # procd fallback) must not inherit the maintenance lock and hold it until reboot.
+  if command -v gm_lock_safe_exec >/dev/null 2>&1; then
+    gm_lock_safe_exec "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+  else
+    "$(P /etc/init.d/$1)" "$2" 2>/dev/null
+  fi
+}
+
+# ============================================================ PREFLIGHT
+# R04: the lock primitive is a mandatory dependency of every writer, on the normal install as
+# well as on the reinstall preflight. Echoes the missing piece (Linux only); rc=1 when usable.
+# Without flock every writer refuses to mutate, and the copied helper file must not exist.
+lock_primitive_missing() {
+  [ "$(uname -s 2>/dev/null)" = Linux ] || return 0
+  have flock || { printf 'flock applet (BusyBox; upstream OpenWrt 24.10 ships it)'; return 0; }
+  if have python3 && ! python3 -c 'import fcntl' >/dev/null 2>&1; then
+    printf 'python3 fcntl (the config transaction lock is fail-closed without it)'
+    return 0
+  fi
+  return 1
+}
+
+# Everything that can only fail later is checked here, before the first byte is written:
+# a reset router must not end up with a panel and no working mihomo config.
+preflight() {
+  _need=0
+  _c="$(P $MIHOMO_CONF)"
+  if [ -z "$GM_VPN_URL" ]; then
+    _u=""
+    [ -s "$_c" ] && _u=$(_prov_url "$_c" sub)
+    if [ -z "$_u" ] && [ -s "$_c" ]; then _u=$(any_provider_url "$_c"); fi
+    if [ -z "$_u" ]; then
+      _mo=0
+      [ -s "$_c" ] && { geomask_config_verdict "$_c" || _mo=$?; }
+      if [ "$_mo" = 2 ]; then
+        # N04: an unreadable file is not "somebody else's config" - say what is missing.
+        bad "preflight: конфиг mihomo не читается (python3-yaml отсутствует или файл повреждён)"
+        info "  Владение конфигом определить нельзя; установка не начинается."
+      elif [ "$_mo" = 1 ] && [ "${GM_ADOPT:-0}" != 1 ] && [ "${GM_REPLACE:-0}" != 1 ]; then
+        bad "preflight: на роутере свой конфиг mihomo, подписка не задана"
+        info "  Либо --vpn-url '<ссылка>' (геомаск перепишет конфиг по шаблону),"
+        info "  либо --adopt-config (взять текущий конфиг под управление, сохранив его),"
+        info "  либо --replace-config (явная замена шаблоном)."
+      else
+        bad "preflight: не задана ссылка VPN-подписки"
+        info "  Запустите: sh $0 --vpn-url 'https://...' --auto"
+      fi
+      _need=1
+    fi
+  fi
+  if have python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    have apk || have opkg || { bad "preflight: нет apk/opkg - python3-yaml не поставить"; _need=1; }
+  fi
+  _lpm=$(lock_primitive_missing)
+  [ -z "$_lpm" ] || { bad "preflight: нет примитива блокировки: $_lpm"; info "  Без него писатели отказываются изменять конфиг (fail-closed), а не работают без lock."; _need=1; }
+  [ -n "$(lan_ip)" ] || { bad "preflight: не определён адрес LAN ($(lan_iface)) - слушатели некуда привязать"; _need=1; }
+  return $_need
+}
+
+# ============================================================ STEP 1: env
+step1_check() {
+  _need=0
+  # Reset first: the flag is a property of THIS check, not a sticky state from an earlier run.
+  GM_STEP1_FATAL=0
+  [ -f "$(P /etc/openwrt_release)" ] && info "OpenWrt: $(grep '^DISTRIB_RELEASE=' "$(P /etc/openwrt_release)" 2>/dev/null | cut -d"'" -f2)" || { bad "not OpenWrt (/etc/openwrt_release missing)"; _need=1; }
+  if have apk; then info "pkg manager: apk"; elif have opkg; then info "pkg manager: opkg"; else bad "no apk/opkg"; _need=1; fi
+  # v1.30.5: geomask is an overlay over mihomo, not a standalone product. Saying so here
+  # means a bare/reset router stops at step 1, before a single file is written, instead of
+  # installing the panel and only then reporting "mihomo binary missing" at step 3.
+  if have mihomo; then info "mihomo: present"
+  else bad "mihomo: MISSING - geomask is an overlay over mihomo; install mihomo first (its config, subscriptions and TUN come from it)"; _need=1; fi
+  if have magitrickled || [ -f "$(P /etc/init.d/magitrickle)" ]; then info "magitrickle: present"
+  else bad "magitrickle: MISSING - domain lists and per-domain routing live there; install magitrickle first"; _need=1; fi
+  for c in python3 curl; do
+    if have "$c"; then info "$c: present"; else warn "$c: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
+  done
+  # v1.30.15: PyYAML is a hard runtime dependency (slot patcher, audit state, node audit).
+  # CI installed it on the runner, so a reset router without python3-yaml was never tested.
+  if have python3; then
+    if python3 -c 'import yaml' >/dev/null 2>&1; then info "python3-yaml: present"
+    else warn "python3-yaml: MISSING - will be installed at apply (apk/opkg)"; _need=1; fi
+  fi
+  # R04: a fresh install must fail before step 2 if the lock primitive is missing, otherwise
+  # every writer installed by the run would refuse to mutate. This is a hard refusal: the
+  # interactive wizard must not go on applying steps 2-7 after it (see run_step).
+  _lpm=$(lock_primitive_missing)
+  [ -z "$_lpm" ] || { GM_STEP1_FATAL=1; bad "flock: MISSING ($_lpm) - geomask writers are fail-closed without it"; _need=1; }
+  # the AI lane is a second hev-socks5-tunnel instance; without the binary it cannot exist
+  if module_selected path_ai || module_selected ai_dns; then
+    if have hev-socks5-tunnel || [ -x "$(P /usr/bin/hev-socks5-tunnel)" ]; then info "hev-socks5-tunnel: present"
+    else warn "hev-socks5-tunnel: MISSING - нужен для AI-пути и AI-DNS; в фидах его нет, ставится с базовым стеком"; fi
+  else
+    info "hev-socks5-tunnel: не требуется выбранными модулями"
+  fi
+  _tmp=$(df -m "$(P /tmp)" 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -n "${_tmp:-}" ] && [ "$_tmp" -ge 20 ] 2>/dev/null; then info "/tmp free: ${_tmp}MB"; else warn "/tmp free low or unknown"; _need=1; fi
+  _root=$(df -m "$(P /)" 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -n "${_root:-}" ] && [ "$_root" -ge 30 ] 2>/dev/null; then info "root free: ${_root}MB"; else warn "root free low or unknown"; _need=1; fi
+  _code=$(curl -m 5 -s -o /dev/null -w '%{http_code}' http://www.gstatic.com/generate_204 2>/dev/null)
+  if [ "$_code" = "204" ]; then info "internet: OK (204 via router path)"; else warn "internet check: HTTP ${_code:-none} (WAN may be down)"; _need=1; fi
+  return $_need
+}
+# v1.30.6: python3 and curl are installed by the installer itself. A reset router has
+# neither, and the owner should not have to know package names - the rest of geomask
+# (sync, module updater, doctor, backend) does not run without python3.
+step1_apply() {
+  _missing=""
+  for _c in python3 curl; do have "$_c" || _missing="$_missing $_c"; done
+  # package name differs from the import name: python3-yaml provides `import yaml`.
+  # Checked even when python3 itself is absent: requiring python3 first installed python3
+  # and then failed the yaml verification on a bare router.
+  if ! have python3 || ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    _missing="$_missing python3-yaml"
+  fi
+  if [ -z "$_missing" ]; then
+    info "packages: python3 and curl already present"
+    return 0
+  fi
+  _missing=$(echo "$_missing" | sed 's/^ *//')
+  if have apk; then
+    info "installing: $_missing (apk)"
+    apk update >/dev/null 2>&1 || warn "apk update failed - trying the current index"
+    if apk add $_missing >/dev/null 2>&1; then info "installed: $_missing"
+    else bad "apk add $_missing failed - check the internet and free space"; return 1; fi
+  elif have opkg; then
+    info "installing: $_missing (opkg)"
+    opkg update >/dev/null 2>&1 || warn "opkg update failed - trying the current index"
+    if opkg install $_missing >/dev/null 2>&1; then info "installed: $_missing"
+    else bad "opkg install $_missing failed - check the internet and free space"; return 1; fi
+  else
+    bad "no apk/opkg - install $_missing manually, then re-run"
+    return 1
+  fi
+  for _c in python3 curl; do
+    have "$_c" || { bad "$_c still missing after install"; return 1; }
+  done
+  if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+    bad "python3-yaml still missing after install - панель не сможет назначать подписки"
+    return 1
+  fi
+  info "packages: python3, python3-yaml and curl ready"
+  return 0
+}
+step1_verify() { step1_check; }
+
+# ============================================================ STEP 2: geo overlay (ours)
+
+# ============================================================ STEP 2: geo overlay (ours)
+# I08 (audit 18.11.2026): the check knew 13 of the files step2 installs, and nothing about the
+# doctor. A router with an old doctor/lock/updater asset therefore printed "check: ALL GOOD"
+# and step2_apply was skipped - the old bytes stayed. The presence list below is exactly the
+# set step2_apply writes (a test keeps them equal), and a passing step-2 check no longer
+# skips the apply (see step_check_is_authoritative): presence cannot prove freshness.
+STEP2_FILES="/usr/lib/geomask/geomask-node-audit.py
+/usr/lib/geomask/geomask-audit-state.py
+/usr/lib/geomask/geomask-config-tx.py
+/usr/lib/geomask/geomask-config-owner.py
+/usr/lib/geomask/geomask-apply.py
+/usr/lib/geomask/geomask-lane-torrent.py
+/usr/lib/geomask/geomask-sync-youtube.py
+/usr/lib/geomask/geomask-audit-scheduler.py
+/usr/lib/geomask/geomask-subscription-status.py
+/usr/lib/geomask/geomask-slot-patch.py
+/usr/lib/geomask/geomask-mihomo-adopt.py
+/usr/lib/geomask/geomask-reload-state.py
+/usr/bin/geo-backend.sh
+/usr/lib/geomask/geomask-routes.sh
+/usr/lib/geomask/geomask-lock.sh
+/usr/lib/geomask/geomask-module-update.py
+/usr/lib/geomask/geomask-lists-edit.py
+/usr/lib/geomask/geomask-doctor.py
+/usr/lib/geomask/geomask-dnsguard.sh
+/usr/lib/geomask/geomask-console.py
+/usr/lib/geomask/geomask-diag-redact.py
+/usr/lib/geomask/geomask-diag-spool.py
+/etc/geomask/modules-index.json
+/usr/libexec/rpcd/geo-sync
+/usr/share/rpcd/acl.d/luci-app-geo-sync.json
+/usr/share/luci/menu.d/luci-app-geo-sync.json
+/www/luci-static/resources/view/geo-sync/main.js"
+
+step2_check() {
+  _need=0
+  for f in $STEP2_FILES; do
+    module_skip_path "$f" && continue
+    if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
+  done
+  # v1.30.0: the panel is its own module; without it there is nothing to register in ubus
+  if module_selected luci; then
+    if have ubus && ubus list 2>/dev/null | grep -qx 'geo-sync'; then info "ubus geo-sync: registered"; else bad "ubus geo-sync not registered"; _need=1; fi
+  else
+    mod_skipped luci
+  fi
+  # v1.29.0: what this router is supposed to carry, and what the owner left out
+  _sel=$(modules_state_read 2>/dev/null || true)
+  if [ -n "$_sel" ]; then
+    _off=""
+    for _m in $GM_ALL_MODULES; do
+      case " $_sel " in *" $_m "*) ;; *) _off="$_off $_m" ;; esac
+    done
+    info "модули: $_sel${_off:+ (не выбраны:$_off)}"
+  else
+    info "модули: выбор не записан - считаем, что выбраны все"
+  fi
+  if module_selected backup_share; then
+    if [ -e "$(P /etc/ksmbd/ksmbd.conf)" ]; then
+      # The share is published only after an explicit opt-in. Without the marker its absence
+      # is the expected state: requiring it here made --auto fail step 2 on every fresh
+      # system with ksmbd installed, because apply deliberately creates nothing (F15).
+      if [ -f "$(P $SMB_SHARE_ENABLE)" ]; then
+        if grep -qF "[$SMB_SHARE_NAME]" "$(P /etc/ksmbd/ksmbd.conf)" 2>/dev/null; then
+          info "SMB share $SMB_SHARE_NAME: present"
+        else
+          bad "SMB share $SMB_SHARE_NAME missing (opt-in marker exists)"; _need=1
+        fi
+      else
+        info "SMB share: автопубликация выключена (opt-in: touch $SMB_SHARE_ENABLE) - проверка пропущена"
+      fi
+    fi
+  else
+    info "пропущен: SMB-шар с бэкапами (модуль 'backup_share' не выбран)"
+  fi
+  return $_need
+}
+# R10b: the guard now reports a missing /etc/geo-devices.list as "per-device state unknown"
+# (rc 2) instead of silently skipping the device blocks. The list used to appear only on the
+# first dev_add, so a fresh install had no file at all and "damaged" was indistinguishable
+# from "normal". Create an EMPTY list on install; an existing list is owner data and is never
+# truncated - install and reinstall both only fill the gap.
+ensure_devices_list() {
+  _edl=$(P /etc/geo-devices.list)
+  if [ -L "$_edl" ]; then
+    warn "$_edl is a symlink - refusing to create the device list through it"
+    return 1
+  fi
+  if [ -e "$_edl" ]; then
+    chmod 600 "$_edl" 2>/dev/null || true
+    return 0
+  fi
+  ( umask 077; : > "$_edl" ) 2>/dev/null || {
+    warn "cannot create the empty device list $_edl"
+    return 1
+  }
+  chmod 600 "$_edl" 2>/dev/null || true
+  chown root:root "$_edl" 2>/dev/null || true
+  return 0
+}
+
+step2_apply() {
+  _save_before=${SAVE_FAIL:-0}
+  # Before the assets, so a failure here aborts before any service file is replaced.
+  ensure_devices_list || { bad "не удалось создать пустой список устройств"; return 1; }
+  save_stream /usr/lib/geomask/geomask-node-audit.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-node-audit.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-audit-state.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-audit-state.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-config-tx.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-config-tx.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-config-owner.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-config-owner.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-apply.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-apply.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-lane-torrent.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-lane-torrent.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-sync-youtube.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-sync-youtube.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-audit-scheduler.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-audit-scheduler.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-subscription-status.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-subscription-status.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-slot-patch.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-slot-patch.py@@
+ASSET_EOF
+  # I05: adoption of a foreign mihomo config is a real merge, not a silent no-op.
+  save_stream /usr/lib/geomask/geomask-mihomo-adopt.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-mihomo-adopt.py@@
+ASSET_EOF
+  # C04/C07: reload verdict + pending marker shared by the sync and the AI-DNS apply.
+  save_stream /usr/lib/geomask/geomask-reload-state.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-reload-state.py@@
+ASSET_EOF
+  save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
+@@ASSET:geo-backend.sh@@
+ASSET_EOF
+  # Shared route-table helper: the ifup hotplug script and the backend both use it, so the
+  # two copies of the mirroring logic can never drift apart (audit 14.11.2026, F01/F02).
+  save_stream /usr/lib/geomask/geomask-routes.sh 644 <<'ASSET_EOF'
+@@ASSET:geomask-routes.sh@@
+ASSET_EOF
+  # R04: the one lock helper (kernel flock on a persistent inode). Every writer sources it;
+  # the installer itself runs the very same functions from this script (injected below).
+  save_stream /usr/lib/geomask/geomask-lock.sh 644 <<'ASSET_EOF'
+@@ASSET:geomask-lock.sh@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-module-update.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-module-update.py@@
+ASSET_EOF
+  # v1.30.1: safe editor for the MagiTrickle lists (add/remove one domain at a time).
+  save_stream /usr/lib/geomask/geomask-lists-edit.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-lists-edit.py@@
+ASSET_EOF
+  # v1.29.1: the diagnostics engine behind the "Диагностика" tab - checks, route trace, logs.
+  save_stream /usr/lib/geomask/geomask-doctor.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-doctor.py@@
+ASSET_EOF
+  # v1.31.0: strict DNS with an emergency reserve (owner decision 14.11.2026).
+  save_stream /usr/lib/geomask/geomask-dnsguard.sh 755 <<'ASSET_EOF'
+@@ASSET:geomask-dnsguard.sh@@
+ASSET_EOF
+  # v1.31.0: the console lane patcher (provider + select group + listener in one place).
+  save_stream /usr/lib/geomask/geomask-console.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-console.py@@
+ASSET_EOF
+  # v1.31.0: the diagnostic bundle redactor (`uci show`, mihomo YAML, controller JSON,
+  # log text) and the verify gate the backend runs before it packs anything.
+  save_stream /usr/lib/geomask/geomask-diag-redact.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-diag-redact.py@@
+ASSET_EOF
+  save_stream /usr/lib/geomask/geomask-diag-spool.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-diag-spool.py@@
+ASSET_EOF
+  save_stream /etc/geomask/modules-index.json 644 <<'ASSET_EOF'
+@@ASSET:module-index.json@@
+ASSET_EOF
+  # the updater caches the catalogue for an hour; right after an install that cache still
+  # describes the previous release, so every file looked locally modified. Drop it here - both
+  # the private copy (audit U01) and the legacy /tmp one an older release may have left behind.
+  mkdir -p "$(P /etc/geomask/cache)" 2>/dev/null && chmod 700 "$(P /etc/geomask/cache)" 2>/dev/null
+  rm -f "$(P /etc/geomask/cache)/modules-index.json" 2>/dev/null || true
+  rm -f "$(P /tmp)/geomask-modules-index.json" 2>/dev/null || true
+  save_stream /usr/libexec/rpcd/geo-sync 755 <<'ASSET_EOF'
+@@ASSET:geo-sync@@
+ASSET_EOF
+  save_stream /usr/share/rpcd/acl.d/luci-app-geo-sync.json 644 <<'ASSET_EOF'
+@@ASSET:acl.json@@
+ASSET_EOF
+
+  # v1.30.3: the release identity of THIS router. The panel compares the GitHub release
+  # against this file, so a leftover installer copy in /root cannot make it offer a downgrade.
+  printf '%s\n' "$GM_VERSION" > "$(P /etc/geomask/version)" 2>/dev/null || true
+
+  # Baseline for per-module updates: record the hashes and the versions we just installed
+  # (--versions: files this release generates, like mihomo rulesets, are not byte-equal).
+  [ -f /etc/geomask/modules-index.json ] && \
+    python3 /usr/lib/geomask/geomask-module-update.py seed --versions \
+      --index-file /etc/geomask/modules-index.json >/dev/null 2>&1 || true
+  # v1.29.0: remember which modules this router carries (panel + per-module updater read it).
+  modules_state_sync
+  save_stream /usr/share/luci/menu.d/luci-app-geo-sync.json 644 <<'ASSET_EOF'
+@@ASSET:menu.json@@
+ASSET_EOF
+  save_stream /www/luci-static/resources/view/geo-sync/main.js 644 <<'ASSET_EOF'
+@@ASSET:geo-main.js@@
+ASSET_EOF
+  info "reloading rpcd + luci menu..."
+  initd rpcd reload 2>/dev/null || true
+  sleep 1
+  # procd can coalesce the uninstall+install reload pair in --reinstall and drop
+  # the second signal -> geo-sync stays unregistered; re-send until it appears.
+  ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
+  ubus list 2>/dev/null | grep -qx 'geo-sync' || { initd rpcd reload 2>/dev/null || true; sleep 2; }
+  if module_selected backup_share; then
+    ensure_smb_share || { bad "SMB share не создана (см. сообщения выше)"; return 1; }
+  else
+    info "пропущен: SMB-шар с бэкапами (модуль 'backup_share' не выбран)"
+  fi
+  # A write failure above must never be reported as a successful apply: the reinstall flow
+  # used to continue and only check that the ubus object existed (audit 14.11.2026, F12).
+  if [ "${SAVE_FAIL:-0}" != "${_save_before:-0}" ]; then
+    bad "не все файлы записаны (ошибок: $((SAVE_FAIL - _save_before)))"
+    return 1
+  fi
+  return 0
+}
+step2_verify() { step2_check; }
+
+# ============================================================ STEP 3: mihomo 2-subscription config
+MIHOMO_CONF=/etc/mihomo/config.yaml
+

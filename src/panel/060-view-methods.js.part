@@ -1,0 +1,101 @@
+
+		return wrap;
+	},
+
+	act: function(rpcFn, params, okMsg) {
+		var view = this;
+		return rpcFn(params).then(function(res) {
+			if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+			if (okMsg) ui.addNotification(null, E('p', {}, okMsg), 'info');
+			return view.reload();
+		}).catch(function(e) {
+			ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error');
+		});
+	},
+
+	reload: function() {
+		var view = this;
+		var calls = [
+			callStatus(), callLeases(), callLog(), callAiSubGet(), callSubsList(),
+			callUpdCheck({ force: null }), callUpdStatus(), callBackups(), callStack(),
+			callNodesGet(), callListsGet(), callYtGet(), callTorGet(), callNodesPathsGet(), callModList(), callDiagList()
+		];
+		return Promise.all(calls).then(function(all) {
+			var newView = view.render(all);
+			var old = document.querySelector('.gs-wrap');
+			if (old && old.parentNode) old.parentNode.replaceChild(newView, old);
+		});
+	},
+
+	// Poll job status until complete.
+	//
+	// One timer per path, kept outside the view instance: reload() builds a new view, so a
+	// timer owned by the old one survived and kept polling -- several clicks, or a couple of
+	// reloads, produced a swarm of overlapping requests and one "interrupted" notice each.
+	// A transient timeout is retried a few times before it is reported at all.
+	pollJob: function(jobId, pathId) {
+		var view = this;
+		if (POLL_TIMERS[pathId]) {
+			clearInterval(POLL_TIMERS[pathId].timer);
+			delete POLL_TIMERS[pathId];
+		}
+		var state = { jobId: jobId, failures: 0, timer: null };
+
+		function stop() {
+			if (state.timer !== null) {
+				clearInterval(state.timer);
+				state.timer = null;
+			}
+			if (POLL_TIMERS[pathId] === state) delete POLL_TIMERS[pathId];
+		}
+
+		state.timer = setInterval(function() {
+			callNodesAuditJobGet(jobId).then(function(res) {
+				if (!res || !res.ok) {
+					var error = (res || {}).error || 'ошибка RPC';
+					stop();
+					// A newer check replaced this job file; the card already shows it.
+					if (error !== 'job not found') {
+						ui.addNotification(null, E('p', {}, 'Наблюдение прервано: ' + error), 'warning');
+					}
+					return;
+				}
+				state.failures = 0;
+				var job = res.job || {};
+				var st = job.status;
+				if (st === 'complete' || st === 'error' || st === 'stale' || st === 'cancelled') {
+					stop();
+					var msg, kind = 'info';
+					if (st === 'complete') {
+						var counts = job.counts || {};
+						msg = 'Проверка завершена: ' + (counts.eligible || 0) + ' допущено, '
+							+ (counts.excluded || 0) + ' исключено, '
+							+ (counts.unknown || 0) + ' неизвестно.';
+					} else if (st === 'stale') {
+						var staleCounts = job.counts || {};
+						msg = 'Проверка завершена, но результат уже устарел (конфиг изменился): '
+							+ (staleCounts.eligible || 0) + ' допущено, '
+							+ (staleCounts.excluded || 0) + ' исключено, '
+							+ (staleCounts.unknown || 0) + ' неизвестно. Нужна повторная проверка.';
+						kind = 'warning';
+					} else if (st === 'cancelled') {
+						msg = 'Проверка отменена.';
+						kind = 'warning';
+					} else {
+						msg = 'Проверка завершилась ошибкой: ' + (job.error || 'причина не указана');
+						kind = 'error';
+					}
+					ui.addNotification(null, E('p', {}, msg), kind);
+					view.reload();
+				}
+			}).catch(function(err) {
+				state.failures += 1;
+				if (state.failures < 3) return;
+				stop();
+				ui.addNotification(null, E('p', {}, 'Наблюдение прервано: ' + String(err)
+					+ '. Нажмите «Обновить результаты».'), 'warning');
+			});
+		}, 2000);
+		POLL_TIMERS[pathId] = state;
+	}
+});

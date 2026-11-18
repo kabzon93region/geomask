@@ -1,0 +1,411 @@
+_aidns_sync() {
+  [ -f "$AIDNS_UID_FILE" ] || return 0
+  [ -f "$AIDNS_OFF_FILE" ] && return 0
+  _uid=$(cat "$AIDNS_UID_FILE" 2>/dev/null | tr -dc '0-9')
+  [ -n "$_uid" ] || return 0
+  _ips=$(awk '$2=="ai" && $1 !~ /^#/ {print $1}' "$DEVICES" 2>/dev/null)
+  _list=""
+  for _ip in $_ips; do _list="$_list $_ip,"; done
+  _list=${_list%,}
+  _aidns=$(_gm_aidns_ip)
+  _lip=$(_gm_lan_ip)
+  if [ -z "$_lip" ]; then
+    # The LAN address itself is unreadable (ip missing / interface down): that is a transient
+    # condition, not a bad alias. Changing the ruleset now could reject DNS for good.
+    echo "$(date +%FT%T) AI-DNS: LAN address unreadable - ruleset left as is" >> "$LOG"
+    return 0
+  fi
+  # mktemp, not /tmp/geomask-aidns.nft.$$: a predictable pid-suffixed name in a
+  # world-writable directory can be planted before this process starts (R06 M3).
+  _tmp=$(mktemp "${TMPDIR:-/tmp}/geomask-aidns.XXXXXX" 2>/dev/null) || return 0
+  {
+    printf '# geomask AI-DNS (auto-generated from /etc/geo-devices.list - do not edit)\n'
+    printf '# DNS of AI-mode devices goes into the AI tunnel: no DNS leak, no geo mismatch.\n'
+    printf '# idempotent include pattern (same as 20-https-dns-proxy-notrack.nft)\n'
+    printf 'add table inet geomask_ai_dns\n'
+    printf 'flush table inet geomask_ai_dns\n'
+    printf 'add chain inet geomask_ai_dns pre_nat { type nat hook prerouting priority -110; policy accept; }\n'
+    printf 'add chain inet geomask_ai_dns out_mark { type route hook output priority -150; policy accept; }\n'
+    printf 'add rule inet geomask_ai_dns out_mark meta skuid %s mark set 0x64\n' "$_uid"
+    if [ -n "$_list" ]; then
+      if [ -n "$_aidns" ]; then
+        printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 dnat ip to %s:%s\n' "$_list" "$_aidns" "$AIDNS_DNS_PORT"
+      else
+        # FAIL CLOSED. A DNAT to a guessed address black-holes DNS, and leaving the clients
+        # alone sends them to the router's ordinary resolver - the leak this feature exists to
+        # prevent. Neither may look like success (audit 14.11.2026, F08).
+        printf 'add rule inet geomask_ai_dns pre_nat ip saddr { %s } meta l4proto { tcp, udp } th dport 53 counter reject\n' "$_list"
+      fi
+    fi
+  } > "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 0; }
+  if ! nft -c -f "$_tmp" >/dev/null 2>&1; then
+    rm -f "$_tmp"
+    echo "$(date +%FT%T) AI-DNS: generated rules failed syntax check - nothing applied" >> "$LOG"
+    return 0
+  fi
+  # Compare the WHOLE ruleset, not just the device list: an address or uid that changed while
+  # the list stayed the same must still be applied (audit 14.11.2026, F08).
+  if cmp -s "$_tmp" "$AIDNS_NFT_DEST"; then
+    rm -f "$_tmp"
+    # Identical bytes do not mean the runtime matches them: retry the reload while the marker
+    # says the previous write was never proven active (C04).
+    if [ ! -f "$AIDNS_PENDING" ]; then
+      [ -n "$_list" ] && [ -z "$_aidns" ] && printf 'error' > "$AIDNS_STATE"
+      return 0
+    fi
+    if _aidns_reload_prove; then
+      _aidns_clear_pending
+      printf 'ok' > "$AIDNS_STATE"
+      printf '%s' "$_list" > "$AIDNS_LAST"
+      echo "$(date +%FT%T) AI-DNS: reload retried after a pending write - table is live" >> "$LOG"
+      return 0
+    fi
+    _aidns_mark_pending "reload failed (retry)"
+    echo "$(date +%FT%T) AI-DNS: reload retry failed - still pending" >> "$LOG"
+    return 1
+  fi
+  if ! cp "$_tmp" "$AIDNS_NFT_DEST" 2>/dev/null; then
+    rm -f "$_tmp"
+    echo "$(date +%FT%T) AI-DNS: cannot write $AIDNS_NFT_DEST" >> "$LOG"
+    return 0
+  fi
+  rm -f "$_tmp"
+  if [ -n "$_list" ] && [ -z "$_aidns" ]; then
+    echo "$(date +%FT%T) AI-DNS: listen address unknown - client DNS REJECTED (fail closed)" >> "$LOG"
+  fi
+  # State follows the proof, not the write: `ok` only after the table is live, `error` for the
+  # deliberate reject path (fail closed is a correct end state), `pending` otherwise.
+  if ! _aidns_reload_prove; then
+    if [ -n "$_list" ] && [ -z "$_aidns" ]; then
+      printf 'error' > "$AIDNS_STATE"
+    else
+      _aidns_mark_pending "firewall reload failed after the include was written"
+    fi
+    echo "$(date +%FT%T) AI-DNS: include written but not active (firewall reload failed) - pending, the next sync retries" >> "$LOG"
+    return 1
+  fi
+  _aidns_clear_pending
+  if [ -n "$_list" ] && [ -z "$_aidns" ]; then
+    printf 'error' > "$AIDNS_STATE"
+  else
+    printf 'ok' > "$AIDNS_STATE"
+  fi
+  printf '%s' "$_list" > "$AIDNS_LAST"
+  echo "$(date +%FT%T) AI-DNS: ruleset updated -> firewall reloaded (table live)" >> "$LOG"
+  return 0
+}
+
+# (re)apply routing for all managed devices:
+#   bypass -> direct (19900) | realtz -> normal mihomo path | ai -> AI tunnel (19900 -> table 101 -> dev AI)
+_apply_routing() {
+  # A failed AI lane is not a reason to point an AI device at an empty table (black hole):
+  # remember the failure and return it after the per-device loop (R05 D7).
+  _ar_fail=0
+  # drop stale per-device rules first (we re-add per mode)
+  if [ -f "$DEVICES" ]; then
+    while read -r dip dmode dname; do
+      case "$dip" in ''|'#'*) continue ;; esac
+      ip rule del from "$dip" lookup main 2>/dev/null || true
+      ip rule del from "$dip" lookup 101 2>/dev/null || true
+    done < "$DEVICES"
+    while read -r dip dmode dname; do
+      case "$dip" in ''|'#'*) continue ;; esac
+      if [ "$dmode" = "bypass" ]; then
+        ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup main
+      elif [ "$dmode" = "ai" ]; then
+        if _ai_tun_ensure; then
+          ip rule show | grep -q "from $dip" || ip rule add priority 19900 from "$dip" lookup 101
+        else
+          _ar_fail=1
+          echo "$(date +%FT%T) AI tunnel not ready - rule for $dip not installed" >> "$LOG"
+        fi
+      fi
+    done < "$DEVICES"
+  fi
+  _hotplug_sync
+  _aidns_sync || _ar_fail=1
+  return "$_ar_fail"
+}
+
+# Table 101 must be filled BEFORE its default is installed and before any per-device rule is
+# pointed at it: a default in a table without the LAN prefixes black-holes the device (R05 D7).
+# The rc of the shared sync is propagated, not ignored.
+_ai_routes_ensure() {
+  _gm_sync_routes 101
+  _are=$?
+  if [ "$_are" != 0 ]; then
+    echo "$(date +%FT%T) AI table 101 not synced (rc=$_are) - default and device rules skipped" >> "$LOG"
+    return "$_are"
+  fi
+  ip route replace table 101 default dev "$AI_TUN_DEV" 2>/dev/null || return 77
+  return 0
+}
+
+# provision AI tunnel on first use: hev-socks5-tunnel instance #2 (own TUN "AI",
+# socks 127.0.0.1:7891) + network iface + firewall zone. The WORKING main tunnel
+# is never restarted - hev-ai is a separate init.d service.
+_ai_tun_ensure() {
+  mkdir -p /etc/hev-socks5-tunnel
+  if [ ! -f /etc/hev-socks5-tunnel/ai.yml ]; then
+    cat > /etc/hev-socks5-tunnel/ai.yml <<'EOF'
+tunnel:
+  name: AI
+  mtu: 8500
+  multi-queue: false
+  ipv4: 198.19.0.1
+socks5:
+  port: 7891
+  address: 127.0.0.1
+  udp: 'udp'
+EOF
+  fi
+  if [ ! -x /etc/init.d/hev-ai ]; then
+    cat > /etc/init.d/hev-ai <<'EOF'
+#!/bin/sh /etc/rc.common
+USE_PROCD=1
+START=99
+start_service() {
+  procd_open_instance
+  procd_set_param command /usr/bin/hev-socks5-tunnel /etc/hev-socks5-tunnel/ai.yml
+  procd_set_param file /etc/hev-socks5-tunnel/ai.yml
+  procd_set_param limits core="unlimited"
+  procd_set_param limits nofile="1000000 1000000"
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_set_param respawn
+  procd_close_instance
+}
+EOF
+    chmod +x /etc/init.d/hev-ai
+  fi
+  ip link show "$AI_TUN_DEV" >/dev/null 2>&1 || {
+    /etc/init.d/hev-ai enable >/dev/null 2>&1
+    /etc/init.d/hev-ai start >/dev/null 2>&1
+    _i=0
+    while [ $_i -lt 10 ] && ! ip link show "$AI_TUN_DEV" >/dev/null 2>&1; do
+      sleep 1; _i=$((_i+1))
+    done
+  }
+  uci -q get network.AI >/dev/null 2>&1 || {
+    uci set network.AI=interface
+    uci set network.AI.proto='none'
+    uci set network.AI.device="$AI_TUN_DEV"
+    uci commit network
+  }
+  if ! uci -q show firewall 2>/dev/null | grep -q "name='AI'"; then
+    # clone the working Mihomo zone + its forwardings for the AI tunnel
+    ZN=''
+    for s in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=zone$/\1/p'); do
+      [ "$(uci -q get "$s.name")" = "Mihomo" ] && { ZN="$s"; break; }
+    done
+    if [ -n "$ZN" ]; then
+      NEW=$(uci add firewall zone)
+      uci set "firewall.$NEW.name=AI"
+      uci set "firewall.$NEW.input=$(uci -q get "$ZN.input")"
+      uci set "firewall.$NEW.output=$(uci -q get "$ZN.output")"
+      uci set "firewall.$NEW.forward=$(uci -q get "$ZN.forward")"
+      uci set "firewall.$NEW.masq=$(uci -q get "$ZN.masq")"
+      uci set "firewall.$NEW.mtu_fix=$(uci -q get "$ZN.mtu_fix")"
+      uci set "firewall.$NEW.network=AI"
+      for f in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=forwarding$/\1/p'); do
+        [ "$(uci -q get "$f.src")" = "lan" ] && [ "$(uci -q get "$f.dest")" = "Mihomo" ] || continue
+        NF=$(uci add firewall forwarding)
+        uci set "firewall.$NF.src=lan"
+        uci set "firewall.$NF.dest=AI"
+      done
+      for f in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=forwarding$/\1/p'); do
+        [ "$(uci -q get "$f.src")" = "Mihomo" ] && [ "$(uci -q get "$f.dest")" = "lan" ] || continue
+        NF=$(uci add firewall forwarding)
+        uci set "firewall.$NF.src=AI"
+        uci set "firewall.$NF.dest=lan"
+      done
+      uci commit firewall
+      # uci forwarding lan->AI alone does NOT generate an accept rule (the zone
+      # subnet is a /32 assigned by the TUN itself, so fw4 leaves accept_to_AI
+      # empty and forwarded LAN packets are dropped). Drop-in adds the accept.
+      _ai_drop_write
+      /etc/init.d/firewall reload >/dev/null 2>&1
+    fi
+  fi
+  # v1.27.10: the accept drop-in above was written only when the AI zone was first
+  # created. On a box where the zone already existed (ours), a WireGuard peer routed
+  # by MagiTrickle into the AI tunnel hit forward_wg with no matching accept, so fw4
+  # answered the phone with a TCP reset and YouTube stalled after the first second.
+  # Ensure the WG rule on every run, not just at creation time.
+  _ai_drop=/usr/share/nftables.d/ruleset-post/99-ai-accept.nft
+  if [ ! -s "$_ai_drop" ] || ! grep -q 'iifname "Wireguard" oifname "AI"' "$_ai_drop" 2>/dev/null \
+     || ! grep -qxF "# geomask-lan: $(_gm_lan_devices)" "$_ai_drop" 2>/dev/null; then
+    _ai_drop_write
+    /etc/init.d/firewall reload >/dev/null 2>&1
+  fi
+  # table 101: LAN/host routes must stay local, only internet goes to AI tunnel
+  _ai_routes_ensure
+  _are_tun=$?
+  [ "$_are_tun" = 0 ] || return "$_are_tun"
+  echo "$(date +%FT%T) AI_TUN provisioned" >> "$LOG"
+}
+
+_hotplug_sync() {
+  # The installer owns this file: it is the only code that knows this router's LAN device
+  # and TUN name. Rewriting it here (as this function did until v1.30.19) replaced the
+  # portable version with a br-lan/Mihomo heredoc on every device add/delete, so the
+  # portability fix did not survive the first panel action.
+  _hp=/etc/hotplug.d/iface/99-default-vpn-route
+  if [ ! -s "$_hp" ]; then
+    if [ -s /usr/lib/geomask/99-default-vpn-route.dist ]; then
+      mkdir -p /etc/hotplug.d/iface 2>/dev/null
+      cp -f /usr/lib/geomask/99-default-vpn-route.dist "$_hp" 2>/dev/null
+      chmod 755 "$_hp" 2>/dev/null
+      echo "$(date +%FT%T) hotplug route script restored from the shipped copy" >> "$LOG"
+    else
+      echo "$(date +%FT%T) hotplug route script missing - re-run the geomask installer" >> "$LOG"
+    fi
+  fi
+  if ! sh -n "$_hp" 2>/dev/null; then
+    # Diagnostics must not go to stdout: the caller prints its own JSON answer.
+    warn "hotplug route script has a syntax error: $_hp"
+  fi
+}
+
+# ---- AI path (no own subscription since v1.23.0; rides the provider its group uses) ----
+cmd_ai_sub_get() {
+  # `provider` stays the provider the AI group actually rides (for a managed pool that is
+  # the audit-* file provider). The resolved source subscription is an added field.
+  if [ -f "$SUB_STATUS_PY" ]; then
+    _AIJSON=$("$SUB_STATUS_PYTHON" -B "$SUB_STATUS_PY" ai-sub 2>/dev/null)
+    case "$_AIJSON" in
+      '{"provider"'*) printf '%s\n' "$_AIJSON"; return 0 ;;
+    esac
+  fi
+  p=$(_prov_of_group AI)
+  u=''
+  [ -n "$p" ] && u=$(_url_of_provider "$p")
+  printf '{"url":"%s","provider":"%s"}' "$(json_esc "$u")" "$(json_esc "$p")"
+}
+
+# ---- slot patcher: point a group (VPN / VPN-noP2P / AI) at a subscription URL ----
+# The patcher used to rewrite the config as TEXT and required `  - name: GROUP` with a
+# double-quoted provider URL. Applying a verified pool re-serialises the config with PyYAML
+# (`- name:` at column 0, bare scalars), so every switch failed: the AI slot claimed its
+# anchor was missing while the group was present. assets/geomask-slot-patch.py parses and
+# writes YAML structurally (YAML 1.2 booleans) and is syntax-checked by the test suite.
+# Isolation: a provider shared with another group, or a managed audit-* file pool, is never
+# re-pointed in place - the group gets its own "slot" provider, so switching AI cannot move
+# VPN/VPN-noP2P or rewrite a verified pool.
+SLOT_PATCH_PY=/usr/lib/geomask/geomask-slot-patch.py
+# A subscription URL is a credential: keep the token out of logs and process arguments.
+_mask_url() {
+  # Drop the userinfo part first: some providers hand out https://user:token@host/sub, and
+  # masking only the path would keep the password in the log and in the panel JSON.
+  printf '%s' "$1" | sed -E 's#(https?://)[^/@[:space:]]+@#\1#; s#(https?://[^/[:space:]]+/?)[^[:space:]]*#\1…#'
+}
+_slot_apply() { # _slot_apply <group> <url> -> patch config so <group> is fed by <url>
+  _g="$1"; URL="$2"
+  case "$URL" in
+    http://*|https://*) ;;
+    *) printf '{"error":"url must start with http:// or https://"}'; return 1 ;;
+  esac
+  if printf '%s' "$URL" | grep -qE '[[:space:]"]'; then
+    printf '{"error":"url contains forbidden characters"}'; return 1
+  fi
+  [ -f "$MIHOMO_CONF" ] || { printf '{"error":"mihomo config missing"}'; return 1; }
+  if [ ! -f "$SLOT_PATCH_PY" ]; then
+    printf '{"error":"slot patcher not installed"}'; return 1
+  fi
+  _require_backup || return 1
+  # C11 (audit 18.11.2026): this lane used to open the live config for writing inside the
+  # patcher and keep an unchecked backup copy around it. It now stages candidate bytes and
+  # commits them through the same transaction as every other writer: preimage, CAS on the bytes
+  # it read, trial, atomic write and rollback owned by one component.
+  _slot_base=$(_sha_file "$MIHOMO_CONF") || {
+    printf '{"ok":false,"error":"cannot fingerprint the mihomo config - live config untouched"}'; return 1; }
+  _slot_cand="${TMPDIR:-/tmp}/geomask-slot-candidate.$$.yaml"
+  _slot_err="${TMPDIR:-/tmp}/geomask-slot-error.$$"
+  # The URL goes through stdin, never argv: /proc/<pid>/cmdline is world-readable.
+  ( umask 077; printf '%s\n' "$URL" | "$PYTHON_BIN" -B "$SLOT_PATCH_PY" "$MIHOMO_CONF" "$_g" - \
+      > "$_slot_cand" 2> "$_slot_err" )
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    _res=$(head -1 "$_slot_err" 2>/dev/null | tr -d '\r')
+    rm -f "$_slot_cand" "$_slot_err" 2>/dev/null
+    printf '{"ok":false,"error":"%s"}' "$(json_esc "$_res")"; return 1
+  fi
+  _res=$(head -1 "$_slot_err" 2>/dev/null | tr -d '\r')
+  rm -f "$_slot_err" 2>/dev/null
+  _slot_out=$("$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" --expect-sha256 "$_slot_base" \
+    < "$_slot_cand" 2>&1)
+  _slot_rc=$?
+  rm -f "$_slot_cand" 2>/dev/null
+  if [ "$_slot_rc" != 0 ]; then
+    _detail=$(printf '%s' "$_slot_out" | tail -1 | sed 's/["\\]//g' | cut -c1-300)
+    printf '{"ok":false,"error":"switch not applied: %s - live config untouched"}' \
+      "$(json_esc "${_detail:-transaction refused}")"
+    return 1
+  fi
+  if ! _mihomo_reload; then
+    # The bytes are the new ones, but the running core did not confirm them: say so instead of
+    # reporting a switch that did not take effect.
+    printf '{"ok":false,"error":"config saved, but mihomo did not confirm the reload - check the controller"}'
+    return 1
+  fi
+  echo "$(date +%FT%T) SLOT $_g <- $(_mask_url "$URL") ($_res)" >> "$LOG"
+  printf '{"ok":true,"slot":"%s","change":"%s","url":"%s","node":"%s"}' \
+    "$_g" "$(json_esc "$_res")" "$(json_esc "$(_mask_url "$URL")")" "$(json_esc "$(_grp_node "$_g")")"
+}
+
+cmd_ai_sub_set() {
+  # v1.25.2: AI subscription switch is back - it points the AI group at this URL.
+  # When the AI group shares its provider with VPN/VPN-noP2P, a dedicated provider is
+  # created instead of silently re-pointing the shared one (isolation).
+  _slot_apply AI "$1"
+}
+
+# ---- subscription registry (id|name|url) ----
+_subs_json() {
+  FIRST=1
+  printf '['
+  [ -f "$SUBS_FILE" ] || { printf ']'; return; }
+  while IFS='|' read -r sid sname surl; do
+    case "$sid" in ''|'#'*) continue ;; esac
+    [ "$FIRST" -eq 1 ] || printf ','
+    printf '{"id":"%s","name":"%s","url":"%s"}' \
+      "$(json_esc "${sid:-}")" "$(json_esc "${sname:-}")" "$(json_esc "$(_mask_url "${surl:-}")")"
+    FIRST=0
+  done < "$SUBS_FILE"
+  printf ']'
+}
+
+_find_sub_url() { # _find_sub_url <id> -> url on stdout, rc=1 if not found
+  [ -f "$SUBS_FILE" ] || return 1
+  awk -F'|' -v id="$1" '$1==id {print $3; found=1; exit} END{exit found?0:1}' "$SUBS_FILE"
+}
+
+_sub_id_by_url() { # _sub_id_by_url <url> -> id, rc=1 if not found
+  [ -f "$SUBS_FILE" ] || return 1
+  awk -F'|' -v u="$1" '$3==u {print $1; found=1; exit} END{exit found?0:1}' "$SUBS_FILE"
+}
+
+cmd_subs_list() {
+  # fresh/empty registry: auto-import the providers currently in mihomo config
+  if [ ! -s "$SUBS_FILE" ] || ! grep -qE '^[^#]' "$SUBS_FILE" 2>/dev/null; then
+    _subs_seed_internal
+  fi
+  printf '{"subs":%s}' "$(_subs_json)"
+}
+
+_subs_count() { grep -cE '^[^#]' "$SUBS_FILE" 2>/dev/null || echo 0; }
+
+# import current config providers into the registry (skips urls already present)
+_subs_seed_internal() {
+  _subu=$(awk '/^  sub:/{f=1;next} f&&/^    url:/{gsub(/^[^"]*"/,"");gsub(/".*/,"");print;exit} f&&/^  [A-Za-z0-9_-]+:/{f=0} f&&/^[A-Za-z]/{f=0}' "$MIHOMO_CONF" 2>/dev/null)
+  if [ -n "$_subu" ]; then
+    _subs_json | grep -Fq "$_subu" || cmd_sub_add "VPN (текущая)" "$_subu" internal >/dev/null
+  fi
+  echo "$(date +%FT%T) SUB seed (auto)" >> "$LOG"
+}
+
+cmd_subs_seed() {
+  _subs_seed_internal
+  printf '{"ok":true,"subs":%s}' "$(_subs_json)"
+}
+

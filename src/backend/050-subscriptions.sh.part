@@ -1,0 +1,386 @@
+cmd_sub_add() {
+  NAME="$1"; URL="$2"; _internal="${3:-}"
+  case "$URL" in
+    http://*|https://*) ;;
+    *) printf '{"error":"url must start with http:// or https://"}'; return 1 ;;
+  esac
+  if printf '%s' "$URL" | grep -qE '[[:space:]"]'; then
+    printf '{"error":"url contains forbidden characters"}'; return 1
+  fi
+  # The auto-import of the providers already in the config is not an owner action: it must
+  # not fail just because no fresh backup exists yet.
+  [ "$_internal" = internal ] || _require_backup || return 1
+  [ -n "$NAME" ] || NAME=$(printf '%s' "$URL" | sed 's|^https\?://||; s|/.*||')
+  NAME=$(printf '%s' "$NAME" | tr -d '|' | head -c 48)
+  # The registry is read-modify-written (id allocation + append / delete): the shared `subs`
+  # kernel lock makes the id unique and keeps a concurrent delete from dropping this append.
+  command -v gm_lock_acquire >/dev/null 2>&1 && gm_lock_acquire subs 20 || {
+    printf '{"ok":false,"error":"subscription registry is busy"}\n'; return 1; }
+  ID=$(date +%s | tail -c 9)
+  _sa_i=0
+  while grep -q "^$ID|" "$SUBS_FILE" 2>/dev/null && [ "$_sa_i" -lt 100 ]; do ID=$((ID+1)); _sa_i=$((_sa_i+1)); done
+  echo "$ID|$NAME|$URL" >> "$SUBS_FILE"
+  # The registry holds subscription tokens: root-only, like the mihomo config itself.
+  chmod 600 "$SUBS_FILE" 2>/dev/null
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
+  echo "$(date +%FT%T) SUB add $ID $NAME" >> "$LOG"
+  printf '{"ok":true,"subs":%s}' "$(_subs_json)"
+}
+
+cmd_sub_del() {
+  ID="$1"
+  case "$ID" in ''|*[!0-9]*) printf '{"error":"bad id"}'; return 1 ;; esac
+  [ -f "$SUBS_FILE" ] || { printf '{"error":"registry empty"}'; return 1; }
+  # A path may still be backed by this subscription. Deleting the registry entry would
+  # leave its group pointing at a provider whose source no longer exists, so refuse until
+  # the path is switched to another subscription.
+  URL=$(awk -F'|' -v id="$ID" '$1==id {print $3; exit}' "$SUBS_FILE")
+  if [ -n "$URL" ] && [ -f "$NODE_AUDIT" ]; then
+    USED=$("$PYTHON_BIN" "$NODE_AUDIT" source-in-use "$URL" 2>/dev/null)
+    case "$USED" in
+      *'"in_use": true'*|*'"in_use":true'*)
+        printf '{"error":"subscription is used by a path; switch the path to another subscription before deleting it"}'
+        return 1 ;;
+    esac
+  fi
+  command -v gm_lock_acquire >/dev/null 2>&1 && gm_lock_acquire subs 20 || {
+    printf '{"ok":false,"error":"subscription registry is busy"}\n'; return 1; }
+  _sd_tmp="$SUBS_FILE.tmp.$$"
+  if ! grep -v "^$ID|" "$SUBS_FILE" > "$_sd_tmp"; then
+    rm -f "$_sd_tmp"; command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
+    printf '{"ok":false,"error":"cannot rewrite the subscription registry"}\n'; return 1
+  fi
+  if ! mv -f "$_sd_tmp" "$SUBS_FILE"; then
+    rm -f "$_sd_tmp"; command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
+    printf '{"ok":false,"error":"cannot replace the subscription registry"}\n'; return 1
+  fi
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release subs
+  echo "$(date +%FT%T) SUB del $ID" >> "$LOG"
+  printf '{"ok":true,"subs":%s}' "$(_subs_json)"
+}
+
+_mihomo_reload() { # re-read the config in the running core (no service restart)
+  # The status code decides, not the exit of `sleep`: a reload that the controller refused used
+  # to be reported as a successful switch (audit C11).
+  _mr=$(controller_curl -s -m15 -o /dev/null -w '%{http_code}' -X PUT "$MIHOMO_API/configs" \
+    -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" 2>/dev/null)
+  case "$_mr" in
+    200|204) sleep 2; return 0 ;;
+  esac
+  return 1
+}
+
+cmd_ai_sub_use() {
+  # v1.25.2: the AI slot switch is back - it points the AI group at this registry subscription.
+  # When the AI group shares its provider with VPN/VPN-noP2P, a dedicated provider is created
+  # instead of silently re-pointing the shared one (isolation).
+  _slot_use AI "$1"
+}
+
+# v1.18.2: slots are resolved through the GROUP, not a hardcoded provider name - on a box that was
+# migrated the default tunnel may be fed by "sub", on a fresh install it always is.
+#   slot vpn        -> group VPN         (P2P-tolerant tunnel, the default one)
+#   slot vpn_nop2p  -> group VPN-noP2P   (subscription whose provider forbids P2P; created on demand)
+#   slot ai         -> group AI          (v1.25.2: switch restored; a shared provider is isolated,
+#                                          never silently re-pointed - switching AI cannot move VPN)
+
+_slot_use() { # _slot_use <group> <id>  -> assigns the registry subscription to that mihomo group
+  _g="$1"; ID="$2"
+  URL=$(_find_sub_url "$ID") || { printf '{"error":"subscription not found"}'; return 1; }
+  _slot_apply "$_g" "$URL"
+}
+
+cmd_vpn_sub_use()    { _slot_use VPN "$1"; }
+cmd_vpnnp_sub_use()  { _slot_use VPN-noP2P "$1"; }
+
+# ---------------- self-update (v1.7.0): check / status / apply ----------------
+# check -> $UPD_CHECK (cache TTL), apply -> detached runner writes $UPD_STATUS.
+# Flow: full backup -> download release artifact -> sh -n + version + sha256
+# -> "sh new --reinstall --yes" (module files only, no service restarts) -> rpcd reload.
+
+_upd_esc() { sed 's/\\/\\\\/g; s/"/\\"/g'; }   # stdin -> json-safe
+
+_upd_mark() { # $1=file, $2=marker name; supports NAME="v" and NAME = 'v'
+  [ -f "$1" ] || { printf 'none'; return 0; }
+  sed -n "s/.*$2[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" "$1" 2>/dev/null | head -1
+}
+
+_upd_core_ver() { # release identity: the deployed marker first, then an installer copy
+  # v1.30.3: /etc/geomask/version is written by the installer and by a deploy, so it always
+  # describes THIS router. The /root and /tmp copies are leftovers from old runs: one of them
+  # (1.25.3) made the panel offer a "downgrade" to the release it already had.
+  if [ -s /etc/geomask/version ]; then
+    _v=$(sed -n 's/^[[:space:]]*\([0-9][0-9.]*\).*/\1/p' /etc/geomask/version 2>/dev/null | head -1)
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+  fi
+  for f in /tmp/geomask.sh /root/geomask.sh; do
+    [ -f "$f" ] || continue
+    _v=$(sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -1)
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+  done
+  printf 'none'
+}
+
+_upd_newer() { # $1 candidate > $2 current ? (numeric X.Y.Z, missing parts = 0)
+  _a=$(printf '%s' "$1" | sed 's/^v//; s/[^0-9.].*$//')
+  _b=$(printf '%s' "$2" | sed 's/^v//; s/[^0-9.].*$//')
+  [ -n "$_a" ] && [ -n "$_b" ] || return 1
+  _i=1
+  while [ "$_i" -le 3 ]; do
+    _x=$(printf '%s' "$_a" | cut -d. -f"$_i"); _y=$(printf '%s' "$_b" | cut -d. -f"$_i")
+    _x=${_x:-0}; _y=${_y:-0}
+    case "$_x$_y" in *[!0-9]*) return 1 ;; esac
+    [ "$_x" -gt "$_y" ] && return 0
+    [ "$_x" -lt "$_y" ] && return 1
+    _i=$((_i+1))
+  done
+  return 1
+}
+
+_upd_bin_info() { # first existing path -> "file YYYY-MM-DD"
+  for f in "$@"; do
+    if [ -f "$f" ]; then printf 'file %s' "$(date -r "$f" +%F 2>/dev/null || printf '?')"; return 0; fi
+  done
+  printf 'not found'
+}
+
+_upd_stack_json() { # display-only versions of the managed stack
+  _mv=none
+  if command -v mihomo >/dev/null 2>&1; then
+    _mv=$(mihomo -v 2>&1 | head -1 | tr -d '\r' | head -c 90)
+    [ -n "$_mv" ] || _mv=none
+  fi
+  _o="{\"n\":\"mihomo\",\"v\":\"$(printf '%s' "$_mv" | _upd_esc)\"}"
+  _o="$_o,{\"n\":\"magitrickle\",\"v\":\"$(_upd_bin_info /usr/bin/magitrickled)\"}"
+  _o="$_o,{\"n\":\"hev-socks5-tunnel\",\"v\":\"$(_upd_bin_info /usr/sbin/hev-socks5-tunnel /usr/bin/hev-socks5-tunnel)\"}"
+  _o="$_o,{\"n\":\"tg-ws-proxy\",\"v\":\"$(_upd_bin_info /usr/bin/tg-ws-proxy)\"}"
+  _o="$_o,{\"n\":\"https-dns-proxy\",\"v\":\"$(_upd_bin_info /usr/sbin/https-dns-proxy)\"}"
+  _o="$_o,{\"n\":\"zapret / nfqws\",\"v\":\"$(_upd_bin_info /opt/zapret/nfq/nfqws)\"}"
+  printf '[%s]' "$_o"
+}
+
+# Live "installed versions" block + need flag for a given latest version. Sets _LBLK and _LNEED.
+# v1.14.2: the update card used to serve these straight from the TTL cache, so after a deploy the
+# panel kept showing the OLD installed versions for up to an hour (looked like "not updated").
+_upd_local_block() { # $1 = latest version (no leading v)
+  _core=$(_upd_core_ver)
+  _panel=$(_upd_mark "$DEPLOY_JS" PANEL_VERSION); [ -n "$_panel" ] || _panel=none
+  _guard=$(_upd_mark "$DEPLOY_GUARD" GUARD_VERSION); [ -n "$_guard" ] || _guard=none
+  _backend=$(_upd_mark "$DEPLOY_BACKEND" BACKEND_VERSION); [ -n "$_backend" ] || _backend=none
+  _LNEED=false
+  # The release identity comes from the deployed (flash) components - newest wins. The core
+  # marker is only a fallback: an installer copy under /tmp dies on every reboot, and a stale
+  # copy in /root once made a 1.30.0 router compare itself against 1.25.3 and offer a
+  # "downgrade" to the release it already had.
+  _cur=none
+  for _cand in "$_backend" "$_panel" "$_guard"; do
+    [ "$_cand" = "none" ] && continue
+    [ -z "$_cand" ] && continue
+    if [ "$_cur" = "none" ]; then _cur=$_cand
+    elif _upd_newer "$_cand" "$_cur"; then _cur=$_cand
+    fi
+  done
+  [ "$_cur" = "none" ] && _cur=$_core
+  if [ "$_cur" = "none" ]; then _LNEED=true          # nothing deployed at all -> really needs install
+  elif _upd_newer "$1" "$_cur"; then _LNEED=true
+  elif [ "$_cur" = "$1" ] && { [ "$_panel" != "$1" ] || [ "$_guard" != "$1" ] || [ "$_backend" != "$1" ]; }; then
+    _LNEED=true   # partial/misaligned deploy of the same release -> repair
+  fi
+  _LBLK=$(printf '{"core":"%s","panel":"%s","guard":"%s","backend":"%s"}' "$_core" "$_panel" "$_guard" "$_backend")
+}
+
+_upd_check_now() { # $1 = "force" bypasses the TTL cache
+  mkdir -p "$UPD_DIR" 2>/dev/null
+  _age=$(( $(date +%s) - $(date -r "$UPD_CHECK" +%s 2>/dev/null || echo 0) ))
+  if [ "$1" != "force" ] && [ -s "$UPD_CHECK" ] && [ "$_age" -lt "$UPD_TTL" ]; then
+    # cached GitHub answer, but installed versions are always recomputed live
+    _lv=$(sed -n 's/.*"latest":{[^}]*"version":"\([^"]*\)".*/\1/p' "$UPD_CHECK" | head -1)
+    if [ -n "$_lv" ]; then
+      _upd_local_block "$_lv"
+      sed -e 's#"local":{[^}]*}#"local":'"$_LBLK"'#' -e 's#"need":[a-z]*#"need":'"$_LNEED"'#' "$UPD_CHECK"
+      return 0
+    fi
+    cat "$UPD_CHECK"; return 0
+  fi
+  _j=$(curl -fsS -m 10 -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/$UPD_REPO/releases/latest" 2>/dev/null)
+  # GitHub answers pretty-printed JSON -> allow whitespace around ':'
+  _tag=$(printf '%s' "$_j" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  if [ -n "$_tag" ]; then
+    _src=github
+    _dig=$(printf '%s' "$_j" | sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"\(sha256:[0-9a-f]*\)".*/\1/p' | head -1)
+    _pub=$(printf '%s' "$_j" | sed -n 's/.*"published_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  else
+    # fallback: version from raw master (no digest -> sha256 check skipped at apply)
+    _rv=$(curl -fsS -m 12 "https://raw.githubusercontent.com/$UPD_REPO/master/geomask.sh" 2>/dev/null \
+      | sed -n 's/^GM_VERSION="\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$_rv" ] || { printf '{"ok":false,"error":"version source unreachable"}'; return 1; }
+    _tag="v$_rv"; _src=raw; _dig=""; _pub=""
+  fi
+  _ver=$(printf '%s' "$_tag" | sed 's/^v//')
+  _upd_local_block "$_ver"
+  _need=$_LNEED
+  _now=$(date '+%F %T')
+  printf '{"ok":true,"checked_at":"%s","src":"%s","local":%s,"latest":{"tag":"%s","version":"%s","digest":"%s","published":"%s"},"need":%s,"stack":%s}\n' \
+    "$_now" "$_src" "$_LBLK" \
+    "$_tag" "$_ver" "$_dig" "$_pub" "$_need" "$(_upd_stack_json)" > "$UPD_CHECK.tmp" \
+    && mv -f "$UPD_CHECK.tmp" "$UPD_CHECK"
+  cat "$UPD_CHECK"
+}
+
+_upd_running() {
+  # The runner holds the shared kernel `updater` lock from the moment it is spawned until it
+  # exits; a pid file was check-then-write and a killed runner left a pid that could be
+  # reused, so the lock is the truth here (R10).
+  command -v gm_lock_busy >/dev/null 2>&1 || return 1
+  gm_lock_busy updater "$UPD_LOCK"
+}
+
+cmd_upd_check() { _upd_check_now "${1:-}"; printf '\n'; }
+
+# v1.10.0: "stack state" for the panel - sync/last-run, guard events, pins, DPI strategy, health
+cmd_stack() {
+  LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$LANIP" ] || LANIP=192.168.0.1
+  _sync=$(cat /tmp/geomask-sync.state 2>/dev/null)
+  case "$_sync" in '{'*'}'*) : ;; *) _sync='{"ts":"","changed":false,"reload":null,"mt":0,"ai":0,"moved":0}' ;; esac
+  _sd=false; pgrep -f geomask-syncd.sh >/dev/null 2>&1 && _sd=true
+  _sde=false; ls /etc/rc.d/ 2>/dev/null | grep -q geomask-syncd && _sde=true
+  _sci=$(crontab -l 2>/dev/null | grep 'sync_mtrickle_mihomo.sh' | head -1 | awk '{print $1}')
+  [ -n "$_sci" ] || _sci='*/5'
+  _nse=false; crontab -l 2>/dev/null | grep -q 'geomask-nodescan$' && _nse=true
+  _ns=$(cat /tmp/geomask-nodescan.state 2>/dev/null)
+  case "$_ns" in '{'*'}'*) : ;; *) _ns=null ;; esac
+  _guard=$(logread 2>/dev/null | grep geomask-guard | grep -v crond | tail -5 | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  _pin=false; [ -e /root/.geomask-norestart ] && _pin=true
+  _strat=$(json_esc "$(sed -n "/option NFQWS_OPT '/,+1p" /etc/config/zapret 2>/dev/null | tail -1 | tr -d " \t'")")
+  _nu=$(grep -c . /opt/zapret/ipset/zapret-hosts-user.txt 2>/dev/null)
+  _ne=$(grep -c . /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)
+  _nc=$(grep -cE '#[[:space:]]*nochange' /opt/zapret/ipset/zapret-hosts-user-exclude.txt 2>/dev/null)
+  _ng=$(grep -c . /opt/zapret/ipset/zapret-hosts-google.txt 2>/dev/null)
+  _nr=$(grep -c . /opt/zapret/ipset/zapret-hosts-rkn.txt 2>/dev/null)
+  _nt=$(pgrep -f tg-ws-proxy 2>/dev/null | wc -l)
+  _land=false; wget -q -T 3 -O /dev/null http://127.0.0.1:8000/ 2>/dev/null && _land=true
+  printf '{"ok":true,"sync":%s,"syncd":%s,"syncd_enabled":%s,"sync_interval":"%s","nodescan_enabled":%s,"nodescan":%s,"guard":[%s],"pin":%s,"strategy":"%s","lists":{"user":%d,"exclude":%d,"nochange":%d,"google":%d,"rkn":%d},"health":{"tg":%d,"landing":%s},"links":{"magitrickle":"http://%s:8080","zapret":"http://%s:7788","landing":"http://%s:8000","luci":"http://%s/"}}\n' \
+    "$_sync" "$_sd" "$_sde" "$_sci" "$_nse" "$_ns" "$_guard" "$_pin" "$_strat" \
+    "${_nu:-0}" "${_ne:-0}" "${_nc:-0}" "${_ng:-0}" "${_nr:-0}" \
+    "${_nt:-0}" "$_land" "$LANIP" "$LANIP" "$LANIP" "$LANIP"
+}
+
+# v1.9.0: backup folder inventory for the panel (SMB link + files list, newest first)
+# v1.9.4: UNC contains backslashes - MUST go through json_esc (raw \g breaks rpcd parsing)
+cmd_backups() {
+  DIR="$BACKUP_DIR"
+  LANIP=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$LANIP" ] || LANIP=192.168.0.1
+  _sh=false
+  grep -qF '[geomask-backups]' /etc/ksmbd/ksmbd.conf 2>/dev/null && _sh=true
+  _unc=$(json_esc "$(printf '\\\\%s\\geomask-backups' "$LANIP")")
+  _smbu=$(json_esc "$(printf 'smb://%s/geomask-backups' "$LANIP")")
+  _files=''
+  for f in $(ls -t "$DIR"/router-backup-*.tar.gz 2>/dev/null); do
+    [ -f "$f" ] || continue
+    _n=$(basename "$f")
+    _sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+    _t=$(date -r "$f" '+%F %T' 2>/dev/null)
+    _files="$_files{\"n\":\"$_n\",\"s\":${_sz:-0},\"t\":\"$_t\"},"
+  done
+  _files=${_files%,}
+  # No credentials are advertised: the share is created only on explicit opt-in and uses a
+  # named ksmbd user the owner creates. The old fields exposed a known backup/backup login.
+  _optin=false
+  [ -f /etc/geomask/backup-share.enable ] && _optin=true
+  printf '{"ok":true,"dir":"%s","unc":"%s","smb":"%s","share_ok":%s,"optin":%s,"auth":"named user (ksmbd.adduser)","files":[%s]}\n' \
+    "$DIR" "$_unc" "$_smbu" "$_sh" "$_optin" "$_files"
+}
+
+MODULE_UPDATER=/usr/lib/geomask/geomask-module-update.py
+DOCTOR=/usr/lib/geomask/geomask-doctor.py
+
+# The diagnostics engine ships as its own optional module: without it the tab must say so
+# instead of failing with an empty answer.
+_diag_missing() {
+  printf '{"ok":false,"error":"модуль doctor не установлен"}\n'
+  return 1
+}
+
+# The Diagnostics tab and the archive both need the same registry snapshot. It reads the cached
+# last results and the log paths; it never executes a check (R09: download must not probe).
+_diag_list_json() {
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  "$PYTHON_BIN" -B "$DOCTOR" list 2>&1
+}
+
+cmd_diag_list() {
+  # Registry plus the results of the last run; never runs a check, so the tab paints fast.
+  _diag_list_json
+}
+
+cmd_diag_run() { # $1 = check id or "all"
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  case "$1" in
+    ''|*[!A-Za-z0-9_]*) printf '{"ok":false,"error":"bad check id"}\n'; return 1 ;;
+  esac
+  python3 "$DOCTOR" run "$1" 2>&1
+}
+
+cmd_diag_log() { # $1 = check id
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  case "$1" in
+    ''|*[!A-Za-z0-9_]*) printf '{"ok":false,"error":"bad check id"}\n'; return 1 ;;
+  esac
+  python3 "$DOCTOR" log "$1" 2>&1
+}
+
+cmd_diag_domain() { # $1 = domain, $2 = "live" to make a real request
+  [ -f "$DOCTOR" ] || { _diag_missing; return 1; }
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) printf '{"ok":false,"error":"bad domain"}\n'; return 1 ;;
+  esac
+  if [ "$2" = "live" ] || [ "$2" = "1" ]; then
+    python3 "$DOCTOR" domain "$1" --live 2>&1
+  else
+    python3 "$DOCTOR" domain "$1" 2>&1
+  fi
+}
+
+cmd_mod_list() {
+  # Installed modules and what the cached index says about them. Read-only: never
+  # touches the network, so the panel can paint the list instantly.
+  if [ ! -f "$MODULE_UPDATER" ]; then
+    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
+  fi
+  python3 "$MODULE_UPDATER" status 2>&1
+}
+
+cmd_mod_check() {
+  # Force a fresh index fetch; falls back to the cache when the network is down.
+  if [ ! -f "$MODULE_UPDATER" ]; then
+    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
+  fi
+  python3 "$MODULE_UPDATER" check 2>&1
+}
+
+cmd_mod_update() { # $1 = module id, $2 = "force" to overwrite local edits
+  if [ ! -f "$MODULE_UPDATER" ]; then
+    printf '{"ok":false,"error":"module updater not installed"}\n'; return 1
+  fi
+  case "$1" in
+    ''|*[!A-Za-z0-9_]*) printf '{"ok":false,"error":"bad module id"}\n'; return 1 ;;
+  esac
+  _require_backup || return 1
+  if [ "$2" = "force" ]; then
+    python3 "$MODULE_UPDATER" update "$1" --force 2>&1
+  else
+    python3 "$MODULE_UPDATER" update "$1" 2>&1
+  fi
+}
+
+cmd_upd_status() {
+  mkdir -p "$UPD_DIR" 2>/dev/null
+  if [ -s "$UPD_STATUS" ]; then _b=$(cat "$UPD_STATUS"); else _b='{"phase":"idle"}'; fi
+  # v1.8.0 console list: tail of steps.log as a "lines" JSON array (each say() appends there)
+  _lines=$(tail -60 "$UPD_DIR/steps.log" 2>/dev/null | while IFS= read -r _l; do printf '"%s",' "$(json_esc "$_l")"; done | sed 's/,$//')
+  printf '%s,"lines":[%s]}\n' "${_b%\}}" "$_lines"
+}
+

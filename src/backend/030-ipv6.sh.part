@@ -1,0 +1,418 @@
+_ipv6_apply_off() { # every write of the disabled state; no commit, no reload
+  # Record BEFORE the first change, and stop if it cannot be written: turning IPv6 off with
+  # no way back is exactly the trap that G04 described.
+  _ipv6_save || return 1
+  _ipv6_kernel 1 || return 1
+  uci set network.lan.ip6assign='0' 2>/dev/null || return 1
+  uci set dhcp.lan.ra='disabled' 2>/dev/null || return 1
+  uci set dhcp.lan.dhcpv6='disabled' 2>/dev/null || return 1
+  uci set dhcp.lan.ndp='disabled' 2>/dev/null || return 1
+  # The real LAN section may not be called `lan` (C06/P06): disabling only the hardcoded name
+  # left IPv6 running on the interface that actually serves the LAN.
+  for _if in $(_ipv6_interfaces); do
+    [ "$_if" = lan ] && continue
+    uci set "network.$_if.ip6assign=0" 2>/dev/null || return 1
+    uci set "dhcp.$_if.ra=disabled" 2>/dev/null || return 1
+    uci set "dhcp.$_if.dhcpv6=disabled" 2>/dev/null || return 1
+    uci set "dhcp.$_if.ndp=disabled" 2>/dev/null || return 1
+  done
+  _ipv6_guard_install || return 1
+  return 0
+}
+
+_ipv6_apply_on() { # every write of the restored state; no commit, no reload
+  _ipv6_kernel_restore || return 1
+  _ipv6_restore || return 1
+  _ipv6_guard_restore || return 1
+  return 0
+}
+
+cmd_ipv6() {
+  _require_backup || return 1
+  case "$1" in
+    off|on) ;;
+    *) printf '{"error":"bad arg"}'; return 1 ;;
+  esac
+  if [ "$1" = off ]; then
+    cp -n /etc/config/network "/etc/config/network.bak_v6off_$(date +%s)" 2>/dev/null || true
+    if ! _ipv6_apply_off; then
+      printf '{"ok":false,"error":"cannot apply IPv6 off - previous settings restored"}\n'
+      _ipv6_restore; uci commit network 2>/dev/null; uci commit dhcp 2>/dev/null
+      return 1
+    fi
+  else
+    if ! _ipv6_apply_on; then
+      printf '{"ok":false,"error":"cannot restore the previous IPv6 settings - record kept"}\n'
+      return 1
+    fi
+  fi
+  if ! uci commit network 2>/dev/null || ! uci commit dhcp 2>/dev/null; then
+    printf '{"ok":false,"error":"uci commit failed - previous settings restored"}\n'
+    _ipv6_restore; uci commit network 2>/dev/null; uci commit dhcp 2>/dev/null
+    return 1
+  fi
+  if ! reload_config 2>/dev/null && ! ubus call network reload >/dev/null 2>&1; then
+    printf '{"ok":false,"error":"network reload failed - check /etc/config/network"}\n'
+    return 1
+  fi
+  # Only a successful `on` consumes the record: the next `off` must save the value that is
+  # current then, not the one from months ago.
+  [ "$1" = on ] && rm -f "$IPV6_STATE" 2>/dev/null
+  sleep 1
+  # Report OUR own result. The previous version ended with cmd_status, whose JSON has no "ok"
+  # field, so the installer read a successful switch as a failure every time.
+  _v6g=$(ip -6 addr show scope global 2>/dev/null | grep -c 'inet6 ')
+  case "$_v6g" in ''|*[!0-9]*) _v6g=0 ;; esac
+  printf '{"ok":true,"state":"%s","global":%s,"ip6assign":"%s","ra":"%s","dhcpv6":"%s"}\n' \
+    "$1" "$_v6g" "$(uci -q get network.lan.ip6assign 2>/dev/null)" \
+    "$(uci -q get dhcp.lan.ra 2>/dev/null)" "$(uci -q get dhcp.lan.dhcpv6 2>/dev/null)"
+}
+
+# AI-DNS on demand: regenerate the nft DNAT list for ai-mode devices + reload firewall.
+# Installs nothing (that is the installer's aidns step); only re-syncs the device list.
+cmd_aidns_apply() {
+  if [ -f "$AIDNS_OFF_FILE" ]; then
+    printf '{"ok":true,"warn":"AI-DNS disabled (/etc/geomask-aidns.off)"}'
+    return 0
+  fi
+  if [ ! -f "$AIDNS_UID_FILE" ]; then
+    # "Not installed" was answered with rc 0, so a caller could not tell the no-op from a
+    # successful apply. The JSON keeps `warn` for the panel and names the state explicitly;
+    # the exit code is the honest one (R10b item 4).
+    printf '{"ok":false,"state":"not_installed","warn":"AI-DNS not installed - run the aidns step of geomask"}\n'
+    return 1
+  fi
+  _before=$(sha256sum "$AIDNS_NFT_DEST" 2>/dev/null | awk '{print $1}')
+  _aidns_sync
+  _after=$(sha256sum "$AIDNS_NFT_DEST" 2>/dev/null | awk '{print $1}')
+  if [ "$(cat "$AIDNS_STATE" 2>/dev/null)" = error ]; then
+    printf '{"ok":false,"error":"AI-DNS listen address is unknown: client DNS is rejected (fail closed)"}'
+    return 1
+  fi
+  if [ "$(cat "$AIDNS_STATE" 2>/dev/null)" = pending ]; then
+    # C04: the include is written but the kernel is not running it. Saying ok here is what made
+    # the persisted file look like the applied state.
+    printf '{"ok":false,"state":"pending","error":"AI-DNS include written but not active (firewall reload failed) - the next sync retries"}\n'
+    return 1
+  fi
+  if [ "$_before" != "$_after" ]; then
+    echo "$(date +%FT%T) AI-DNS apply (manual)" >> "$LOG"
+    printf '{"ok":true,"warn":""}'
+  else
+    printf '{"ok":true,"warn":"no changes"}'
+  fi
+  return 0
+}
+
+# strict IPv4: four octets, 0-255, not the unspecified/broadcast address
+_ipv4_ok() {
+  awk -v ip="$1" 'BEGIN{
+    n=split(ip,A,"."); if (n != 4) exit 1;
+    for (i=1; i<=4; i++) { if (A[i] !~ /^[0-9]+$/ || A[i] < 0 || A[i] > 255) exit 1 }
+    if (ip == "0.0.0.0" || ip == "255.255.255.255") exit 1;
+    exit 0
+  }'
+}
+
+_devices_lock() {
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire devices 20 "$DEVICES_LOCK"
+}
+
+_devices_unlock() {
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release devices
+}
+
+# G03: find the dhcp host section for an exact MAC (not a substring of the whole uci dump).
+_dhcp_host_section() { # _dhcp_host_section <mac> -> section id, empty when absent
+  _dhs_out=$(uci -q show dhcp 2>/dev/null) || return 0
+  printf '%s\n' "$_dhs_out" | awk -F= -v mac="$1" '
+    $1 ~ /\.mac$/ {
+      value = $2
+      gsub(/^\047|\047$/, "", value)
+      if (value != mac) next
+      section = $1; sub(/\.mac$/, "", section); sub(/^[^.]+\./, "", section)
+      print section; exit
+    }'
+}
+
+_dhcp_owned_add() { # _dhcp_owned_add <section> <ip> <mac>
+  mkdir -p "$(dirname "$DHCP_OWNED")" 2>/dev/null
+  _do_tmp="$DHCP_OWNED.tmp.$$"
+  _devices_lock || return 1
+  if [ -f "$DHCP_OWNED" ]; then
+    awk -F'|' -v id="$1" '$1!=id' "$DHCP_OWNED" > "$_do_tmp" 2>/dev/null || { rm -f "$_do_tmp"; _devices_unlock; return 1; }
+    mv -f "$_do_tmp" "$DHCP_OWNED" 2>/dev/null || { rm -f "$_do_tmp"; _devices_unlock; return 1; }
+  fi
+  printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$DHCP_OWNED"
+  chmod 600 "$DHCP_OWNED" 2>/dev/null
+  _devices_unlock
+}
+
+# add/update a device geo-policy: dev_add <ip> <mode> [mac] [name]
+cmd_dev_add() {
+  IP="$1"; MODE="$2"; MAC="$3"; NAME="${4:-$IP}"
+  _ipv4_ok "$IP" || { printf '{"error":"bad ip"}'; return 1; }
+  case "$MODE" in bypass|realtz|ai) ;; *) printf '{"error":"bad mode"}'; return 1 ;; esac
+  NAME=$(printf '%s' "$NAME" | tr -d '"\\"\n\r\t' | head -c 64)
+  _require_backup || return 1
+  mkdir -p "$(dirname "$DEVICES")"; touch "$DEVICES"
+  # replace existing entry for this ip (exact first field, not a regex: a dotted address used
+  # as a regex matches unrelated lines). A failed awk (ENOSPC) must NOT leave an empty file
+  # behind: the old `|| : > tmp` truncated the list and dropped every device policy.
+  # The rewrite runs under the shared `devices` lock and through a per-process temp, so two
+  # panel calls cannot install a list built from the same stale baseline (report R08).
+  _devices_lock || { printf '{"ok":false,"error":"device list is busy: another writer holds the lock"}\n'; return 1; }
+  _dv_tmp="$DEVICES.tmp.$$"
+  if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$_dv_tmp" 2>/dev/null; then
+    rm -f "$_dv_tmp"; _devices_unlock
+    printf '{"ok":false,"error":"cannot rewrite %s (disk full?) - nothing changed"}\n' "$DEVICES"
+    return 1
+  fi
+  if ! mv -f "$_dv_tmp" "$DEVICES"; then
+    rm -f "$_dv_tmp"; _devices_unlock
+    printf '{"ok":false,"error":"cannot replace %s - nothing changed"}\n' "$DEVICES"
+    return 1
+  fi
+  echo "$IP $MODE $NAME" >> "$DEVICES"
+  _devices_unlock
+  # stable lease if mac given (strict MAC format only)
+  if [ -n "$MAC" ] && echo "$MAC" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'; then
+    # G03 (audit 18.11.2026): the old probe was `uci show dhcp | grep ".mac=<mac>"` - a substring
+    # match that also skipped updating a lease whose IP changed - and every `uci set` ran with its
+    # exit code ignored, so a failed set still committed a host section with an empty ip/name and
+    # recorded ownership for it. Section lookup, writes and ownership are now explicit.
+    _dh_section=$(_dhcp_host_section "$MAC")
+    if [ -z "$_dh_section" ]; then
+      _dh_section=$(uci add dhcp host 2>/dev/null)
+    fi
+    if [ -n "$_dh_section" ]; then
+      _dh_ok=1
+      uci set "$_dh_section.mac=$MAC" 2>/dev/null || _dh_ok=0
+      [ "$_dh_ok" = 1 ] && { uci set "$_dh_section.ip=$IP" 2>/dev/null || _dh_ok=0; }
+      [ "$_dh_ok" = 1 ] && { uci set "$_dh_section.name=$NAME" 2>/dev/null || _dh_ok=0; }
+      if [ "$_dh_ok" = 1 ] && uci commit dhcp 2>/dev/null \
+         && [ "$(uci -q get "$_dh_section.mac" 2>/dev/null)" = "$MAC" ] \
+         && [ "$(uci -q get "$_dh_section.ip" 2>/dev/null)" = "$IP" ]; then
+        _dhcp_owned_add "$_dh_section" "$IP" "$MAC"
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+      else
+        # Nothing half-written survives: the section is removed and no ownership is recorded,
+        # so a later run retries instead of trusting an empty host entry.
+        uci -q delete "$_dh_section" 2>/dev/null
+        uci commit dhcp 2>/dev/null
+        warn "dhcp host set/commit failed - static lease not created (no ownership recorded)"
+      fi
+    else
+      warn "dhcp host section could not be created - static lease not created"
+    fi
+  fi
+  _apply_routing || warn "routing not fully applied - see $LOG"
+  echo "$(date +%FT%T) DEV add $IP mode=$MODE ($NAME)" >> "$LOG"
+  cmd_status
+}
+
+cmd_dev_del() {
+  IP="$1"
+  _ipv4_ok "$IP" || { printf '{"error":"bad ip"}'; return 1; }
+  _require_backup || return 1
+  if [ -f "$DEVICES" ]; then
+    _devices_lock || { printf '{"ok":false,"error":"device list is busy: another writer holds the lock"}\n'; return 1; }
+    _dv_tmp="$DEVICES.tmp.$$"
+    if ! awk -v ip="$IP" '$1 != ip' "$DEVICES" > "$_dv_tmp" 2>/dev/null; then
+      rm -f "$_dv_tmp"; _devices_unlock
+      printf '{"ok":false,"error":"cannot rewrite %s (disk full?) - nothing changed"}\n' "$DEVICES"
+      return 1
+    fi
+    mv -f "$_dv_tmp" "$DEVICES" || { rm -f "$_dv_tmp"; _devices_unlock; printf '{"ok":false,"error":"cannot replace %s"}\n' "$DEVICES"; return 1; }
+    _devices_unlock
+  fi
+  # remove rules for this ip explicitly per table (bypass -> main, ai -> 101).
+  # NEVER delete by pref alone: all per-device rules share priority 19900, so
+  # `ip rule del pref` would drop another device's rule (and _apply_routing re-adds it)
+  ip rule del from "$IP" lookup main 2>/dev/null || true
+  ip rule del from "$IP" lookup 101 2>/dev/null || true
+  # DHCP: only a host section geomask created for this exact address may be removed. The old
+  # code took the first section whose ip matched and deleted it - including the owner's own
+  # static lease (audit 14.11.2026, F09).
+  _sec=$(awk -F'|' -v ip="$IP" '$2==ip {print $1; exit}' "$DHCP_OWNED" 2>/dev/null)
+  if [ -n "$_sec" ]; then
+    _sip=$(uci -q get "$_sec.ip" 2>/dev/null)
+    _smac=$(uci -q get "$_sec.mac" 2>/dev/null)
+    if [ "$_sip" = "$IP" ] && [ -n "$_smac" ]; then
+      if uci -q delete "$_sec" 2>/dev/null && uci commit dhcp 2>/dev/null; then
+        _do_tmp="$DHCP_OWNED.tmp.$$"
+        if _devices_lock; then
+          awk -F'|' -v id="$_sec" '$1!=id' "$DHCP_OWNED" > "$_do_tmp" 2>/dev/null \
+            && mv -f "$_do_tmp" "$DHCP_OWNED" 2>/dev/null
+          rm -f "$_do_tmp"
+          _devices_unlock
+        fi
+      else
+        warn "cannot remove dhcp host $_sec - section left in place"
+      fi
+    else
+      warn "dhcp host $_sec no longer matches $IP - left in place"
+    fi
+  fi
+  _apply_routing || warn "routing not fully applied - see $LOG"
+  echo "$(date +%FT%T) DEV del $IP" >> "$LOG"
+  cmd_status
+}
+
+# AI-DNS: keep the nft DNAT list in sync with the ai-mode devices of /etc/geo-devices.list.
+# No-op when the step was not installed (/etc/geomask-aidns.uid absent) or disabled
+# (/etc/geomask-aidns.off present). Firewall is reloaded only when the list changes.
+# NOTE: the AI dnsmasq listens on the LAN alias at :5353 (NOT :53) - the main dnsmasq
+# rebinds every interface address including our alias, so :53 there is taken.
+# The AI-DNS address belongs to this router's LAN, not to one owner's network: read it from
+# the config the installer wrote, then from the UCI alias. It is never derived from the
+# router address - `.53` is outside a /25 and equals the router itself on some LANs.
+_gm_lan_prefix() {
+  ip -4 addr show "$(_gm_lan_iface)" 2>/dev/null \
+    | sed -n 's/.*inet [0-9.]*\/\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+_gm_lan_ip() {
+  ip -4 addr show "$(_gm_lan_iface)" 2>/dev/null \
+    | sed -n 's/.*inet \([0-9][0-9.]*\)\/.*/\1/p' | head -1
+}
+
+_gm_aidns_usable() { # _gm_aidns_usable <candidate> <lan-ip> <prefix>
+  awk -v ip="$1" -v lan="$2" -v p="$3" 'BEGIN{
+    n=split(ip,A,"."); m=split(lan,B,".");
+    if (n != 4 || m != 4) exit 1;
+    for (i=1; i<=4; i++) { if (A[i] !~ /^[0-9]+$/ || A[i] < 0 || A[i] > 255) exit 1 }
+    for (i=1; i<=4; i++) { if (B[i] !~ /^[0-9]+$/ || B[i] < 0 || B[i] > 255) exit 1 }
+    ipn=((A[1]*256+A[2])*256+A[3])*256+A[4];
+    lann=((B[1]*256+B[2])*256+B[3])*256+B[4];
+    size=2^(32-p); net=int(lann/size)*size;
+    if (ipn < net+1 || ipn > net+size-2) exit 1;
+    if (ipn == lann) exit 1;
+    exit 0
+  }'
+}
+
+# The AI-DNS address belongs to this router's LAN, not to one owner's network: read it from
+# the config the installer wrote, then from the UCI alias - and validate it against the LIVE
+# subnet. The old version returned whatever the file contained (audit 14.11.2026, F11).
+_gm_aidns_ip() {
+  _a=$(sed -n 's/^listen-address=\([0-9.]*\).*/\1/p' /etc/dnsmasq-ai.conf 2>/dev/null | head -1)
+  if [ -z "$_a" ]; then
+    _a=$(uci -q get network.lanai.ipaddr 2>/dev/null)
+  fi
+  case "$_a" in *.*.*.*) ;; *) printf ''; return 0 ;; esac
+  _lip=$(_gm_lan_ip)
+  _lpfx=$(_gm_lan_prefix)
+  case "$_lpfx" in ''|*[!0-9]*) _lpfx=24 ;; esac
+  [ "$_lpfx" -ge 1 ] 2>/dev/null || _lpfx=24
+  [ "$_lpfx" -le 30 ] 2>/dev/null || { printf ''; return 0; }
+  case "$_lip" in *.*.*.*) ;; *) printf ''; return 0 ;; esac
+  _gm_aidns_usable "$_a" "$_lip" "$_lpfx" || { printf ''; return 0; }
+  printf '%s' "$_a"
+}
+
+_gm_lan_iface() {
+  _i=$(uci -q get network.lan.device 2>/dev/null)
+  [ -n "$_i" ] || _i=$(uci -q get network.lan.ifname 2>/dev/null)
+  case "$_i" in ''|*[!a-zA-Z0-9._-]*) _i=br-lan ;; esac
+  printf '%s' "$_i"
+}
+
+_gm_lan_devices() { # every LAN-zone device, not just br-lan/br-lan.1
+  # A configured device is included even when it does not exist yet: nft `iifname` matches by
+  # name at packet time, and filtering on `ip link show` meant a VLAN/guest bridge created
+  # later stayed without an accept rule until the panel ran again (audit 14.11.2026, F18).
+  _devs=""
+  for _z in $(uci -q show firewall 2>/dev/null | sed -n 's/^firewall\.\([^.=]*\)=zone$/\1/p'); do
+    [ "$(uci -q get "firewall.$_z.name" 2>/dev/null)" = "lan" ] || continue
+    for _n in $(uci -q get "firewall.$_z.network" 2>/dev/null); do
+      _d=$(uci -q get "network.$_n.device" 2>/dev/null)
+      [ -n "$_d" ] || _d=$(uci -q get "network.$_n.ifname" 2>/dev/null)
+      # a list of ports is a bridge: the interface that carries the address is br-<network>
+      case "$_d" in *" "*|"") _d="br-$_n" ;; esac
+      case "$_d" in ''|*[!a-zA-Z0-9._-]*) continue ;; esac
+      case " $_devs " in *" $_d "*) ;; *) _devs="$_devs $_d" ;; esac
+    done
+  done
+  _d=$(_gm_lan_iface)
+  case " $_devs " in *" $_d "*) ;; *) _devs="$_devs $_d" ;; esac
+  printf '%s' "$_devs"
+}
+
+_gm_nft_names() { # "a b" -> "a", "b"  (nft set syntax)
+  _out=""
+  for _n in $1; do _out="$_out\"$_n\", "; done
+  printf '%s' "${_out%, }"
+}
+
+_ai_drop_write() { # regenerate the AI accept rule for the current LAN devices
+  _devs=$(_gm_lan_devices)
+  _names=$(_gm_nft_names "$_devs")
+  mkdir -p /usr/share/nftables.d/ruleset-post
+  {
+    printf '# geomask-lan: %s\n' "$_devs"
+    printf 'table inet fw4 {\n'
+    printf '    chain accept_to_AI {\n'
+    [ -n "$_names" ] && printf '        iifname { %s } oifname "AI" counter accept comment "custom: LAN clients to AI tunnel"\n' "$_names"
+    printf '        iifname "Wireguard" oifname "AI" counter accept comment "custom: WG peers to AI tunnel"\n'
+    printf '    }\n}\n'
+  } > /usr/share/nftables.d/ruleset-post/99-ai-accept.nft
+}
+
+_gm_sync_routes() { # _gm_sync_routes <table> - mirror LAN connected routes only
+  # One implementation, shared with the ifup hotplug script: the old copy here mirrored
+  # every non-default route and deleted anything it did not find in `main`, including
+  # routes another policy router owned (audit 14.11.2026, F01/F02).
+  [ -r "$GM_ROUTES_LIB" ] || return 1
+  . "$GM_ROUTES_LIB"
+  geomask_routes_sync "$1"
+}
+
+AIDNS_DNS_PORT=5353
+AIDNS_NFT_DEST=${GM_AIDNS_NFT:-/usr/share/nftables.d/ruleset-post/98-geomask-ai-dns.nft}
+AIDNS_UID_FILE=${GM_AIDNS_UID:-/etc/geomask-aidns.uid}
+AIDNS_OFF_FILE=${GM_AIDNS_OFF:-/etc/geomask-aidns.off}
+# Outcome of the last sync, read by status. A parameterless hard path here was one of the ways
+# the tests wrote into the host's /tmp (review 15.11, point 1).
+AIDNS_STATE=${GM_AIDNS_STATE:-/tmp/geomask-aidns.state}
+# C04 (audit 18.11.2026): the include and state=ok were written BEFORE the firewall reload, a
+# failed reload only logged a line, and the identical next run cmp-returned without retrying -
+# so the persisted include was never the applied DNAT. The marker records "written, not proven
+# active"; every later sync retries the reload and the read-back before it may say ok.
+AIDNS_PENDING=${GM_AIDNS_PENDING:-/tmp/geomask-aidns.pending}
+AIDNS_FW_INIT=${GM_AIDNS_FW_INIT:-/etc/init.d/firewall}
+# C04: the previous device list is a runtime witness like the state file; a hardcoded
+# /tmp path here escaped the sandbox in tests and could collide with another run.
+AIDNS_LAST=${GM_AIDNS_LAST:-/tmp/geomask-aidns-last}
+
+# Read-back: the reload is trusted only when the kernel actually carries our table.
+_aidns_active() {
+  nft list table inet geomask_ai_dns 2>/dev/null | grep -qE 'dnat ip to|counter reject'
+}
+
+_aidns_mark_pending() { # _aidns_mark_pending <reason> -> keeps the attempt counter
+  _ap_n=0
+  [ -f "$AIDNS_PENDING" ] && _ap_n=$(sed -n 's/^attempts=//p' "$AIDNS_PENDING" 2>/dev/null | head -1)
+  case "$_ap_n" in ''|*[!0-9]*) _ap_n=0 ;; esac
+  _ap_n=$((_ap_n + 1))
+  { printf 'attempts=%s\n' "$_ap_n"; printf 'reason=%s\n' "$1"; } > "$AIDNS_PENDING" 2>/dev/null || true
+  printf 'pending' > "$AIDNS_STATE"
+  return "$_ap_n"
+}
+
+_aidns_clear_pending() {
+  rm -f "$AIDNS_PENDING" 2>/dev/null || true
+}
+
+# One place for "write happened, now prove the runtime": returns 0 only when the table is live.
+_aidns_reload_prove() {
+  # The init script is a variable so a test can point at a stub; production default unchanged.
+  if ! "$AIDNS_FW_INIT" reload >/dev/null 2>&1; then
+    sleep 1
+    "$AIDNS_FW_INIT" reload >/dev/null 2>&1 || return 1
+  fi
+  _aidns_active
+}
+

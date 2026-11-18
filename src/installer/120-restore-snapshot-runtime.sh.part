@@ -1,0 +1,333 @@
+_rs_snap_runtime() { # _rs_snap_runtime <dir> - tri-state enabled/running per service
+  while IFS='|' read -r _rs_id _rs_kind _rs_initd _rs_pid _rs_mode _rs_extra; do
+    [ "${_rs_kind:-}" = service ] || continue
+    _rs_svc_scope "$_rs_id" || continue
+    for _rs_is in $(printf '%s' "$_rs_initd" | tr '/' ' '); do
+      if ! _rs_safe_exec "/etc/init.d/$_rs_is"; then
+        bad "snapshot: init script /etc/init.d/$_rs_is is behind an unsafe or unpinned symlink"
+        return 1
+      fi
+    done
+    _rs_en=$(_rs_svc_enabled "$_rs_initd")
+    _rs_run=$(_rs_svc_running "$_rs_pid" "$_rs_mode")
+    if [ "$_rs_en" = unknown ]; then
+      bad "snapshot: runtime state unobservable: $_rs_id (enabled unknown)"
+      return 1
+    fi
+    if [ "$_rs_run" = unknown ]; then
+      bad "snapshot: runtime state unobservable: $_rs_id (running unknown)"
+      return 1
+    fi
+    printf '%s|%s|%s|%s|%s|%s\n' "$_rs_id" "$_rs_initd" "$_rs_pid" "$_rs_mode" "$_rs_en" "$_rs_run" >> "$_rs_snap/services"
+  done <<EOF
+${REINSTALL_PREFLIGHT_OBJECTS:-}
+EOF
+  # network/firewall are reloaded directly by the rollback even when their service row
+  # is out of scope; pin them too so a target swap cannot redirect the reload.
+  for _rs_is in network firewall; do
+    if ! _rs_safe_exec "/etc/init.d/$_rs_is"; then
+      bad "snapshot: /etc/init.d/$_rs_is is behind an unsafe or unpinned symlink"
+      return 1
+    fi
+  done
+  return 0
+}
+
+_rs_snap_links() { # <dir> - exact rc.d link names AND targets of our services
+  _rs_ld="$(P /etc/rc.d)"
+  if ! _rs_safe_path /etc/rc.d; then
+    bad "snapshot: /etc/rc.d is behind a symlink - refusing to read autostart links through it"
+    return 1
+  fi
+  if [ ! -d "$_rs_ld" ] || ! ls "$_rs_ld" >/dev/null 2>&1; then
+    bad "snapshot: rc.d autostart links unobservable"
+    return 1
+  fi
+  : > "$_rs_snap/links" || return 1
+  for _rs_lf in "$_rs_ld"/*; do
+    [ -L "$_rs_lf" ] || continue
+    _rs_ln=${_rs_lf##*/}
+    case "$_rs_ln" in
+      [SK][0-9][0-9]*) : ;;
+      *) continue ;;
+    esac
+    _rs_ls=${_rs_ln#[SK]}
+    _rs_ls=${_rs_ls#??}
+    _rs_link_owned "$_rs_ls" || continue
+    _rs_lt=$(readlink "$_rs_lf" 2>/dev/null) \
+      || { bad "snapshot: cannot read the target of $_rs_ln"; return 1; }
+    printf '%s|%s\n' "$_rs_ln" "$_rs_lt" >> "$_rs_snap/links"
+  done
+  return 0
+}
+
+_rs_snap_net() { # _rs_snap_net <dir> - ip rule, nft table content, alias address
+  ip rule show > "$_rs_snap/iprule.raw" 2>/dev/null \
+    || { bad "snapshot: ip rule state unobservable"; return 1; }
+  _rs_irs=$(_rs_iprule_state) || { bad "snapshot: ip rule state unobservable"; return 1; }
+  printf 'iprule|%s\n' "$_rs_irs" >> "$_rs_snap/net"
+  : > "$_rs_snap/nft-ai.list" || return 1
+  : > "$_rs_snap/nft-v6.list" || return 1
+  nft list table inet geomask_ai_dns > "$_rs_snap/nft-ai.list" 2>/dev/null
+  _rs_nr=$?
+  case "$_rs_nr" in
+    0) printf 'nft-ai|present\n' >> "$_rs_snap/net" ;;
+    1) : > "$_rs_snap/nft-ai.list"; printf 'nft-ai|absent\n' >> "$_rs_snap/net" ;;
+    *) bad "snapshot: nft state unobservable: inet geomask_ai_dns (rc=$_rs_nr)"; return 1 ;;
+  esac
+  nft list chain inet fw4 geomask_no_v6 > "$_rs_snap/nft-v6.list" 2>/dev/null
+  _rs_nr=$?
+  case "$_rs_nr" in
+    0) printf 'nft-v6|present\n' >> "$_rs_snap/net" ;;
+    1) : > "$_rs_snap/nft-v6.list"; printf 'nft-v6|absent\n' >> "$_rs_snap/net" ;;
+    *) bad "snapshot: nft state unobservable: inet fw4 geomask_no_v6 (rc=$_rs_nr)"; return 1 ;;
+  esac
+  _rs_ai=$(uci -q get network.lanai.ipaddr 2>/dev/null)
+  _rs_ad=$(uci -q get network.lanai.device 2>/dev/null)
+  if [ -n "${_rs_ai:-}" ]; then
+    printf 'alias|present|%s|%s\n' "$_rs_ad" "$_rs_ai" >> "$_rs_snap/net"
+  else
+    printf 'alias|absent||\n' >> "$_rs_snap/net"
+  fi
+  return 0
+}
+
+_reinstall_snapshot() { # <dir> -> 0 when captured; pin mode is always reset
+  _rs_pin_mode=1
+  _rs_snapshot_capture "$@"
+  _rs_snapshot_rc=$?
+  _rs_pin_mode=0
+  # A successful snapshot arms pin enforcement for the install actions that follow;
+  # a failed/aborted snapshot must not leave the caller unable to use initd.
+  if [ "$_rs_snapshot_rc" = 0 ]; then _rs_pin_enforce=1; else _rs_pin_enforce=0; fi
+  return $_rs_snapshot_rc
+}
+
+_rs_snapshot_capture() { # <dir> - body of the snapshot, runs with pin mode 1
+  _rs_snap="$1"
+  mkdir -p "$_rs_snap/files" 2>/dev/null || return 1
+  : > "$_rs_snap/symlinks" || return 1
+  if ! _rs_critical_paths_safe; then
+    bad "snapshot: unsafe or unpinned symlink in a tracked path; reinstall refused before mutation"
+    return 1
+  fi
+  : > "$1/present"; : > "$1/absent"; : > "$1/rc.d"
+  : > "$_rs_snap/objects" || return 1
+  : > "$_rs_snap/listing" || return 1
+  : > "$_rs_snap/links" || return 1
+  : > "$_rs_snap/uci" || return 1
+  : > "$_rs_snap/services" || return 1
+  : > "$_rs_snap/sysctl" || return 1
+  : > "$_rs_snap/net" || return 1
+  : > "$_rs_snap/shared" || return 1
+  printf 'schema=2\nprefix=%s\n' "$GM_PREFIX" > "$_rs_snap/meta" || return 1
+  if [ -n "${GM_AUTO_LANE:-}" ]; then
+    bad "snapshot: GM_AUTO_LANE is armed - geomask-lane.sh would create uci/service objects this snapshot cannot journal; reinstall refused before mutation"
+    return 1
+  fi
+  _rs_snap_listing || return 1
+  _rs_snap_cron || return 1
+  _rs_snap_files || return 1
+  _rs_snap_shared || return 1
+  _rs_snap_uci || return 1
+  _rs_snap_sysctl || return 1
+  _rs_snap_runtime || return 1
+  _rs_snap_links || return 1
+  _rs_snap_net || return 1
+  info "snapshot: state recorded in $_rs_snap"
+  return 0
+}
+
+_rs_stop_new_services() { # _rs_stop_new_services <dir> - stop what the run started, BEFORE
+  # file restore deletes the init scripts the failed install created. A refused stop is an
+  # error: leaving a service running that was stopped before is not a rollback.
+  [ -f "$_rs_snap/services" ] || return 0
+  while IFS='|' read -r _rs_id _rs_initd _rs_pid _rs_mode _rs_en _rs_run; do
+    [ -n "${_rs_id:-}" ] || continue
+    [ "$_rs_run" = 0 ] || continue
+    _rs_now=$(_rs_svc_running "$_rs_pid" "$_rs_mode")
+    [ "$_rs_now" = 1 ] || continue
+    _rs_stop_service "$_rs_initd" \
+      || { bad "rollback: cannot stop $_rs_id (it was stopped before the run)"; _rr=1; }
+  done < "$_rs_snap/services"
+  return 0
+}
+
+_rs_restore_files() { # <dir> - byte objects, serialised with the config transaction (R04 round 3)
+  # rpcd is reloaded in step2, so by the time a failed reinstall rolls back the panel is live
+  # and can commit config.yaml through geomask-config-tx.py. This restore writes that very
+  # file (cp) and then proves it: without the SAME kernel lock a live commit can land between
+  # the copy and the verification (or be overwritten by an older snapshot), and the rollback
+  # would report a state that no longer exists. Fail closed when the lock cannot be taken.
+  if ! command -v gm_lock_acquire >/dev/null 2>&1; then
+    bad "rollback: lock helper missing - refusing to restore config.yaml without serialisation"
+    _rr=1
+    return 1
+  fi
+  if ! gm_lock_acquire config-tx 30; then
+    bad "rollback: config transaction lock is busy - refusing to restore config.yaml unlocked (retry after the live commit finishes)"
+    _rr=1
+    return 1
+  fi
+  _rs_rf_rc=0
+  _rs_restore_files_unlocked "$@" || _rs_rf_rc=1
+  # Verify the bytes while the lock is still held: no live commit can slip between the copy and
+  # this check. The later _rs_restore_verify repeats it outside the lock on purpose - if a
+  # writer changed the file after our restore, that verify must fail loudly.
+  _rs_verify_files "$@" || { bad "rollback: byte objects do not match the snapshot while the transaction lock is held"; _rs_rf_rc=1; }
+  gm_lock_release config-tx
+  return $_rs_rf_rc
+}
+
+_rs_restore_files_unlocked() { # the byte restore itself; called only under config-tx
+  [ -f "$_rs_snap/objects" ] || { bad "rollback: snapshot objects list missing"; return 1; }
+  while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
+    [ -n "${_rs_op:-}" ] || continue
+    _rs_dst="$(P "$_rs_op")"
+    if [ "$_rs_ok" = absent ]; then
+      if ! _rs_safe_path "$(dirname "$_rs_op")"; then
+        bad "conflict: a path component of $_rs_op is an unsafe or unpinned symlink"
+        _rr=1
+        continue
+      fi
+    elif [ "$_rs_ok" = file ]; then
+      if ! _rs_safe_file "$_rs_op"; then
+        bad "conflict: $_rs_op is a symlink (byte object; refusing to restore through it)"
+        _rr=1
+        continue
+      fi
+    else
+      if ! _rs_safe_path "$_rs_op"; then
+        bad "conflict: $_rs_op (or a parent) is an unsafe or unpinned symlink"
+        _rr=1
+        continue
+      fi
+    fi
+    case "$_rs_ok" in
+      file)
+        if [ ! -f "$_rs_snap/files$_rs_op" ]; then
+          bad "rollback: snapshot has no copy of $_rs_op"
+          _rr=1
+          continue
+        fi
+        if [ -L "$_rs_dst" ] || { [ -e "$_rs_dst" ] && [ ! -f "$_rs_dst" ]; }; then
+          bad "rollback: $_rs_op is not a regular file any more - refusing to overwrite"
+          _rr=1
+          continue
+        fi
+        mkdir -p "$(dirname "$_rs_dst")" 2>/dev/null \
+          || { bad "rollback: cannot create the directory of $_rs_op"; _rr=1; continue; }
+        cp -p "$_rs_snap/files$_rs_op" "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: copy failed for $_rs_op"; _rr=1; continue; }
+        chmod "$_rs_oa" "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: chmod $_rs_oa failed for $_rs_op"; _rr=1; continue; }
+        ;;
+      dirlink)
+        if [ ! -L "$_rs_dst" ] || [ ! -d "$_rs_dst" ]; then
+          bad "conflict: $_rs_op is no longer the pinned symlinked directory"
+          _rr=1
+          continue
+        fi
+        _rs_lh=$(readlink -f "$_rs_dst" 2>/dev/null) || _rs_lh=""
+        _rs_lr=$(_rs_posix_path "$_rs_lh")
+        _rs_ld=$(_rs_devino "$_rs_lh" 2>/dev/null) || _rs_ld=""
+        if [ "$_rs_lr" != "$_rs_od" ] || [ "$_rs_ld" != "$_rs_oc" ]; then
+          bad "conflict: target of $_rs_op changed after the snapshot - refusing to restore through it"
+          _rr=1
+          continue
+        fi
+        chmod "$_rs_oa" "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: chmod $_rs_oa failed for symlinked directory $_rs_op"; _rr=1; }
+        ;;
+      dir)
+        if [ -L "$_rs_dst" ]; then
+          bad "conflict: $_rs_op is a symlink to a directory - refusing to restore through it"
+          _rr=1
+          continue
+        fi
+        if [ -e "$_rs_dst" ] && [ ! -d "$_rs_dst" ]; then
+          bad "rollback: $_rs_op is not a directory any more - refusing to replace"
+          _rr=1
+          continue
+        fi
+        mkdir -p "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: cannot recreate directory $_rs_op"; _rr=1; continue; }
+        chmod "$_rs_oa" "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: chmod $_rs_oa failed for directory $_rs_op"; _rr=1; }
+        ;;
+      absent)
+        if [ -d "$_rs_dst" ] && [ ! -L "$_rs_dst" ]; then
+          if [ "$_rs_op" = "/root/geomask-backups" ]; then
+            _rs_left=$(ls -A "$_rs_dst" 2>/dev/null | grep -v '^router-backup-' || true)
+            if [ -z "$_rs_left" ]; then
+              rmdir "$_rs_dst" 2>/dev/null \
+                || { bad "rollback: cannot remove directory $_rs_op"; _rr=1; }
+            else
+              _rs_note "$_rs_op contains non-evidence files - directory kept"
+            fi
+          else
+            rmdir "$_rs_dst" 2>/dev/null \
+              || { bad "rollback: directory $_rs_op did not exist before the run and is not empty"; _rr=1; }
+          fi
+          continue
+        fi
+        rm -f "$_rs_dst" 2>/dev/null \
+          || { bad "rollback: cannot remove $_rs_op (it did not exist before the run)"; _rr=1; }
+        ;;
+      shared|norestore|norestore-absent)
+        : ;;   # shared files by _rs_restore_shared; NR state is never overwritten
+    esac
+  done < "$_rs_snap/objects"
+  return 0
+}
+
+_rs_prune_temps() { # _rs_prune_temps <dir> - only temp/backup names this transaction created
+  _rs_tl="$_rs_snap/listing"
+  [ -f "$_rs_tl" ] || return 0
+  while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
+    [ -n "${_rs_op:-}" ] || continue
+    case "$_rs_ok" in
+      file|absent|shared|norestore|norestore-absent)
+        if ! _rs_safe_path "$(dirname "$_rs_op")"; then continue; fi
+        for _rs_sfx in ${REINSTALL_TEMP_SUFFIXES:-}; do
+          _rs_cand="$_rs_op$_rs_sfx"
+          [ -e "$(P "$_rs_cand")" ] || continue
+          _rs_in_list "$_rs_snap" "$_rs_cand" && continue
+          rm -f "$(P "$_rs_cand")" 2>/dev/null \
+            || { bad "rollback: cannot remove our temporary $_rs_cand"; _rr=1; }
+        done
+        # Per-PID names: same rule, matched as a glob instead of an exact suffix.
+        for _rs_glob in ${REINSTALL_TEMP_GLOBS:-}; do
+          for _rs_cand in "$(P "$_rs_op")"$_rs_glob; do
+            [ -e "$_rs_cand" ] || continue
+            _rs_rel=${_rs_cand#"$GM_PREFIX"}
+            _rs_in_list "$_rs_snap" "$_rs_rel" && continue
+            rm -f "$_rs_cand" 2>/dev/null \
+              || { bad "rollback: cannot remove our temporary $_rs_rel"; _rr=1; }
+          done
+        done
+        for _rs_cand in "$(P "$_rs_op")".bak_geomask_* "$(P "$_rs_op")".pre-run-*; do
+          [ -e "$_rs_cand" ] || continue
+          _rs_rel=${_rs_cand#"$GM_PREFIX"}
+          _rs_in_list "$_rs_snap" "$_rs_rel" && continue
+          rm -f "$_rs_cand" 2>/dev/null \
+            || { bad "rollback: cannot remove our backup $_rs_rel"; _rr=1; }
+        done
+        ;;
+    esac
+  done < "$_rs_snap/objects"
+  # UCI config files are not byte objects, so their backups need their own scan:
+  # geo-backend's `network.bak_v6off_*` is created by the IPv6 branch of the run.
+  for _rs_ucp in network dhcp ksmbd firewall; do
+    if ! _rs_safe_path "/etc/config/$_rs_ucp"; then continue; fi
+    for _rs_cand in "$(P "/etc/config/$_rs_ucp")".bak_v6off_*; do
+      [ -e "$_rs_cand" ] || continue
+      _rs_rel=${_rs_cand#"$GM_PREFIX"}
+      _rs_in_list "$_rs_snap" "$_rs_rel" && continue
+      rm -f "$_rs_cand" 2>/dev/null \
+        || { bad "rollback: cannot remove our backup $_rs_rel"; _rr=1; }
+    done
+  done
+  return 0
+}
+

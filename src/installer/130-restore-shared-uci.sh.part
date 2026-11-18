@@ -1,0 +1,430 @@
+_rs_restore_shared() { # _rs_restore_shared <dir> - managed subset only, conflicts refuse
+  [ -f "$_rs_snap/shared" ] || return 0
+  while IFS='|' read -r _rs_sc _rs_sp _rs_si _rs_sk _rs_sh _rs_sd _rs_sm; do
+    [ -n "${_rs_sp:-}" ] || continue
+    _rs_sa="$(P "$_rs_sp")"
+    if [ "$_rs_sk" = regular ] && ! _rs_safe_file "$_rs_sp"; then
+      bad "rollback: $_rs_sp is a symlink (byte file; refusing to restore through it)"
+      _rr=1
+      continue
+    fi
+    if [ "$_rs_sk" = absent ]; then
+      # A router without zapret legitimately has no such file: absent -> absent is fine.
+      # Only a file that APPEARED after the snapshot is not restorable (its writer may be us).
+      if [ -e "$_rs_sa" ] || [ -L "$_rs_sa" ]; then
+        bad "rollback: shared object $_rs_sp did not exist before the run and appeared since - not restorable"
+        _rr=1
+      fi
+      continue
+    fi
+    if [ -L "$_rs_sa" ]; then
+      bad "conflict: $_rs_sp is a symlink now - refusing to write through it"
+      _rr=1
+      continue
+    fi
+    if ! _rs_safe_file "$_rs_sp"; then
+      bad "conflict: $_rs_sp is a symlink (byte file) - refusing to write through it"
+      _rr=1
+      continue
+    fi
+    _rs_pre="$_rs_snap/shared.$_rs_si.pre"
+    if [ ! -f "$_rs_sa" ]; then
+      bad "rollback: shared object $_rs_sp disappeared during the run"
+      _rr=1
+      continue
+    fi
+    if [ ! -f "$_rs_pre" ]; then
+      bad "rollback incomplete / recovery required: snapshot lost the managed preimage of $_rs_sp"
+      _rr=1
+      continue
+    fi
+    if [ "$_rs_sc" = dnsai ]; then
+      _rs_nd=$(_rs_devino "$_rs_sa") || _rs_nd=""
+      if [ -n "${_rs_nd:-}" ] && [ "$_rs_nd" != "$_rs_sd" ]; then
+        bad "conflict: $_rs_sp was replaced after the snapshot - not touching it"
+        _rr=1
+        continue
+      fi
+    fi
+    _rs_nh=$(_rs_shared_neutral "$_rs_sc" "$_rs_sa" | _rs_hash_stream) || _rs_nh=""
+    if [ "$_rs_nh" != "$_rs_sh" ]; then
+      bad "conflict: foreign change in $_rs_sp - not overwriting (snapshot kept)"
+      _rr=1
+      continue
+    fi
+    # mktemp, not a predictable name: a planted <file>.rsnew symlink used to redirect the
+    # rebuilt bytes outside the restored file (review 16.11, item 4).
+    _rs_new=$(mktemp "$_rs_sa.rsnew.XXXXXX" 2>/dev/null)
+    if [ -z "${_rs_new:-}" ]; then
+      bad "rollback: cannot create a rebuild temp for $_rs_sp"
+      _rr=1
+      continue
+    fi
+    case "$_rs_sc" in
+      dnsai)
+        awk -v u="$AIDNS_USER" 'index($0, u ":") != 1' "$_rs_sa" > "$_rs_new" 2>/dev/null \
+          || { bad "rollback: cannot rebuild $_rs_sp"; rm -f "$_rs_new"; _rr=1; continue; }
+        cat "$_rs_pre" >> "$_rs_new" 2>/dev/null || true ;;
+      zapret-block)
+        awk -v b='# >>> geomask sync: tunneled domains (generated) >>>' \
+            -v e="# <<< geomask sync: tunneled domains <<<" '
+          $0 == b { skip = 1; next }
+          $0 == e { skip = 0; next }
+          !skip { print }' "$_rs_sa" > "$_rs_new" 2>/dev/null \
+          || { bad "rollback: cannot rebuild $_rs_sp"; rm -f "$_rs_new"; _rr=1; continue; }
+        cat "$_rs_pre" >> "$_rs_new" 2>/dev/null || true ;;
+      zapret-force)
+        awk -v m='# geomask: tunneled, DPI removed' -v pre="$_rs_pre" '
+          BEGIN {
+            while ((getline line < pre) > 0) {
+              st = substr(line, 1, 1); d = substr(line, 3)
+              if (d != "") want[d] = st
+            }
+          }
+          {
+            if (index($0, m) == 1) {
+              d = substr($0, length(m) + 2)
+              if (want[d] == "A") { print d; next }      # managed -> must be active again
+              print; next
+            }
+            if ($0 != "" && $0 !~ /^#/) {
+              if (want[$0] == "M") { print m " " $0; next }  # active -> must be managed again
+            }
+            print
+          }' "$_rs_sa" > "$_rs_new" 2>/dev/null \
+          || { bad "rollback: cannot rebuild $_rs_sp"; rm -f "$_rs_new"; _rr=1; continue; } ;;
+    esac
+    chmod "$_rs_sm" "$_rs_new" 2>/dev/null \
+      || { bad "rollback: chmod $_rs_sm failed for $_rs_sp"; _rr=1; }
+    mv -f "$_rs_new" "$_rs_sa" 2>/dev/null \
+      || { bad "rollback: cannot install the rebuilt $_rs_sp"; rm -f "$_rs_new"; _rr=1; continue; }
+  done < "$_rs_snap/shared"
+  return 0
+}
+
+_rs_restore_uci() { # _rs_restore_uci <dir> - only our keys, only when no foreign delta
+  for _rs_up in network dhcp ksmbd; do
+    if [ -f "$(P "/tmp/.uci/$_rs_up")" ]; then
+      bad "conflict: pending uci delta for $_rs_up appeared after the snapshot - not committing"
+      _rr=1
+      return 1
+    fi
+  done
+  [ -f "$_rs_snap/uci" ] || return 0
+  for _rs_ucf in network dhcp ksmbd; do
+    if ! _rs_safe_path "/etc/config/$_rs_ucf"; then
+      bad "conflict: /etc/config/$_rs_ucf is behind a symlink - refusing uci writes"
+      _rr=1
+      return 1
+    fi
+  done
+  _rs_ty=$(sed -n 's/^uci|network|lanai|@type|//p' "$_rs_snap/uci" 2>/dev/null | head -1)
+  if [ -n "${_rs_ty:-}" ]; then
+    if [ "$_rs_ty" = '<absent>' ]; then
+      if uci -q get network.lanai >/dev/null 2>&1; then
+        _rs_wip=$(uci -q get network.lanai.ipaddr 2>/dev/null)
+        _rs_wdev=$(uci -q get network.lanai.device 2>/dev/null)
+        printf '%s|%s\n' "$_rs_wdev" "$_rs_wip" > "$_rs_snap/alias.was" 2>/dev/null || true
+        uci -q delete network.lanai 2>/dev/null \
+          || { bad "rollback: cannot delete network.lanai"; _rr=1; }
+        if [ -f "$(P "/tmp/.uci/network")" ]; then
+          uci commit network 2>/dev/null \
+            || { bad "rollback: uci commit network failed"; _rr=1; }
+        fi
+      fi
+    else
+      uci set "network.lanai=$_rs_ty" 2>/dev/null \
+        || { bad "rollback: cannot set network.lanai type"; _rr=1; }
+      for _rs_o in proto device ipaddr netmask; do
+        grep -q "^uci|network|lanai|$_rs_o|" "$_rs_snap/uci" 2>/dev/null || continue
+        _rs_v=$(sed -n "s/^uci|network|lanai|$_rs_o|//p" "$_rs_snap/uci" 2>/dev/null | head -1)
+        if [ "$_rs_v" = '<absent>' ]; then
+          uci -q delete "network.lanai.$_rs_o" 2>/dev/null || true
+          continue
+        fi
+        case "$_rs_o" in
+          proto) uci set network.lanai.proto="$_rs_v" 2>/dev/null || _rr=1 ;;
+          device) uci set network.lanai.device="$_rs_v" 2>/dev/null || _rr=1 ;;
+          ipaddr) uci set network.lanai.ipaddr="$_rs_v" 2>/dev/null || _rr=1 ;;
+          netmask) uci set network.lanai.netmask="$_rs_v" 2>/dev/null || _rr=1 ;;
+        esac
+      done
+      if [ -f "$(P "/tmp/.uci/network")" ]; then
+        uci commit network 2>/dev/null \
+          || { bad "rollback: uci commit network failed"; _rr=1; }
+      fi
+    fi
+  fi
+  if grep -q '^uci|network|lan|ip6assign|' "$_rs_snap/uci" 2>/dev/null; then
+    _rs_v=$(sed -n 's/^uci|network|lan|ip6assign|//p' "$_rs_snap/uci" 2>/dev/null | head -1)
+    if [ "$_rs_v" = '<absent>' ]; then
+      uci -q delete network.lan.ip6assign 2>/dev/null || true
+    else
+      uci set network.lan.ip6assign="$_rs_v" 2>/dev/null \
+        || { bad "rollback: cannot restore network.lan.ip6assign"; _rr=1; }
+    fi
+    if [ -f "$(P "/tmp/.uci/network")" ]; then
+      uci commit network 2>/dev/null \
+        || { bad "rollback: uci commit network failed"; _rr=1; }
+    fi
+  fi
+  for _k in ra dhcpv6 ndp; do
+    grep -q "^uci|dhcp|lan|$_k|" "$_rs_snap/uci" 2>/dev/null || continue
+    _rs_v=$(sed -n "s/^uci|dhcp|lan|$_k|//p" "$_rs_snap/uci" 2>/dev/null | head -1)
+    if [ "$_rs_v" = '<absent>' ]; then
+      uci -q delete "dhcp.lan.$_k" 2>/dev/null || true
+    else
+      uci set "dhcp.lan.$_k=$_rs_v" 2>/dev/null \
+        || { bad "rollback: cannot restore dhcp.lan.$_k"; _rr=1; }
+    fi
+  done
+  if [ -f "$(P "/tmp/.uci/dhcp")" ]; then
+    uci commit dhcp 2>/dev/null \
+      || { bad "rollback: uci commit dhcp failed"; _rr=1; }
+  fi
+  # ksmbd: compare the semantic signature first. If nothing changed, leave the sections
+  # (and their anonymous ids) alone; a recreate would reorder/drop owner options.
+  _rs_want_sig=$(_rs_ksmbd_snap_sig)
+  _rs_now_sig=$(_rs_ksmbd_live_sig)
+  if [ "$_rs_want_sig" != "$_rs_now_sig" ]; then
+    _rs_guard=0
+    while [ "$_rs_guard" -lt 50 ]; do
+      _drop=$(_rs_ksmbd_ours geomask-backups | tail -1)
+      [ -n "${_drop:-}" ] || break
+      uci delete "$_drop" 2>/dev/null \
+        || { bad "rollback: cannot delete our ksmbd share section"; _rr=1; break; }
+      _rs_guard=$((_rs_guard+1))
+    done
+    _rs_kids=$(sed -n 's/^uci|ksmbd|\(@match[0-9]*\)|@type|share$/\1/p' "$_rs_snap/uci" 2>/dev/null | sort -u)
+    for _rs_kid in $_rs_kids; do
+      _sec=$(uci add ksmbd share 2>/dev/null)
+      if [ -z "${_sec:-}" ]; then
+        bad "rollback: cannot recreate our ksmbd share section"
+        _rr=1
+        continue
+      fi
+      while IFS='|' read -r _rs_uk _rs_ug _rs_um _rs_uo _rs_uv; do
+        [ "$_rs_uk" = uci ] || continue
+        [ "$_rs_ug" = ksmbd ] || continue
+        [ "$_rs_um" = "$_rs_kid" ] || continue
+        [ "$_rs_uo" = "@type" ] && continue
+        uci set "ksmbd.$_sec.$_rs_uo=$_rs_uv" 2>/dev/null \
+          || { bad "rollback: cannot set ksmbd.$_rs_uo"; _rr=1; }
+      done < "$_rs_snap/uci"
+    done
+    if [ -f "$(P "/tmp/.uci/ksmbd")" ]; then
+      uci commit ksmbd 2>/dev/null \
+        || { bad "rollback: uci commit ksmbd failed"; _rr=1; }
+    fi
+  fi
+  return 0
+}
+
+_rs_verify_alias() { # _rs_verify_alias <present|absent> <dev> <ip>
+  [ -n "${1:-}" ] || return 0
+  if [ "$1" = present ]; then
+    [ "$(uci -q get network.lanai.ipaddr 2>/dev/null)" = "$3" ] || return 1
+    [ -n "${2:-}" ] || return 1
+    ip -4 addr show "$2" 2>/dev/null | grep -q " $3/" || return 1
+    return 0
+  fi
+  uci -q get network.lanai >/dev/null 2>&1 && return 1
+  if [ -n "${3:-}" ] && [ -n "${2:-}" ]; then
+    ip -4 addr show "$2" 2>/dev/null | grep -q " $3/" && return 1
+  fi
+  return 0
+}
+
+_rs_restore_network() { # _rs_restore_network <dir> - netifd reload + alias confirmation
+  _rs_aw=""; _rs_adev=""; _rs_aip=""
+  while IFS='|' read -r _rs_nk _rs_nv _rs_nd _rs_ni; do
+    [ "$_rs_nk" = alias ] || continue
+    _rs_aw=$_rs_nv; _rs_adev=$_rs_nd; _rs_aip=$_rs_ni
+  done < "$_rs_snap/net"
+  if [ "$_rs_aw" = absent ] && [ -f "$_rs_snap/alias.was" ]; then
+    IFS='|' read -r _rs_adev _rs_aip < "$_rs_snap/alias.was" || true
+  fi
+  if ! _rs_safe_exec /etc/init.d/network; then
+    bad "conflict: /etc/init.d/network is behind an unsafe or unpinned symlink - refusing to reload network"
+    _rr=1
+    return 1
+  fi
+  initd network reload >/dev/null 2>&1 \
+    || { bad "rollback: network reload failed - interfaces not confirmed"; _rr=1; return 1; }
+  if ! _rs_verify_alias "$_rs_aw" "$_rs_adev" "$_rs_aip"; then
+    _rs_settle
+    initd network reload >/dev/null 2>&1 \
+      || { bad "rollback: network reload failed (second attempt)"; _rr=1; return 1; }
+    _rs_verify_alias "$_rs_aw" "$_rs_adev" "$_rs_aip" \
+      || { bad "rollback: alias/interface state not confirmed"; _rr=1; return 1; }
+  fi
+  return 0
+}
+
+_rs_restore_firewall() { # <dir> - fw4 reload, nft table, our ip rule (pref+table)
+  if ! _rs_safe_exec /etc/init.d/firewall; then
+    bad "conflict: /etc/init.d/firewall is behind an unsafe or unpinned symlink - refusing to reload firewall"
+    _rr=1
+    return 1
+  fi
+  initd firewall reload >/dev/null 2>&1 \
+    || { bad "rollback: firewall reload failed - nft state not applied"; _rr=1; }
+  while IFS='|' read -r _rs_nk _rs_nv; do
+    [ "$_rs_nk" = nft-ai ] || continue
+    [ "$_rs_nv" = absent ] || continue
+    if nft list table inet geomask_ai_dns >/dev/null 2>&1; then
+      nft delete table inet geomask_ai_dns >/dev/null 2>&1 \
+        || { bad "rollback: cannot delete nft table inet geomask_ai_dns"; _rr=1; }
+    fi
+  done < "$_rs_snap/net"
+  while IFS= read -r _rs_nline; do
+    [ -n "$_rs_nline" ] || continue
+    _rs_nk=${_rs_nline%%|*}
+    _rs_nv=${_rs_nline#*|}
+    [ "$_rs_nk" = iprule ] || continue
+    _rs_now=$(_rs_iprule_state) \
+      || { bad "rollback: ip rule state unobservable"; _rr=1; continue; }
+    [ "$_rs_nv" = "$_rs_now" ] && continue
+    # Compare the WHOLE set of rules with our mark. Only the pref AIDNS_RULE_PREF is
+    # ours; every other same-mark rule is foreign and is never modified. A foreign
+    # change is a conflict, not something we silently overwrite.
+    _rs_w_ours=""; _rs_w_for=""
+    _rs_c_ours=""; _rs_c_for=""
+    if [ "$_rs_nv" != absent ]; then
+      for _rs_row in $(printf '%s' "$_rs_nv" | tr ';' ' '); do
+        case "$_rs_row" in
+          *"|ours") _rs_w_ours=$_rs_row ;;
+          *) _rs_w_for="$_rs_w_for$_rs_row;" ;;
+        esac
+      done
+    fi
+    if [ "$_rs_now" != absent ]; then
+      for _rs_row in $(printf '%s' "$_rs_now" | tr ';' ' '); do
+        case "$_rs_row" in
+          *"|ours") _rs_c_ours=$_rs_row ;;
+          *) _rs_c_for="$_rs_c_for$_rs_row;" ;;
+        esac
+      done
+    fi
+    _rs_wp=""; _rs_wt=""
+    if [ -n "$_rs_w_ours" ]; then
+      _rs_wp=${_rs_w_ours%%|*}
+      _rs_wrest=${_rs_w_ours#*|}
+      _rs_wt=${_rs_wrest%%|*}
+    fi
+    _rs_cp=""; _rs_ct=""
+    if [ -n "$_rs_c_ours" ]; then
+      _rs_cp=${_rs_c_ours%%|*}
+      _rs_crest=${_rs_c_ours#*|}
+      _rs_ct=${_rs_crest%%|*}
+    fi
+    if [ -n "$_rs_c_ours" ] && { [ -z "$_rs_w_ours" ] || [ "$_rs_wt" != "$_rs_ct" ]; }; then
+      ip rule del pref "$_rs_cp" fwmark "$AIDNS_MARK" table "$_rs_ct" >/dev/null 2>&1 \
+        || { bad "rollback: cannot remove our ip rule (pref $_rs_cp table $_rs_ct)"; _rr=1; }
+      _rs_c_ours=""
+    fi
+    if [ -n "$_rs_w_ours" ] && [ -z "$_rs_c_ours" ]; then
+      ip rule add pref "$_rs_wp" fwmark "$AIDNS_MARK" table "$_rs_wt" >/dev/null 2>&1 \
+        || { bad "rollback: cannot restore our ip rule (pref $_rs_wp table $_rs_wt)"; _rr=1; }
+    fi
+    if [ "$_rs_w_for" != "$_rs_c_for" ]; then
+      bad "conflict: foreign ip rules with fwmark $AIDNS_MARK changed - not touching them"
+      _rr=1
+    fi
+  done < "$_rs_snap/net"
+  return 0
+}
+
+_rs_restore_sysctl() { # _rs_restore_sysctl <dir> - per-interface values, never a "0" default
+  [ -f "$_rs_snap/sysctl" ] || return 0
+  while IFS='|' read -r _rs_kk _rs_kn _rs_kv; do
+    [ "$_rs_kk" = sysctl ] || continue
+    _rs_kf="$(P "/proc/sys/net/ipv6/conf/$_rs_kn")"
+    if ! _rs_safe_path "/proc/sys/net/ipv6/conf/$_rs_kn"; then
+      bad "conflict: /proc/sys/net/ipv6/conf/$_rs_kn is behind a symlink - not writing sysctl"
+      _rr=1
+      continue
+    fi
+    if [ ! -d "$_rs_kf" ]; then
+      bad "rollback: interface $_rs_kn disappeared - its disable_ipv6 is not restorable"
+      _rr=1
+      continue
+    fi
+    _rs_now=$(cat "$_rs_kf/disable_ipv6" 2>/dev/null | tr -dc '01')
+    [ "$_rs_now" = "$_rs_kv" ] && continue
+    sysctl -w "net.ipv6.conf.$_rs_kn.disable_ipv6=$_rs_kv" >/dev/null 2>&1 \
+      || { bad "rollback: cannot write net.ipv6.conf.$_rs_kn.disable_ipv6"; _rr=1; }
+  done < "$_rs_snap/sysctl"
+  _rs_sf="$(P /etc/sysctl.d/99-disable-ipv6.conf)"
+  if [ -f "$_rs_sf" ]; then
+    if ! _rs_safe_path /etc/sysctl.d/99-disable-ipv6.conf; then
+      bad "conflict: /etc/sysctl.d/99-disable-ipv6.conf is behind a symlink - refusing sysctl -p"
+      _rr=1
+      return 0
+    fi
+    sysctl -p "$_rs_sf" >/dev/null 2>&1 \
+      || { bad "rollback: sysctl -p $_rs_sf failed"; _rr=1; }
+  fi
+  return 0
+}
+
+_rs_restore_links() { # <dir> - exact link names and targets
+  _rs_rd="$(P /etc/rc.d)"
+  if ! _rs_safe_path /etc/rc.d; then
+    bad "conflict: /etc/rc.d is behind a symlink - refusing to write autostart links through it"
+    _rr=1
+    return 1
+  fi
+  if [ ! -d "$_rs_rd" ]; then
+    bad "rollback: rc.d unobservable"
+    _rr=1
+    return 1
+  fi
+  for _rs_l in "$_rs_rd"/[SK][0-9][0-9]*; do
+    [ -L "$_rs_l" ] || continue
+    _rs_n=${_rs_l##*/}
+    _rs_svc=${_rs_n#[SK]}
+    _rs_svc=${_rs_svc#??}
+    _rs_link_owned "$_rs_svc" || continue
+    grep -q "^$_rs_n|" "$_rs_snap/links" 2>/dev/null && continue
+    rm -f "$_rs_l" 2>/dev/null \
+      || { bad "rollback: cannot remove the autostart link $_rs_n created by the run"; _rr=1; }
+  done
+  while IFS='|' read -r _rs_n _rs_t; do
+    [ -n "${_rs_n:-}" ] || continue
+    _rs_l="$_rs_rd/$_rs_n"
+    if [ -L "$_rs_l" ] && [ "$(readlink "$_rs_l" 2>/dev/null)" = "$_rs_t" ]; then
+      continue
+    fi
+    rm -f "$_rs_l" 2>/dev/null \
+      || { bad "rollback: cannot replace the autostart link $_rs_n"; _rr=1; continue; }
+    ln -s "$_rs_t" "$_rs_l" 2>/dev/null \
+      || { bad "rollback: cannot recreate the autostart link $_rs_n -> $_rs_t"; _rr=1; }
+  done < "$_rs_snap/links"
+  return 0
+}
+
+_rs_restore_services() { # _rs_restore_services <dir> - back to the recorded running state
+  [ -f "$_rs_snap/services" ] || return 0
+  while IFS='|' read -r _rs_id _rs_initd _rs_pid _rs_mode _rs_en _rs_run; do
+    [ -n "${_rs_id:-}" ] || continue
+    _rs_now=$(_rs_svc_running "$_rs_pid" "$_rs_mode")
+    case "$_rs_run" in
+      1)
+        if [ "$_rs_now" != 1 ]; then
+          _rs_start_service "$_rs_initd" \
+            || { bad "rollback: cannot start $_rs_id (it was running before the run)"; _rr=1; }
+        fi ;;
+      0)
+        if [ "$_rs_now" = 1 ]; then
+          _rs_stop_service "$_rs_initd" \
+            || { bad "rollback: cannot stop $_rs_id (it was stopped before the run)"; _rr=1; }
+        fi ;;
+      *)
+        bad "rollback: snapshot recorded an unknown running state for $_rs_id"
+        _rr=1 ;;
+    esac
+  done < "$_rs_snap/services"
+  return 0
+}
+

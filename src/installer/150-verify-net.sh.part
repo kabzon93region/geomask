@@ -1,0 +1,377 @@
+_rs_nft_norm() { # <src> <dst> - canonical nft semantics (list or script form), counters ignored
+  _rs_nft_out=$2
+  _rs_nft_txt=$(awk '
+    function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    function norm(s) {
+      sub(/\r/, "", s)
+      gsub(/counter packets [0-9]+ bytes [0-9]+/, "counter", s)
+      gsub(/packets [0-9]+ bytes [0-9]+/, "", s)
+      gsub(/[ \t]+/, " ", s)
+      sub(/^ /, "", s); sub(/ $/, "", s)
+      gsub(/[ \t]*[{][ \t]*/, "{", s)
+      gsub(/[ \t]*[}][ \t]*/, "}", s)
+      gsub(/[ \t]*,[ \t]*/, ",", s)
+      gsub(/[ \t]*;[ \t]*/, ";", s)
+      sub(/;$/, "", s)
+      return s
+    }
+    function addattrs(f, t, c, s,   n, a, i, part, sp, k, v) {
+      n = split(s, a, ";")
+      for (i = 1; i <= n; i++) {
+        part = trim(a[i])
+        if (part == "") continue
+        sp = index(part, " ")
+        if (sp > 0) { k = substr(part, 1, sp - 1); v = trim(substr(part, sp + 1)) }
+        else { k = part; v = "" }
+        attrs[f SUBSEP t SUBSEP c SUBSEP k] = v
+      }
+    }
+    function clear_all(   k, n, ks, i) {
+      n = 0; for (k in tables) ks[++n] = k
+      for (i = 1; i <= n; i++) delete tables[ks[i]]
+      n = 0; for (k in chains) ks[++n] = k
+      for (i = 1; i <= n; i++) delete chains[ks[i]]
+      n = 0; for (k in attrs) ks[++n] = k
+      for (i = 1; i <= n; i++) delete attrs[ks[i]]
+      n = 0; for (k in rules) ks[++n] = k
+      for (i = 1; i <= n; i++) delete rules[ks[i]]
+      n = 0; for (k in rcount) ks[++n] = k
+      for (i = 1; i <= n; i++) delete rcount[ks[i]]
+    }
+    function clear_pref(pref,   k, n, ks, i) {
+      n = 0; for (k in chains) if (index(k, pref) == 1) ks[++n] = k
+      for (i = 1; i <= n; i++) delete chains[ks[i]]
+      n = 0; for (k in attrs) if (index(k, pref) == 1) ks[++n] = k
+      for (i = 1; i <= n; i++) delete attrs[ks[i]]
+      n = 0; for (k in rules) if (index(k, pref) == 1) ks[++n] = k
+      for (i = 1; i <= n; i++) delete rules[ks[i]]
+      n = 0; for (k in rcount) if (index(k, pref) == 1) ks[++n] = k
+      for (i = 1; i <= n; i++) delete rcount[ks[i]]
+    }
+    function add_rule(f, t, c, e,   key) {
+      tables[f SUBSEP t] = 1
+      chains[f SUBSEP t SUBSEP c] = 1
+      key = f SUBSEP t SUBSEP c
+      rcount[key]++
+      rules[key SUBSEP sprintf("%05d", rcount[key])] = norm(e)
+    }
+    BEGIN { format = ""; ldepth = 0; lfam = ""; ltab = ""; lchain = ""; lattr = "" }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      s = trim(line)
+      if (s == "" || s ~ /^#/) next
+      if (format == "") {
+        if (s ~ /^table[ \t]+[^ \t]+[ \t]+[^ \t{]+[ \t]+[{]/) format = "list"
+        else if (s ~ /^(add|flush|delete|insert)[ \t]/) format = "script"
+        else format = "raw"
+      }
+      if (format == "list") {
+        if (s ~ /^table[ \t]/) {
+          n = split(s, a, /[ \t]+/)
+          lfam = a[2]; ltab = a[3]; sub(/[{;].*/, "", ltab)
+          tables[lfam SUBSEP ltab] = 1
+          ldepth = 1; lchain = ""; lattr = ""
+          next
+        }
+        if (s ~ /^chain[ \t]/) {
+          n = split(s, a, /[ \t]+/)
+          lchain = a[2]; sub(/[{;].*/, "", lchain)
+          chains[lfam SUBSEP ltab SUBSEP lchain] = 1
+          ldepth = 2; lattr = ""
+          next
+        }
+        if (s == "}") {
+          if (ldepth >= 2) {
+            if (lchain != "") { if (lattr != "") addattrs(lfam, ltab, lchain, lattr); lchain = "" }
+            ldepth--
+          } else if (ldepth == 1) { ldepth = 0 }
+          next
+        }
+        if (ldepth == 1) {
+          if (s ~ /^(set|map|flowtable|element|elements|counter|quota)[ \t]/) ldepth = 2
+          print "raw|" lfam "|" ltab "|" norm(s)
+          next
+        }
+        if (ldepth == 2 && lchain != "") {
+          if (s ~ /^(type|policy|device|comment)[ \t]/) { lattr = lattr (lattr == "" ? "" : " ") s; next }
+          add_rule(lfam, ltab, lchain, s)
+          next
+        }
+        print "raw|" norm(s)
+        next
+      }
+      if (format == "script") {
+        n = split(s, a, /[ \t]+/)
+        if (a[1] == "flush" && a[2] == "ruleset") { clear_all(); next }
+        if (a[1] == "flush" && a[2] == "table") {
+          fam = a[3]; tab = a[4]; sub(/[;].*/, "", tab)
+          clear_pref(fam SUBSEP tab SUBSEP)
+          tables[fam SUBSEP tab] = 1
+          next
+        }
+        if (a[1] == "delete" && a[2] == "table") {
+          fam = a[3]; tab = a[4]; sub(/[;].*/, "", tab)
+          clear_pref(fam SUBSEP tab SUBSEP)
+          delete tables[fam SUBSEP tab]
+          next
+        }
+        if (a[1] == "delete" && a[2] == "chain") {
+          fam = a[3]; tab = a[4]; name = a[5]; sub(/[;{].*/, "", name)
+          clear_pref(fam SUBSEP tab SUBSEP name SUBSEP)
+          delete chains[fam SUBSEP tab SUBSEP name]
+          next
+        }
+        if (a[1] == "add" && a[2] == "table") {
+          fam = a[3]; tab = a[4]; sub(/[;].*/, "", tab)
+          tables[fam SUBSEP tab] = 1
+          next
+        }
+        if (a[1] == "add" && a[2] == "chain") {
+          fam = a[3]; tab = a[4]; name = a[5]; sub(/[;{].*/, "", name)
+          chains[fam SUBSEP tab SUBSEP name] = 1
+          if (index(s, "{") > 0) {
+            rest = substr(s, index(s, "{") + 1)
+            sub(/[}].*/, "", rest)
+            addattrs(fam, tab, name, rest)
+          }
+          next
+        }
+        if (a[1] == "add" && a[2] == "rule") {
+          fam = a[3]; tab = a[4]; name = a[5]
+          rest = s
+          sub(/^[a-z]+[ \t]+rule[ \t]+[^ \t]+[ \t]+[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", rest)
+          add_rule(fam, tab, name, rest)
+          next
+        }
+        print "raw|" norm(s)
+        next
+      }
+      print "raw|" norm(s)
+    }
+    END {
+      for (k in tables) { split(k, p, SUBSEP); print "table|" p[1] "|" p[2] }
+      for (k in chains) { split(k, p, SUBSEP); print "chain|" p[1] "|" p[2] "|" p[3] }
+      for (k in attrs) { split(k, p, SUBSEP); print "attr|" p[1] "|" p[2] "|" p[3] "|" p[4] "|" attrs[k] }
+      for (k in rules) { split(k, p, SUBSEP); print "rule|" p[1] "|" p[2] "|" p[3] "|" p[4] "|" rules[k] }
+    }
+  ' "$1" 2>/dev/null) || return 1
+  printf '%s\n' "$_rs_nft_txt" | LC_ALL=C sort > "$_rs_nft_out" 2>/dev/null || return 1
+}
+
+_rs_verify_net() { # _rs_verify_net <dir>
+  [ -f "$_rs_snap/net" ] || return 0
+  _rs_vr=0
+  _rs_aw=""; _rs_adev=""; _rs_aip=""
+  while IFS= read -r _rs_nline; do
+    [ -n "$_rs_nline" ] || continue
+    _rs_nk=${_rs_nline%%|*}
+    _rs_nrest=${_rs_nline#*|}
+    case "$_rs_nk" in
+      iprule)
+        _rs_now=$(_rs_iprule_state)
+        if [ "$_rs_now" != "$_rs_nrest" ]; then
+          bad "verify: ip rule state is ${_rs_now:-unobservable}, expected $_rs_nrest"
+          _rs_vr=1
+        fi ;;
+      nft-ai)
+        _rs_nv=${_rs_nrest%%|*}
+        if [ "$_rs_nv" = present ]; then
+          if nft list table inet geomask_ai_dns > "$_rs_snap/nft-ai.now" 2>/dev/null; then
+            _rs_nft_norm "$_rs_snap/nft-ai.list" "$_rs_snap/nft-ai.list.norm" \
+              && _rs_nft_norm "$_rs_snap/nft-ai.now" "$_rs_snap/nft-ai.now.norm" \
+              && cmp -s "$_rs_snap/nft-ai.list.norm" "$_rs_snap/nft-ai.now.norm" \
+              || { bad "verify: nft table inet geomask_ai_dns structure differs from the snapshot"; _rs_vr=1; }
+          else
+            bad "verify: nft table inet geomask_ai_dns is missing"
+            _rs_vr=1
+          fi
+        else
+          if nft list table inet geomask_ai_dns >/dev/null 2>&1; then
+            bad "verify: nft table inet geomask_ai_dns should be absent"
+            _rs_vr=1
+          fi
+        fi ;;
+      nft-v6)
+        _rs_nv=${_rs_nrest%%|*}
+        if [ "$_rs_nv" = present ]; then
+          if nft list chain inet fw4 geomask_no_v6 > "$_rs_snap/nft-v6.now" 2>/dev/null; then
+            _rs_nft_norm "$_rs_snap/nft-v6.list" "$_rs_snap/nft-v6.list.norm" \
+              && _rs_nft_norm "$_rs_snap/nft-v6.now" "$_rs_snap/nft-v6.now.norm" \
+              && cmp -s "$_rs_snap/nft-v6.list.norm" "$_rs_snap/nft-v6.now.norm" \
+              || { bad "verify: nft chain inet fw4 geomask_no_v6 structure differs from the snapshot"; _rs_vr=1; }
+          else
+            bad "verify: nft chain inet fw4 geomask_no_v6 is missing"
+            _rs_vr=1
+          fi
+        else
+          if nft list chain inet fw4 geomask_no_v6 >/dev/null 2>&1; then
+            bad "verify: nft chain inet fw4 geomask_no_v6 should be absent"
+            _rs_vr=1
+          fi
+        fi ;;
+      alias)
+        _rs_aw=${_rs_nrest%%|*}
+        _rs_atmp=${_rs_nrest#*|}
+        _rs_adev=${_rs_atmp%%|*}; _rs_aip=${_rs_atmp#*|}
+        [ "$_rs_aip" = "$_rs_atmp" ] && _rs_aip="" ;;
+    esac
+  done < "$_rs_snap/net"
+  if [ "$_rs_aw" = absent ] && [ -f "$_rs_snap/alias.was" ]; then
+    IFS='|' read -r _rs_adev _rs_aip < "$_rs_snap/alias.was" || true
+  fi
+  if ! _rs_verify_alias "$_rs_aw" "$_rs_adev" "$_rs_aip"; then
+    bad "verify: alias/interface state does not match the snapshot"
+    _rs_vr=1
+  fi
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_runtime() { # _rs_verify_runtime <dir> - enabled AND running for every service
+  [ -f "$_rs_snap/services" ] || return 0
+  _rs_vr=0
+  if ! _rs_safe_path /etc/rc.d || ! _rs_safe_path /etc/init.d; then
+    bad "verify: /etc/rc.d or /etc/init.d is behind a symlink - runtime state unreadable safely"
+    return 1
+  fi
+  while IFS='|' read -r _rs_id _rs_initd _rs_pid _rs_mode _rs_en _rs_run; do
+    [ -n "${_rs_id:-}" ] || continue
+    for _rs_is in $(printf '%s' "$_rs_initd" | tr '/' ' '); do
+      if ! _rs_safe_exec "/etc/init.d/$_rs_is"; then
+        bad "verify: init script /etc/init.d/$_rs_is is behind an unsafe or unpinned symlink"
+        _rs_vr=1
+      fi
+    done
+    _rs_now_en=$(_rs_svc_enabled "$_rs_initd")
+    _rs_now_run=$(_rs_svc_running "$_rs_pid" "$_rs_mode")
+    if [ "$_rs_now_en" != "$_rs_en" ]; then
+      bad "verify: $_rs_id enabled=$_rs_now_en, expected $_rs_en"
+      _rs_vr=1
+    fi
+    if [ "$_rs_now_run" != "$_rs_run" ]; then
+      bad "verify: $_rs_id running=$_rs_now_run, expected $_rs_run"
+      _rs_vr=1
+    fi
+  done < "$_rs_snap/services"
+  if [ -f "$_rs_snap/links" ]; then
+    while IFS='|' read -r _rs_n _rs_t; do
+      [ -n "${_rs_n:-}" ] || continue
+      _rs_l="$(P "/etc/rc.d/$_rs_n")"
+      if [ ! -L "$_rs_l" ] || [ "$(readlink "$_rs_l" 2>/dev/null)" != "$_rs_t" ]; then
+        bad "verify: autostart link $_rs_n -> $_rs_t is missing or has another target"
+        _rs_vr=1
+      fi
+    done < "$_rs_snap/links"
+  fi
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_cron() { # _rs_verify_cron <dir>
+  _rs_want=$(cat "$_rs_snap/cron" 2>/dev/null)
+  _rs_now=$(crontab -l 2>/dev/null)
+  if [ "$_rs_now" != "$_rs_want" ]; then
+    bad "verify: crontab does not match the snapshot"
+    return 1
+  fi
+  return 0
+}
+
+_rs_nr_notes() { # _rs_nr_notes <dir> - honest NR list (they are not restored by design)
+  _rs_note "MagiTrickle state is owned by magitrickled (NR): it is not overwritten, and a change makes the rollback incomplete"
+  _rs_note "mihomo provider cache and the controller API refresh are network effects (not files)"
+  _rs_note "network/firewall reload effects are verified as live state, not restored as files"
+  _rs_note "witness logs (geo-sync.log, node-audit events/pools/reports) and /tmp transients are kept"
+  return 0
+}
+
+_rs_restore_verify() { # _rs_restore_verify <dir> - the rollback is not trusted, it is verified
+  _rs_vok=0
+  # R04: the byte objects were written and proven under config-tx already. This second check
+  # runs after that lock was released, so a live panel commit may legitimately (or not) change
+  # config.yaml in between. A mismatch here is reported as a concurrent writer, not silently
+  # accepted as "restored": the snapshot no longer describes the live file.
+  _rs_verify_files || { _rs_vok=1; bad "rollback verification failed: file objects (a concurrent writer - e.g. a live config transaction - changed them after the serialised restore)"; }
+  _rs_verify_shared || { _rs_vok=1; bad "rollback verification failed: shared files"; }
+  _rs_verify_uci || { _rs_vok=1; bad "rollback verification failed: uci keys"; }
+  _rs_verify_sysctl || { _rs_vok=1; bad "rollback verification failed: sysctl"; }
+  _rs_verify_net || { _rs_vok=1; bad "rollback verification failed: net runtime"; }
+  _rs_verify_runtime || { _rs_vok=1; bad "rollback verification failed: services/links"; }
+  _rs_verify_cron || { _rs_vok=1; bad "rollback verification failed: crontab"; }
+  if [ "$_rs_vok" != 0 ]; then
+    bad "rollback verification failed: the restored state could not be confirmed"
+    return 1
+  fi
+  return 0
+}
+
+_reinstall_restore() { # _reinstall_restore <dir> -> 0 only when the restored state is verified
+  _rs_snap="$1"
+  _rs_pin_mode=0
+  _rs_pin_enforce=1
+  _rr=0
+  _rs_check_snapshot "$_rs_snap" || return 1
+  if ! _rs_critical_paths_safe; then
+    bad "rollback incomplete / recovery required: unsafe path (symlink component) - no writes, reloads or exec were attempted"
+    return 1
+  fi
+  _rs_stop_new_services "$_rs_snap" || _rr=1
+  _rs_restore_files "$_rs_snap" || _rr=1
+  _rs_prune_temps "$_rs_snap" || _rr=1
+  _rs_restore_shared "$_rs_snap" || _rr=1
+  _rs_restore_uci "$_rs_snap" || _rr=1
+  _rs_restore_network "$_rs_snap" || _rr=1
+  _rs_restore_firewall "$_rs_snap" || _rr=1
+  _rs_restore_sysctl "$_rs_snap" || _rr=1
+  _rs_restore_links "$_rs_snap" || _rr=1
+  _rs_restore_services "$_rs_snap" || _rr=1
+  _rs_restore_cron "$_rs_snap" || _rr=1
+  _rs_nr_notes "$_rs_snap" || _rr=1
+  _rs_restore_verify "$_rs_snap" || _rr=1
+  if [ "$_rr" = 0 ]; then
+    info "откат проверен (verified rollback): файлы, UCI, сервисы и runtime соответствуют снимку"
+    rm -rf "$_rs_snap" 2>/dev/null || true
+  else
+    bad "rollback incomplete / recovery required: снимок сохранён в $_rs_snap (не удаляйте его)"
+  fi
+  return $_rr
+}
+
+_reinstall_steps() { # _reinstall_steps <vpn-url> -> 0 only when every critical step succeeded
+  _rvpn="$1"
+  hdr "1/6" "удаление geomask"
+  geomask_uninstall noreload || { bad "удаление не завершено"; return 1; }
+  hdr "2/6" "гео-оверлей LuCI"
+  step2_apply || { bad "файлы панели не записаны"; return 1; }
+  step2_verify || { bad "проверка панели не пройдена"; return 1; }
+  hdr "3/6" "mihomo: подписка + AI-USA"
+  if write_mihomo_config "$_rvpn" ""; then
+    api_refresh_provider sub "$_rvpn" && info "provider sub refreshed (no restart)" || warn "provider sub: refresh failed, применится при старте mihomo"
+  else
+    bad "конфиг mihomo не записан"
+    return 1
+  fi
+  hdr "4/6" "AI-DNS (нет утечки DNS)"
+  step4_apply || { bad "AI-DNS не настроен"; return 1; }
+  step4_verify || { bad "проверка AI-DNS не пройдена"; return 1; }
+  hdr "5/6" "синхронизация + роутинг"
+  step5_apply || { bad "синхронизация не выполнена"; return 1; }
+  step5_verify || { bad "проверка синхронизации не пройдена"; return 1; }
+  hdr "6/6" "сервисы"
+  step6_apply || { bad "сервисы не настроены"; return 1; }
+  # The security baseline is part of a reinstall/update, not an optional extra: an update that
+  # leaves IPv6 leaking is the same half-done repair the owner complained about elsewhere.
+  # `--ipv6=keep` is the documented way out.
+  hdr "IPv6" "выключение по умолчанию"
+  apply_ipv6_default || { bad "IPv6 не выключен - переустановка отменена (--ipv6=keep, чтобы сохранить IPv6)"; return 1; }
+  hdr "VERIFY" "итоговая проверка"
+  step7_check || { bad "итоговая проверка не пройдена"; return 1; }
+  info "verify: PASS"
+  return 0
+}
+
+# ---- R03: package installs and the fail-closed reinstall preflight ------------
+# Package installs are FORBIDDEN inside the reinstall path: the transaction promises a
+# full rollback, and a package database plus post-install side effects cannot be rolled
+# back by the file snapshot. The reinstall therefore never installs anything (including
+# `apk add inotifywait` in step 5 - the sync watchdog falls back to a 10s poll); a missing
+# dependency is a preflight REFUSAL, not an installation.

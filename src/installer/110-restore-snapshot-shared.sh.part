@@ -1,0 +1,423 @@
+_rs_is_shared() { # _rs_is_shared <install-path> -> 0 for a shared file with a managed subset
+  while IFS='|' read -r _rs_if _rs_ic; do
+    [ -n "${_rs_if:-}" ] || continue
+    [ "$_rs_if" = "$1" ] && return 0
+  done <<EOF
+${REINSTALL_SHARED_APPEND:-}
+EOF
+  return 1
+}
+
+_rs_note() { info "NR (not restorable): $*"; }
+
+_rs_svc_scope() { # _rs_svc_scope <manifest service id> -> 0 when the reinstall touches it
+  case "$1" in
+    svc.ai-doh|svc.dnsmasq-ai)
+      module_selected ai_dns && [ ! -f "$(P /etc/geomask-aidns.off)" ] ;;
+    svc.hev-socks5-tunnel)
+      module_selected path_ai || module_selected ai_dns ;;
+    svc.hev-nop2p)
+      [ -n "${GM_AUTO_LANE:-}" ] ;;
+    svc.ksmbd)
+      module_selected backup_share ;;
+    *)
+      return 0 ;;
+  esac
+}
+
+_rs_svc_enabled() { # _rs_svc_enabled <initd-names-slash-separated> -> 1|0|unknown
+  _rs_re="$(P /etc/rc.d)"
+  if ! _rs_safe_path /etc/rc.d || [ ! -d "$_rs_re" ] || ! ls "$_rs_re" >/dev/null 2>&1; then
+    printf 'unknown'; return 0
+  fi
+  for _rs_sn in $(printf '%s' "$1" | tr '/' ' '); do
+    if ls "$_rs_re" 2>/dev/null | grep -qE "^S[0-9][0-9]${_rs_sn}$"; then
+      printf '1'; return 0
+    fi
+  done
+  printf '0'
+}
+
+_rs_svc_running() { # _rs_svc_running <pid-or-port> <mode> -> 1|0|unknown
+  case "${2:-pidof}" in
+    pgrep)
+      have pgrep || { printf 'unknown'; return 0; }
+      pgrep -f "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      ;;
+    port)
+      if have netstat; then
+        netstat -ltnu 2>/dev/null | grep -q ":$1 " && printf '1' || printf '0'
+      else
+        printf 'unknown'
+      fi
+      ;;
+    *)
+      if have pidof; then
+        pidof "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      elif have pgrep; then
+        pgrep -x "$1" >/dev/null 2>&1 && printf '1' || printf '0'
+      else
+        printf 'unknown'
+      fi
+      ;;
+  esac
+}
+
+_rs_settle() { [ "${GM_RESTORE_VERIFY_TRIES:-2}" = 1 ] && return 0; sleep 1; }
+
+_rs_start_service() { # _rs_start_service <initd-names>
+  for _rs_ss in $(printf '%s' "$1" | tr '/' ' '); do
+    if ! _rs_safe_exec "/etc/init.d/$_rs_ss"; then
+      bad "conflict: /etc/init.d/$_rs_ss is behind an unsafe or unpinned symlink - refusing to execute it"
+      _rr=1
+      return 1
+    fi
+    _rs_sp="$(P "/etc/init.d/$_rs_ss")"
+    if [ -f "$_rs_sp" ]; then
+      initd "$_rs_ss" start >/dev/null 2>&1
+      return $?
+    fi
+  done
+  return 1
+}
+
+_rs_stop_service() { # _rs_stop_service <initd-names>
+  for _rs_ss in $(printf '%s' "$1" | tr '/' ' '); do
+    if ! _rs_safe_exec "/etc/init.d/$_rs_ss"; then
+      bad "conflict: /etc/init.d/$_rs_ss is behind an unsafe or unpinned symlink - refusing to execute it"
+      _rr=1
+      return 1
+    fi
+    _rs_sp="$(P "/etc/init.d/$_rs_ss")"
+    if [ -f "$_rs_sp" ]; then
+      initd "$_rs_ss" stop >/dev/null 2>&1
+      return $?
+    fi
+  done
+  return 1
+}
+
+_rs_link_owned() { # _rs_link_owned <svc-name> -> 0 when the snapshot tracks that service
+  [ -f "$_rs_snap/services" ] || return 1
+  while IFS='|' read -r _rs_li _rs_lin _rs_lip _rs_lim _rs_lie _rs_lir; do
+    [ -n "${_rs_lin:-}" ] || continue
+    for _rs_ls in $(printf '%s' "$_rs_lin" | tr '/' ' '); do
+      [ "$_rs_ls" = "$1" ] && return 0
+    done
+  done < "$_rs_snap/services"
+  return 1
+}
+
+_rs_ksmbd_ours() { # _rs_ksmbd_ours <share-name> -> uci section paths of OUR share only
+  _rs_ka=$(uci -q show ksmbd 2>/dev/null | sed -n 's/^\(ksmbd\.[^=]*\)=share$/\1/p')
+  for _rs_ks in $_rs_ka; do
+    if [ "$(uci -q get "$_rs_ks.name" 2>/dev/null)" = "$1" ]; then
+      printf '%s\n' "$_rs_ks"
+    fi
+  done
+}
+
+_rs_shared_neutral() { # _rs_shared_neutral <class> <abs-file> -> the part geomask does not own
+  case "$1" in
+    dnsai)
+      awk -v u="$AIDNS_USER" 'index($0, u ":") != 1' "$2" ;;
+    zapret-block)
+      awk -v b='# >>> geomask sync: tunneled domains (generated) >>>' \
+          -v e="# <<< geomask sync: tunneled domains <<<" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip { print }' "$2" ;;
+    zapret-force)
+      awk -v m='# geomask: tunneled, DPI removed' '
+        index($0, m) == 1 { print substr($0, length(m) + 2); next }
+        { print }' "$2" ;;
+    *)
+      cat "$2" ;;
+  esac
+}
+
+_rs_snap_listing() { # _rs_snap_listing <dir> - names that existed before the transaction
+  : > "$_rs_snap/listing" || return 1
+  for _rs_ld in ${REINSTALL_LIST_DIRS:-}; do
+    _rs_lp="$(P "$_rs_ld")"
+    [ -d "$_rs_lp" ] || continue
+    if ! _rs_safe_path "$_rs_ld"; then
+      bad "snapshot: listing directory $_rs_ld is behind a symlink"
+      return 1
+    fi
+    for _rs_lf in "$_rs_lp"/* "$_rs_lp"/.[!.]*; do
+      [ -e "$_rs_lf" ] || [ -L "$_rs_lf" ] || continue
+      printf '%s\n' "${_rs_lf#"$GM_PREFIX"}" >> "$_rs_snap/listing" 2>/dev/null || return 1
+    done
+  done
+  return 0
+}
+
+_rs_snap_cron() { # _rs_snap_cron <dir>
+  crontab -l > "$_rs_snap/cron" 2>/dev/null
+  _rs_cr=$?
+  case "$_rs_cr" in
+    0|1) : ;;
+    *) bad "snapshot: crontab state unobservable (crontab -l rc=$_rs_cr)"; return 1 ;;
+  esac
+  [ -f "$_rs_snap/cron" ] || : > "$_rs_snap/cron"
+  return 0
+}
+
+_rs_snap_files() { # _rs_snap_files <dir> - byte objects of the manifest
+  while IFS='|' read -r _rs_fp _rs_fe; do
+    [ -n "${_rs_fp:-}" ] || continue
+    _rs_is_shared "$_rs_fp" && continue
+    if [ "$_rs_fe" = dir-or-absent ]; then
+      if ! _rs_safe_path "$_rs_fp"; then
+        bad "snapshot: $_rs_fp is behind an unsafe or unpinned symlink"
+        return 1
+      fi
+    else
+      if ! _rs_safe_file "$_rs_fp"; then
+        bad "snapshot: $_rs_fp is a symlink (byte object; links are not restored as bytes)"
+        return 1
+      fi
+    fi
+    _rs_ft=$(_rs_type "$_rs_fp")
+    if _rs_is_nr_state "$_rs_fp"; then
+      case "$_rs_ft" in
+        regular)
+          _rs_fa="$(P "$_rs_fp")"
+          _rs_f4=$(_rs_stat4 "$_rs_fa") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
+          _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+          _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+          _rs_fi=${_rs_fr%%|*}; _rs_fs=${_rs_fr#*|}
+          _rs_fh=$(_rs_hash "$_rs_fa") || { bad "snapshot: cannot hash $_rs_fp"; return 1; }
+          printf 'norestore|%s|%s|%s|%s|%s|%s\n' "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_fi" "$_rs_fs" "$_rs_fh" >> "$_rs_snap/objects" ;;
+        absent)
+          printf 'norestore-absent|%s|-\n' "$_rs_fp" >> "$_rs_snap/objects" ;;
+        *)
+          bad "snapshot: NR object $_rs_fp has unrestorable type $_rs_ft"
+          return 1 ;;
+      esac
+      continue
+    fi
+    case "$_rs_ft" in
+      symlink)
+        if [ "$_rs_fe" = dir-or-absent ] && [ -d "$(P "$_rs_fp")" ]; then
+          # A trusted storage link (extroot-style /etc/mihomo, /etc/geomask) is a
+          # directory object: keep the link, pin its target identity, restore metadata.
+          _rs_fa="$(P "$_rs_fp")"
+          _rs_f4=$(_rs_stat4 "$_rs_fa") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
+          _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+          _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+          _rs_fi=${_rs_fr%%|*}
+          _rs_lh=$(readlink -f "$_rs_fa" 2>/dev/null) || _rs_lh=""
+          [ -n "${_rs_lh:-}" ] || { bad "snapshot: cannot resolve $_rs_fp"; return 1; }
+          _rs_lr=$(_rs_posix_path "$_rs_lh")
+          _rs_ld=$(_rs_devino "$_rs_lh") || { bad "snapshot: cannot pin $_rs_fp"; return 1; }
+          printf 'dirlink|%s|%s|%s|%s|%s|-\n' \
+            "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_ld" "$_rs_lr" >> "$_rs_snap/objects"
+          continue
+        fi
+        bad "snapshot: unrestorable object: $_rs_fp is a symlink (the snapshot restores bytes, not links)"
+        return 1 ;;
+      unknown)
+        bad "snapshot: unobservable object: $_rs_fp"
+        return 1 ;;
+      absent)
+        printf 'absent|%s|-\n' "$_rs_fp" >> "$_rs_snap/objects" ;;
+      dir)
+        if [ "$_rs_fe" != dir-or-absent ]; then
+          bad "snapshot: $_rs_fp is a directory, expected $_rs_fe"
+          return 1
+        fi
+        _rs_fa="$(P "$_rs_fp")"
+        _rs_f4=$(_rs_stat4 "$_rs_fa") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
+        _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+        _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+        _rs_fi=${_rs_fr%%|*}
+        printf 'dir|%s|%s|%s|%s\n' "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_fi" >> "$_rs_snap/objects" ;;
+      regular)
+        _rs_fdir="$_rs_snap/files$(dirname "$_rs_fp")"
+        mkdir -p "$_rs_fdir" 2>/dev/null || { bad "snapshot: cannot create $_rs_fdir"; return 1; }
+        _rs_fa="$(P "$_rs_fp")"
+        cp -p "$_rs_fa" "$_rs_fdir/" 2>/dev/null || { bad "snapshot: cannot copy $_rs_fp"; return 1; }
+        _rs_f4=$(_rs_stat4 "$_rs_fa") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
+        _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+        _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+        _rs_fi=${_rs_fr%%|*}; _rs_fs=${_rs_fr#*|}
+        _rs_fh=$(_rs_hash "$_rs_fa") || { bad "snapshot: cannot hash $_rs_fp (sha256sum/md5sum missing)"; return 1; }
+        printf 'file|%s|%s|%s|%s|%s|%s\n' "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_fi" "$_rs_fs" "$_rs_fh" >> "$_rs_snap/objects" ;;
+    esac
+  done <<EOF
+${REINSTALL_PREFLIGHT_BYTE_FILES:-}
+EOF
+  for _rs_fp in ${REINSTALL_TRACKED:-}; do
+    _rs_is_shared "$_rs_fp" && continue
+    if grep -qF "|$_rs_fp|" "$_rs_snap/objects" 2>/dev/null; then continue; fi
+    if ! _rs_safe_file "$_rs_fp"; then
+      bad "snapshot: extra tracked object $_rs_fp is a symlink"
+      return 1
+    fi
+    _rs_ft=$(_rs_type "$_rs_fp")
+    case "$_rs_ft" in
+      regular)
+        _rs_fdir="$_rs_snap/files$(dirname "$_rs_fp")"
+        mkdir -p "$_rs_fdir" 2>/dev/null || { bad "snapshot: cannot create $_rs_fdir"; return 1; }
+        _rs_fa="$(P "$_rs_fp")"
+        cp -p "$_rs_fa" "$_rs_fdir/" 2>/dev/null || { bad "snapshot: cannot copy $_rs_fp"; return 1; }
+        _rs_f4=$(_rs_stat4 "$_rs_fa") || return 1
+        _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
+        _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
+        _rs_fi=${_rs_fr%%|*}; _rs_fs=${_rs_fr#*|}
+        _rs_fh=$(_rs_hash "$_rs_fa") || return 1
+        printf 'file|%s|%s|%s|%s|%s|%s\n' "$_rs_fp" "$_rs_fm" "$_rs_fu" "$_rs_fi" "$_rs_fs" "$_rs_fh" >> "$_rs_snap/objects" ;;
+      absent)
+        printf 'absent|%s|-\n' "$_rs_fp" >> "$_rs_snap/objects" ;;
+      *)
+        bad "snapshot: extra tracked object $_rs_fp is not a regular file or absent"
+        return 1 ;;
+    esac
+  done
+  return 0
+}
+
+_rs_snap_shared() { # _rs_snap_shared <dir> - managed subset of the shared files
+  _rs_si=0
+  while IFS='|' read -r _rs_sp _rs_sc; do
+    [ -n "${_rs_sp:-}" ] || continue
+    if ! _rs_safe_file "$_rs_sp"; then
+      bad "snapshot: shared object $_rs_sp is a symlink - refusing to snapshot through it"
+      return 1
+    fi
+    _rs_si=$((_rs_si+1))
+    _rs_st=$(_rs_type "$_rs_sp")
+    case "$_rs_st" in
+      symlink)
+        bad "snapshot: unrestorable shared object: $_rs_sp is a symlink"
+        return 1 ;;
+      dir)
+        bad "snapshot: unrestorable shared object: $_rs_sp is a directory"
+        return 1 ;;
+      unknown)
+        bad "snapshot: unobservable shared object: $_rs_sp"
+        return 1 ;;
+      absent)
+        printf 'shared|%s|%s\n' "$_rs_sp" "$_rs_sc" >> "$_rs_snap/objects"
+        printf '%s|%s|%s|absent|-|-|-\n' "$_rs_sc" "$_rs_sp" "$_rs_si" >> "$_rs_snap/shared"
+        continue ;;
+    esac
+    _rs_sa="$(P "$_rs_sp")"
+    _rs_s4=$(_rs_stat4 "$_rs_sa") || { bad "snapshot: cannot stat $_rs_sp"; return 1; }
+    _rs_sm=${_rs_s4%%|*}; _rs_sr=${_rs_s4#*|}
+    _rs_sd=${_rs_sr#*|}; _rs_sd=${_rs_sd%%|*}
+    _rs_sh=$(_rs_shared_neutral "$_rs_sc" "$_rs_sa" | _rs_hash_stream) \
+      || { bad "snapshot: cannot hash the managed part of $_rs_sp"; return 1; }
+    : > "$_rs_snap/shared.$_rs_si.pre" || { bad "snapshot: cannot create shared.$_rs_si.pre"; return 1; }
+    case "$_rs_sc" in
+      dnsai)
+        grep -E "^$AIDNS_USER:" "$_rs_sa" > "$_rs_snap/shared.$_rs_si.pre" 2>/dev/null || true ;;
+      zapret-block)
+        awk -v b='# >>> geomask sync: tunneled domains (generated) >>>' \
+            -v e="# <<< geomask sync: tunneled domains <<<" '
+          $0 == b { inb = 1 }
+          inb { print }
+          $0 == e { inb = 0 }' "$_rs_sa" > "$_rs_snap/shared.$_rs_si.pre" 2>/dev/null || true ;;
+      zapret-force)
+        # per-domain state before the run: A|domain = in the clear, M|domain = managed
+        # (commented out by sync). A managed line returned to the clear must be re-commented,
+        # which an "active domains only" preimage could not know (review 16.11, item 3).
+        awk -v m='# geomask: tunneled, DPI removed' '
+          index($0, m) == 1 { d = substr($0, length(m) + 2)
+                              if (d != "") print "M|" d; next }
+          $0 != "" && $0 !~ /^#/ { print "A|" $0 }' "$_rs_sa" \
+          > "$_rs_snap/shared.$_rs_si.pre" 2>/dev/null || true ;;
+    esac
+    printf 'shared|%s|%s\n' "$_rs_sp" "$_rs_sc" >> "$_rs_snap/objects"
+    printf '%s|%s|%s|regular|%s|%s|%s\n' "$_rs_sc" "$_rs_sp" "$_rs_si" "$_rs_sh" "$_rs_sd" "$_rs_sm" >> "$_rs_snap/shared"
+  done <<EOF
+${REINSTALL_SHARED_APPEND:-}
+EOF
+  return 0
+}
+
+_rs_snap_uci() { # _rs_snap_uci <dir> - preimage of the managed uci keys
+  for _rs_up in network dhcp ksmbd; do
+    if [ -f "$(P "/tmp/.uci/$_rs_up")" ]; then
+      bad "snapshot: pending uci delta for $_rs_up - another writer is mid-edit; reinstall refused"
+      return 1
+    fi
+  done
+  while IFS='|' read -r _rs_pkg _rs_sel _rs_kind _rs_opts; do
+    [ -n "${_rs_pkg:-}" ] || continue
+    if ! _rs_safe_path "/etc/config/$_rs_pkg"; then
+      bad "snapshot: /etc/config/$_rs_pkg is behind a symlink - refusing uci reads through it"
+      return 1
+    fi
+    case "$_rs_kind" in
+      section)
+        if uci -q get "$_rs_pkg.$_rs_sel" >/dev/null 2>&1; then
+          _rs_ty=$(uci -q get "$_rs_pkg.$_rs_sel" 2>/dev/null)
+          printf 'uci|%s|%s|@type|%s\n' "$_rs_pkg" "$_rs_sel" "$_rs_ty" >> "$_rs_snap/uci"
+          for _rs_o in $(printf '%s' "$_rs_opts" | tr ',' ' '); do
+            if _rs_v=$(uci -q get "$_rs_pkg.$_rs_sel.$_rs_o" 2>/dev/null); then
+              printf 'uci|%s|%s|%s|%s\n' "$_rs_pkg" "$_rs_sel" "$_rs_o" "$_rs_v" >> "$_rs_snap/uci"
+            else
+              printf 'uci|%s|%s|%s|<absent>\n' "$_rs_pkg" "$_rs_sel" "$_rs_o" >> "$_rs_snap/uci"
+            fi
+          done
+        else
+          printf 'uci|%s|%s|@type|<absent>\n' "$_rs_pkg" "$_rs_sel" >> "$_rs_snap/uci"
+        fi ;;
+      option)
+        for _rs_o in $(printf '%s' "$_rs_opts" | tr ',' ' '); do
+          if _rs_v=$(uci -q get "$_rs_pkg.$_rs_sel.$_rs_o" 2>/dev/null); then
+            printf 'uci|%s|%s|%s|%s\n' "$_rs_pkg" "$_rs_sel" "$_rs_o" "$_rs_v" >> "$_rs_snap/uci"
+          else
+            printf 'uci|%s|%s|%s|<absent>\n' "$_rs_pkg" "$_rs_sel" "$_rs_o" >> "$_rs_snap/uci"
+          fi
+        done ;;
+      name)
+        _rs_mi=0
+        for _rs_ms in $(_rs_ksmbd_ours "$_rs_sel"); do
+          _rs_mi=$((_rs_mi+1))
+          printf 'uci|%s|@match%d|@type|share\n' "$_rs_pkg" "$_rs_mi" >> "$_rs_snap/uci"
+          # every option of OUR section is recorded: force_root appeared in the manifest
+          # after phase 2b and a fixed allowlist silently dropped it.
+          _rs_kol=$(uci -q show "$_rs_pkg" 2>/dev/null | awk -v p="$_rs_ms." '
+            index($0, p) == 1 { rest = substr($0, length(p) + 1); sub(/=.*/, "", rest)
+                                if (rest != "") print rest }')
+          for _rs_ko in $_rs_kol; do
+            if _rs_v=$(uci -q get "$_rs_ms.$_rs_ko" 2>/dev/null); then
+              printf 'uci|%s|@match%d|%s|%s\n' "$_rs_pkg" "$_rs_mi" "$_rs_ko" "$_rs_v" >> "$_rs_snap/uci"
+            else
+              printf 'uci|%s|@match%d|%s|<absent>\n' "$_rs_pkg" "$_rs_mi" "$_rs_ko" >> "$_rs_snap/uci"
+            fi
+          done
+        done
+        [ "$_rs_mi" -gt 0 ] || printf 'uci|%s|@none|@type|<absent>\n' "$_rs_pkg" >> "$_rs_snap/uci"
+        ;;
+    esac
+  done <<EOF
+${REINSTALL_UCI_OBJECTS:-}
+EOF
+  return 0
+}
+
+_rs_snap_sysctl() { # _rs_snap_sysctl <dir> - per-interface disable_ipv6, never "0 by default"
+  _rs_kd="$(P /proc/sys/net/ipv6/conf)"
+  if ! _rs_safe_path /proc/sys/net/ipv6/conf || [ ! -d "$_rs_kd" ] || ! ls "$_rs_kd" >/dev/null 2>&1; then
+    bad "snapshot: kernel sysctl state unobservable: /proc/sys/net/ipv6/conf"
+    return 1
+  fi
+  for _rs_kf in "$_rs_kd"/*; do
+    [ -d "$_rs_kf" ] || continue
+    _rs_kn=${_rs_kf##*/}
+    _rs_kv=$(cat "$_rs_kf/disable_ipv6" 2>/dev/null | tr -dc '01')
+    case "$_rs_kv" in
+      0|1) : ;;
+      *) bad "snapshot: kernel sysctl unobservable: net.ipv6.conf.$_rs_kn.disable_ipv6"
+         return 1 ;;
+    esac
+    printf 'sysctl|%s|%s\n' "$_rs_kn" "$_rs_kv" >> "$_rs_snap/sysctl"
+  done
+  return 0
+}
+

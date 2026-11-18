@@ -1,0 +1,343 @@
+
+		/* Isolated per-path service-egress observations; no production apply. */
+		panels.nodes.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Раздельные фильтры выхода: VPN / VPN-noP2P / AI'),
+			E('p', { 'class': 'gs-hint' }, 'Проверка не переключает рабочие узлы. Страна определяется по ответу сайта, не по адресу входного сервера. Сохранение — желаемая настройка, не применение фильтра. Старый ночной сканер ниже работает отдельно.'),
+			pathAudit.error ? E('p', {}, 'Ошибка: ' + pathAudit.error) : E('span', {}, '')
+		]));
+		(pathAudit.paths || []).forEach(function(path) {
+			// Keep an unsaved edit per path. Reloading the page (or the automatic reload after
+			// a check) used to wipe whatever was typed in the other cards.
+			var draftKey = 'gs-draft-' + path.id;
+			var draft = '';
+			try { draft = localStorage.getItem(draftKey) || ''; } catch (e) { draft = ''; }
+			var savedValue = (path.countries_allow || []).join(',');
+			var input = E('input', { 'class': 'gs-text', type: 'text', size: 22,
+				value: draft || savedValue,
+				'input': function() {
+					try { localStorage.setItem(draftKey, this.value); } catch (e) { /* ignore */ }
+				} });
+			var draftHint = draft && draft !== savedValue
+				? E('span', { 'class': 'gs-warn' }, 'есть несохранённый ввод')
+				: E('span', {});
+			var report = path.report || {};
+			var status = E('div', { 'class': 'gs-hint' }, report.status ? ('Проверка: ' + report.status + (report.stale ? ' · УСТАРЕЛА' : '')) : 'Ещё не проверялся');
+			var save = E('button', { 'class': 'gs-btn', 'click': function() {
+				save.disabled = true;
+				callNodesPathSave(path.id, input.value.trim().toUpperCase(), pathAudit.revision).then(function(res) {
+					if (!res || !res.ok) throw new Error((res || {}).error || 'Сохранение не подтверждено');
+					try { localStorage.removeItem(draftKey); } catch (e) { /* ignore */ }
+					ui.addNotification(null, E('p', {}, res.changed ? 'Желаемый фильтр сохранён. В mihomo не применён.' : 'Настройки не изменились.'), 'info');
+					view.reload();
+				}).catch(function(err) { ui.addNotification(null, E('p', {}, String(err)), 'error'); }).finally(function() { save.disabled = false; });
+			} }, 'Сохранить настройки');
+			var run = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+				run.disabled = true;
+				callNodesPathCheck(path.id).then(function(res) {
+					if (!res || !res.ok) throw new Error((res || {}).error || 'Запуск не подтверждён');
+					var jobId = res.job_id;
+					// Store jobId for polling and cancel
+					run._jobId = jobId;
+					status.textContent = 'Проверка запущена (job ' + jobId + '). Ожидание результатов...';
+					run.style.display = 'none';
+					cancel.style.display = 'inline-block';
+					view.pollJob(jobId, path.id);
+				}).catch(function(err) { ui.addNotification(null, E('p', {}, String(err)), 'error'); }).finally(function() { run.disabled = false; });
+			} }, 'Проверить ' + path.label);
+			var cancel = E('button', { 'class': 'gs-btn gs-btn-warn', style: 'display:none', 'click': function() {
+				var jobId = run._jobId;
+				if (jobId) {
+					cancel.disabled = true;
+					callNodesAuditCancel(jobId).then(function(res) {
+						if (res && res.ok) {
+							status.textContent = 'Отмена запрошена, ожидание завершения...';
+							cancel.style.display = 'none';
+							// polling will detect cancelled status and reload
+						} else {
+							ui.addNotification(null, E('p', {}, 'Отмена не удалась: ' + ((res || {}).error || 'unknown')), 'error');
+						}
+					}).catch(function(err) { ui.addNotification(null, E('p', {}, String(err)), 'error'); }).finally(function() { cancel.disabled = false; });
+				}
+			} }, 'Отменить');
+			var rows = (report.nodes || []).map(function(node) {
+				var facts = Object.keys(node.probes || {}).map(function(service) {
+					var proof = node.probes[service];
+					return service + ': ' + (proof.country || 'UNKNOWN') + (proof.ip ? ' / ' + proof.ip : '') + (proof.reason ? ' (' + proof.reason + ')' : '');
+				}).join(' · ');
+				return E('div', { 'class': 'gs-upd-meta' }, node.name + ' — ' + node.status + '\n' + facts);
+			});
+			panels.nodes.appendChild(E('div', { 'class': 'gs-card' }, [
+				E('h3', {}, path.label),
+				E('p', { 'class': 'gs-hint' }, 'Источник: ' + ((path.providers || []).join(', ') || 'не определён') + (path.configured ? ' · сохранено' : ' · предлагаемые страны, ещё не сохранены')),
+				E('div', { 'class': 'gs-row' }, [E('span', {}, 'Разрешённые страны выхода (ISO-2)'), input, save, run,
+					E('button', { 'class': 'gs-btn', 'click': function() { view.reload(); } }, 'Обновить результаты'), draftHint]),
+				status,
+				E('p', { 'class': 'gs-hint' }, report.error || report.limit || 'HTTP 200/204 Google не означает US. Проверки SOCKS5h не подтверждают путь клиента с локальным hosts.'),
+				// What admission actually means for this path, in plain words.
+				path.id === 'ai' ? E('p', { 'class': 'gs-hint' },
+					'Допуск AI: ChatGPT и Cloudflare. Google не отдаёт страну в машинно-читаемом виде — '
+					+ 'его страна показывается как «неизмерима» и в допуске не участвует.') : E('span', {}),
+				// Positive state of the filter. Without this the card only ever showed a
+				// warning when something was wrong, so "nothing applied" and "applied and
+				// healthy" looked identical to the owner.
+				(function() {
+					var d = path.applied_detail || {};
+					var state = d.status || 'never';
+					var text, cls = 'gs-hint';
+					if (state === 'applied') {
+						text = 'Фильтр действует: ' + (d.node_count || 0) + ' проверенных узлов'
+							+ (d.applied_at ? ', применён ' + new Date(d.applied_at).toLocaleString() : '')
+							+ (d.provider_id ? ' · ' + d.provider_id : '');
+					} else if (state === 'applying') {
+						// An apply in flight, or one that died between commit and bookkeeping.
+						// The group may already be pinned, so this must never read as "not applied".
+						text = 'Применение не завершено: пул может быть уже подключён. Проверьте состав '
+							+ 'и при необходимости отзовите фильтр.';
+						cls = 'gs-warn';
+					} else if (state === 'expired') {
+						text = 'Фильтр действует, но доказательства просрочены: нужен новый Check и повторное применение';
+						cls = 'gs-warn';
+					} else if (state === 'revoked') {
+						text = 'Фильтр отозван: путь снова использует исходный источник';
+					} else {
+						text = 'Фильтр не применялся: путь использует исходный источник без сужения';
+					}
+					// Desired and acting are different questions: say so when they diverge.
+					var acting = (d.acting_countries || []).join(',');
+					var desired = (path.countries_allow || []).join(',');
+					var nodes = [E('p', { 'class': cls }, text)];
+					if ((state === 'applied' || state === 'expired') && acting && acting !== desired) {						nodes.push(E('p', { 'class': 'gs-hint' },
+							'Желаемые страны: ' + (desired || '—') + ' · действующие: ' + acting));
+					}
+					return E('div', {}, nodes);
+				})(),
+				E('div', {}, rows),
+				// Revoke is always available while a filter is in force: an owner must be able
+				// to undo an apply even when the report has gone stale, which is exactly the
+				// state an apply itself creates.
+				path.applied && (path.applied_detail || {}).status !== 'revoked' ? E('div', { 'class': 'gs-row', style: 'margin-top: 8px' }, [
+					E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesPathRevoke(path.id).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Отзыв не подтверждён');
+							ui.addNotification(null, E('p', {}, res.revoked ? 'Фильтр отозван, исходный источник и фильтр группы восстановлены' : 'Активного фильтра нет'), 'info');
+							view.reload();
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'Отозвать фильтр')
+				]) : E('span', {}),
+				// Preview and Apply section
+				report.status === 'complete' && !report.stale && report.counts && report.counts.eligible > 0 ? E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color,#30363d)' }, [
+					E('button', { 'class': 'gs-btn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesPathPreview(path.id, report.job_id, report.settings_revision, report.source_revision).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Предпросмотр не подтверждён');
+							// Show preview in notification
+							var msg = 'Предпросмотр: ' + res.eligible_count + ' подходят, ' + res.excluded_count + ' исключены, ' + res.unknown_count + ' неизвестно.';
+							if (res.to_add && res.to_add.length) msg += ' Добавится: ' + res.to_add.join(', ');
+							if (res.to_remove && res.to_remove.length) msg += ' Удалится: ' + res.to_remove.join(', ');
+							if (res.warnings && res.warnings.length) msg += ' ⚠ ' + res.warnings.join('; ');
+							ui.addNotification(null, E('p', {}, msg), 'info');
+							// Store preview_id for apply
+							path._preview_id = res.preview_id;
+						}).catch(function(err) {
+							btn.disabled = false;
+							// A check that finished after this page was drawn replaces the
+							// report, so the card holds a dead job id. Refresh instead of
+							// leaving the owner with an unexplained refusal.
+							if (/Report ID mismatch|Report not found|Report not complete/i.test(String(err))) {
+								ui.addNotification(null, E('p', {},
+									'Отчёт обновился после загрузки страницы. Данные перечитаны — '
+									+ 'нажмите «Предпросмотр» ещё раз.'), 'warning');
+								view.reload();
+								return;
+							}
+							ui.addNotification(null, E('p', {}, String(err)), 'error');
+						});
+					} }, 'Предпросмотр'),
+					E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+						var btn = this; 
+						var previewId = path._preview_id;
+						if (!previewId) { ui.addNotification(null, E('p', {}, 'Сначала сделайте предпросмотр'), 'error'); return; }
+						btn.disabled = true;
+						callNodesPathApply(path.id, previewId, report.settings_revision).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Применение не подтверждено');
+							ui.addNotification(null, E('p', {}, 'Фильтр применён к трафику (' + (res.tx_id || '') + ')'), 'info');
+							view.reload();
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'Применить фильтр'),
+				]) : E('span', {}),
+				// History section
+				E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color,#30363d)' }, [
+					E('button', { 'class': 'gs-btn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesAuditEventsGet(path.id, null, 10).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'История не загружена');
+							var msg = 'История (' + res.events.length + '):\n' + res.events.map(function(e) {
+								var ts = e.timestamp;
+								var t;
+								if (ts) {
+									t = new Date(ts).toLocaleString();
+								} else if (e.event_id) {
+									// Fallback: extract ISO timestamp from event_id prefix (format: 2026-11-09T14:16:28.149342+03:00-xxx)
+									var m = e.event_id.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/);
+									if (m) t = new Date(m[1]).toLocaleString();
+								}
+								t = t || 'Время неизвестно';
+								return t + ' [' + e.action + '] ' + (e.result || '') + (e.revoked_nodes ? ' · отозвано: ' + e.revoked_nodes.join(', ') : '');
+							}).join('\n');
+							ui.addNotification(null, E('p', { 'style': 'white-space: pre-wrap; max-height: 300px; overflow: auto' }, msg), 'info');
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'История')
+				]),
+				// Drift detection
+				report.status === 'complete' && !report.stale && path.applied && path.applied_detail && path.applied_detail.runtime_verified === false ? E('div', { 'class': 'gs-row gs-warn', style: 'margin-top: 8px; padding: 8px; background: #d2992222; border: 1px solid #d29922; border-radius: 6px' }, [
+					E('span', { 'class': 'gs-warn' }, '⚠ Применённый фильтр не подтверждён на работающем mihomo.'),
+					E('button', { 'class': 'gs-btn', 'click': function() { view.reload(); } }, 'Перезагрузить')
+				]) : E('span', {}),
+				// Expired evidence: the filter is still narrowing the pool, it was not widened.
+				path.applied_detail && path.applied_detail.status === 'expired' ? E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding: 8px; background: #d2992222; border: 1px solid #d29922; border-radius: 6px' }, [
+					E('span', { 'class': 'gs-warn' }, '⏳ Срок давности проверки истёк. Фильтр продолжает действовать и путь не расширен: нужен новый Check и повторное применение.'),
+					E('button', { 'class': 'gs-btn', 'click': function() {
+						var btn = this; btn.disabled = true;
+						callNodesPathCheck(path.id).then(function(res) {
+							btn.disabled = false;
+							if (!res || !res.ok) throw new Error((res || {}).error || 'Проверка не запущена');
+							view.reload();
+						}).catch(function(err) { btn.disabled = false; ui.addNotification(null, E('p', {}, String(err)), 'error'); });
+					} }, 'Проверить сейчас')
+				]) : E('span', {}),
+				// Schedule section
+				(function() {
+					var sched = path.schedule || {};
+					var inTime = E('input', { 'class': 'gs-text', type: 'text', value: sched.time || '03:30', size: 6 });
+					var inMode = E('select', { 'class': 'gs-text' }, [
+						E('option', { value: 'check-only' }, 'Только проверка'),
+						E('option', { value: 'check-and-apply' }, 'Проверка и применение')
+					]);
+					inMode.value = sched.mode || 'check-only';
+					var chkEn = E('input', { 'class': 'gs-check', type: 'checkbox' });
+					chkEn.checked = sched.enabled === true;
+
+					function persist() {
+						callNodesAuditScheduleSet(path.id, chkEn.checked ? 'true' : 'false',
+							inTime.value.trim(), inMode.value).then(function(res) {
+							if (!res || !res.ok) {
+								ui.addNotification(null, E('p', {}, 'Ошибка: ' + ((res || {}).error || 'unknown')), 'error');
+								return;
+							}
+							ui.addNotification(null, E('p', {}, 'Расписание сохранено'), 'info');
+							view.reload();
+						}).catch(function(err) {
+							ui.addNotification(null, E('p', {}, String(err)), 'error');
+						});
+					}
+
+					return E('div', { 'class': 'gs-row', style: 'margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-color,#30363d)' }, [
+						E('span', { 'class': 'gs-label' }, 'Расписание проверки'),
+						E('label', { 'class': 'gs-check' }, [chkEn, E('span', {}, 'включено')]),
+						E('span', { 'class': 'gs-label' }, 'Время (ЧЧ:ММ)'), inTime,
+						E('span', { 'class': 'gs-label' }, 'Режим'), inMode,
+						E('button', { 'class': 'gs-btn', 'click': persist }, 'Сохранить расписание')
+					]);
+				})()
+			]));
+		});
+
+		/* ===================== Legacy node audit (separate server-country policy) ===================== */
+		var conf = nd.conf || {};
+		var chkEn = E('input', { type: 'checkbox' }); chkEn.checked = (nd.enabled !== false);
+		var inSched = E('input', { 'class': 'gs-text', type: 'text', value: nd.schedule || '03:30', size: 6 });
+		var inCC = E('input', { 'class': 'gs-text', type: 'text', value: conf.bad_countries || '', size: 14 });
+		var inAS = E('input', { 'class': 'gs-text', type: 'text', value: conf.bad_asns || '', size: 24 });
+		var inBase = E('input', { 'class': 'gs-text', type: 'text', value: conf.base_filter || '', size: 40 });
+		var inProv = E('input', { 'class': 'gs-text', type: 'text', value: conf.sub_provider || 'sub', size: 8 });
+		var btnSave = E('button', { 'class': 'gs-btn gs-btn-primary', 'click': function() {
+			btnSave.disabled = true; btnSave.textContent = 'Сохранение…';
+			callNodesSet({
+				enabled: chkEn.checked ? '1' : '0',
+				schedule: inSched.value.trim(), countries: inCC.value.trim(), asns: inAS.value.trim(),
+				base: inBase.value.trim(), provider: inProv.value.trim()
+			}).then(function(res) {
+				btnSave.disabled = false; btnSave.textContent = 'Сохранить';
+				if (res && res.error) { ui.addNotification(null, E('p', {}, 'Ошибка: ' + res.error), 'error'); return; }
+				ui.addNotification(null, E('p', {}, 'Настройки аудита сохранены'), 'info');
+				return view.reload();
+			}).catch(function(e) { btnSave.disabled = false; btnSave.textContent = 'Сохранить'; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Сохранить');
+		var btnRun = E('button', { 'class': 'gs-btn', 'click': function() {
+			btnRun.disabled = true; btnRun.textContent = 'Запущен…';
+			callNodescan().then(function() {
+				ui.addNotification(null, E('p', {}, 'Аудит запущен (до ~1 минуты), затем фильтр применится сам'), 'info');
+				setTimeout(function() { view.reload(); }, 45000);
+			}).catch(function(e) { btnRun.disabled = false; ui.addNotification(null, E('p', {}, 'Ошибка: ' + e), 'error'); });
+		} }, 'Проверить сейчас');
+		var nst = nd.state || {};
+		var blocked = nd.blocked || [];
+		panels.nodes.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Ночной аудит узлов подписки'),
+			E('div', { 'class': 'gs-hint', 'style': 'margin:0 0 8px' },
+				'Сканер скачивает подписку, проверяет адрес каждого сервера по гео-реестрам (страна и владелец сети), ' +
+				'и собирает exclude-filter группы VPN: узлы с «плохой» сетью блокируются точным именем, чистые — разблокируются. ' +
+				'Трафик при этом не переключается; конфиг применяется только после успешной проверки mihomo -t.'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Последний прогон'),
+				E('span', { 'class': 'gs-val' }, nst.ts ? (nst.ts + ' · узлов ' + nst.total + ' · заблокировано ' + nst.blocked
+					+ (nst.errors ? ' · сбоев проверки ' + nst.errors : '') + (nst.changed ? ' · фильтр обновлён' : ''))
+					: 'ещё не запускался')
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('label', { 'class': 'gs-check' }, [chkEn, E('span', {}, 'Аудит по расписанию (ночью)')]),
+				E('span', { 'class': 'gs-label' }, 'Время (ЧЧ:ММ)'), inSched, btnRun
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Плохие страны'), inCC,
+				E('span', { 'class': 'gs-label' }, 'Плохие сети (ASN)'), inAS,
+				E('span', { 'class': 'gs-label' }, 'Провайдер'), inProv
+			]),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Базовый фильтр имён'), inBase, btnSave
+			]),
+			E('div', { 'class': 'gs-hint' }, 'Страны: AA,BB (ISO-2). ASN: AS123456,AS234. Без кавычек и обратных слэшей.'),
+			E('div', { 'class': 'gs-blocklist' }, blocked.length ? blocked.join('\n') : 'заблокированных узлов нет'),
+			E('div', { 'class': 'gs-upd-meta' }, (nd.log || []).join('\n'))
+		]));
+
+		/* ===================== Settings tab ===================== */
+		var btnPin = stk.pin
+			? E('button', { 'class': 'gs-btn gs-btn-warn', 'click': function() {
+				if (!confirm('Снять запрет рестарта mihomo? Панельные операции с --restart снова станут возможны.')) return;
+				btnPin.disabled = true;
+				callPinSet({ state: 'off' }).then(function() { view.reload(); }).catch(function() { btnPin.disabled = false; });
+			} }, 'Снять пин')
+			: E('button', { 'class': 'gs-btn', 'click': function() {
+				btnPin.disabled = true;
+				callPinSet({ state: 'on' }).then(function() { view.reload(); }).catch(function() { btnPin.disabled = false; });
+			} }, 'Запретить рестарты');
+		var K = stk.links || {};
+		function linkRow(label, url) {
+			return E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, label),
+				url ? E('a', { 'href': url, 'target': '_blank', 'class': 'gs-mono' }, url) : E('span', {}, '—')
+			]);
+		}
+		panels.set.appendChild(E('div', { 'class': 'gs-card' }, [
+			E('h3', {}, 'Прочее'),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Пин «не рестартить mihomo»'),
+				E('span', { 'class': 'gs-badge ' + (stk.pin ? 'gs-on' : 'gs-off') }, stk.pin ? 'установлен' : 'снят'),
+				btnPin
+			]),
+			E('div', { 'class': 'gs-hint' }, 'С пином безопасные операции панели не трогают живой VPN-трафик рестартами. Снимайте только осознанно.'),
+			linkRow('MagiTrickle (группы доменов)', K.magitrickle),
+			linkRow('Zapret DPI (стратегии)', K.zapret),
+			linkRow('Лендинг портов', K.landing),
+			linkRow('LuCI', K.luci),
+			E('div', { 'class': 'gs-row' }, [
+				E('span', { 'class': 'gs-label' }, 'Версия панели'),
+				E('span', { 'class': 'gs-val gs-mono' }, PANEL_VERSION)
+			])
+		]));

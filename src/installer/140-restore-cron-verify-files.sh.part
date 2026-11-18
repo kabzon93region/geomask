@@ -1,0 +1,315 @@
+_rs_restore_cron() { # _rs_restore_cron <dir> - exact crontab, foreign lines are a conflict
+  # I03/I04 (audit 18.11.2026): the read, the foreign-line comparison and the write must all
+  # happen under the same kernel `cron` lock. The old version compared before taking it, so a
+  # panel write between the compare and the restore was silently overwritten; it also wrote
+  # the snapshot even when the lock could not be taken.
+  _cron_begin || {
+    bad "rollback: crontab lock unavailable - not overwriting"
+    _rr=1
+    return 1
+  }
+  _rs_cur=$(crontab -l 2>/dev/null)
+  _rs_cr=$?
+  case "$_rs_cr" in
+    0|1) : ;;
+    *) _cron_end; bad "rollback: crontab state unobservable (rc=$_rs_cr)"; _rr=1; return 1 ;;
+  esac
+  _rs_want=$(cat "$_rs_snap/cron" 2>/dev/null)
+  _rs_re='# geomask-(guard|ytwatch|ytwatch-reset|doctor-prune|vpnwatch|nodescan|audit-schedule)|sync_mtrickle_mihomo|geomask-node-scan'
+  _rs_p1=$(printf '%s\n' "$_rs_cur" | grep -vE "$_rs_re" 2>/dev/null)
+  _rs_p2=$(printf '%s\n' "$_rs_want" | grep -vE "$_rs_re" 2>/dev/null)
+  if [ "$_rs_p1" != "$_rs_p2" ]; then
+    _cron_end
+    bad "conflict: crontab changed by another writer after the snapshot - not overwriting"
+    _rr=1
+    return 1
+  fi
+  crontab "$_rs_snap/cron" 2>/dev/null \
+    || { _cron_end; bad "rollback: crontab write failed"; _rr=1; return 1; }
+  _cron_end
+  _rs_after=$(crontab -l 2>/dev/null)
+  if [ "$_rs_after" != "$_rs_want" ]; then
+    bad "rollback: crontab did not verify (silent write failure?)"
+    _rr=1
+    return 1
+  fi
+  return 0
+}
+
+_rs_verify_files() { # _rs_verify_files <dir>
+  # Honour the argument every caller already passes: relying on a global _rs_snap silently
+  # verified "whatever snapshot was set last" when a test or a future caller pointed elsewhere.
+  _rs_snap=${1:-$_rs_snap}
+  [ -f "$_rs_snap/objects" ] || return 1
+  _rs_vr=0
+  while IFS='|' read -r _rs_ok _rs_op _rs_oa _rs_ob _rs_oc _rs_od _rs_oe; do
+    [ -n "${_rs_op:-}" ] || continue
+    _rs_dst="$(P "$_rs_op")"
+    case "$_rs_ok" in
+      file)
+        if ! _rs_safe_file "$_rs_op"; then
+          bad "verify: $_rs_op is a symlink (byte object)"
+          _rs_vr=1
+          continue
+        fi ;;
+      dir|dirlink)
+        if ! _rs_safe_path "$_rs_op"; then
+          bad "verify: $_rs_op (or a parent) is an unsafe or unpinned symlink"
+          _rs_vr=1
+          continue
+        fi ;;
+      absent)
+        if ! _rs_safe_path "$(dirname "$_rs_op")"; then
+          bad "verify: a path component of $_rs_op is an unsafe or unpinned symlink"
+          _rs_vr=1
+          continue
+        fi ;;
+    esac
+    case "$_rs_ok" in
+      file)
+        if [ ! -f "$_rs_snap/files$_rs_op" ]; then
+          bad "verify: no snapshot copy of $_rs_op"
+          _rs_vr=1
+          continue
+        fi
+        if [ -L "$_rs_dst" ]; then
+          bad "verify: $_rs_op is a symlink, expected the restored regular file"
+          _rs_vr=1
+          continue
+        fi
+        if ! cmp -s "$_rs_snap/files$_rs_op" "$_rs_dst" 2>/dev/null; then
+          bad "verify: $_rs_op does not match the snapshot bytes"
+          _rs_vr=1
+        fi
+        _rs_nowm=$(_rs_mode "$_rs_dst" 2>/dev/null) || _rs_nowm=""
+        if [ "$_rs_nowm" != "$_rs_oa" ]; then
+          bad "verify: mode of $_rs_op is ${_rs_nowm:-unknown}, expected $_rs_oa"
+          _rs_vr=1
+        fi ;;
+      dirlink)
+        if [ ! -L "$_rs_dst" ] || [ ! -d "$_rs_dst" ]; then
+          bad "verify: $_rs_op is not the pinned symlinked directory"
+          _rs_vr=1
+        else
+          _rs_lh=$(readlink -f "$_rs_dst" 2>/dev/null) || _rs_lh=""
+          _rs_lr=$(_rs_posix_path "$_rs_lh")
+          _rs_ld=$(_rs_devino "$_rs_lh" 2>/dev/null) || _rs_ld=""
+          if [ "$_rs_lr" != "$_rs_od" ] || [ "$_rs_ld" != "$_rs_oc" ]; then
+            bad "verify: target of $_rs_op changed after the snapshot"
+            _rs_vr=1
+          fi
+        fi ;;
+      dir)
+        if [ -L "$_rs_dst" ]; then
+          bad "verify: $_rs_op is a symlink, expected the restored directory"
+          _rs_vr=1
+        elif [ ! -d "$_rs_dst" ]; then
+          bad "verify: directory $_rs_op is missing"
+          _rs_vr=1
+        fi ;;
+      absent)
+        if [ -e "$_rs_dst" ] || [ -L "$_rs_dst" ]; then
+          bad "verify: $_rs_op did not exist before the run but is still present"
+          _rs_vr=1
+        fi ;;
+      norestore)
+        if [ ! -f "$_rs_dst" ]; then
+          bad "verify: NR object $_rs_op disappeared during the run - not restorable"
+          _rs_vr=1
+        else
+          _rs_nowh=$(_rs_hash "$_rs_dst" 2>/dev/null) || _rs_nowh=""
+          if [ "$_rs_nowh" != "$_rs_oe" ]; then
+            bad "verify: NR state $_rs_op was rewritten by its owner and cannot be restored (MagiTrickle state changed) - rollback incomplete"
+            _rs_vr=1
+          fi
+        fi ;;
+      norestore-absent)
+        if [ -e "$_rs_dst" ] || [ -L "$_rs_dst" ]; then
+          bad "verify: NR object $_rs_op did not exist before the run; it was created by the seeder and is not restorable"
+          _rs_vr=1
+        fi ;;
+    esac
+  done < "$_rs_snap/objects"
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_shared() { # _rs_verify_shared <dir>
+  [ -f "$_rs_snap/shared" ] || return 0
+  _rs_vr=0
+  while IFS='|' read -r _rs_sc _rs_sp _rs_si _rs_sk _rs_sh _rs_sd _rs_sm; do
+    [ -n "${_rs_sp:-}" ] || continue
+    _rs_sa="$(P "$_rs_sp")"
+    if [ "$_rs_sk" = absent ]; then
+      if ! _rs_safe_path "$(dirname "$_rs_sp")"; then
+        bad "verify: a path component of $_rs_sp is an unsafe or unpinned symlink"
+        _rs_vr=1
+        continue
+      fi
+      if [ -e "$_rs_sa" ] || [ -L "$_rs_sa" ]; then
+        bad "verify: $_rs_sp did not exist before the run but is present now"
+        _rs_vr=1
+      fi
+      continue
+    fi
+    if ! _rs_safe_file "$_rs_sp"; then
+      bad "verify: $_rs_sp is a symlink or an unsafe/unpinned path"
+      _rs_vr=1
+      continue
+    fi
+    if [ -L "$_rs_sa" ]; then
+      bad "verify: $_rs_sp is a symlink"
+      _rs_vr=1
+      continue
+    fi
+    _rs_pre="$_rs_snap/shared.$_rs_si.pre"
+    if [ ! -f "$_rs_pre" ]; then
+      bad "verify: snapshot lost the managed preimage of $_rs_sp"
+      _rs_vr=1
+      continue
+    fi
+    _rs_nh=$(_rs_shared_neutral "$_rs_sc" "$_rs_sa" 2>/dev/null | _rs_hash_stream) || _rs_nh=""
+    if [ "$_rs_nh" != "$_rs_sh" ]; then
+      bad "verify: foreign part of $_rs_sp differs from the snapshot"
+      _rs_vr=1
+    fi
+    _rs_nowm=$(_rs_mode "$_rs_sa" 2>/dev/null) || _rs_nowm=""
+    if [ "$_rs_nowm" != "$_rs_sm" ]; then
+      bad "verify: mode of $_rs_sp is ${_rs_nowm:-unknown}, expected $_rs_sm"
+      _rs_vr=1
+    fi
+    case "$_rs_sc" in
+      dnsai)
+        _rs_got=$(grep -E "^$AIDNS_USER:" "$_rs_sa" 2>/dev/null | sort)
+        _rs_exp=$(sort "$_rs_pre" 2>/dev/null)
+        if [ "$_rs_got" != "$_rs_exp" ]; then
+          bad "verify: $AIDNS_USER lines in $_rs_sp do not match the snapshot"
+          _rs_vr=1
+        fi ;;
+      zapret-block)
+        _rs_got=$(awk -v b='# >>> geomask sync: tunneled domains (generated) >>>' \
+                     -v e="# <<< geomask sync: tunneled domains <<<" '
+          $0 == b { inb = 1 }
+          inb { print }
+          $0 == e { inb = 0 }' "$_rs_sa" 2>/dev/null | sort)
+        _rs_exp=$(sort "$_rs_pre" 2>/dev/null)
+        if [ "$_rs_got" != "$_rs_exp" ]; then
+          bad "verify: managed block of $_rs_sp does not match the snapshot"
+          _rs_vr=1
+        fi ;;
+      zapret-force)
+        if ! awk -v m='# geomask: tunneled, DPI removed' -v pre="$_rs_pre" '
+             BEGIN {
+               while ((getline line < pre) > 0) {
+                 st = substr(line, 1, 1); d = substr(line, 3)
+                 if (d != "") want[d] = st
+               }
+             }
+             {
+               if (index($0, m) == 1) {
+                 d = substr($0, length(m) + 2)
+                 if (want[d] == "A") exit 1
+                 seenM[d] = 1; next
+               }
+               if ($0 != "" && $0 !~ /^#/) {
+                 if (want[$0] == "M") exit 1
+                 seenA[$0] = 1
+               }
+             }
+             END {
+               for (d in want) {
+                 if (want[d] == "A" && !(d in seenA)) exit 1
+                 if (want[d] == "M" && !(d in seenM)) exit 1
+               }
+             }' "$_rs_sa" 2>/dev/null; then
+          bad "verify: per-domain state of $_rs_sp does not match the snapshot"
+          _rs_vr=1
+        fi ;;
+    esac
+  done < "$_rs_snap/shared"
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_uci() { # _rs_verify_uci <dir>
+  [ -f "$_rs_snap/uci" ] || return 0
+  _rs_vr=0
+  for _rs_up in network dhcp ksmbd; do
+    if [ -f "$(P "/tmp/.uci/$_rs_up")" ]; then
+      bad "verify: uci delta for $_rs_up is still pending - commit did not apply"
+      _rs_vr=1
+    fi
+  done
+  for _rs_ucf in network dhcp ksmbd; do
+    if ! _rs_safe_path "/etc/config/$_rs_ucf"; then
+      bad "verify: /etc/config/$_rs_ucf is behind a symlink - uci values not readable safely"
+      return 1
+    fi
+  done
+  while IFS='|' read -r _rs_uk _rs_pkg _rs_sec _rs_opt _rs_val; do
+    [ "$_rs_uk" = uci ] || continue
+    case "$_rs_sec" in
+      @*) continue ;;   # @none / @matchN are journal markers, not live section names
+    esac
+    case "$_rs_opt" in
+      @type)
+        if [ "$_rs_val" = '<absent>' ]; then
+          if uci -q get "$_rs_pkg.$_rs_sec" >/dev/null 2>&1; then
+            bad "verify: $_rs_pkg.$_rs_sec did not exist before the run but is present"
+            _rs_vr=1
+          fi
+        else
+          _rs_got=$(uci -q get "$_rs_pkg.$_rs_sec" 2>/dev/null)
+          if [ "$_rs_got" != "$_rs_val" ]; then
+            bad "verify: type of $_rs_pkg.$_rs_sec is ${_rs_got:-missing}, expected $_rs_val"
+            _rs_vr=1
+          fi
+        fi ;;
+      *)
+        _rs_got=$(uci -q get "$_rs_pkg.$_rs_sec.$_rs_opt" 2>/dev/null)
+        _rs_grc=$?
+        if [ "$_rs_val" = '<absent>' ]; then
+          if [ "$_rs_grc" = 0 ]; then
+            bad "verify: $_rs_pkg.$_rs_sec.$_rs_opt did not exist before the run but is present"
+            _rs_vr=1
+          fi
+        elif [ "$_rs_got" != "$_rs_val" ]; then
+          bad "verify: $_rs_pkg.$_rs_sec.$_rs_opt is ${_rs_got:-missing}, expected $_rs_val"
+          _rs_vr=1
+        fi ;;
+    esac
+  done < "$_rs_snap/uci"
+  # ksmbd: sections are compared by their full option set (ids are not stable and the
+  # preimage now includes force_root and every other option the owner had).
+  _rs_want_sig=$(_rs_ksmbd_snap_sig)
+  _rs_now_sig=$(_rs_ksmbd_live_sig)
+  if [ "$_rs_want_sig" != "$_rs_now_sig" ]; then
+    bad "verify: ksmbd share 'geomask-backups' does not match the snapshot"
+    _rs_vr=1
+  fi
+  [ "$_rs_vr" = 0 ]
+}
+
+_rs_verify_sysctl() { # _rs_verify_sysctl <dir>
+  [ -f "$_rs_snap/sysctl" ] || return 0
+  _rs_vr=0
+  while IFS='|' read -r _rs_kk _rs_kn _rs_kv; do
+    [ "$_rs_kk" = sysctl ] || continue
+    _rs_kf="$(P "/proc/sys/net/ipv6/conf/$_rs_kn")"
+    if ! _rs_safe_path "/proc/sys/net/ipv6/conf/$_rs_kn"; then
+      bad "verify: /proc/sys/net/ipv6/conf/$_rs_kn is an unsafe or unpinned symlink"
+      _rs_vr=1
+      continue
+    fi
+    if [ ! -d "$_rs_kf" ]; then
+      bad "verify: interface $_rs_kn is gone"
+      _rs_vr=1
+      continue
+    fi
+    _rs_now=$(cat "$_rs_kf/disable_ipv6" 2>/dev/null | tr -dc '01')
+    if [ "$_rs_now" != "$_rs_kv" ]; then
+      bad "verify: net.ipv6.conf.$_rs_kn.disable_ipv6 is ${_rs_now:-unreadable}, expected $_rs_kv"
+      _rs_vr=1
+    fi
+  done < "$_rs_snap/sysctl"
+  [ "$_rs_vr" = 0 ]
+}
+

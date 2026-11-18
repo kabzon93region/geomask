@@ -1,0 +1,416 @@
+_console_rule_on() { # _console_rule_on <ip> -> 0, 75/76 (retryable), 2 (unobservable) or 77
+  # Short route budget, restored afterwards: other callers of the shared helper keep the
+  # default. A busy table is reported, never waited out under the console lock (R05 D6).
+  _cro_saved=${GM_ROUTE_LOCK_WAIT-}
+  GM_ROUTE_LOCK_WAIT=$CONSOLE_ROUTE_WAIT
+  export GM_ROUTE_LOCK_WAIT
+  _gm_sync_routes "$CONSOLE_TABLE"
+  _cro=$?
+  # Restore a concrete budget: an unset variable would make the next acquire see '' and fail
+  # closed with rc=2. The helper default is 20 s.
+  GM_ROUTE_LOCK_WAIT=${_cro_saved:-20}
+  export GM_ROUTE_LOCK_WAIT
+  [ "$_cro" = 0 ] || return "$_cro"
+  ip route replace table "$CONSOLE_TABLE" default dev "$CONSOLE_TUN_DEV" 2>/dev/null || return 77
+  # A switch keeps exactly one console rule: the previous address must not keep its own path
+  # (audit C03: A->B left both rules and the next owner of A's DHCP lease got the policy).
+  if ! ip rule show > "${TMPDIR:-/tmp}/geomask-console-on.$$" 2>/dev/null; then
+    rm -f "${TMPDIR:-/tmp}/geomask-console-on.$$"
+    return 2
+  fi
+  for _con_old in $(_console_own_rules < "${TMPDIR:-/tmp}/geomask-console-on.$$"); do
+    [ "$_con_old" = "$1" ] && continue
+    ip rule del pref "$CONSOLE_RULE_PREF" from "$_con_old" lookup "$CONSOLE_TABLE" 2>/dev/null || true
+  done
+  rm -f "${TMPDIR:-/tmp}/geomask-console-on.$$"
+  ip rule del pref "$CONSOLE_RULE_PREF" from "$1" lookup "$CONSOLE_TABLE" 2>/dev/null || true
+  ip rule add pref "$CONSOLE_RULE_PREF" from "$1" lookup "$CONSOLE_TABLE" 2>/dev/null || return 77
+}
+
+# Ownership is exact: our rule is `pref <CONSOLE_RULE_PREF> from <ipv4> lookup <CONSOLE_TABLE>`
+# and nothing else. A rule of another writer that happens to point at table 102 (foreign
+# pref 15000, per the audit C08) is never touched.
+_console_own_rules() { # stdin: `ip rule show` -> one source IP per owned rule
+  awk -v want_pref="$CONSOLE_RULE_PREF" -v want_tbl="$CONSOLE_TABLE" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      n = split(line, f, /[ \t]+/)
+      if (n != 5) next
+      pref = f[1]; sub(/:$/, "", pref)
+      if (pref != want_pref) next
+      if (f[2] != "from" || f[4] != "lookup") next
+      if (f[5] != want_tbl) next
+      if (f[3] !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
+      print f[3]
+    }'
+}
+
+_console_rule_off() { # remove only the rules we can prove are ours; 0 ok, 1 left, 2 unknown
+  _cro_tmp="${TMPDIR:-/tmp}/geomask-console-rules.$$"
+  # A failed `ip rule show` used to look like "there is no rule": the kill switch then reported
+  # success while an active rule kept the console off the normal path (audit C09).
+  if ! ip rule show > "$_cro_tmp" 2>/dev/null; then
+    rm -f "$_cro_tmp" 2>/dev/null
+    return 2
+  fi
+  _had=0
+  for _cro_from in $(_console_own_rules < "$_cro_tmp"); do
+    ip rule del pref "$CONSOLE_RULE_PREF" from "$_cro_from" lookup "$CONSOLE_TABLE" 2>/dev/null \
+      && _had=1
+  done
+  rm -f "$_cro_tmp" 2>/dev/null
+  if [ "$_had" = 1 ] && [ -n "${1:-}" ]; then
+    conntrack -D -s "$1" >/dev/null 2>&1
+    conntrack -D -d "$1" >/dev/null 2>&1
+  fi
+  # The caller decides what to report: an unremoved rule is a failure, an unreadable table is
+  # "unknown" - and unknown is never success.
+  if ! ip rule show > "$_cro_tmp" 2>/dev/null; then
+    rm -f "$_cro_tmp" 2>/dev/null
+    return 2
+  fi
+  _left=$(_console_own_rules < "$_cro_tmp" | head -1)
+  rm -f "$_cro_tmp" 2>/dev/null
+  [ -z "$_left" ] || return 1
+  return 0
+}
+
+# Digest of a file's bytes, or rc 1 when it cannot be read. Used to decide whether the live
+# config is still the one this lane wrote before any rollback is allowed to touch it.
+_console_file_sha() {
+  _sha_file "${1:-}"
+}
+
+# Undo the console patch: put the pre-switch bytes back through the SAME transaction the switch
+# used, then prove the live file is usable again. A restore that leaves mihomo unable to load
+# the file, or the controller not answering, is not a restore.
+#   _console_cfg_restore [preimage] -> 0 only when the live config is byte-identical to the
+#   preimage, `mihomo -t` accepts it and the controller answers /version.
+#   -> 2 when the live file is neither our preimage nor the candidate we installed: another
+#   writer committed after us, and undoing "our" change would destroy their bytes (C01).
+_console_cfg_restore() {
+  _pre="${1:-${_orig:-}}"
+  [ -n "$_pre" ] && [ -f "$_pre" ] || return 1
+  _pre_sha=$(_console_file_sha "$_pre") || return 1
+  _live_sha=$(_console_file_sha "$MIHOMO_CONF")
+  if [ -n "$_live_sha" ] && [ "$_live_sha" != "$_pre_sha" ]; then
+    # Only undo OUR OWN write. The candidate we installed is the one other state this lane is
+    # allowed to replace; a live file that is neither is a concurrent commit, so refuse instead
+    # of restoring "the original" over it. The CAS below also closes the read-to-write window.
+    _post_sha=''
+    [ -n "${_cand:-}" ] && [ -f "$_cand" ] && _post_sha=$(_console_file_sha "$_cand")
+    [ -n "$_post_sha" ] && [ "$_live_sha" = "$_post_sha" ] || return 2
+    "$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" --expect-sha256 "$_live_sha" \
+      < "$_pre" >/dev/null 2>&1 || :
+    cmp -s "$MIHOMO_CONF" "$_pre" || return 1
+  fi
+  if command -v mihomo >/dev/null 2>&1; then
+    mihomo -d /etc/mihomo -f "$MIHOMO_CONF" -t >/dev/null 2>&1 || return 1
+  fi
+  _ver=$(controller_curl -s -o /dev/null -w '%{http_code}' -m10 "$MIHOMO_API/version" 2>/dev/null)
+  case "$_ver" in 200|204) return 0 ;; *) return 1 ;; esac
+}
+
+# A failed switch: name the step, put the pre-switch config back and say honestly whether the
+# live file really is the old one again. The preimage is kept only when the restore failed -
+# then it is the only working copy left, and the answer has to say where it is.
+# A busy route table is marked `"retryable":true`: the caller may repeat the switch at once.
+_console_on_fail() { # _console_on_fail <step> <message> [retryable]
+  _cof_retry=""
+  [ "${3:-}" = retryable ] && _cof_retry=',"retryable":true'
+  _restored=false
+  _cof_conflict=false
+  _cof_rc=0
+  _console_cfg_restore "$_orig" || _cof_rc=$?
+  case "$_cof_rc" in
+    0) _restored=true; rm -f "$_orig" 2>/dev/null ;;
+    2) _cof_conflict=true ;;
+  esac
+  rm -f "$_cand" 2>/dev/null
+  # Every failure path ends here; none of them may return with the lane lock still held.
+  _console_unlock
+  if [ "$_restored" = true ]; then
+    printf '{"ok":false%s,"step":"%s","restored":true,"error":"%s - previous config restored"}\n' "$_cof_retry" "$1" "$2"
+  elif [ "$_cof_conflict" = true ]; then
+    # The honest answer for C01: our change is gone, but the live bytes belong to somebody
+    # else's commit. Nothing was overwritten, and the preimage is kept as the working copy.
+    printf '{"ok":false%s,"step":"%s","restored":false,"conflict":true,"error":"%s - the live config was changed by another writer after this switch; it was NOT overwritten, the pre-switch copy is kept at %s"}\n' "$_cof_retry" "$1" "$2" "$_orig"
+  else
+    # Not verified is not the same as "left patched": the transaction rolls back on its own, so
+    # the bytes may already be the old ones while mihomo or the controller still refuses to
+    # confirm it. Say what is certain and where the working copy is.
+    printf '{"ok":false%s,"step":"%s","restored":false,"error":"%s - RESTORE NOT VERIFIED (mihomo -t or the controller did not confirm it); the live config may still be the patched one, the pre-switch copy is kept at %s"}\n' "$_cof_retry" "$1" "$2" "$_orig"
+  fi
+  _console_unlock
+  return 1
+}
+
+cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
+  _act="$1"
+  case "$_act" in
+    on|off|status) ;;
+    *) printf '{"error":"bad arg"}'; return 1 ;;
+  esac
+  _ip="${2:-$(_console_get ip)}"
+  # The caller's fields are authoritative, EMPTY INCLUDED: that is how the panel asks for "no
+  # country filter" and "subscription like the VPN again". The old `${4:-saved}` fallback read
+  # an empty field as "keep the previous value", so neither reset was possible.
+  _countries="${4-}"
+  _sub="${3-}"
+  if [ "$_act" = status ]; then
+    # `status` reports what is stored instead of what the caller sent. The old fields
+    # (`enabled`, `rule`, `tun`, `config`) stay for the panel, but `rule` is now set only by
+    # the exact pref/from/lookup match and the honest answer is `state`.
+    _countries=$(_console_get countries)
+    _sub=$(_console_get sub)
+    _console_status_state
+    _cs_lan_json=''
+    for _cs_p in $_cs_lan_missing; do
+      _cs_lan_json="${_cs_lan_json}${_cs_lan_json:+,}\"$_cs_p\""
+    done
+    _cfg='{}'
+    [ -x "$CONSOLE_PY" ] && [ -f "$MIHOMO_CONF" ] && \
+      _cfg=$("$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" 2>/dev/null)
+    [ -n "$_cfg" ] || _cfg='{}'
+    # `sub` is the registry id the panel restores into its field; empty means "as the VPN".
+    printf '{"ok":true,"enabled":%s,"ip":"%s","sub":"%s","countries":"%s","rule":%s,"tun":%s,"config":%s,"state":"%s","unknown":[%s],"desired":{"enabled":%s,"ip":"%s","pref":%s,"table":%s,"default":"dev %s","tun":"%s"},"runtime":{"rule":%s,"tun":%s,"default":"%s","lan_missing":[%s]}}\n' \
+      "$([ "$_cs_enabled" = 1 ] && echo true || echo false)" \
+      "$(json_esc "$_ip")" "$(json_esc "$_sub")" "$(json_esc "$_countries")" \
+      "$_cs_rule" "$_cs_tun" "$_cfg" \
+      "$_cs_state" "$_cs_unknown" \
+      "$([ "$_cs_enabled" = 1 ] && echo true || echo false)" "$(json_esc "$_ip")" \
+      "$CONSOLE_RULE_PREF" "$CONSOLE_TABLE" "$CONSOLE_TUN_DEV" "$CONSOLE_TUN_DEV" \
+      "$_cs_rule" "$_cs_tun" "$_cs_default" "$_cs_lan_json"
+    return 0
+  fi
+  # Serialise the lane before anything is changed: `off` must not interleave with a switch,
+  # and the guard takes the same lock before it re-reads the state. The emergency path waits
+  # for the lock (bounded), but never for a fresh backup.
+  _console_lock || {
+    printf '{"ok":false,"error":"console is busy: another switch holds the lane lock (%s)"}\n' "$CONSOLE_LOCK"
+    return 1
+  }
+  if [ "$_act" = off ]; then
+    # The kill switch must work when the router is already half-broken: no backup gate and no
+    # silent success. State goes first (the watchdog reads it), then the service and the rules,
+    # and every step is checked.
+    _console_set enabled 0 || {
+      _console_unlock
+      printf '{"ok":false,"error":"cannot update the console state file"}\n'; return 1; }
+    _rc=0
+    if [ -x "$CONSOLE_INITD" ]; then
+      "$CONSOLE_INITD" stop >/dev/null 2>&1 || _rc=1
+      "$CONSOLE_INITD" disable >/dev/null 2>&1 || _rc=1
+    fi
+    _console_rule_off "$_ip"; _off_rc=$?
+    [ "$_off_rc" = 0 ] || _rc=1
+    _console_rule_off ""; _off2_rc=$?
+    [ "$_off2_rc" = 0 ] || _rc=1
+    _console_unlock
+    if [ "$_rc" != 0 ]; then
+      if [ "$_off_rc" = 2 ] || [ "$_off2_rc" = 2 ]; then
+        printf '{"ok":false,"enabled":false,"unknown":true,"error":"console is marked off, but the rule table could not be read - a rule may still be active; check ip rule show"}\n'
+      else
+        printf '{"ok":false,"enabled":false,"error":"console is marked off, but a rule or the tunnel did not stop - check ip rule and hev-console"}\n'
+      fi
+      return 1
+    fi
+    echo "$(date +%FT%T) CONSOLE off (ip ${_ip:-none}) - console back on the normal path" >> "$LOG"
+    printf '{"ok":true,"enabled":false}\n'
+    return 0
+  fi
+  _require_backup || { _console_unlock; return 1; }
+  # --- on ---
+  _ipv4_ok "$_ip" || { _console_unlock; printf '{"ok":false,"error":"bad or missing console IP"}\n'; return 1; }
+  # A device already managed as ai/bypass gets its own rule at pref 19900, which outranks the
+  # console rule (19903): the panel would say "on" while the traffic goes somewhere else.
+  if [ -f "$DEVICES" ] && awk -v i="$_ip" '$1==i {found=1} END{exit found?0:1}' "$DEVICES" 2>/dev/null; then
+    _console_unlock
+    printf '{"ok":false,"error":"this IP is already a managed device (ai/bypass) - its rule would win; remove it from the device list first"}\n'
+    return 1
+  fi
+  if [ ! -x "$CONSOLE_PY" ]; then
+    _console_unlock
+    printf '{"ok":false,"error":"console patcher not installed (/usr/lib/geomask/geomask-console.py)"}\n'; return 1
+  fi
+  _url=''
+  if [ -n "${3:-}" ]; then
+    _url=$(_find_sub_url "$3") || {
+      _console_unlock
+      printf '{"ok":false,"error":"subscription %s is not in the registry"}\n' "$3"; return 1
+    }
+  fi
+  # Patch a CANDIDATE, validate it, and only then replace the live file: the first version
+  # wrote the live config first and checked afterwards, so a rejected config was already on
+  # disk and the next mihomo restart would fail.
+  _cand="${TMPDIR:-/tmp}/geomask-console-candidate.$$.yaml"
+  _orig="${TMPDIR:-/tmp}/geomask-console-orig.$$"
+  cp -p "$MIHOMO_CONF" "$_cand" 2>/dev/null || {
+    _console_unlock
+    printf '{"ok":false,"error":"cannot read the mihomo config"}\n'; return 1
+  }
+  # The candidate is patched from THIS copy, so its digest is the base the transaction must
+  # still find live at commit time. Without it a concurrent mtrickle_sync/apply commit would
+  # be silently erased by a candidate built before it (report R06): the transaction refuses
+  # with "changed since read" instead.
+  _base_sha=$(_sha_file "$_cand")
+  [ -n "$_base_sha" ] || {
+    rm -f "$_cand"; _console_unlock
+    printf '{"ok":false,"error":"cannot fingerprint the mihomo config - live config untouched"}\n'; return 1
+  }
+  if [ -n "$_url" ]; then
+    _res=$(printf '%s\n' "$_url" | "$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --url - --countries "$_countries" 2>&1)
+  else
+    # No subscription chosen = "as the VPN": the patcher re-derives the URL from the VPN group
+    # instead of keeping whatever the provider was pinned to earlier.
+    _res=$("$PYTHON_BIN" -B "$CONSOLE_PY" apply "$_cand" --url default --countries "$_countries" 2>&1)
+  fi
+  case "$_res" in
+    *'"ok": true'*|*'"ok":true'*) ;;
+    *) rm -f "$_cand"
+       _console_unlock
+       printf '{"ok":false,"error":"mihomo config not patched: %s"}\n' "$(printf '%s' "$_res" | tail -1)"; return 1 ;;
+  esac
+  # A pre-check only: the transaction repeats the validation shaped for the trial, so this is
+  # not duplicated work, it is the cheap "do not even start" gate.
+  if command -v mihomo >/dev/null 2>&1; then
+    mihomo -d /etc/mihomo -f "$_cand" -t >/dev/null 2>&1 || {
+      rm -f "$_cand"
+      _console_unlock
+      printf '{"ok":false,"error":"mihomo -t rejected the patched config - live config untouched"}\n'; return 1
+    }
+  fi
+  # Private copy of the live bytes. The transaction keeps its own preimage, but the rollback
+  # below runs in this shell and must not depend on the tx work dir surviving. The old backup
+  # copy is gone: it lived forever and no transaction owned it.
+  ( umask 077; cp -p "$MIHOMO_CONF" "$_orig" ) 2>/dev/null || {
+    rm -f "$_cand"
+    _console_unlock
+    printf '{"ok":false,"error":"cannot keep a private copy of the mihomo config - live config untouched"}\n'
+    return 1
+  }
+  chmod 600 "$_orig" 2>/dev/null
+  # The switch itself: preimage, mihomo -t, isolated trial, atomic write, reload and a rollback
+  # if any of it fails. Nothing here changes the live file by hand.
+  _txout=$("$PYTHON_BIN" -B "$TX_PY" --commit "$MIHOMO_CONF" --expect-sha256 "$_base_sha" < "$_cand" 2>&1)
+  _txrc=$?
+  if [ "$_txrc" != 0 ]; then
+    _detail=$(printf '%s' "$_txout" | tail -1 | sed 's/["\\]//g' | cut -c1-300)
+    _console_on_fail transaction "mihomo config transaction failed: ${_detail:-no output}"
+    return 1
+  fi
+  # A new listener exists only after mihomo re-reads the file: force a reload and prove the
+  # listener is really listening before any traffic is pointed at it.
+  _code=$(controller_curl -s -o /dev/null -w '%{http_code}' -m15 -X PUT "$MIHOMO_API/configs?force=true" \
+    -H 'Content-Type: application/json' -d "{\"path\":\"$MIHOMO_CONF\"}" 2>/dev/null)
+  case "$_code" in
+    200|204) ;;
+    *) _console_on_fail reload "mihomo reload failed (HTTP ${_code:-none})"; return 1 ;;
+  esac
+  _i=0; _lst=0
+  while [ "$_i" -lt 5 ]; do
+    netstat -lnt 2>/dev/null | grep -q ":$CONSOLE_SOCKS_PORT " && { _lst=1; break; }
+    sleep 1; _i=$((_i+1))
+  done
+  [ "$_lst" = 1 ] || {
+    _console_on_fail listener "console listener did not appear on :$CONSOLE_SOCKS_PORT"; return 1
+  }
+  _console_tun_ensure || { _console_on_fail tun "console tunnel did not come up"; return 1; }
+  _console_fw_ensure || { _console_on_fail firewall "console firewall zone not created"; return 1; }
+  # State before the rule (audit C02): with the rule first, four failed writes still produced
+  # `ok:true` and left an active policy with no state for the watchdog or the kill switch.
+  # `countries` and `sub` are written ALWAYS, empty string included: an empty field is the
+  # reset the panel offers. `enabled` stays the COMMIT MARKER and is written after the rule.
+  _cst_fail=0
+  _console_set countries "$_countries" || _cst_fail=1
+  _console_set sub "$_sub" || _cst_fail=1
+  _console_set ip "$_ip" || _cst_fail=1
+  if [ "$_cst_fail" != 0 ]; then
+    _console_on_fail state "console state could not be written"
+    return 1
+  fi
+  _console_rule_on "$_ip"
+  _crr=$?
+  if [ "$_crr" != 0 ]; then
+    case "$_crr" in
+      75|76)
+        # The table is owned by another writer right now. Do not turn that into a generic
+        # failure: the caller can retry as soon as the table is free (R05 D6).
+        _console_on_fail rule "console route table $CONSOLE_TABLE is busy - retry" retryable ;;
+      2)
+        # The rule table could not be read: the switch did not install a rule, and nothing can
+        # be claimed about the previous one either (audit C09).
+        _console_on_fail rule "the rule table could not be read" ;;
+      *)
+        _console_on_fail rule "console route rule not installed (rc=$_crr)" ;;
+    esac
+    return 1
+  fi
+  if ! _console_set enabled 1; then
+    # The rule is the only enforcement; without the commit marker the watchdog and the kill
+    # switch cannot find it. Undo our own rule rather than report a lane we cannot describe.
+    _console_rule_off "$_ip" >/dev/null 2>&1 || true
+    _console_unlock
+    printf '{"ok":false,"step":"state","restored":false,"error":"console state could not be committed - the new rule was removed"}\n'
+    return 1
+  fi
+  rm -f "$_orig" "$_cand" 2>/dev/null
+  _console_unlock
+  echo "$(date +%FT%T) CONSOLE on ip=$_ip countries=${_countries:-any} sub=${_sub:-vpn}" >> "$LOG"
+  printf '{"ok":true,"enabled":true,"ip":"%s","sub":"%s","countries":"%s"}\n' "$_ip" "$_sub" "$_countries"
+}
+
+# Read-only twin of `cmd_console status`, registered in tools/geo-rpc.json as `console_status`
+# with acl "read": the panel needs the state on every render, and a write-granted method there
+# would let any panel reader change the lane.
+cmd_console_status() { cmd_console status; }
+
+# uci keeps the real credentials: WireGuard private_key, PPPoE password, provider tokens.
+# `uci show network` and `uci show firewall` went into the bundle untouched, so the archive
+# carried the owner's keys. The redactor is a shipped asset with the real `uci show` grammar
+# (plus mihomo YAML, controller JSON and log text), so the masking is testable off-router.
+DIAG_PY=${GM_DIAG_PY:-/usr/lib/geomask/geomask-diag-redact.py}
+# R07: the bundle and its sidecar live in one private spool (0700, owned by us) instead of
+# world-writable /tmp, and every read goes through the shipped helper - never through
+# `wc`/`base64`, which follow symlinks.
+DIAG_SPOOL=${GM_DIAG_SPOOL:-/tmp/geomask-diag}
+DIAG_SPOOL_PY=${GM_DIAG_SPOOL_PY:-/usr/lib/geomask/geomask-diag-spool.py}
+
+_console_diag_fail() { # $1 = stage that failed
+  rm -rf "$_dir" 2>/dev/null
+  printf '{"ok":false,"error":"redaction failed: %s"}\n' "$1"
+  return 1
+}
+
+_console_diag_redact() { # $1 = uci|yaml|json|text|nft, $2 = stage, $3 = output file, stdin
+  "$PYTHON_BIN" -B "$DIAG_PY" redact "$1" > "$3" 2>/dev/null
+  _cdr=$?
+  [ "$_cdr" = 0 ] || { _console_diag_fail "$2"; return 1; }
+  return 0
+}
+
+# A bounded JSON member (R08): the raw response is measured first, because a truncated JSON
+# body breaks both the redactor and the panel parser. Over the limit it is replaced with a
+# valid, self-describing object; the raw file is removed either way.
+_console_diag_json() { # $1 = stage, $2 = raw file, $3 = output file, $4 = limit bytes
+  _cdj_bytes=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
+  case "$_cdj_bytes" in ''|*[!0-9]*) _cdj_bytes=0 ;; esac
+  if [ "$_cdj_bytes" -gt "$4" ]; then
+    rm -f "$2" 2>/dev/null
+    printf '{"error":"response too large","bytes":%s}\n' "$_cdj_bytes" > "$3"
+    return 0
+  fi
+  if "$PYTHON_BIN" -B "$DIAG_PY" redact json < "$2" > "$3" 2>/dev/null; then
+    rm -f "$2" 2>/dev/null
+    return 0
+  fi
+  rm -f "$2" 2>/dev/null
+  _console_diag_fail "$1"
+  return 1
+}
+
+# Sanitised, clamped environment number (R08). A junk value falls back to its default, a
+# six-digit one clamps to the maximum before arithmetic: `GM_CONSOLE_DIAG_KEEP=24h` used to
+# abort the back end inside $((...)) before any JSON reached rpcd. No leading zeros either:
+# ash reads `08` as an invalid octal constant.

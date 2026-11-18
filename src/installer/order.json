@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "target": "installer",
+  "parts": [
+    {
+      "path": "010-ui-and-discovery.sh.part"
+    },
+    {
+      "path": "020-config-modules-writes.sh.part"
+    },
+    {
+      "path": "030-preflight-step1-step2.sh.part"
+    },
+    {
+      "path": "040-step3.sh.part"
+    },
+    {
+      "path": "050-mihomo-writer.sh.part"
+    },
+    {
+      "path": "060-backup.sh.part"
+    },
+    {
+      "path": "070-step4.sh.part"
+    },
+    {
+      "path": "080-step5.sh.part"
+    },
+    {
+      "path": "090-step7-ipv6.sh.part"
+    },
+    {
+      "path": "100-uninstall.sh.part"
+    },
+    {
+      "path": "110-restore-snapshot-shared.sh.part"
+    },
+    {
+      "path": "120-restore-snapshot-runtime.sh.part"
+    },
+    {
+      "path": "130-restore-shared-uci.sh.part"
+    },
+    {
+      "path": "140-restore-cron-verify-files.sh.part"
+    },
+    {
+      "path": "150-verify-net.sh.part"
+    },
+    {
+      "path": "160-reinstall-preflight.sh.part"
+    },
+    {
+      "path": "170-menu-args.sh.part"
+    }
+  ]
+}

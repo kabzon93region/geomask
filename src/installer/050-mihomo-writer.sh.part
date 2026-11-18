@@ -1,0 +1,394 @@
+_write_mihomo_config_unlocked() { # the actual writer; called only under config-tx
+  _wpid=$$
+  _c="$(P $MIHOMO_CONF)"
+  _vpnu="$1"; _aiu="$2"
+  # The rollback source must be the file as it was BEFORE this run touched it. The old code
+  # copied the already-replaced file in safe_mihomo_restart, so "rollback" restored the
+  # broken candidate.
+  _lanip=$(lan_ip)
+  if [ -z "$_lanip" ]; then
+    bad "не удалось определить адрес LAN ($(lan_iface)) - listener некуда привязать"
+    info "  Проверьте: uci show network.lan; ip -4 addr show $(lan_iface)"
+    return 1
+  fi
+  if [ -s "$_c" ] && [ -z "${GM_PRE_CONFIG:-}" ]; then
+    GM_PRE_CONFIG="$_c.pre-run-$(date +%s 2>/dev/null || echo pre)"
+    cp -p "$_c" "$GM_PRE_CONFIG" 2>/dev/null || GM_PRE_CONFIG=""
+  fi
+  # v1.30.19: the guard used to live only in step3_apply, so --reinstall (which calls this
+  # function directly) rewrote an owner's config with the template. It belongs here.
+  # --replace-config IS the owner's explicit decision to replace a foreign config, so it must
+  # pass this guard - the flag used to be offered in the message and then rejected (F16).
+  _mihomo_guard "$_c" "mihomo config" || return 1
+  # I05 (audit 18.11.2026): --adopt-config used to pass the guard above and then do nothing -
+  # the in-place patch below only rewrites geomask-shaped files, so the run reported success
+  # without adopting anything and the NEXT run refused the same file. Adoption is a real step
+  # now, and it happens before the first write: the tool merges into a separate candidate
+  # (owner's tun/dns/secret/rules/proxies stay byte-identical), `mihomo -t` must accept it and
+  # only then is the live config replaced. A refusal names the reason and changes nothing.
+  if [ -s "$_c" ] && [ "${GM_ADOPT:-0}" = 1 ] && ! geomask_config_shaped "$_c"; then
+    _adopt="$_c.adopt.$_wpid"
+    _adopt_tool="$(P /usr/lib/geomask/geomask-mihomo-adopt.py)"
+    _adopt_msg=$(_gm_py_script "$_adopt_tool" "$_c" "$_adopt" --vpn-url "$_vpnu" \
+                   --lan-ip "$_lanip" ${_hwid:+--hwid "$_hwid"} 2>&1 >/dev/null)
+    if [ ! -s "$_adopt" ]; then
+      rm -f "$_adopt"
+      bad "adopt невозможен: конфиг не удаётся слить без потери смысла"
+      [ -n "$_adopt_msg" ] && info "  $_adopt_msg"
+      info "  Ничего не изменено. Полная замена: --replace-config (настройки будут потеряны)"
+      return 1
+    fi
+    if ! mihomo_validate "$_adopt"; then
+      rm -f "$_adopt"
+      bad "adopt: mihomo -t не принял объединённый конфиг - живой файл не тронут"
+      return 1
+    fi
+    cp -p "$_c" "$_c.bak_geomask_$(date +%s 2>/dev/null || echo bak)" 2>/dev/null || true
+    chmod 600 "$_adopt" 2>/dev/null
+    mv -f "$_adopt" "$_c" || { rm -f "$_adopt"; bad "adopt: не удалось заменить конфиг"; return 1; }
+    chmod 600 "$_c" 2>/dev/null
+    info "конфиг взят под управление (adopt): $_adopt_msg"
+  fi
+  # --- existing 2-subscription config: keep it as-is (custom rules, headers, sniffer)
+  #     and only patch provider urls / ensure the ai-devices listener ---
+  # --- existing config: keep it as-is (custom rules, headers, sniffer) and only patch
+  #     provider urls / ensure the ai-devices listener. v1.23.0: de5 (the retired un1.pro AI
+  #     sub) is no longer required and is stripped if still present; AI rides `sub`.
+  # --replace-config means "replace the file", not "maybe patch it": the in-place branch used
+  # to swallow the flag and keep the old secret, so the requested rewrite never happened.
+  if [ -s "$_c" ] && [ "${GM_REPLACE:-0}" != 1 ] && geomask_config_shaped "$_c"; then
+    if grep -qE '^  de5:[[:space:]]*$' "$_c"; then
+      cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+      awk 'BEGIN{sect="";d=0}
+        /^[A-Za-z0-9_-]+:/ {sect=$1; sub(/:.*/,"",sect)}
+        sect=="proxy-providers" && /^  de5:[[:space:]]*$/ {d=1; next}
+        d && /^  [A-Za-z0-9_-]+:/ {d=0}
+        d && /^[A-Za-z]/ {d=0}
+        !d {print}' "$_c" > "$_c.de5rm.$_wpid" \
+        && mihomo_validate "$_c.de5rm.$_wpid" && mv -f "$_c.de5rm.$_wpid" "$_c" && rm -f "$_c.de5rm.$_wpid" \
+        && info "retired de5 provider removed from config" || { rm -f "$_c.de5rm.$_wpid"; warn "de5 removal skipped (validation)"; }
+    fi
+    _curv=$(_prov_url "$_c" sub)
+    if [ -n "${_vpnu:-}" ] && [ "$_vpnu" != "$_curv" ]; then
+      cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+      # Patch `proxy-providers.sub.url` only. The old pattern matched ANY `  sub:` line, so a
+      # `rule-providers.sub` received the VPN subscription URL (audit 14.11.2026, F06).
+      if ! awk -v nu="$_vpnu" '
+        BEGIN{sect="";f=0;done=0}
+        /^[A-Za-z0-9_-]+:/ {sect=$1; sub(/:.*/,"",sect); if (sect != "proxy-providers") f=0}
+        sect=="proxy-providers" && /^  [A-Za-z0-9_-]+:/ {
+          name=$1; sub(/:.*/,"",name); f=(name=="sub")
+        }
+        f && /^    url:/ {print "    url: \"" nu "\""; done=1; f=0; next}
+        {print}
+        END{exit done?0:1}' "$_c" > "$_c.urlnew.$_wpid"; then
+        rm -f "$_c.urlnew.$_wpid"; bad "provider url patch failed - точечное обновление невозможно, нужен --replace-config"; return 1
+      fi
+      mihomo_validate "$_c.urlnew.$_wpid" && mv -f "$_c.urlnew.$_wpid" "$_c" || { rm -f "$_c.urlnew.$_wpid"; bad "mihomo -t failed - config kept"; return 1; }
+      info "provider url updated in place (sub)"
+    fi
+    if ! grep -q 'ai-devices' "$_c"; then
+      cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+      awk -v L="$_lanip" 'BEGIN{d=0}
+        /^proxy-providers:/ && !d {print "listeners:";print "  - name: ai-devices";print "    type: mixed";print "    port: 7891";print "    listen: 127.0.0.1";print "    proxy: AI";print "  - name: torrent-direct";print "    type: mixed";print "    port: 7894";print "    listen: " L;print "";d=1}
+        {print}' "$_c" > "$_c.zmnew.$_wpid" || return 1
+      if mihomo_validate "$_c.zmnew.$_wpid"; then
+        mv -f "$_c.zmnew.$_wpid" "$_c"; info "listeners block added to existing config (custom rules preserved)"
+      else
+        rm -f "$_c.zmnew.$_wpid"; bad "mihomo -t failed after adding listeners - config kept"; return 1
+      fi
+    else
+      # v1.14.4: config already had listeners - make sure the torrent DIRECT one exists
+      if ! grep -q 'torrent-direct' "$_c"; then
+        cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+        awk -v L="$_lanip" 'BEGIN{d=0} {print} (!d && $0 ~ /^    proxy: AI$/) {
+              print "  - name: torrent-direct"; print "    type: mixed"; print "    port: 7894";
+              print "    listen: " L; d=1 }' "$_c" > "$_c.tdnew.$_wpid" || return 1
+        if mihomo_validate "$_c.tdnew.$_wpid"; then
+          mv -f "$_c.tdnew.$_wpid" "$_c"; info "torrent-direct listener added (listeners already present)"
+        else
+          rm -f "$_c.tdnew.$_wpid"; bad "mihomo -t failed after adding torrent-direct - config kept"; return 1
+        fi
+      else
+        info "existing 2-subscription config kept as-is (ai-devices + torrent-direct present)"
+      fi
+    fi
+    # A controller bound to 0.0.0.0 (often without a secret) lets any LAN device switch nodes
+    # and read connections. The template always used loopback; the in-place path did not, so
+    # updated routers kept the old exposure (audit follow-up).
+    _ec=$(grep -E '^external-controller:' "$_c" 2>/dev/null | head -1)
+    case "$_ec" in
+      ''|*127.0.0.1*|*localhost*) ;;
+      *)
+        cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+        if sed 's|^external-controller:.*|external-controller: 127.0.0.1:9090|' "$_c" > "$_c.ecnew.$_wpid" \
+           && mihomo_validate "$_c.ecnew.$_wpid" && mv -f "$_c.ecnew.$_wpid" "$_c"; then
+          info "external-controller moved to 127.0.0.1:9090 (LAN devices could switch nodes)"
+        else
+          rm -f "$_c.ecnew.$_wpid"; warn "external-controller not changed (validation) - check it manually"
+        fi
+        ;;
+    esac
+    chmod 600 "$_c" 2>/dev/null
+    return 0
+  fi
+  # The template below replaces the whole file. Reaching it with an existing config means
+  # the in-place branch did not match, and rewriting would silently drop tun/dns/secret and
+  # the owner's rules - even for a config that passed the ownership check. Only an explicit
+  # --replace-config may do that.
+  if [ -s "$_c" ] && [ "${GM_REPLACE:-0}" != 1 ]; then
+    bad "точечное обновление конфига невозможно - шаблон поверх существующего не пишется"
+    info "  Полная замена с потерей tun/dns/secret и ваших правил: --replace-config (бэкап сохраняется)"
+    return 1
+  fi
+  if [ -s "$_c" ]; then warn "полная замена конфига mihomo по --replace-config (прежний файл в бэкапе)"; fi
+  _hwid=$(grep -A1 'x-hwid' "$_c" 2>/dev/null | sed -n 's/^[[:space:]]*-[[:space:]]*"\(.*\)"/\1/p' | head -1)
+  _tmpconf="$_c.zmnew.$_wpid"
+  {
+    printf '%s\n' '# geomask-managed: 1'
+    printf '%s\n' 'mixed-port: 7890'
+    printf '%s\n' 'allow-lan: true'
+    printf '%s\n' 'bind-address: "0.0.0.0"'
+    printf '%s\n' 'tcp-concurrent: true'
+    printf '%s\n' 'mode: rule'
+    printf '%s\n' 'log-level: info'
+    printf '%s\n' 'ipv6: false'
+    # Loopback only: every geomask client already talks to 127.0.0.1:9090, and a controller
+    # bound to 0.0.0.0 with no secret let any LAN device switch nodes and read connections.
+    printf '%s\n' 'external-controller: 127.0.0.1:9090'
+    printf '%s\n' 'external-ui: ui'
+    printf '%s\n' 'unified-delay: true'
+    printf '%s\n' 'find-process-mode: off'
+    printf '%s\n' 'profile:'
+    printf '%s\n' '  store-selected: true'
+    printf '%s\n' '  store-fake-ip: true'
+    printf '\n'
+    printf '%s\n' 'listeners:'
+    printf '%s\n' '  - name: ai-devices'
+    printf '%s\n' '    type: mixed'
+    printf '%s\n' '    port: 7891'
+    printf '%s\n' '    listen: 127.0.0.1'
+    printf '%s\n' '    proxy: AI'
+    printf '%s\n' '  # torrent clients point here (SOCKS5/HTTP). Fresh installs have no RESERVE lane,'
+    printf '%s\n' '  # so a fixed policy is REQUIRED: without it the rule chain decides and peers on'
+    printf '%s\n' '  # hosting-provider IPs land on the VPN sub (that is what got it blocked, 31.10).'
+    printf '%s\n' '  # DIRECT keeps P2P off the VPN sub entirely; switch to AI if your VPN sub is the'
+    printf '%s\n' '  # only usable tunnel, or drop the policy once a RESERVE lane takes the IP rules.'
+    printf '%s\n' '  - name: torrent-direct'
+    printf '%s\n' '    type: mixed'
+    printf '%s\n' '    port: 7894'
+    printf '    listen: %s\n' "$_lanip"
+    printf '%s\n' '    proxy: DIRECT'
+    printf '\n'
+    printf '%s\n' 'proxy-providers:'
+    printf '%s\n' '  sub:'
+    printf '%s\n' '    type: http'
+    printf '%s\n' '    proxy: DIRECT'
+    if [ -n "${_hwid:-}" ]; then
+      printf '%s\n' '    header:'
+      printf '%s\n' '      x-hwid:'
+      printf '%s\n' "        - \"$_hwid\""
+    fi
+    printf '%s\n' "    url: \"$_vpnu\""
+    printf '%s\n' '    interval: 3600'
+    # NO provider health-check on purpose (v1.21.3): mihomo removes nodes that fail it from the
+    # group, so a slow or briefly unreachable subscription silently empties the lane and every
+    # rule pointing at it starts returning 502. The proxy-group tests are enough.
+    printf '\n'
+    printf '%s\n' 'proxy-groups:'
+    printf '%s\n' '  # slot VPN-noP2P: the subscription whose provider forbids P2P (default tunnel).'
+    printf '%s\n' '  # A second, P2P-tolerant tunnel (slot VPN -> group "VPN") is created by the panel'
+    printf '%s\n' '  # when a subscription is assigned to it; IP rules then move over there.'
+    printf '%s\n' '  - name: VPN-noP2P'
+    printf '%s\n' '    type: url-test'
+    printf '%s\n' '    use:'
+    printf '%s\n' '      - sub'
+    printf '%s\n' '    exclude-filter: "Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания|Финляндия|Нидерланды-(5|13|16|18)($|[^0-9])|Германия-[234]($|[^0-9])|США-1($|[^0-9])|Турция"'
+    printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
+    printf '%s\n' '    interval: 180'
+    printf '%s\n' '    tolerance: 99999'
+    printf '%s\n' '    lazy: false'
+    printf '%s\n' '  # AI lane: v1.22.8 - AI borrows the node-relay subscription (sub) and keeps only'
+    printf '%s\n' '  # its genuine-USA nodes (the old un1.pro AI sub routed OpenAI via a Helsinki relay'
+    printf '%s\n' '  # -> unsupported_country). v1.22.9 guards the egress nightly; v1.23.0 retires de5.'
+    printf '%s\n' '  - name: AI'
+    printf '%s\n' '    type: url-test'
+    printf '%s\n' '    use:'
+    printf '%s\n' '      - sub'
+    printf '%s\n' "    filter: 'USA'"
+    printf '%s\n' "    exclude-filter: 'HY2'"
+    printf '%s\n' '    url: "https://www.gstatic.com/generate_204"'
+    printf '%s\n' '    interval: 180'
+    printf '%s\n' '    tolerance: 99999'
+    printf '%s\n' '    lazy: false'
+    printf '\n'
+    printf '%s\n' 'rule-providers:'
+    printf '%s\n' '  ai:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/ai.yaml'
+    printf '%s\n' '  mtrickle:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/mtrickle.yaml'
+    printf '%s\n' '  ytdirect:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/ytdirect.yaml'
+    printf '%s\n' '  ytvpn:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/ytvpn.yaml'
+    printf '%s\n' '  torrentdirect:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/torrentdirect.yaml'
+    printf '%s\n' '  torrentsites:'
+    printf '%s\n' '    type: file'
+    printf '%s\n' '    behavior: classical'
+    printf '%s\n' '    path: /etc/mihomo/ruleset/torrentsites.yaml'
+    printf '\n'
+    printf '%s\n' 'rules:'
+    printf '%s\n' '  # AUTO-SYNC from magitrickle: /root/sync_mtrickle_mihomo.sh - DO NOT EDIT MANUALLY'
+    printf '%s\n' '  # v1.15.0: no blanket DST-PORT rules for P2P - they sat ABOVE the ai ruleset and'
+    printf '%s\n' '  # hijacked AI relays that happen to use those ports. Trackers are pinned by the'
+    printf '%s\n' '  # torrentdirect ruleset below (managed by geomask-torrent.sh).'
+    printf '%s\n' '  # v1.20.0: the old hand-written "DOMAIN-SUFFIX,rutracker.*,DIRECT" pins were removed.'
+    printf '%s\n' '  # Torrent sites belong in a MagiTrickle group on a direct interface - that is the'
+    printf '%s\n' '  # single place where direction is decided; a pin above the rules silently outranks'
+    printf '%s\n' '  # whatever group the owner puts the domain in.'
+    printf '%s\n' '  # QUIC forced to TCP for video hosts (RKN UDP-443 throttle, B-016)'
+    printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,googlevideo.com)),REJECT'
+    printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtube.com)),REJECT'
+    printf '%s\n' '  - AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,youtu.be)),REJECT'
+    printf '%s\n' '  # v1.25.0: ALL Yandex domains go DIRECT (RU). Yandex Go / Plus / Bank are geo-'
+    printf '%s\n' '  # sensitive and break on any non-RU exit; the app uses yandex-net.ru /'
+    printf '%s\n' '  # yandexcom.net which are NOT covered by the yandex.ru/.net namespace. These'
+    printf '%s\n' '  # are also listed in /etc/geomask/zapret-always-exclude.txt so nfqws never'
+    printf '%s\n' '  # DPI-mangles them (owner: Yandex must bypass zapret too).'
+    for _yd in yandex.ru yandex.net yandex.com yandex.com.tr yandexcloud.net yandex-net.ru yandexcom.net yandex-team.ru yastatic.net yasandbox.net ya.ru yandex.kz yandex.by yandex.az yandex.am yandex.ge yandex.tj yandex.tm yandex.uz yandex.md yandex.aero yandex.co.il yandex.eu yandex.lt yandex.lv yandex.ee; do
+      printf '  - DOMAIN-SUFFIX,%s,DIRECT\n' "$_yd"
+    done
+    printf '%s\n' '  - RULE-SET,ytvpn,VPN-noP2P'
+    printf '%s\n' '  - RULE-SET,ytdirect,DIRECT'
+    printf '%s\n' '  - DOMAIN-SUFFIX,cloudflare-ech.com,AI'
+    printf '%s\n' '  - RULE-SET,ai,AI'
+    printf '%s\n' '  # torrent tracker endpoints (public lists) - DIRECT, after ai so the AI policy always wins'
+    printf '%s\n' '  # v1.22.0: forum/catalog sites stay DIRECT - Cloudflare rejects the VPN exit'
+    printf '%s\n' '  # IPs, so routing them to a VPN makes them unreachable (measured 502 vs 301).'
+    printf '%s\n' '  - RULE-SET,torrentsites,DIRECT'
+    printf '%s\n' '  - RULE-SET,torrentdirect,VPN-noP2P'
+    printf '%s\n' '  # torrent client listening port: peers that dial US must not reach the VPN slot;'
+    printf '%s\n' '  # with a RESERVE/VPN lane configured geomask repoints this to that lane'
+    printf '%s\n' '  - SRC-PORT,41552,DIRECT'
+    printf '%s\n' '  - RULE-SET,mtrickle,VPN-noP2P'
+    printf '%s\n' '  # STUN: stop WebRTC leaking the real (RU) IP, keep calls working'
+    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,3478)),VPN-noP2P'
+    printf '%s\n' '  - AND,((NETWORK,udp),(DST-PORT,19302)),VPN-noP2P'
+
+    printf '%s\n' '  - MATCH,GLOBAL'
+    printf '\n'
+    printf '%s\n' 'sniffer:'
+    printf '%s\n' '  enable: true'
+    printf '%s\n' '  parse-pure-ip: true'
+    printf '%s\n' '  override-destination: true'
+    printf '%s\n' '  sniff:'
+    printf '%s\n' '    HTTP:'
+    printf '%s\n' '      ports: [80, 8080-8880]'
+    printf '%s\n' '    TLS:'
+    printf '%s\n' '      ports: [443, 8443, 5228]'
+    printf '%s\n' '    QUIC:'
+    printf '%s\n' '      ports: [443, 8443]'
+  } > "$_tmpconf" || { bad "cannot write $_tmpconf"; return 1; }
+  # ruleset files must exist before mihomo -t
+  mkdir -p "$(P /etc/mihomo/ruleset)"
+  for rf in mtrickle ai ytdirect ytvpn torrentdirect torrentsites; do
+    [ -s "$(P /etc/mihomo/ruleset/$rf.yaml)" ] || printf 'payload: []\n' > "$(P /etc/mihomo/ruleset/$rf.yaml)"
+  done
+  if mihomo_validate "$_tmpconf"; then
+    info "mihomo -t on new config: PASS"
+  else
+    bad "mihomo -t FAILED on new config - keeping old"; rm -f "$_tmpconf"; return 1
+  fi
+  if [ -f "$_c" ]; then cp -p "$_c" "$_c.bak_geomask_$(date +%s 2>/dev/null || echo bak)"; fi
+  # The config carries subscription URLs and the controller secret: root-only.
+  chmod 600 "$_tmpconf" 2>/dev/null
+  mv -f "$_tmpconf" "$_c" || { bad "cannot install new config"; return 1; }
+  chmod 600 "$_c" 2>/dev/null
+  info "config installed"
+  return 0
+}
+
+# runtime provider refresh through mihomo API - NO restart, VPN stays up
+api_refresh_provider() { # api_refresh_provider <name> <url>
+  [ -n "${2:-}" ] || return 1
+  # re-read config from file (re-fetches provider subscription)
+  controller_curl -s -m15 -f -X PUT "http://127.0.0.1:9090/configs" \
+    -H 'Content-Type: application/json' \
+    -d "{\"path\":\"/etc/mihomo/config.yaml\"}" >/dev/null 2>&1
+}
+
+# ============================================================ SAFETY layer
+# full settings backup (restorable via LuCI) - MANDATORY before any router change
+# v1.9.0: stored persistently in /root/geomask-backups/ (retention: freshest one - replaced by
+#         the next successful backup; full history lives on the PC via fetch_backup.ps1).
+#         Built in /tmp first, then moved: sysupgrade -b archives /root, so an existing copy
+#         must not be present while the new one is created (that nesting bloated archives in
+#         v1.6-1.8). The folder is published read-only over SMB (share 'geomask-backups',
+#         see ensure_smb_share) and linked from the panel.
+BACKUP_KEEP=1          # freshest copy on the router; full history lives on the PC
+BACKUP_RECOVERY=/etc/geomask/backup-recovery
+
+# Diagnostics of the backup path must reach the operator even when the function runs inside
+# a command substitution: `_bk=$(ensure_backup full)` used to swallow every warning,
+# including the path of the only remaining copy (audit 14.11.2026, F03).
+_bnote() { printf '  %s\n' "$*" >&2; }
+_bwarn() { printf '  [WARN] %s\n' "$*" >&2; }
+_bbad() { printf '  [FAIL] %s\n' "$*" >&2; }
+
+# A non-empty file is not a backup: sysupgrade can return 0 and still leave a truncated or
+# empty archive, and that file used to replace the last good copy during rotation.
+archive_ok() { # archive_ok <file> -> 0 only for a readable tar.gz that carries a router tree
+  # A gzip stream is not an archive: `gzip -t` accepts arbitrary compressed bytes, and such a
+  # file then replaced the last good backup. The table of contents is the only proof that
+  # sysupgrade produced a tar at all, so no fallback is allowed when tar is missing.
+  [ -s "$1" ] || return 1
+  have tar || return 1
+  tar -tzf "$1" >/dev/null 2>&1 || return 1
+  # A readable tar of one arbitrary file is not a router backup: sysupgrade always archives
+  # /etc, so at least one etc/ entry must be present (audit 14.11.2026, F29).
+  tar -tzf "$1" 2>/dev/null | grep -qE '(^|/)etc/' || return 1
+  # CRC/length of the whole stream: tar can stop at the first damaged member and still exit 0
+  if have gzip; then gzip -t "$1" >/dev/null 2>&1 || return 1; fi
+  return 0
+}
+
+_backup_park_restore() { # _backup_park_restore <park> <dir> -> 0 only when every parked copy is back
+  _rp_ok=1
+  for _rp in "$1"/*.tar.gz; do
+    [ -f "$_rp" ] || continue
+    mv -f "$_rp" "$2/" 2>/dev/null || { _rp_ok=0; _bwarn "не удалось вернуть $(basename "$_rp") - копия осталась в $1"; }
+  done
+  [ "$_rp_ok" = 1 ] && rm -rf "$1"
+  return $((1 - _rp_ok))
+}
+
+_backup_recovery_write() { # _backup_recovery_write <park> <reason>
+  mkdir -p "$(dirname "$(P $BACKUP_RECOVERY)")" 2>/dev/null || return 1
+  { printf 'park=%s\n' "$1"; printf 'reason=%s\n' "$2"; printf 'ts=%s\n' "$(date +%FT%T 2>/dev/null)"; } \
+    > "$(P $BACKUP_RECOVERY).tmp" 2>/dev/null || return 1
+  mv -f "$(P $BACKUP_RECOVERY).tmp" "$(P $BACKUP_RECOVERY)" 2>/dev/null
+}
+
+_backup_recovery_park() { sed -n 's/^park=//p' "$(P $BACKUP_RECOVERY)" 2>/dev/null | head -1; }
+
+_backup_recovery_clear() { rm -f "$(P $BACKUP_RECOVERY)" 2>/dev/null; }
+
+_backup_keep_failed() { # a parked copy could not be returned: keep it and say exactly where
+  _bkf_park=$1
+  _backup_recovery_write "$_bkf_park" "restore failed"
+  _bbad "прежняя резервная копия осталась в $_bkf_park"
+  _bbad "  перенесите её вручную: mv $_bkf_park/*.tar.gz $(P $BACKUP_DIR)/"
+  _bbad "  путь записан в $(P $BACKUP_RECOVERY); следующая попытка сначала восстановит её"
+}
+

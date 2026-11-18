@@ -14,10 +14,36 @@ COMMITTED = os.path.join(ROOT, "geomask.sh")
 BUILD = os.path.join(ROOT, "build.py")
 
 
+def composition_problems():
+    """Stage 0: the delivery views must equal their parts, checked WITHOUT writing them.
+
+    A verification run that composed (and thus republished) the file it is judging would
+    prove nothing, so drift is reported here and only `--write`/`build.py` may repair it.
+    """
+    sys.path.insert(0, HERE)
+    import compose_sources
+    problems = []
+    for target in compose_sources.TARGETS:
+        try:
+            status, detail = compose_sources.check_target(target, ROOT)
+        except compose_sources.ComposeError as exc:
+            problems.append('%s: %s' % (target, exc))
+            continue
+        if status == 'drift':
+            problems.append('%s: %s (run: python -B tools/compose_sources.py --write)'
+                            % (target, detail))
+    return problems
+
+
 def main():
     # --verify-only builds into a scratch file. Without it this checker rewrote the very
     # artifact it was asked to verify, so a stale build looked "in sync" after the run.
     verify_only = '--verify-only' in sys.argv[1:]
+    drift = composition_problems()
+    if drift:
+        for problem in drift:
+            print("FAIL: source composition: %s" % problem)
+        return 1
     if not os.path.exists(COMMITTED):
         print("FAIL: geomask.sh not found - run: python build.py")
         return 1

@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "target": "backend",
+  "parts": [
+    {
+      "path": "010-write-gate.sh.part"
+    },
+    {
+      "path": "020-status-health.sh.part"
+    },
+    {
+      "path": "030-ipv6.sh.part"
+    },
+    {
+      "path": "040-aidns-routing.sh.part"
+    },
+    {
+      "path": "050-subscriptions.sh.part"
+    },
+    {
+      "path": "060-updates.sh.part"
+    },
+    {
+      "path": "070-nodes.sh.part"
+    },
+    {
+      "path": "080-console-rules.sh.part"
+    },
+    {
+      "path": "090-diag-collect.sh.part"
+    },
+    {
+      "path": "100-diag-archive.sh.part"
+    }
+  ]
+}

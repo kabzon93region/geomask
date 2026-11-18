@@ -38,6 +38,31 @@
 - Осталось: slot→TX на живом mihomo (стенд), `_rs_restore_cron`-подобный CAS для
   restart-preimage (I04, вторая половина).
 
+## Партия 10 — этап 0в: перенос трёх целей с байт-паритетом
+
+- Инсталлятор: `geomask.sh.in` (6 386 строк) → 17 частей `src/installer/010-…170-*.sh.part`
+  (192–430 строк), порядок в `order.json`.
+- Backend: `assets/geo-backend.sh` (3 847) → 10 частей `src/backend/010-…100-*.sh.part`
+  (246–428 строк).
+- Panel: `assets/geo-sync-page.js` (1 930) → 6 текстовых render-частей
+  `src/panel/010-…060-*.js.part` (99–410 строк) внутри прежней closure.
+- Паритет **байт-в-байт** проверен композицией: `compose --check` даёт ok для всех трёх целей
+  (300 072 / 179 479 / 121 345 байт), `build.py` выдаёт прежний `geomask.sh`
+  (1 671 765 байт, sha256 `ecdb81065121fe82`), `check_build --verify-only` и
+  `gen-geo-rpc.py --check` зелёные. В этом переносе нет ни bugfix, ни formatting, ни version
+  bump — только перемещение байтов.
+- Пайплайн: `build.py` перед сборкой компонует цели, у которых есть части (без `--out`), а
+  `check_build.py --verify-only` сначала проверяет композицию и падает на расхождении, ничего
+  не перезаписывая (проверяющий не должен починять то, что проверяет).
+- Документация: в `docs/DEVELOPMENT.md` добавлен раздел «Этап 0: небольшие source-parts» —
+  authoritative parts, порядок сборки, команда check, запрет править generated view.
+- Доказательства: `tests/test_source_composition.py` 18 → 23 (реальное дерево компонуется в
+  байты delivery-файлов, мягкий лимит 500 строк соблюдён без исключений, heredoc не пересекает
+  границу части, `check_build` не публикует проверяемое).
+- Осталось по этапу 0: 0в-хвост (перевод RPC-writer'а `gen-geo-rpc.py` на generated part
+  вместо записи в asset), 0г и 0д-хвост (repo-check oversized-файлов, обновление локального
+  индекса), плюс gate этапа 0 на изолированной машине.
+
 ## Партия 9 — этап 0: baseline и composer (0а, 0б)
 
 - 0а: зафиксирован baseline для будущего переноса — `docs/source-split/BASELINE-0a.md`:

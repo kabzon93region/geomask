@@ -1,0 +1,413 @@
+cmd_nodes_path_check() {
+  case "$1" in vpn|vpn_nop2p|ai) : ;; *) printf '{"ok":false,"error":"invalid path"}\n'; return 1 ;; esac
+  [ -f "$NODE_AUDIT" ] || { printf '{"ok":false,"error":"audit module not installed"}\n'; return 1; }
+  # Module validates and reserves synchronously, then forks with the job lock.
+  python3 "$NODE_AUDIT" start "$1"
+}
+cmd_nodes_audit_events_get() {
+  python3 "$NODE_AUDIT" audit-events "$1" "$2" "$3"
+}
+cmd_nodes_audit_job_get() {
+  python3 "$NODE_AUDIT" audit-job "$1"
+}
+cmd_nodes_audit_cancel() {
+  python3 "$NODE_AUDIT" audit-cancel "$1"
+}
+cmd_nodes_path_preview() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" preview "$1" "$2" "$3" "$4"
+}
+cmd_nodes_path_apply() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" apply "$1" "$2" "$3"
+}
+cmd_nodes_path_apply_status() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" status "$1"
+}
+cmd_nodes_path_revoke() {
+  [ -f "$NODE_APPLY" ] || { printf '{"ok":false,"error":"apply module not installed"}\n'; return 1; }
+  python3 "$NODE_APPLY" revoke "$1"
+}
+cmd_mtrickle_sync() {
+  python3 /usr/lib/geomask/geomask-sync-youtube.py mtrickle-sync
+}
+cmd_nodes_audit_schedule_get() {
+  python3 "$NODE_AUDIT" schedule-get "$1"
+}
+cmd_nodes_audit_schedule_set() {
+  python3 "$NODE_AUDIT" schedule-set "$1" "$2" "$3" "$4"
+}
+
+# v1.16.0: Policy management (paths, filters, subscriptions, preview)
+cmd_policy_get() {
+  _pol=/etc/geomask/policies.yaml
+  [ -f "$_pol" ] || { printf '{"ok":false,"error":"policy file not found"}\n'; return 1; }
+  cat "$_pol"
+}
+
+cmd_policy_preview() {
+  _py=/usr/lib/geomask/policy_preview.py
+  [ -f "$_py" ] || { printf '{"ok":false,"error":"preview engine not installed"}\n'; return 1; }
+  _path_id="$2"
+  _nodes_json="$3"
+  if [ -z "$_path_id" ]; then
+    printf '{"ok":false,"error":"path_id required"}\n'; return 1
+  fi
+  if [ -z "$_nodes_json" ]; then
+    _nodes_json='[]'
+  fi
+  python3 "$_py" "$_path_id" --nodes-json "$_nodes_json"
+}
+
+cmd_policy_apply() {
+  _pol=/etc/geomask/policies.yaml
+  [ -f "$_pol" ] || { printf '{"ok":false,"error":"policy file not found"}\n'; return 1; }
+  _new_policy="$2"
+  if [ -z "$_new_policy" ]; then
+    printf '{"ok":false,"error":"policy_json required"}\n'; return 1
+  fi
+  # Validate JSON structure
+  echo "$_new_policy" | python3 -m json.tool >/dev/null 2>&1 || { printf '{"ok":false,"error":"invalid JSON"}\n'; return 1; }
+  # Backup current policy
+  _bak="/etc/geomask/policies.yaml.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$_pol" "$_bak"
+  # Write new policy
+  printf '%s' "$_new_policy" > "$_pol"
+  # Verify the new policy is valid
+  python3 -c "import yaml, sys; yaml.safe_load(open('/etc/geomask/policies.yaml'))" 2>/dev/null || {
+    mv "$_bak" "$_pol"
+    printf '{"ok":false,"error":"invalid policy structure"}\n'; return 1
+  }
+  printf '{"ok":true,"backup":"%s"}\n' "$(basename "$_bak")"
+}
+
+# Strict DNS with an emergency reserve (owner decision 14.11.2026). The policy itself lives in
+# one script so the panel, the installer and a shell call all do the same thing.
+DNSGUARD=${GM_DNSGUARD:-/usr/lib/geomask/geomask-dnsguard.sh}
+cmd_dns_guard() { # cmd_dns_guard <status|apply|revert>
+  case "${1:-status}" in
+    status|apply|revert) ;;
+    *) printf '{"error":"bad arg"}\n'; return 1 ;;
+  esac
+  [ "$1" = status ] || _require_backup || return 1
+  [ -x "$DNSGUARD" ] || { printf '{"ok":false,"error":"dns guard not installed (/usr/lib/geomask/geomask-dnsguard.sh)"}\n'; return 1; }
+  "$DNSGUARD" "$1"
+}
+
+# Read-only twin of `dns_guard status`: the panel needs the policy on every render, while
+# apply/revert must stay behind the write ACL. Keeping one method for both made `status`
+# unreachable for a read-only user (R10b item 3).
+cmd_dns_guard_status() { cmd_dns_guard status; }
+
+# ---------------------------------------------------------------- console lane (v1.31.0)
+# A console needs ONE egress for the whole session: auth, game and UDP must leave through the
+# same node, or the service drops the session mid-match. Domain rules cannot promise that —
+# the same CDN/API hosts serve every device — so the console gets its own tunnel and listener,
+# exactly like the AI lane. The egress is chosen by the listener, not by a rule.
+#
+# `off` is the kill switch the owner asked for: it removes the ip rule and stops the tunnel, so
+# the console falls back to the normal path immediately. The mihomo side stays in place, so
+# switching back on is instant and does not reload mihomo.
+CONSOLE_STATE=${GM_CONSOLE_STATE:-/etc/geomask/console.state}
+CONSOLE_TUN_DEV=Console
+CONSOLE_TUN_IP=198.21.0.1
+CONSOLE_SOCKS_PORT=7893
+CONSOLE_TABLE=102
+CONSOLE_RULE_PREF=19903
+CONSOLE_YML=${GM_CONSOLE_YML:-/etc/hev-socks5-tunnel/console.yml}
+CONSOLE_INITD=${GM_CONSOLE_INITD:-/etc/init.d/hev-console}
+CONSOLE_NFT=${GM_CONSOLE_NFT:-/usr/share/nftables.d/ruleset-post/99-console-accept.nft}
+CONSOLE_PY=/usr/lib/geomask/geomask-console.py
+# The switch writes the live config through the transaction CLI declared at the top of this
+# file (preimage, mihomo -t, isolated trial, atomic write, reload, rollback).
+# One lock for `on`, `off` and the guard's console block: a rule must not come back after the
+# kill switch removed it. `status` never takes it - the panel calls it on every render.
+# The primitive is the shared kernel lock (geomask-lock.sh, console rank): a killed switch is
+# released by the kernel, the lock file is never deleted and there is no PID to guess. The
+# emergency path waits a bounded number of seconds and then fails; it never works unserialised.
+CONSOLE_LOCK=${GM_CONSOLE_LOCK:-/tmp/geomask-locks/console.lock}
+# R05: `on` holds `console` while it fills table 102. Waiting 20 s for `route-102` inside that
+# window made the kill switch answer "console is busy" for the whole budget. The route table is
+# a separate writer: a short try-wait is enough, and a busy table is a RETRYABLE error.
+CONSOLE_ROUTE_WAIT=${GM_CONSOLE_ROUTE_WAIT:-2}
+
+_console_get() { sed -n "s/^$1=//p" "$CONSOLE_STATE" 2>/dev/null | head -1; }
+
+# R10b: the console status used to be three boolean substrings. `grep "from $ip lookup 102"`
+# matched a longer address and table 1020, and `grep '^default'` accepted a default through the
+# WAN. A match must be the exact rule (pref, address and table are separate tokens), the
+# default must name our tunnel without a gateway, and the LAN prefixes mirrored into table 102
+# must be there. "Cannot check" is a third answer, never folded into "healthy".
+_console_rule_exact() { # stdin: ip rule show; $1 = ip; 0 only for pref 19903 from <ip> lookup 102
+  awk -v ip="$1" -v pref="$CONSOLE_RULE_PREF" -v tbl="$CONSOLE_TABLE" '
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      n = split(line, f, /[ \t]+/)
+      p = f[1]
+      sub(/:$/, "", p)
+      if (n == 5 && p == pref && f[2] == "from" && f[3] == ip && f[4] == "lookup" && f[5] == tbl) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+_console_rule_any_table() { # stdin: ip rule show; 0 when any rule looks up the console table
+  awk -v tbl="$CONSOLE_TABLE" '
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      n = split(line, f, /[ \t]+/)
+      for (i = 1; i < n; i++) if (f[i] == "lookup" && f[i + 1] == tbl) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+_console_default_kind() { # stdin: ip route show table 102; prints "dev Console" | "foreign" | "none"
+  awk -v tun="$CONSOLE_TUN_DEV" '
+    $1 == "default" {
+      seen = 1
+      for (i = 2; i < NF; i++) {
+        if ($i == "via") via = 1
+        if ($i == "dev" && $(i + 1) == tun) dev = 1
+      }
+      if (dev && !via) ours = 1
+    }
+    END {
+      if (ours) print "dev " tun
+      else if (seen) print "foreign"
+      else print "none"
+    }
+  '
+}
+
+_console_lan_present() { # stdin: ip route show table 102; $1 = prefix, $2 = device
+  awk -v net="$1" -v dev="$2" '
+    $1 == net {
+      for (i = 2; i < NF; i++) if ($i == "dev" && $(i + 1) == dev) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+_console_status_unknown() { _cs_unknown="${_cs_unknown}${_cs_unknown:+,}\"$1\""; }
+
+# Sets the status fields without writing anything (the panel calls this on every render).
+# _cs_state is ok|drift|down|unknown; _cs_unknown is a JSON array body of checks that could
+# not run; _cs_rule/_cs_tun keep the old boolean fields, but only an exact match sets _cs_rule.
+_console_status_state() {
+  _cs_state=ok
+  _cs_unknown=''
+  _cs_rule=0
+  _cs_tun=0
+  _cs_default=unknown
+  _cs_lan_missing=''
+  _cs_enabled=$(_console_get enabled)
+  _cs_ip=$(_console_get ip)
+  _cs_ip_ok=0
+  if [ -n "$_cs_ip" ] && _ipv4_ok "$_cs_ip"; then _cs_ip_ok=1; fi
+  if [ ! -f "$CONSOLE_STATE" ]; then
+    _cs_state=unknown
+    _console_status_unknown state
+  else
+    case "$_cs_enabled" in
+      0|1) ;;
+      *) _cs_state=unknown; _console_status_unknown enabled ;;
+    esac
+  fi
+  if ! command -v ip >/dev/null 2>&1; then
+    _cs_state=unknown
+    _console_status_unknown ip
+    return 0
+  fi
+  if _cs_rules=$(ip rule show 2>/dev/null); then
+    :
+  else
+    _cs_rules=''
+    _cs_state=unknown
+    _console_status_unknown ip-rule
+  fi
+  ip link show "$CONSOLE_TUN_DEV" >/dev/null 2>&1 && _cs_tun=1
+  # A disabled lane has no desired table: only "no rule may point at 102" is checked.
+  if [ "$_cs_enabled" != 1 ]; then
+    _cs_default=not_checked
+    if printf '%s\n' "$_cs_rules" | _console_rule_any_table; then
+      [ "$_cs_state" = unknown ] || _cs_state=drift
+    fi
+    return 0
+  fi
+  if [ "$_cs_ip_ok" = 1 ]; then
+    printf '%s\n' "$_cs_rules" | _console_rule_exact "$_cs_ip" && _cs_rule=1
+  fi
+  _cs_routes=''
+  _cs_routes_ok=0
+  if _cs_routes=$(ip route show table "$CONSOLE_TABLE" 2>/dev/null); then
+    _cs_routes_ok=1
+    _cs_default=$(printf '%s\n' "$_cs_routes" | _console_default_kind)
+  else
+    _cs_default=unknown
+    _cs_state=unknown
+    _console_status_unknown ip-route
+  fi
+  if [ -r "$GM_ROUTES_LIB" ]; then
+    # The same helper the switch uses, so "desired" is what the sync really writes. A
+    # subshell: the helper defines a crowd of _gm_* functions and variables.
+    _cs_expected=$( ( . "$GM_ROUTES_LIB" && _gm_route_local_lines ) 2>/dev/null )
+    if [ "$_cs_routes_ok" = 1 ]; then
+      while IFS= read -r _cs_line; do
+        [ -n "$_cs_line" ] || continue
+        _cs_net=${_cs_line%% *}
+        _cs_dev=''
+        _cs_rest=" $_cs_line "
+        case "$_cs_rest" in
+          *" dev "*) _cs_tail=${_cs_rest#* dev }; _cs_dev=${_cs_tail%% *} ;;
+        esac
+        [ -n "$_cs_net" ] && [ -n "$_cs_dev" ] || continue
+        if printf '%s\n' "$_cs_routes" | _console_lan_present "$_cs_net" "$_cs_dev"; then
+          :
+        else
+          _cs_lan_missing="$_cs_lan_missing $_cs_net"
+        fi
+      done <<EOF
+$_cs_expected
+EOF
+    fi
+  else
+    _cs_state=unknown
+    _console_status_unknown routes-helper
+  fi
+  if [ "$_cs_state" = unknown ]; then
+    return 0
+  fi
+  if [ "$_cs_enabled" = 1 ]; then
+    if [ "$_cs_tun" != 1 ]; then
+      _cs_state=down
+    elif [ "$_cs_ip_ok" != 1 ] || [ "$_cs_rule" != 1 ] \
+      || [ "$_cs_default" != "dev $CONSOLE_TUN_DEV" ] || [ -n "$_cs_lan_missing" ]; then
+      _cs_state=drift
+    fi
+  else
+    if printf '%s\n' "$_cs_rules" | _console_rule_any_table; then
+      _cs_state=drift
+    fi
+  fi
+  return 0
+}
+
+_console_lock() {
+  command -v gm_lock_acquire >/dev/null 2>&1 || {
+    echo "console: lock helper missing ($GM_LOCK_LIB) - refusing to switch the lane" >&2
+    return 1
+  }
+  gm_lock_acquire console "${CONSOLE_LOCK_TRIES:-10}" "$CONSOLE_LOCK"
+}
+
+# Releases only the lock this process holds. The lock file stays: deleting or recreating it
+# would give two writers two different inodes (the historical reclaim bug, R04).
+_console_unlock() {
+  command -v gm_lock_release >/dev/null 2>&1 || return 0
+  gm_lock_release console
+  return 0
+}
+
+_console_set() { # _console_set <key> <value>
+  mkdir -p "$(dirname "$CONSOLE_STATE")" 2>/dev/null || return 1
+  _ct_tmp="$CONSOLE_STATE.tmp.$$"
+  if [ -f "$CONSOLE_STATE" ]; then
+    grep -v "^$1=" "$CONSOLE_STATE" > "$_ct_tmp" 2>/dev/null || : > "$_ct_tmp"
+  else
+    : > "$_ct_tmp"
+  fi
+  printf '%s=%s\n' "$1" "$2" >> "$_ct_tmp" 2>/dev/null || { rm -f "$_ct_tmp"; return 1; }
+  chmod 600 "$_ct_tmp" 2>/dev/null
+  mv -f "$_ct_tmp" "$CONSOLE_STATE" 2>/dev/null
+}
+
+_console_tun_ensure() {
+  mkdir -p /etc/hev-socks5-tunnel 2>/dev/null
+  if [ ! -f "$CONSOLE_YML" ]; then
+    {
+      printf 'tunnel:\n'
+      printf '  name: %s\n' "$CONSOLE_TUN_DEV"
+      printf '  mtu: 8500\n  multi-queue: false\n'
+      printf '  ipv4: %s\n' "$CONSOLE_TUN_IP"
+      printf 'socks5:\n  port: %s\n  address: 127.0.0.1\n  udp: %s\n' \
+        "$CONSOLE_SOCKS_PORT" "'udp'"
+    } > "$CONSOLE_YML" || return 1
+  fi
+  if [ ! -x "$CONSOLE_INITD" ]; then
+    {
+      printf '#!/bin/sh /etc/rc.common\n'
+      printf 'USE_PROCD=1\nSTART=99\n'
+      printf 'start_service() {\n  procd_open_instance\n'
+      printf '  procd_set_param command /usr/bin/hev-socks5-tunnel %s\n' "$CONSOLE_YML"
+      printf '  procd_set_param file %s\n' "$CONSOLE_YML"
+      printf '  procd_set_param limits core="unlimited"\n'
+      printf '  procd_set_param limits nofile="1000000 1000000"\n'
+      printf '  procd_set_param stdout 1\n  procd_set_param stderr 1\n'
+      printf '  procd_set_param respawn\n  procd_close_instance\n}\n'
+    } > "$CONSOLE_INITD" || return 1
+    chmod 755 "$CONSOLE_INITD" 2>/dev/null
+  fi
+  "$CONSOLE_INITD" enable >/dev/null 2>&1
+  # The tunnel is a procd service: run the init script without the lock descriptor, or the
+  # daemon inherits it and holds the console lock until reboot.
+  if command -v gm_lock_safe_exec >/dev/null 2>&1; then
+    gm_lock_safe_exec "$CONSOLE_INITD" start >/dev/null 2>&1
+  else
+    "$CONSOLE_INITD" start >/dev/null 2>&1
+  fi
+  _i=0
+  while [ "$_i" -lt 10 ] && ! ip link show "$CONSOLE_TUN_DEV" >/dev/null 2>&1; do
+    sleep 1; _i=$((_i+1))
+  done
+  ip link show "$CONSOLE_TUN_DEV" >/dev/null 2>&1
+}
+
+_console_fw_ensure() {
+  uci -q get network.Console >/dev/null 2>&1 || {
+    uci set network.Console=interface
+    uci set network.Console.proto='none'
+    uci set network.Console.device="$CONSOLE_TUN_DEV"
+    uci commit network
+  }
+  if ! uci -q show firewall 2>/dev/null | grep -q "name='Console'"; then
+    _zn=''
+    for _s in $(uci -q show firewall 2>/dev/null | sed -n 's/^\(firewall\.[^.]*\)=zone$/\1/p'); do
+      [ "$(uci -q get "$_s.name")" = "Mihomo" ] && { _zn="$_s"; break; }
+    done
+    [ -n "$_zn" ] || return 1
+    _new=$(uci add firewall zone)
+    uci set "firewall.$_new.name=Console"
+    for _o in input output forward masq mtu_fix; do
+      uci set "firewall.$_new.$_o=$(uci -q get "$_zn.$_o")"
+    done
+    uci set "firewall.$_new.network=Console"
+    for _f in $(uci -q show firewall 2>/dev/null | sed -n 's/^\(firewall\.[^.]*\)=forwarding$/\1/p'); do
+      _src=$(uci -q get "$_f.src"); _dst=$(uci -q get "$_f.dest")
+      if [ "$_src" = "lan" ] && [ "$_dst" = "Mihomo" ]; then
+        _nf=$(uci add firewall forwarding); uci set "firewall.$_nf.src=lan"; uci set "firewall.$_nf.dest=Console"
+      fi
+      if [ "$_src" = "Mihomo" ] && [ "$_dst" = "lan" ]; then
+        _nf=$(uci add firewall forwarding); uci set "firewall.$_nf.src=Console"; uci set "firewall.$_nf.dest=lan"
+      fi
+    done
+    uci commit firewall
+  fi
+  # The TUN zone is a /32, so fw4 generates no accept for lan->Console: without this rule the
+  # console's packets are dropped by the firewall even though routing is correct.
+  _devs=$(_gm_lan_devices)
+  _names=$(_gm_nft_names "$_devs")
+  mkdir -p "$(dirname "$CONSOLE_NFT")" 2>/dev/null
+  {
+    printf '# geomask-lan: %s\n' "$_devs"
+    printf 'table inet fw4 {\n    chain accept_to_Console {\n'
+    [ -n "$_names" ] && printf '        iifname { %s } oifname "Console" counter accept comment "geomask-console: LAN to console tunnel"\n' "$_names"
+    printf '        iifname "Wireguard" oifname "Console" counter accept comment "geomask-console: WG to console tunnel"\n'
+    printf '    }\n}\n'
+  } > "$CONSOLE_NFT" 2>/dev/null
+  /etc/init.d/firewall reload >/dev/null 2>&1
+}
+

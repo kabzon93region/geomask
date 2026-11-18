@@ -323,6 +323,7 @@ uci() {
                  'AIDNS_DNS_PORT=5353\n'
                  'AIDNS_FW_INIT="' + posix(fw) + '"\n'
                  'AIDNS_PENDING="' + posix(self.case / 'aidns.pending') + '"\n'
+                 'AIDNS_LAST="' + posix(self.case / 'aidns.last') + '"\n'
                  '_gm_lan_ip() { printf "192.168.1.1"; }\n'
                  '_gm_aidns_ip() { printf ""; }\n')
         result = self.run_backend('_aidns_sync; printf "RC=%s\\n" "$?"',
@@ -373,6 +374,7 @@ uci() {
                  'AIDNS_DNS_PORT=5353\n'
                  'AIDNS_FW_INIT="' + posix(fw) + '"\n'
                  'AIDNS_PENDING="' + posix(self.case / 'aidns.pending') + '"\n'
+                 'AIDNS_LAST="' + posix(self.case / 'aidns.last') + '"\n'
                  '_gm_lan_ip() { printf "192.168.1.1"; }\n'
                  '_gm_aidns_ip() { printf "192.168.1.53"; }\n')
         return dest, extra

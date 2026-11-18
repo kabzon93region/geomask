@@ -7895,6 +7895,9 @@ AIDNS_STATE=${GM_AIDNS_STATE:-/tmp/geomask-aidns.state}
 # active"; every later sync retries the reload and the read-back before it may say ok.
 AIDNS_PENDING=${GM_AIDNS_PENDING:-/tmp/geomask-aidns.pending}
 AIDNS_FW_INIT=${GM_AIDNS_FW_INIT:-/etc/init.d/firewall}
+# C04: the previous device list is a runtime witness like the state file; a hardcoded
+# /tmp path here escaped the sandbox in tests and could collide with another run.
+AIDNS_LAST=${GM_AIDNS_LAST:-/tmp/geomask-aidns-last}
 
 # Read-back: the reload is trusted only when the kernel actually carries our table.
 _aidns_active() {
@@ -7983,7 +7986,7 @@ _aidns_sync() {
     if _aidns_reload_prove; then
       _aidns_clear_pending
       printf 'ok' > "$AIDNS_STATE"
-      printf '%s' "$_list" > /tmp/geomask-aidns-last
+      printf '%s' "$_list" > "$AIDNS_LAST"
       echo "$(date +%FT%T) AI-DNS: reload retried after a pending write - table is live" >> "$LOG"
       return 0
     fi
@@ -8017,7 +8020,7 @@ _aidns_sync() {
   else
     printf 'ok' > "$AIDNS_STATE"
   fi
-  printf '%s' "$_list" > /tmp/geomask-aidns-last
+  printf '%s' "$_list" > "$AIDNS_LAST"
   echo "$(date +%FT%T) AI-DNS: ruleset updated -> firewall reloaded (table live)" >> "$LOG"
   return 0
 }
@@ -18230,7 +18233,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "09546dd28f5c77a45f8ffcbeaeb0d401e24670d1fca0ac81bf54cf17682ab198"
+          "sha256": "597722fd1ee60300fec399bfd363c4b017b45716d3699cc67a9fd8b71423fb0b"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",

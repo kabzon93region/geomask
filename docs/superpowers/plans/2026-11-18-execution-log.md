@@ -349,6 +349,14 @@
 - Осталось: живой crontab на OpenWrt (BusyBox crond, `lock`-семантика), параллельный
   panel nodes_set во время restore — стенд.
 
+## Стендовые gates — runbook
+
+Всё, что нельзя доказать на Windows-хосте, собрано в исполнимый порядок действий:
+[`docs/STAND-GATES-RUNBOOK.md`](../../STAND-GATES-RUNBOOK.md) — правила стенда, изолированный
+Linux-unit-gate (CI-лог 187), gate этапа 0, R06/R11 и phase2a–2f на финальном SHA, dataplane
+(P01/P10/G05/DNS), backup/durability (P06/P08/P09) и матрица финального SHA. Каждый пункт
+закрывается только записанным evidence (лог + sha256 + команды), иначе остаётся OPEN.
+
 ## Что ещё не начато (по плану)
 
 - Задача 5 (DNS/rulesets: C04/C07/G02/G03/G05/P10/P11), задача 7 (диагностика: остаток

@@ -79,6 +79,9 @@
   adopt/reload и каталог); проверка шага 2 идёт по нему и пропускает пути снятых модулей так
   же, как `save_stream`. `step_check_is_authoritative`: для шага 2 пройденный check больше не
   отменяет apply (presence не доказывает свежесть), остальные шаги сохраняют быстрый путь.
+- Полный gate на этом SHA: 94 модуля, 1362 теста (1333 выполнено, 29 allowlisted skip),
+  0 fail, 0 timeout, verdict PASS (лог `gate15`, `--timeout 4200`: дефолтные 600 с малы для
+  `test_reinstall_phase2b`, 2181 с на этой машине).
 - Test-infra: `test_sandbox_guard` один раз упал в полном прогоне на `WinError 2` при запуске
   python (в отдельном прогоне проходит), добавлен один повтор с явным путём интерпретатора.
 - Доказательства: новый `test_reload_state` 10, `test_backend_safety` 17 → 22 → 25,

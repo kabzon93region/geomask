@@ -63,7 +63,7 @@
   oversize = 1). Прогнаны профильные наборы: install_safety 49, module_index 7, docs_claims 4,
   pycheck 7, module_update 67 (1 posix-only skip), doctor 73, dnsguard 44, routes 32,
   console_diag 30 — зелёные.
-- Полный gate после 0г: 95 модулей, 1394 теста (1364 выполнено, 30 allowlisted skip),
+- Полный gate после 0г: 96 модулей, 1398 тестов (1368 выполнено, 30 allowlisted skip),
   0 fail, 0 timeout, PASS (лог `gate23`).
 - Осталось по этапу 0: gate этапа 0 на изолированной машине (Linux/BusyBox/real runtime) —
   локальный паритет и проверки это не заменяют.

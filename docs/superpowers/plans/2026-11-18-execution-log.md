@@ -82,6 +82,12 @@
 - Полный gate на этом SHA: 94 модуля, 1362 теста (1333 выполнено, 29 allowlisted skip),
   0 fail, 0 timeout, verdict PASS (лог `gate15`, `--timeout 4200`: дефолтные 600 с малы для
   `test_reinstall_phase2b`, 2181 с на этой машине).
+- P03: обновление модуля больше не может менять файлы под идущей переустановкой. Взят
+  kernel-lock `maintenance` (тот же файл, что у shell-helper'а; rank 10, outermost) — try-lock:
+  занято → `ok:false` с причиной, без ожидания в очереди. Ответ обновления несёт
+  `activation: restart-required|none`, так что «файлы установлены» не выдаётся за «сервис уже
+  на новом коде».
+- Финальный gate на этом SHA: 95 модулей, 1374 теста, 0 fail, 0 timeout, PASS (лог `gate17`).
 - Test-infra: `test_sandbox_guard` один раз упал в полном прогоне на `WinError 2` при запуске
   python (в отдельном прогоне проходит), добавлен один повтор с явным путём интерпретатора.
 - Доказательства: новый `test_reload_state` 10, `test_backend_safety` 17 → 22 → 25,

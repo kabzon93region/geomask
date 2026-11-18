@@ -438,6 +438,7 @@ module_owns_path() { # echoes the module id that owns an install path, if any
     "/etc/hotplug.d/iface/99-default-vpn-route") GM_PATH_MODULE="core" ;;
     "/etc/init.d/geomask-syncd") GM_PATH_MODULE="core" ;;
     "/root/sync_mtrickle_mihomo.sh") GM_PATH_MODULE="core" ;;
+    "/usr/bin/geo-backend.sh") GM_PATH_MODULE="core" ;;
     "/usr/bin/geomask-lane.sh") GM_PATH_MODULE="core" ;;
     "/usr/bin/geomask-node-scan.sh") GM_PATH_MODULE="core" ;;
     "/usr/bin/geomask-seed-lists.py") GM_PATH_MODULE="core" ;;
@@ -467,7 +468,6 @@ module_owns_path() { # echoes the module id that owns an install path, if any
     "/usr/lib/geomask/geomask-doctor.py") GM_PATH_MODULE="doctor" ;;
     "/etc/hotplug.d/iface/99-geomask-guard") GM_PATH_MODULE="guard" ;;
     "/usr/bin/geomask-guard.sh") GM_PATH_MODULE="guard" ;;
-    "/usr/bin/geo-backend.sh") GM_PATH_MODULE="luci" ;;
     "/usr/libexec/rpcd/geo-sync") GM_PATH_MODULE="luci" ;;
     "/usr/share/luci/menu.d/luci-app-geo-sync.json") GM_PATH_MODULE="luci" ;;
     "/usr/share/rpcd/acl.d/luci-app-geo-sync.json") GM_PATH_MODULE="luci" ;;
@@ -17153,7 +17153,7 @@ ASSET_EOF
       "files": []
     },
     "core": {
-      "version": "1.30.15",
+      "version": "1.31.0",
       "type": "core",
       "name": "geomask (ядро)",
       "dependencies": [],
@@ -17202,6 +17202,12 @@ ASSET_EOF
           "source": "assets/sync_mtrickle_mihomo.sh",
           "mode": "0755",
           "sha256": "45c5715a89e9b3b598adc1378df87a4ac1c818b61971d754224d2426bf21ff4a"
+        },
+        {
+          "path": "/usr/bin/geo-backend.sh",
+          "source": "assets/geo-backend.sh",
+          "mode": "0755",
+          "sha256": "9263db220a2e24e72a21b5ee0ca1084bb385672be732e33915d229b688e09a4f"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -17427,12 +17433,6 @@ ASSET_EOF
         "core"
       ],
       "files": [
-        {
-          "path": "/usr/bin/geo-backend.sh",
-          "source": "assets/geo-backend.sh",
-          "mode": "0755",
-          "sha256": "9263db220a2e24e72a21b5ee0ca1084bb385672be732e33915d229b688e09a4f"
-        },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",
@@ -42178,6 +42178,36 @@ step6_apply() {
 step6_verify() { step6_check; }
 
 # ============================================================ STEP 7: end-to-end verify (read-only)
+# Groups a fresh install must have (I01, audit 18.11.2026). The template creates VPN-noP2P and
+# AI; `VPN` is the optional second tunnel the panel adds later, so its absence is the documented
+# single-tunnel topology, not a broken install. A VPN group that IS declared in the config but
+# missing from the API means mihomo did not load it - that stays a failure.
+_step7_groups() {
+  _sg_need=0
+  if _sg_px=$(controller_curl -f -m 5 -s "http://127.0.0.1:9090/proxies" 2>/dev/null); then
+    if printf '%s' "$_sg_px" | grep -q '"VPN-noP2P"'; then
+      info "mihomo group VPN-noP2P: in API"
+    else
+      bad "mihomo group VPN-noP2P missing"; _sg_need=1
+    fi
+    if printf '%s' "$_sg_px" | grep -q '"AI"'; then
+      info "mihomo group AI: in API"
+    else
+      bad "mihomo group AI missing"; _sg_need=1
+    fi
+    if printf '%s' "$_sg_px" | grep -q '"VPN"'; then
+      info "mihomo group VPN: in API"
+    elif grep -qE '^[[:space:]]*- name: VPN$' "$(P "$MIHOMO_CONF")" 2>/dev/null; then
+      bad "mihomo group VPN: declared in the config but missing from the API"; _sg_need=1
+    else
+      info "mihomo group VPN: not used (single tunnel - main lists ride VPN-noP2P)"
+    fi
+  else
+    bad "mihomo controller request failed (check authentication/connectivity)"; _sg_need=1
+  fi
+  return $_sg_need
+}
+
 step7_check() {
   _need=0
   _r=$(nslookup ya.ru 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2}' | tail -1)
@@ -42189,12 +42219,7 @@ step7_check() {
   esac
   _code=$(curl -m 5 -s -o /dev/null -w '%{http_code}' http://www.gstatic.com/generate_204 2>/dev/null)
   [ "$_code" = "204" ] && info "connectivity: 204 OK" || { bad "connectivity: HTTP ${_code:-none}"; _need=1; }
-  if _px=$(controller_curl -f -m 5 -s http://127.0.0.1:9090/proxies 2>/dev/null); then
-    printf '%s' "$_px" | grep -q '"VPN"' && info "mihomo group VPN: in API" || { bad "mihomo group VPN missing"; _need=1; }
-    printf '%s' "$_px" | grep -q '"AI"' && info "mihomo group AI: in API" || { bad "mihomo group AI missing"; _need=1; }
-  else
-    bad "mihomo controller request failed (check authentication/connectivity)"; _need=1
-  fi
+  _step7_groups || _need=1
   if have ubus && module_selected luci; then
     ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
   elif ! module_selected luci; then

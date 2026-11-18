@@ -1,7 +1,7 @@
 {
   "id": "core",
   "name": "geomask (ядро)",
-  "version": "1.30.15",
+  "version": "1.31.0",
   "schema_version": 1,
   "type": "core",
   "description": "Ядро geomask: синк MagiTrickle→mihomo, node-audit, лейн, сторож, списки, сидер, обновление модулей",
@@ -23,6 +23,11 @@
       "type": "file",
       "path": "/usr/lib/geomask/safe_write_cli.py",
       "description": ""
+    },
+    {
+      "type": "file",
+      "path": "/usr/bin/geo-backend.sh",
+      "description": "бэкенд состояния: IPv6, устройства, маршруты (единственный writer)"
     },
     {
       "type": "service",

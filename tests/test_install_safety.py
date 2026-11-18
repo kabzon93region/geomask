@@ -712,6 +712,52 @@ step_fn() { case "$2" in check) return 1 ;; apply) printf 'APPLIED\n' ;; esac; r
         self.assertNotIn('APPLIED', result.stdout,
                          'the services were started although the backup gate refused')
 
+    def test_a_single_tunnel_install_passes_the_group_check(self):
+        """I01 of the 18.11 audit: a fresh VPN-noP2P-only topology is not a broken install.
+
+        The template creates VPN-noP2P and AI; `VPN` is the optional second tunnel the panel
+        adds later, and verify used to fail on its absence alone.
+        """
+        conf = self.case / 'etc/mihomo/config.yaml'
+        conf.parent.mkdir(parents=True)
+        conf.write_text('proxy-groups:\n  - name: VPN-noP2P\n  - name: AI\n', encoding='utf-8')
+        extra = ('controller_curl() { printf \'{"VPN-noP2P":{},"AI":{}}\'; }\n')
+        result = self.run_script('_step7_groups; printf "RC=%s\\n" "$?"',
+                                 functions=['_step7_groups'], extra=extra)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RC=0', result.stdout, result.stdout)
+        self.assertNotIn('group VPN missing', result.stdout)
+
+    def test_a_missing_required_group_fails_the_group_check(self):
+        conf = self.case / 'etc/mihomo/config.yaml'
+        conf.parent.mkdir(parents=True)
+        conf.write_text('proxy-groups:\n  - name: VPN-noP2P\n', encoding='utf-8')
+        extra = ('controller_curl() { printf \'{"VPN-noP2P":{}}\'; }\n')
+        result = self.run_script('_step7_groups; printf "RC=%s\\n" "$?"',
+                                 functions=['_step7_groups'], extra=extra)
+        self.assertIn('RC=1', result.stdout, result.stdout)
+        self.assertIn('group AI missing', result.stdout)
+
+    def test_a_declared_vpn_group_missing_from_the_api_fails(self):
+        conf = self.case / 'etc/mihomo/config.yaml'
+        conf.parent.mkdir(parents=True)
+        conf.write_text('proxy-groups:\n  - name: VPN-noP2P\n  - name: AI\n  - name: VPN\n',
+                        encoding='utf-8')
+        extra = ('controller_curl() { printf \'{"VPN-noP2P":{},"AI":{}}\'; }\n')
+        result = self.run_script('_step7_groups; printf "RC=%s\\n" "$?"',
+                                 functions=['_step7_groups'], extra=extra)
+        self.assertIn('RC=1', result.stdout, result.stdout)
+        self.assertIn('declared in the config but missing from the API', result.stdout)
+
+    def test_core_owns_the_backend_so_a_headless_install_can_disable_ipv6(self):
+        """I02: with core/path_vpn the backend was not installed, so IPv6-off never ran."""
+        import json as _json
+        index = _json.loads((ROOT / 'modules' / 'index.json').read_text(encoding='utf-8'))
+        owner = {entry['path']: module_id
+                 for module_id, module in index['modules'].items()
+                 for entry in module.get('files') or []}
+        self.assertEqual(owner.get('/usr/bin/geo-backend.sh'), 'core')
+
     def test_cron_ensure_without_a_lock_does_not_write(self):
         """I03 of the 18.11 audit: a refused lock must not still rewrite the crontab."""
         extra = r"""

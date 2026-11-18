@@ -44,7 +44,7 @@
       "files": []
     },
     "core": {
-      "version": "1.30.15",
+      "version": "1.31.0",
       "type": "core",
       "name": "geomask (ядро)",
       "dependencies": [],
@@ -93,6 +93,12 @@
           "source": "assets/sync_mtrickle_mihomo.sh",
           "mode": "0755",
           "sha256": "45c5715a89e9b3b598adc1378df87a4ac1c818b61971d754224d2426bf21ff4a"
+        },
+        {
+          "path": "/usr/bin/geo-backend.sh",
+          "source": "assets/geo-backend.sh",
+          "mode": "0755",
+          "sha256": "9263db220a2e24e72a21b5ee0ca1084bb385672be732e33915d229b688e09a4f"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -318,12 +324,6 @@
         "core"
       ],
       "files": [
-        {
-          "path": "/usr/bin/geo-backend.sh",
-          "source": "assets/geo-backend.sh",
-          "mode": "0755",
-          "sha256": "9263db220a2e24e72a21b5ee0ca1084bb385672be732e33915d229b688e09a4f"
-        },
         {
           "path": "/usr/libexec/rpcd/geo-sync",
           "source": "assets/geo-sync",

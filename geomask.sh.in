@@ -2736,6 +2736,36 @@ step6_apply() {
 step6_verify() { step6_check; }
 
 # ============================================================ STEP 7: end-to-end verify (read-only)
+# Groups a fresh install must have (I01, audit 18.11.2026). The template creates VPN-noP2P and
+# AI; `VPN` is the optional second tunnel the panel adds later, so its absence is the documented
+# single-tunnel topology, not a broken install. A VPN group that IS declared in the config but
+# missing from the API means mihomo did not load it - that stays a failure.
+_step7_groups() {
+  _sg_need=0
+  if _sg_px=$(controller_curl -f -m 5 -s "http://127.0.0.1:9090/proxies" 2>/dev/null); then
+    if printf '%s' "$_sg_px" | grep -q '"VPN-noP2P"'; then
+      info "mihomo group VPN-noP2P: in API"
+    else
+      bad "mihomo group VPN-noP2P missing"; _sg_need=1
+    fi
+    if printf '%s' "$_sg_px" | grep -q '"AI"'; then
+      info "mihomo group AI: in API"
+    else
+      bad "mihomo group AI missing"; _sg_need=1
+    fi
+    if printf '%s' "$_sg_px" | grep -q '"VPN"'; then
+      info "mihomo group VPN: in API"
+    elif grep -qE '^[[:space:]]*- name: VPN$' "$(P "$MIHOMO_CONF")" 2>/dev/null; then
+      bad "mihomo group VPN: declared in the config but missing from the API"; _sg_need=1
+    else
+      info "mihomo group VPN: not used (single tunnel - main lists ride VPN-noP2P)"
+    fi
+  else
+    bad "mihomo controller request failed (check authentication/connectivity)"; _sg_need=1
+  fi
+  return $_sg_need
+}
+
 step7_check() {
   _need=0
   _r=$(nslookup ya.ru 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2}' | tail -1)
@@ -2747,12 +2777,7 @@ step7_check() {
   esac
   _code=$(curl -m 5 -s -o /dev/null -w '%{http_code}' http://www.gstatic.com/generate_204 2>/dev/null)
   [ "$_code" = "204" ] && info "connectivity: 204 OK" || { bad "connectivity: HTTP ${_code:-none}"; _need=1; }
-  if _px=$(controller_curl -f -m 5 -s http://127.0.0.1:9090/proxies 2>/dev/null); then
-    printf '%s' "$_px" | grep -q '"VPN"' && info "mihomo group VPN: in API" || { bad "mihomo group VPN missing"; _need=1; }
-    printf '%s' "$_px" | grep -q '"AI"' && info "mihomo group AI: in API" || { bad "mihomo group AI missing"; _need=1; }
-  else
-    bad "mihomo controller request failed (check authentication/connectivity)"; _need=1
-  fi
+  _step7_groups || _need=1
   if have ubus && module_selected luci; then
     ubus list 2>/dev/null | grep -qx 'geo-sync' && info "geo ubus: OK" || { bad "geo ubus: missing"; _need=1; }
   elif ! module_selected luci; then

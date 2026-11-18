@@ -22,11 +22,6 @@
   "owned_resources": [
     {
       "type": "file",
-      "path": "/usr/bin/geo-backend.sh",
-      "description": "бэкенд панели"
-    },
-    {
-      "type": "file",
       "path": "/usr/libexec/rpcd/geo-sync",
       "description": "rpcd-обёртка ubus-объекта geo-sync"
     },

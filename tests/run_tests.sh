@@ -1054,11 +1054,12 @@ grep -qF '"vpn_nop2p_node"' "$HERE/../assets/geo-backend.sh" \
   && grep -qF '"vpn_nop2p_sub"' "$HERE/../assets/geo-backend.sh" \
   && { echo "PASS: S25 status reports both VPN slots"; pass=$((pass+1)); } \
   || { echo "FAIL: S25 status misses a slot"; failn=$((failn+1)); }
-# lane creation must be reversible: backup + validate + rollback
-grep -qF 'bak_slot' "$HERE/../assets/geo-backend.sh" \
-  && grep -qF 'mihomo config test failed - old config kept' "$HERE/../assets/geo-backend.sh" \
-  && { echo "PASS: S25 slot edit validates and rolls back"; pass=$((pass+1)); } \
-  || { echo "FAIL: S25 slot edit has no rollback"; failn=$((failn+1)); }
+# lane creation must be reversible through the single writer: staged bytes + CAS, not a
+# hand-made backup copy (C11 of the 18.11.2026 audit).
+grep -qF -- '--commit "$MIHOMO_CONF" --expect-sha256 "$_slot_base"' "$HERE/../assets/geo-backend.sh" \
+  && grep -qF '_sha_file "$MIHOMO_CONF"' "$HERE/../assets/geo-backend.sh" \
+  && { echo "PASS: S25 slot edit goes through the transaction with a CAS base"; pass=$((pass+1)); } \
+  || { echo "FAIL: S25 slot edit is not committed through the transaction"; failn=$((failn+1)); }
 for _p in 'geomask-vpnwatch.sh' 'geomask-vpnwatch.conf'; do
   grep -qF "\"$_p\"" "$HERE/../build.py" \
     && { echo "PASS: S25 asset in build MAP: $_p"; pass=$((pass+1)); } \

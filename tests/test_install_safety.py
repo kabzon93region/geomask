@@ -749,6 +749,53 @@ step_fn() { case "$2" in check) return 1 ;; apply) printf 'APPLIED\n' ;; esac; r
         self.assertIn('RC=1', result.stdout, result.stdout)
         self.assertIn('declared in the config but missing from the API', result.stdout)
 
+    def test_prompt_stdout_is_only_the_url(self):
+        """I06 of the 18.11 audit: the question leaked into the captured value."""
+        functions = ['_prompt_tty', 'prompt_url']
+        body = ('GM_YES=0\n'
+                'url=$(printf "https://example.invalid/sub\\n" | GM_PROMPT_TTY=1 '
+                'prompt_url "VPN URL" "" ""); printf "URL=[%s]\\n" "$url"\n'
+                'cur=$(printf "\\n" | GM_PROMPT_TTY=1 '
+                'prompt_url "VPN URL" "https://kept.invalid/s" ""); printf "CUR=[%s]\\n" "$cur"\n'
+                'fix=$(printf "ftp://bad\\nhttps://good.invalid/s\\n" | GM_PROMPT_TTY=1 '
+                'prompt_url "VPN URL" "" ""); printf "FIX=[%s]\\n" "$fix"')
+        result = self.run_script(body, functions=functions)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('URL=[https://example.invalid/sub]', result.stdout, result.stdout)
+        self.assertIn('CUR=[https://kept.invalid/s]', result.stdout, result.stdout)
+        self.assertIn('FIX=[https://good.invalid/s]', result.stdout, result.stdout)
+        self.assertNotIn('[VPN URL', result.stdout, 'the prompt went into the captured value')
+        self.assertIn('VPN URL:', result.stderr, 'the prompt is not shown to the operator')
+        self.assertIn('http:// или https://', result.stderr)
+
+    def test_step5_apply_reports_write_and_seed_failures(self):
+        """I12: the sync step returned 0 no matter what failed inside it."""
+        body = ('SAVE_FAIL=0; _step5_apply_result 0 0 0 0; printf "OK=%s\\n" "$?"\n'
+                'SAVE_FAIL=2; _step5_apply_result 1 0 0 0; printf "SAVE=%s\\n" "$?"\n'
+                'SAVE_FAIL=0; _step5_apply_result 0 3 0 0; printf "SEED=%s\\n" "$?"\n'
+                'SAVE_FAIL=0; _step5_apply_result 0 0 4 0; printf "LISTS=%s\\n" "$?"\n'
+                'SAVE_FAIL=0; _step5_apply_result 0 0 0 5; printf "STATE=%s\\n" "$?"')
+        result = self.run_script(body, functions=['_step5_apply_result'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for expected in ('OK=0', 'SAVE=1', 'SEED=1', 'LISTS=1', 'STATE=1'):
+            self.assertIn(expected, result.stdout, result.stdout)
+        self.assertIn('не все файлы записаны', result.stdout)
+        self.assertIn('not seeded', result.stdout)
+
+    def test_save_stream_reports_a_truncated_write(self):
+        """The published bytes are checked, not the exit code of `mv`."""
+        extra = ('mv() { command mv "$@" || return 1; : > "$3"; }\n'
+                 'module_skip_path() { return 1; }\n'
+                 'module_owns_path() { printf ""; }\n')
+        body = ('save_stream /etc/geomask/x.conf 644 <<\'EOF\' >/dev/null 2>&1\n'
+                'payload-line\n'
+                'EOF\n'
+                'printf "RC=%s SAVE=%s SIZE=%s\\n" "$?" "$SAVE_FAIL" '
+                '"$(wc -c < "$(P /etc/geomask/x.conf)" | tr -d " ")"')
+        result = self.run_script(body, extra=extra, functions=['save_stream'])
+        self.assertIn('RC=1', result.stdout, result.stdout + result.stderr)
+        self.assertIn('SAVE=1', result.stdout)
+
     def test_core_owns_the_backend_so_a_headless_install_can_disable_ipv6(self):
         """I02: with core/path_vpn the backend was not installed, so IPv6-off never ran."""
         import json as _json

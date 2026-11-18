@@ -885,7 +885,9 @@ save_stream() { # save_stream <target-path> <mode>  (content on stdin)
   fi
   _t="$(P "$1")"; _m="$2"
   mkdir -p "$(dirname "$_t")" || { SAVE_FAIL=$((SAVE_FAIL+1)); return 1; }
-  _tmp="$_t.zmnew"
+  # A fixed `.zmnew` is shared by every writer: two runs interleaving on it could publish one
+  # run's bytes through the other's `mv` (audit I09). mkstemp-style unique temps remove that.
+  _tmp=$(mktemp "$_t.zmnew.XXXXXX" 2>/dev/null) || _tmp="$_t.zmnew.$$"
   cat > "$_tmp" || { rm -f "$_tmp"; SAVE_FAIL=$((SAVE_FAIL+1)); return 1; }
   if [ -f "$_t" ] && cmp -s "$_tmp" "$_t"; then
     # identical bytes: keep the file, but repair a lost mode. Returning before chmod left an
@@ -895,11 +897,20 @@ save_stream() { # save_stream <target-path> <mode>  (content on stdin)
     info "unchanged: $1"
     return 0
   fi
+  _want=$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ')
   if [ -f "$_t" ]; then
     cp -p "$_t" "$_t.bak_geomask_$(date +%s 2>/dev/null || echo bak)" 2>/dev/null || true
   fi
   chmod "$_m" "$_tmp" 2>/dev/null || true
-  mv -f "$_tmp" "$_t" || { SAVE_FAIL=$((SAVE_FAIL+1)); return 1; }
+  mv -f "$_tmp" "$_t" || { rm -f "$_tmp"; SAVE_FAIL=$((SAVE_FAIL+1)); return 1; }
+  # Trust the published bytes, not the exit of `mv`: a short write or a filesystem that
+  # silently truncated the file used to be reported as "written".
+  _got=$(wc -c < "$_t" 2>/dev/null | tr -d ' ')
+  if [ -n "${_want:-}" ] && [ "$_want" != "$_got" ]; then
+    SAVE_FAIL=$((SAVE_FAIL+1))
+    bad "written size mismatch for $1 (${_got:-?} of ${_want} bytes)"
+    return 1
+  fi
   info "written: $1 (mode $_m)"
   return 0
 }
@@ -37997,6 +38008,7 @@ step5_check() {
   return $_need
 }
 step5_apply() {
+  _save5_before=${SAVE_FAIL:-0}
   save_stream /root/sync_mtrickle_mihomo.sh 755 <<'ASSET_EOF'
 #!/bin/sh
 # Sync magitrickle (enabled groups with interface Mihomo) -> TWO mihomo rule-provider files:
@@ -42102,11 +42114,27 @@ ASSET_EOF
     warn "sync not run (it may restart mihomo). Run later: sh /root/sync_mtrickle_mihomo.sh  or use --restart"
   fi
   # v1.13.0: ship the lists template + seeder, and auto-seed MagiTrickle if it is empty (fresh install).
-  write_lists_assets
-  seed_lists ""
+  write_lists_assets; _s5_lists=$?
+  seed_lists ""; _s5_seed=$?
   # v1.29.0: a run that installs sync can also be the only install step (`--step 5 --modules=...`).
-  modules_state_sync
+  modules_state_sync; _s5_state=$?
+  # I12 (audit 18.11.2026): this step used to return 0 no matter what happened to the writes,
+  # the seed or the module state, so verify then accepted the old asset as "present".
+  _step5_apply_result "$_save5_before" "$_s5_seed" "$_s5_lists" "$_s5_state" || return 1
   return 0
+}
+
+# Split out so the failure contract is testable without running the whole step.
+_step5_apply_result() { # <save-fail-before> <seed-rc> <lists-rc> <state-rc>
+  _sar=0
+  if [ "${SAVE_FAIL:-0}" != "${1:-0}" ]; then
+    bad "не все файлы записаны (ошибок: $((SAVE_FAIL - ${1:-0})))"
+    _sar=1
+  fi
+  [ "${2:-0}" = 0 ] || { bad "MagiTrickle lists not seeded (rc=$2)"; _sar=1; }
+  [ "${3:-0}" = 0 ] || { bad "list assets not written (rc=$3)"; _sar=1; }
+  [ "${4:-0}" = 0 ] || { bad "module state not recorded (rc=$4)"; _sar=1; }
+  return $_sar
 }
 step5_verify() { step5_check; }
 
@@ -42563,24 +42591,29 @@ menu_master() {
 }
 
 # prompt for a subscription URL; keeps current value on Enter; honors flags/--yes
+# A prompt belongs on the terminal: stdout is the function's return value (the URL), and the
+# installer captures stdout. Printing the question there put `VPN URL [Enter ...]: ` in front of
+# the URL (audit I06). GM_PROMPT_TTY lets a fixture exercise the interactive path without a tty.
+_prompt_tty() { [ -t 0 ] || [ "${GM_PROMPT_TTY:-}" = 1 ]; }
+
 prompt_url() { # prompt_url <label> <current> <flag-value>  -> prints url, rc=1 if none
   _lbl="$1"; _cur="$2"; _flag="$3"
   if [ -n "$_flag" ]; then printf '%s' "$_flag"; return 0; fi
   if [ -n "$_cur" ]; then
-    if [ "$GM_YES" = 1 ] || [ ! -t 0 ]; then printf '%s' "$_cur"; return 0; fi
-    printf '%s [Enter = оставить %s]: ' "$_lbl" "$(_maskurl "$_cur")"
+    if [ "$GM_YES" = 1 ] || ! _prompt_tty; then printf '%s' "$_cur"; return 0; fi
+    printf '%s [Enter = оставить %s]: ' "$_lbl" "$(_maskurl "$_cur")" >&2
     read -r _v || _v=""
     printf '%s' "${_v:-$_cur}"
     return 0
   fi
-  if [ "$GM_YES" = 1 ] || [ ! -t 0 ]; then return 1; fi
+  if [ "$GM_YES" = 1 ] || ! _prompt_tty; then return 1; fi
   while :; do
-    printf '%s: ' "$_lbl"
+    printf '%s: ' "$_lbl" >&2
     read -r _v || return 1
     case "$_v" in
       http://*|https://*) printf '%s' "$_v"; return 0 ;;
       '') return 1 ;;
-      *) printf '  URL должен начинаться с http:// или https://\n' ;;
+      *) printf '  URL должен начинаться с http:// или https://\n' >&2 ;;
     esac
   done
 }

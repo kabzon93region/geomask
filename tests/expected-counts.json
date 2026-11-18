@@ -32,7 +32,7 @@
   "test_gn_mapping.py": 7,
   "test_guard_entrypoint.py": 13,
   "test_initd_contract.py": 11,
-  "test_install_safety.py": 33,
+  "test_install_safety.py": 36,
   "test_ipv6_state.py": 3,
   "test_lists_edit.py": 21,
   "test_live_paths.py": 3,

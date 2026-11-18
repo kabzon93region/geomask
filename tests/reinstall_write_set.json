@@ -1658,6 +1658,21 @@
       "snapshot": "SB",
       "restore": "RB",
       "notes": "I05: adoption merge tool; executed by _write_mihomo_config_unlocked"
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-reload-state.py",
+      "path": "/usr/lib/geomask/geomask-reload-state.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "phase": "step2+uninstall-removes",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "C04/C07: reload verdict + pending marker, called by the sync and the AI-DNS apply"
     }
   ],
   "dynamic": [
@@ -2463,6 +2478,16 @@
       "snapshot": "NFT",
       "restore": "NR",
       "owner": "ours"
+    },
+    {
+      "id": "net.reload-controller",
+      "kind": "net-site",
+      "object": "http",
+      "pattern": "geomask-reload-state|127\\.0\\.0\\.1:9090",
+      "detail": "PUT /configs to the local mihomo controller; a failure leaves a pending marker (nothing about the router config changes)",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "owner": "ours"
     }
   ],
   "processes": [
@@ -2558,6 +2583,21 @@
       "id": "policy.www",
       "path": "/www/luci-static/",
       "reason": "Разрешённый корень поставки: страница панели LuCI."
+    },
+    {
+      "id": "policy.tmp.geomask-sync.state",
+      "path": "/tmp/geomask-sync.state",
+      "reason": "volatile runtime file of a callee (last-run state / pending-reload marker): recreated by the next run, and a reboot re-reads the generated includes, so there is nothing to restore"
+    },
+    {
+      "id": "policy.tmp.geomask-sync.pending",
+      "path": "/tmp/geomask-sync.pending",
+      "reason": "volatile runtime file of a callee (last-run state / pending-reload marker): recreated by the next run, and a reboot re-reads the generated includes, so there is nothing to restore"
+    },
+    {
+      "id": "policy.tmp.geomask-reload.pending",
+      "path": "/tmp/geomask-reload.pending",
+      "reason": "volatile runtime file of a callee (last-run state / pending-reload marker): recreated by the next run, and a reboot re-reads the generated includes, so there is nothing to restore"
     }
   ],
   "callees": [
@@ -2611,6 +2651,12 @@
       "scope": "all",
       "invoked_by": "_write_mihomo_config_unlocked (--adopt-config), step2_apply installs it",
       "notes": "adoption merge: reads the live mihomo config, writes only a separate <config>.adopt.<pid> candidate; the caller validates it with mihomo -t and then replaces the live file"
+    },
+    {
+      "file": "assets/geomask-reload-state.py",
+      "scope": "all",
+      "invoked_by": "sync_mtrickle_mihomo.sh (cron */5, step5_apply) and geo-backend.sh aidns",
+      "notes": "reads/writes only the pending marker and the state file it is given; talks to the mihomo controller URL passed by the caller"
     }
   ],
   "read_only": [

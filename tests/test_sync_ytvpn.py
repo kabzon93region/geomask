@@ -29,5 +29,23 @@ class SyncYtvpnTests(unittest.TestCase):
         self.assertRegex(SRC, r'if not mt_payload or not ai_payload')
 
 
+    def test_a_failed_reload_is_pending_and_the_run_exits_nonzero(self):
+        """C07: "wrote the rulesets" cannot be reported as "runtime applied"."""
+        body = SRC.split("<<'PYEOF'\n", 1)[1].rsplit('\nPYEOF', 1)[0]
+        self.assertIn('geomask-reload-state.py', body,
+                      'the sync no longer delegates the reload verdict')
+        self.assertIn("sys.exit(1 if _pending else 0)", body,
+                      'a stale runtime still exits as success')
+        self.assertIn("'ytvpn': n3, 'bulk': n4", body,
+                      'the state file does not report all four change flags')
+        self.assertRegex(body, r"if _changed_any:\n        _cmd.append\('--needed'\)",
+                         'an unchanged run can no longer retry a pending reload')
+
+    def test_pending_marker_is_shared_with_the_runtime_files(self):
+        body = SRC.split("<<'PYEOF'\n", 1)[1].rsplit('\nPYEOF', 1)[0]
+        self.assertIn("'/tmp/geomask-sync.pending'", body)
+        self.assertIn("'/tmp/geomask-sync.state'", body)
+
+
 if __name__ == '__main__':
     unittest.main()

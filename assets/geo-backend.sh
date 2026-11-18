@@ -900,6 +900,12 @@ cmd_aidns_apply() {
     printf '{"ok":false,"error":"AI-DNS listen address is unknown: client DNS is rejected (fail closed)"}'
     return 1
   fi
+  if [ "$(cat "$AIDNS_STATE" 2>/dev/null)" = pending ]; then
+    # C04: the include is written but the kernel is not running it. Saying ok here is what made
+    # the persisted file look like the applied state.
+    printf '{"ok":false,"state":"pending","error":"AI-DNS include written but not active (firewall reload failed) - the next sync retries"}\n'
+    return 1
+  fi
   if [ "$_before" != "$_after" ]; then
     echo "$(date +%FT%T) AI-DNS apply (manual)" >> "$LOG"
     printf '{"ok":true,"warn":""}'
@@ -1154,6 +1160,41 @@ AIDNS_OFF_FILE=${GM_AIDNS_OFF:-/etc/geomask-aidns.off}
 # Outcome of the last sync, read by status. A parameterless hard path here was one of the ways
 # the tests wrote into the host's /tmp (review 15.11, point 1).
 AIDNS_STATE=${GM_AIDNS_STATE:-/tmp/geomask-aidns.state}
+# C04 (audit 18.11.2026): the include and state=ok were written BEFORE the firewall reload, a
+# failed reload only logged a line, and the identical next run cmp-returned without retrying -
+# so the persisted include was never the applied DNAT. The marker records "written, not proven
+# active"; every later sync retries the reload and the read-back before it may say ok.
+AIDNS_PENDING=${GM_AIDNS_PENDING:-/tmp/geomask-aidns.pending}
+AIDNS_FW_INIT=${GM_AIDNS_FW_INIT:-/etc/init.d/firewall}
+
+# Read-back: the reload is trusted only when the kernel actually carries our table.
+_aidns_active() {
+  nft list table inet geomask_ai_dns 2>/dev/null | grep -qE 'dnat ip to|counter reject'
+}
+
+_aidns_mark_pending() { # _aidns_mark_pending <reason> -> keeps the attempt counter
+  _ap_n=0
+  [ -f "$AIDNS_PENDING" ] && _ap_n=$(sed -n 's/^attempts=//p' "$AIDNS_PENDING" 2>/dev/null | head -1)
+  case "$_ap_n" in ''|*[!0-9]*) _ap_n=0 ;; esac
+  _ap_n=$((_ap_n + 1))
+  { printf 'attempts=%s\n' "$_ap_n"; printf 'reason=%s\n' "$1"; } > "$AIDNS_PENDING" 2>/dev/null || true
+  printf 'pending' > "$AIDNS_STATE"
+  return "$_ap_n"
+}
+
+_aidns_clear_pending() {
+  rm -f "$AIDNS_PENDING" 2>/dev/null || true
+}
+
+# One place for "write happened, now prove the runtime": returns 0 only when the table is live.
+_aidns_reload_prove() {
+  # The init script is a variable so a test can point at a stub; production default unchanged.
+  if ! "$AIDNS_FW_INIT" reload >/dev/null 2>&1; then
+    sleep 1
+    "$AIDNS_FW_INIT" reload >/dev/null 2>&1 || return 1
+  fi
+  _aidns_active
+}
 
 _aidns_sync() {
   [ -f "$AIDNS_UID_FILE" ] || return 0
@@ -1204,8 +1245,22 @@ _aidns_sync() {
   # the list stayed the same must still be applied (audit 14.11.2026, F08).
   if cmp -s "$_tmp" "$AIDNS_NFT_DEST"; then
     rm -f "$_tmp"
-    [ -n "$_list" ] && [ -z "$_aidns" ] && printf 'error' > "$AIDNS_STATE"
-    return 0
+    # Identical bytes do not mean the runtime matches them: retry the reload while the marker
+    # says the previous write was never proven active (C04).
+    if [ ! -f "$AIDNS_PENDING" ]; then
+      [ -n "$_list" ] && [ -z "$_aidns" ] && printf 'error' > "$AIDNS_STATE"
+      return 0
+    fi
+    if _aidns_reload_prove; then
+      _aidns_clear_pending
+      printf 'ok' > "$AIDNS_STATE"
+      printf '%s' "$_list" > /tmp/geomask-aidns-last
+      echo "$(date +%FT%T) AI-DNS: reload retried after a pending write - table is live" >> "$LOG"
+      return 0
+    fi
+    _aidns_mark_pending "reload failed (retry)"
+    echo "$(date +%FT%T) AI-DNS: reload retry failed - still pending" >> "$LOG"
+    return 1
   fi
   if ! cp "$_tmp" "$AIDNS_NFT_DEST" 2>/dev/null; then
     rm -f "$_tmp"
@@ -1214,20 +1269,27 @@ _aidns_sync() {
   fi
   rm -f "$_tmp"
   if [ -n "$_list" ] && [ -z "$_aidns" ]; then
-    printf 'error' > "$AIDNS_STATE"
     echo "$(date +%FT%T) AI-DNS: listen address unknown - client DNS REJECTED (fail closed)" >> "$LOG"
+  fi
+  # State follows the proof, not the write: `ok` only after the table is live, `error` for the
+  # deliberate reject path (fail closed is a correct end state), `pending` otherwise.
+  if ! _aidns_reload_prove; then
+    if [ -n "$_list" ] && [ -z "$_aidns" ]; then
+      printf 'error' > "$AIDNS_STATE"
+    else
+      _aidns_mark_pending "firewall reload failed after the include was written"
+    fi
+    echo "$(date +%FT%T) AI-DNS: include written but not active (firewall reload failed) - pending, the next sync retries" >> "$LOG"
+    return 1
+  fi
+  _aidns_clear_pending
+  if [ -n "$_list" ] && [ -z "$_aidns" ]; then
+    printf 'error' > "$AIDNS_STATE"
   else
     printf 'ok' > "$AIDNS_STATE"
   fi
-  if ! /etc/init.d/firewall reload >/dev/null 2>&1; then
-    sleep 1
-    if ! /etc/init.d/firewall reload >/dev/null 2>&1; then
-      echo "$(date +%FT%T) AI-DNS: firewall reload failed - rules may not be active" >> "$LOG"
-      return 0
-    fi
-  fi
   printf '%s' "$_list" > /tmp/geomask-aidns-last
-  echo "$(date +%FT%T) AI-DNS: ruleset updated -> firewall reloaded" >> "$LOG"
+  echo "$(date +%FT%T) AI-DNS: ruleset updated -> firewall reloaded (table live)" >> "$LOG"
   return 0
 }
 

@@ -92,13 +92,13 @@
           "path": "/root/sync_mtrickle_mihomo.sh",
           "source": "assets/sync_mtrickle_mihomo.sh",
           "mode": "0755",
-          "sha256": "45c5715a89e9b3b598adc1378df87a4ac1c818b61971d754224d2426bf21ff4a"
+          "sha256": "6aa8e7dc2c96f5445aa8b7d14d5fd951744108c05981d7254b36cd630b343b38"
         },
         {
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "2bce2785f6155f3ef429eb526be8a13c4cc1c6a8be3bffe384ec3593fbd3fd0c"
+          "sha256": "05f0d9d2aa03b4e786920060589ed4b8364976b0d671fc2736e29ded26f65edd"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -213,6 +213,12 @@
           "source": "assets/geomask-node-audit.py",
           "mode": "0755",
           "sha256": "c650ba7ba920339833290619846a738148bc7bee31c4780dcf5a85acdc4b5acb"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-reload-state.py",
+          "source": "assets/geomask-reload-state.py",
+          "mode": "0755",
+          "sha256": "819111b1f368913899cf25f834ce66b4ad93931237b54b67d0fe4eeb8e2a397b"
         },
         {
           "path": "/usr/lib/geomask/geomask-routes.sh",

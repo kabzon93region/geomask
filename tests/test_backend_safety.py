@@ -200,16 +200,29 @@ uci() {
         dest = self.case / '98-geomask-ai-dns.nft'
         self.devices.write_text('192.168.1.50 ai tv\n', encoding='utf-8')
         (self.case / 'geomask-aidns.uid').write_text('65533\n', encoding='utf-8')
-        extra = ('nft() { return 0; }\n'
-                 'AIDNS_NFT_DEST="%s"\nAIDNS_DNS_PORT=5353\n'
+        fw = self.case / 'firewall-stub'
+        fw.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8', newline='\n')
+        fw.chmod(0o755)
+        # C04: reaching "rc=0" now also needs the reject rule to be live in the kernel.
+        extra = ('nft() {\n'
+                 '  case "$*" in\n'
+                 '    *"list table inet geomask_ai_dns"*) printf "%s\\n" "ip saddr { 192.168.1.50 } counter reject" ;;\n'
+                 '  esac\n'
+                 '  return 0\n'
+                 '}\n'
+                 'AIDNS_NFT_DEST="' + posix(dest) + '"\n'
+                 'AIDNS_DNS_PORT=5353\n'
+                 'AIDNS_FW_INIT="' + posix(fw) + '"\n'
+                 'AIDNS_PENDING="' + posix(self.case / 'aidns.pending') + '"\n'
                  '_gm_lan_ip() { printf "192.168.1.1"; }\n'
-                 '_gm_aidns_ip() { printf ""; }\n' % posix(dest))
+                 '_gm_aidns_ip() { printf ""; }\n')
         result = self.run_backend('_aidns_sync; printf "RC=%s\\n" "$?"',
-                                  functions=['_aidns_sync'], extra=extra)
-        self.assertIn('RC=0', result.stdout)
+                                  functions=self.AIDNS_FUNCS, extra=extra)
+        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
         text = dest.read_text(encoding='utf-8')
         self.assertIn('counter reject', text)
         self.assertNotIn('dnat ip to', text)
+        self.assertEqual((self.case / 'geomask-aidns.state').read_text(encoding='utf-8'), 'error')
 
     def test_a_changed_address_rewrites_the_same_device_list(self):
         dest = self.case / '98-geomask-ai-dns.nft'
@@ -228,6 +241,93 @@ uci() {
         self.assertIn('dnat ip to 192.168.1.54:5353', second)
         self.assertNotIn('192.168.1.53', second)
 
+
+    # ---------------------------------------------------------------- C04 reload proof
+    def aidns_fixture(self, reload_ok, table_live):
+        """A device list, a listen address and a firewall stub whose reload can fail."""
+        dest = self.case / '98-geomask-ai-dns.nft'
+        self.devices.write_text('192.168.1.50 ai tv\n', encoding='utf-8')
+        (self.case / 'geomask-aidns.uid').write_text('65533\n', encoding='utf-8')
+        fw = self.case / 'firewall-stub'
+        fw.write_text('#!/bin/sh\nprintf "reload\\n" >> "%s/fw.calls"\nexit %d\n'
+                      % (posix(self.case), 0 if reload_ok else 1),
+                      encoding='utf-8', newline='\n')
+        fw.chmod(0o755)
+        table = 'dnat ip to 192.168.1.53:5353' if table_live else 'no such table'
+        extra = ('nft() {\n'
+                 '  case "$*" in\n'
+                 '    *"list table inet geomask_ai_dns"*) printf "%s\\n" "' + table + '" ;;\n'
+                 '  esac\n'
+                 '  return 0\n'
+                 '}\n'
+                 'AIDNS_NFT_DEST="' + posix(dest) + '"\n'
+                 'AIDNS_DNS_PORT=5353\n'
+                 'AIDNS_FW_INIT="' + posix(fw) + '"\n'
+                 'AIDNS_PENDING="' + posix(self.case / 'aidns.pending') + '"\n'
+                 '_gm_lan_ip() { printf "192.168.1.1"; }\n'
+                 '_gm_aidns_ip() { printf "192.168.1.53"; }\n')
+        return dest, extra
+
+    AIDNS_FUNCS = ['_aidns_sync', '_aidns_active', '_aidns_mark_pending',
+                   '_aidns_clear_pending', '_aidns_reload_prove']
+
+    def test_a_failed_reload_is_pending_and_not_reported_as_applied(self):
+        """C04: the include was written, the reload failed, and the state still said ok."""
+        dest, extra = self.aidns_fixture(reload_ok=False, table_live=False)
+        result = self.run_backend('_aidns_sync; printf "RC=%s\\n" "$?"',
+                                  functions=self.AIDNS_FUNCS, extra=extra)
+        self.assertIn('RC=1', result.stdout,
+                      'a write whose reload failed was reported as success')
+        self.assertIn('dnat ip to 192.168.1.53:5353', dest.read_text(encoding='utf-8'))
+        state = (self.case / 'geomask-aidns.state').read_text(encoding='utf-8')
+        self.assertEqual(state, 'pending')
+        marker = (self.case / 'aidns.pending').read_text(encoding='utf-8')
+        self.assertIn('attempts=1', marker)
+
+    def test_a_reload_that_does_not_load_the_table_is_still_pending(self):
+        """The reload exit code is not proof: the table must be in the kernel."""
+        dest, extra = self.aidns_fixture(reload_ok=True, table_live=False)
+        result = self.run_backend('_aidns_sync; printf "RC=%s\\n" "$?"',
+                                  functions=self.AIDNS_FUNCS, extra=extra)
+        self.assertIn('RC=1', result.stdout,
+                      'a reload that left the table absent was reported as applied')
+        self.assertEqual((self.case / 'geomask-aidns.state').read_text(encoding='utf-8'),
+                         'pending')
+
+    def test_an_identical_run_retries_a_pending_reload(self):
+        """The counterexample: same bytes, runtime stale - the next run must retry."""
+        dest, extra = self.aidns_fixture(reload_ok=False, table_live=False)
+        self.run_backend('_aidns_sync', functions=self.AIDNS_FUNCS, extra=extra)
+        self.assertTrue((self.case / 'aidns.pending').exists())
+        dest, extra_ok = self.aidns_fixture(reload_ok=True, table_live=True)
+        result = self.run_backend('_aidns_sync; printf "RC=%s\\n" "$?"',
+                                  functions=self.AIDNS_FUNCS, extra=extra_ok)
+        self.assertIn('RC=0', result.stdout,
+                      'an unchanged run did not retry the pending reload: ' + result.stdout)
+        self.assertEqual((self.case / 'geomask-aidns.state').read_text(encoding='utf-8'), 'ok')
+        self.assertFalse((self.case / 'aidns.pending').exists(),
+                         'a successful retry left the pending marker behind')
+
+    def test_an_unchanged_healthy_table_is_not_reloaded_again(self):
+        dest, extra = self.aidns_fixture(reload_ok=True, table_live=True)
+        self.run_backend('_aidns_sync', functions=self.AIDNS_FUNCS, extra=extra)
+        calls = self.case / 'fw.calls'
+        before = calls.read_text(encoding='utf-8') if calls.exists() else ''
+        result = self.run_backend('_aidns_sync; printf "RC=%s\\n" "$?"',
+                                  functions=self.AIDNS_FUNCS, extra=extra)
+        after = calls.read_text(encoding='utf-8') if calls.exists() else ''
+        self.assertIn('RC=0', result.stdout)
+        self.assertEqual(before, after, 'a healthy unchanged table caused another reload')
+
+    def test_the_rpc_answers_pending_instead_of_ok(self):
+        dest, extra = self.aidns_fixture(reload_ok=False, table_live=False)
+        extra += 'sha256sum() { printf "aaa  x\\n"; }\n'
+        result = self.run_backend('cmd_aidns_apply; printf "\\nRC=%s\\n" "$?"',
+                                  functions=['cmd_aidns_apply'] + self.AIDNS_FUNCS,
+                                  extra=extra)
+        self.assertIn('RC=1', result.stdout)
+        self.assertIn('"state":"pending"', result.stdout)
+        self.assertNotIn('"ok":true', result.stdout)
 
     # ---------------------------------------------------------------- IPv6 (F14/G04)
     def uci_db(self, **values):
@@ -474,6 +574,10 @@ uci() {
         extra = 'URL="https://sub.example.org/api/v1/list?id=42"\n'
         result = self.run_backend('_mask_url "$URL"', functions=['_mask_url'], extra=extra)
         self.assertEqual(result.stdout, 'https://sub.example.org/…')
+
+
+if __name__ == '__main__':
+    unittest.main()
 
 
 if __name__ == '__main__':

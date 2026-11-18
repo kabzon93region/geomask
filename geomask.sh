@@ -499,6 +499,7 @@ module_owns_path() { # echoes the module id that owns an install path, if any
     "/usr/lib/geomask/geomask-lock.sh") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-mihomo-adopt.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-node-audit.py") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-reload-state.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-routes.sh") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-slot-patch.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-subscription-status.py") GM_PATH_MODULE="core" ;;
@@ -6526,6 +6527,177 @@ def main(argv=None):
 if __name__ == '__main__':
     sys.exit(main())
 ASSET_EOF
+  # C04/C07: reload verdict + pending marker shared by the sync and the AI-DNS apply.
+  save_stream /usr/lib/geomask/geomask-reload-state.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Make "the bytes are written, the runtime applied" an observable fact (C04/C07).
+
+Both the MagiTrickle sync and the AI-DNS apply write files and then ask mihomo to reload
+them through the controller. The old code treated that reload as a best-effort step: on
+failure it printed a line, the identical next run saw "nothing changed" and therefore did
+not retry, and the panel read a state file that said everything was fine. The persisted
+file was not the applied state, and nothing recorded the difference.
+
+This helper owns that gap:
+
+* a pending marker records that a reload was needed but did not succeed;
+* every later identical run retries the reload because of the marker, so the runtime
+  eventually catches up without a restart;
+* a success clears the marker, so the state is "applied" only after a successful reload;
+* the caller gets JSON plus an exit code (0 applied, 1 pending) instead of a log line.
+
+It only talks to the URL it is given and only touches the pending/state files it is given,
+which is what makes the behaviour testable off-router.
+
+    geomask-reload-state.py [--url URL] [--method PUT] [--body JSON] [--header 'K: V']
+                            [--config FILE] [--timeout 5] [--needed] [--pending FILE]
+                            [--state FILE] [--reason TEXT]
+
+--config replaces the body's config path with a `path` field only when --body is not given;
+--needed says the caller changed bytes and wants a reload even without a pending marker.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_PENDING = '/tmp/geomask-reload.pending'
+
+
+def read_pending(path):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError('not a mapping')
+        return {'since': str(data.get('since') or ''), 'attempts': int(data.get('attempts') or 0),
+                'reason': str(data.get('reason') or '')}
+    except FileNotFoundError:
+        return None
+    except Exception:
+        # A damaged marker is still a marker: the runtime was never proven applied, and
+        # guessing "no pending" is what left stale runtime behind before.
+        return {'since': '', 'attempts': 0, 'reason': 'pending marker damaged'}
+
+
+def write_pending(path, marker):
+    tmp = '%s.tmp.%d' % (path, os.getpid())
+    try:
+        with open(tmp, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(marker, handle, ensure_ascii=False)
+            handle.write('\n')
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def clear_pending(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def reload_runtime(url, method, body, headers, timeout):
+    data = body.encode('utf-8') if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as answer:
+        answer.read()
+    return True
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument('--url', default='http://127.0.0.1:9090/configs?force=true')
+    parser.add_argument('--method', default='PUT')
+    parser.add_argument('--body', default='{"path": "/etc/mihomo/config.yaml"}')
+    parser.add_argument('--header', action='append', default=[])
+    parser.add_argument('--timeout', type=float, default=5.0)
+    parser.add_argument('--needed', action='store_true')
+    parser.add_argument('--pending', default=DEFAULT_PENDING)
+    parser.add_argument('--state', default='')
+    parser.add_argument('--reason', default='')
+    args = parser.parse_args(argv)
+
+    marker = read_pending(args.pending)
+    result = {'attempted': False, 'ok': False, 'pending': bool(marker),
+              'attempts': marker['attempts'] if marker else 0, 'reason': args.reason}
+    if not args.needed and marker is None:
+        # Nothing changed and nothing was left unapplied: there is no reload to make.
+        if args.state:
+            write_state(args.state, result)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    headers = {'Content-Type': 'application/json'}
+    for raw in args.header:
+        if ':' in raw:
+            name, value = raw.split(':', 1)
+            headers[name.strip()] = value.strip()
+    result['attempted'] = True
+    result['attempts'] = (marker['attempts'] if marker else 0) + 1
+    try:
+        reload_runtime(args.url, args.method, args.body, headers, args.timeout)
+        result['ok'] = True
+        result['pending'] = False
+        result['attempts'] = 0
+        clear_pending(args.pending)
+        rc = 0
+    except Exception as exc:
+        result['ok'] = False
+        result['pending'] = True
+        result['error'] = str(exc)[:200]
+        write_pending(args.pending, {'since': (marker or {}).get('since') or
+                                     time.strftime('%F %T'),
+                                     'attempts': result['attempts'],
+                                     'reason': args.reason or result['error']})
+        rc = 1
+    if args.state:
+        write_state(args.state, result)
+    print(json.dumps(result, ensure_ascii=False))
+    return rc
+
+
+STATE_LOCK = None
+
+
+def write_state(path, payload):
+    """Merge into the caller's JSON state: a reload verdict must not erase its other fields."""
+    data = {}
+    try:
+        with open(path, encoding='utf-8') as handle:
+            current = json.load(handle)
+        if isinstance(current, dict):
+            data = current
+    except Exception:
+        pass
+    data['reload'] = 'ok' if payload['ok'] else ('failed' if payload['attempted'] else None)
+    data['pending'] = payload['pending']
+    data['attempts'] = payload['attempts']
+    tmp = '%s.tmp.%d' % (path, os.getpid())
+    try:
+        with open(tmp, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(data, handle, ensure_ascii=False)
+            handle.write('\n')
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+ASSET_EOF
   save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
 #!/bin/sh
 # geo-backend.sh - backend for LuCI "Гео-маскировка и AI" panel (geo-sync ubus object).
@@ -7429,6 +7601,12 @@ cmd_aidns_apply() {
     printf '{"ok":false,"error":"AI-DNS listen address is unknown: client DNS is rejected (fail closed)"}'
     return 1
   fi
+  if [ "$(cat "$AIDNS_STATE" 2>/dev/null)" = pending ]; then
+    # C04: the include is written but the kernel is not running it. Saying ok here is what made
+    # the persisted file look like the applied state.
+    printf '{"ok":false,"state":"pending","error":"AI-DNS include written but not active (firewall reload failed) - the next sync retries"}\n'
+    return 1
+  fi
   if [ "$_before" != "$_after" ]; then
     echo "$(date +%FT%T) AI-DNS apply (manual)" >> "$LOG"
     printf '{"ok":true,"warn":""}'
@@ -7683,6 +7861,41 @@ AIDNS_OFF_FILE=${GM_AIDNS_OFF:-/etc/geomask-aidns.off}
 # Outcome of the last sync, read by status. A parameterless hard path here was one of the ways
 # the tests wrote into the host's /tmp (review 15.11, point 1).
 AIDNS_STATE=${GM_AIDNS_STATE:-/tmp/geomask-aidns.state}
+# C04 (audit 18.11.2026): the include and state=ok were written BEFORE the firewall reload, a
+# failed reload only logged a line, and the identical next run cmp-returned without retrying -
+# so the persisted include was never the applied DNAT. The marker records "written, not proven
+# active"; every later sync retries the reload and the read-back before it may say ok.
+AIDNS_PENDING=${GM_AIDNS_PENDING:-/tmp/geomask-aidns.pending}
+AIDNS_FW_INIT=${GM_AIDNS_FW_INIT:-/etc/init.d/firewall}
+
+# Read-back: the reload is trusted only when the kernel actually carries our table.
+_aidns_active() {
+  nft list table inet geomask_ai_dns 2>/dev/null | grep -qE 'dnat ip to|counter reject'
+}
+
+_aidns_mark_pending() { # _aidns_mark_pending <reason> -> keeps the attempt counter
+  _ap_n=0
+  [ -f "$AIDNS_PENDING" ] && _ap_n=$(sed -n 's/^attempts=//p' "$AIDNS_PENDING" 2>/dev/null | head -1)
+  case "$_ap_n" in ''|*[!0-9]*) _ap_n=0 ;; esac
+  _ap_n=$((_ap_n + 1))
+  { printf 'attempts=%s\n' "$_ap_n"; printf 'reason=%s\n' "$1"; } > "$AIDNS_PENDING" 2>/dev/null || true
+  printf 'pending' > "$AIDNS_STATE"
+  return "$_ap_n"
+}
+
+_aidns_clear_pending() {
+  rm -f "$AIDNS_PENDING" 2>/dev/null || true
+}
+
+# One place for "write happened, now prove the runtime": returns 0 only when the table is live.
+_aidns_reload_prove() {
+  # The init script is a variable so a test can point at a stub; production default unchanged.
+  if ! "$AIDNS_FW_INIT" reload >/dev/null 2>&1; then
+    sleep 1
+    "$AIDNS_FW_INIT" reload >/dev/null 2>&1 || return 1
+  fi
+  _aidns_active
+}
 
 _aidns_sync() {
   [ -f "$AIDNS_UID_FILE" ] || return 0
@@ -7733,8 +7946,22 @@ _aidns_sync() {
   # the list stayed the same must still be applied (audit 14.11.2026, F08).
   if cmp -s "$_tmp" "$AIDNS_NFT_DEST"; then
     rm -f "$_tmp"
-    [ -n "$_list" ] && [ -z "$_aidns" ] && printf 'error' > "$AIDNS_STATE"
-    return 0
+    # Identical bytes do not mean the runtime matches them: retry the reload while the marker
+    # says the previous write was never proven active (C04).
+    if [ ! -f "$AIDNS_PENDING" ]; then
+      [ -n "$_list" ] && [ -z "$_aidns" ] && printf 'error' > "$AIDNS_STATE"
+      return 0
+    fi
+    if _aidns_reload_prove; then
+      _aidns_clear_pending
+      printf 'ok' > "$AIDNS_STATE"
+      printf '%s' "$_list" > /tmp/geomask-aidns-last
+      echo "$(date +%FT%T) AI-DNS: reload retried after a pending write - table is live" >> "$LOG"
+      return 0
+    fi
+    _aidns_mark_pending "reload failed (retry)"
+    echo "$(date +%FT%T) AI-DNS: reload retry failed - still pending" >> "$LOG"
+    return 1
   fi
   if ! cp "$_tmp" "$AIDNS_NFT_DEST" 2>/dev/null; then
     rm -f "$_tmp"
@@ -7743,20 +7970,27 @@ _aidns_sync() {
   fi
   rm -f "$_tmp"
   if [ -n "$_list" ] && [ -z "$_aidns" ]; then
-    printf 'error' > "$AIDNS_STATE"
     echo "$(date +%FT%T) AI-DNS: listen address unknown - client DNS REJECTED (fail closed)" >> "$LOG"
+  fi
+  # State follows the proof, not the write: `ok` only after the table is live, `error` for the
+  # deliberate reject path (fail closed is a correct end state), `pending` otherwise.
+  if ! _aidns_reload_prove; then
+    if [ -n "$_list" ] && [ -z "$_aidns" ]; then
+      printf 'error' > "$AIDNS_STATE"
+    else
+      _aidns_mark_pending "firewall reload failed after the include was written"
+    fi
+    echo "$(date +%FT%T) AI-DNS: include written but not active (firewall reload failed) - pending, the next sync retries" >> "$LOG"
+    return 1
+  fi
+  _aidns_clear_pending
+  if [ -n "$_list" ] && [ -z "$_aidns" ]; then
+    printf 'error' > "$AIDNS_STATE"
   else
     printf 'ok' > "$AIDNS_STATE"
   fi
-  if ! /etc/init.d/firewall reload >/dev/null 2>&1; then
-    sleep 1
-    if ! /etc/init.d/firewall reload >/dev/null 2>&1; then
-      echo "$(date +%FT%T) AI-DNS: firewall reload failed - rules may not be active" >> "$LOG"
-      return 0
-    fi
-  fi
   printf '%s' "$_list" > /tmp/geomask-aidns-last
-  echo "$(date +%FT%T) AI-DNS: ruleset updated -> firewall reloaded" >> "$LOG"
+  echo "$(date +%FT%T) AI-DNS: ruleset updated -> firewall reloaded (table live)" >> "$LOG"
   return 0
 }
 
@@ -17892,13 +18126,13 @@ ASSET_EOF
           "path": "/root/sync_mtrickle_mihomo.sh",
           "source": "assets/sync_mtrickle_mihomo.sh",
           "mode": "0755",
-          "sha256": "45c5715a89e9b3b598adc1378df87a4ac1c818b61971d754224d2426bf21ff4a"
+          "sha256": "6aa8e7dc2c96f5445aa8b7d14d5fd951744108c05981d7254b36cd630b343b38"
         },
         {
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "2bce2785f6155f3ef429eb526be8a13c4cc1c6a8be3bffe384ec3593fbd3fd0c"
+          "sha256": "05f0d9d2aa03b4e786920060589ed4b8364976b0d671fc2736e29ded26f65edd"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -18013,6 +18247,12 @@ ASSET_EOF
           "source": "assets/geomask-node-audit.py",
           "mode": "0755",
           "sha256": "c650ba7ba920339833290619846a738148bc7bee31c4780dcf5a85acdc4b5acb"
+        },
+        {
+          "path": "/usr/lib/geomask/geomask-reload-state.py",
+          "source": "assets/geomask-reload-state.py",
+          "mode": "0755",
+          "sha256": "819111b1f368913899cf25f834ce66b4ad93931237b54b67d0fe4eeb8e2a397b"
         },
         {
           "path": "/usr/lib/geomask/geomask-routes.sh",
@@ -38723,7 +38963,7 @@ step5_apply() {
 # AI detection: whole groups by name + domain patterns (AI domains live inside Geoblock too).
 # Reloads mihomo only on change.
 exec python3 - <<'PYEOF'
-import os, re, json, sys, time, urllib.request
+import os, re, json, sys, time, subprocess, urllib.request
 
 def controller_headers(path):
     with open(path, encoding='utf-8') as config:
@@ -39124,7 +39364,51 @@ except Exception as _zf:
     print('zapret force: skipped (%s)' % _zf)
 
 if c1 or c2 or c3 or c4:
-    _r_ok = False
+    _changed_any = True
+else:
+    _changed_any = False
+# C07 (audit 18.11.2026): "wrote the file" is not "the runtime applied it". The reload used to
+# be best-effort: on failure it printed a line and the state still said ok, and the identical
+# next run saw "nothing changed" and never retried. The reload now goes through
+# geomask-reload-state.py, which keeps a pending marker (so the next run retries), clears it
+# only on success and returns 1 while the runtime is stale.
+_st = {'ts': time.strftime('%F %T'), 'mt': n1, 'ai': n2, 'moved': moved,
+       'ytvpn': n3, 'bulk': n4, 'changed': _changed_any, 'reload': None}
+try:
+    _s_tmp = '/tmp/geomask-sync.state.tmp.%d' % os.getpid()
+    with open(_s_tmp, 'w') as f:
+        json.dump(_st, f)
+    os.replace(_s_tmp, '/tmp/geomask-sync.state')
+except Exception:
+    pass
+
+_RELOAD_PY = '/usr/lib/geomask/geomask-reload-state.py'
+_r_ok = None
+_pending = False
+try:
+    _cmd = [sys.executable if sys.executable else 'python3', _RELOAD_PY,
+            '--pending', '/tmp/geomask-sync.pending',
+            '--state', '/tmp/geomask-sync.state',
+            '--reason', 'sync VPN=%d AI=%d ytvpn=%d bulk=%d' % (n1, n2, n3, n4)]
+    if _changed_any:
+        _cmd.append('--needed')
+    try:
+        for _name, _value in controller_headers('/etc/mihomo/config.yaml').items():
+            _cmd += ['--header', '%s: %s' % (_name, _value)]
+    except Exception:
+        pass
+    _out = subprocess.run(_cmd, capture_output=True, text=True, timeout=30)
+    _verdict = json.loads((_out.stdout or '{}').strip().splitlines()[-1]) if _out.stdout.strip() else {}
+    _r_ok = bool(_verdict.get('ok'))
+    _pending = bool(_verdict.get('pending'))
+    if _verdict.get('attempted'):
+        print('mihomo reloaded' if _r_ok else
+              'reload FAILED (controller error) - pending, the next run retries')
+    if _pending:
+        print('WARNING: runtime is stale (pending reload, attempt %s)' % _verdict.get('attempts'))
+except FileNotFoundError:
+    # No helper installed (older tree): fall back to the direct request, still recording the
+    # outcome so the state cannot claim "ok" without a reload.
     try:
         req = urllib.request.Request(
             'http://127.0.0.1:9090/configs?force=true',
@@ -39134,26 +39418,23 @@ if c1 or c2 or c3 or c4:
         urllib.request.urlopen(req, timeout=5).read()
         _r_ok = True
         print('mihomo reloaded')
-    except Exception as e:
+    except Exception:
         print('reload FAILED (configuration or controller error; restart needed)')
+except Exception as _re:
+    print('reload state helper failed (%s) - runtime not proven applied' % _re)
+    _pending = _changed_any
 
-# v1.10.0: machine-readable last-run state for the panel; journal line only on real change
-try:
-    _st = {'ts': time.strftime('%F %T'), 'mt': n1, 'ai': n2, 'moved': moved,
-           'changed': bool(c1 or c2), 'reload': _r_ok if (c1 or c2) else None}
-    _s_tmp = '/tmp/geomask-sync.state.tmp.%d' % os.getpid()
-    with open(_s_tmp, 'w') as f:
-        json.dump(_st, f)
-    os.replace(_s_tmp, '/tmp/geomask-sync.state')
-except Exception:
-    pass
 if c1 or c2:
     try:
         with open('/root/geo-sync.log', 'a') as f:
-            f.write('%s SYNC changed: VPN=%d AI=%d moved-to-AI=%d reload=%s\n' %
-                    (_st['ts'], n1, n2, moved, 'ok' if _r_ok else 'FAILED'))
+            f.write('%s SYNC changed: VPN=%d AI=%d moved-to-AI=%d reload=%s pending=%s\n' %
+                    (_st['ts'], n1, n2, moved,
+                     'ok' if _r_ok else ('FAILED' if _r_ok is False else 'n/a'),
+                     'yes' if _pending else 'no'))
     except Exception:
         pass
+
+sys.exit(1 if _pending else 0)
 PYEOF
 ASSET_EOF
   save_stream /etc/mihomo/ruleset/ytdirect.yaml 644 <<'ASSET_EOF'
@@ -43466,7 +43747,7 @@ geomask_uninstall() {
   for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
             geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
             geomask-sync-youtube.py geomask-audit-scheduler.py geomask-subscription-status.py \
-            geomask-slot-patch.py geomask-mihomo-adopt.py geomask-console.py geomask-dnsguard.sh \
+            geomask-slot-patch.py geomask-mihomo-adopt.py geomask-reload-state.py geomask-console.py geomask-dnsguard.sh \
             geomask-diag-spool.py; do
     rm -f "$(P /usr/lib/geomask/$_m)"
   done
@@ -45778,6 +46059,7 @@ REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-o
 /usr/lib/geomask/geomask-subscription-status.py|regular-or-absent
 /usr/lib/geomask/geomask-slot-patch.py|regular-or-absent
 /usr/lib/geomask/geomask-mihomo-adopt.py|regular-or-absent
+/usr/lib/geomask/geomask-reload-state.py|regular-or-absent
 /usr/lib/geomask/geomask-console.py|regular-or-absent
 /usr/lib/geomask/geomask-dnsguard.sh|regular-or-absent
 /usr/lib/geomask/geomask-diag-spool.py|regular-or-absent

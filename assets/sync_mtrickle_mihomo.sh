@@ -5,7 +5,7 @@
 # AI detection: whole groups by name + domain patterns (AI domains live inside Geoblock too).
 # Reloads mihomo only on change.
 exec python3 - <<'PYEOF'
-import os, re, json, sys, time, urllib.request
+import os, re, json, sys, time, subprocess, urllib.request
 
 def controller_headers(path):
     with open(path, encoding='utf-8') as config:
@@ -406,7 +406,51 @@ except Exception as _zf:
     print('zapret force: skipped (%s)' % _zf)
 
 if c1 or c2 or c3 or c4:
-    _r_ok = False
+    _changed_any = True
+else:
+    _changed_any = False
+# C07 (audit 18.11.2026): "wrote the file" is not "the runtime applied it". The reload used to
+# be best-effort: on failure it printed a line and the state still said ok, and the identical
+# next run saw "nothing changed" and never retried. The reload now goes through
+# geomask-reload-state.py, which keeps a pending marker (so the next run retries), clears it
+# only on success and returns 1 while the runtime is stale.
+_st = {'ts': time.strftime('%F %T'), 'mt': n1, 'ai': n2, 'moved': moved,
+       'ytvpn': n3, 'bulk': n4, 'changed': _changed_any, 'reload': None}
+try:
+    _s_tmp = '/tmp/geomask-sync.state.tmp.%d' % os.getpid()
+    with open(_s_tmp, 'w') as f:
+        json.dump(_st, f)
+    os.replace(_s_tmp, '/tmp/geomask-sync.state')
+except Exception:
+    pass
+
+_RELOAD_PY = '/usr/lib/geomask/geomask-reload-state.py'
+_r_ok = None
+_pending = False
+try:
+    _cmd = [sys.executable if sys.executable else 'python3', _RELOAD_PY,
+            '--pending', '/tmp/geomask-sync.pending',
+            '--state', '/tmp/geomask-sync.state',
+            '--reason', 'sync VPN=%d AI=%d ytvpn=%d bulk=%d' % (n1, n2, n3, n4)]
+    if _changed_any:
+        _cmd.append('--needed')
+    try:
+        for _name, _value in controller_headers('/etc/mihomo/config.yaml').items():
+            _cmd += ['--header', '%s: %s' % (_name, _value)]
+    except Exception:
+        pass
+    _out = subprocess.run(_cmd, capture_output=True, text=True, timeout=30)
+    _verdict = json.loads((_out.stdout or '{}').strip().splitlines()[-1]) if _out.stdout.strip() else {}
+    _r_ok = bool(_verdict.get('ok'))
+    _pending = bool(_verdict.get('pending'))
+    if _verdict.get('attempted'):
+        print('mihomo reloaded' if _r_ok else
+              'reload FAILED (controller error) - pending, the next run retries')
+    if _pending:
+        print('WARNING: runtime is stale (pending reload, attempt %s)' % _verdict.get('attempts'))
+except FileNotFoundError:
+    # No helper installed (older tree): fall back to the direct request, still recording the
+    # outcome so the state cannot claim "ok" without a reload.
     try:
         req = urllib.request.Request(
             'http://127.0.0.1:9090/configs?force=true',
@@ -416,24 +460,21 @@ if c1 or c2 or c3 or c4:
         urllib.request.urlopen(req, timeout=5).read()
         _r_ok = True
         print('mihomo reloaded')
-    except Exception as e:
+    except Exception:
         print('reload FAILED (configuration or controller error; restart needed)')
+except Exception as _re:
+    print('reload state helper failed (%s) - runtime not proven applied' % _re)
+    _pending = _changed_any
 
-# v1.10.0: machine-readable last-run state for the panel; journal line only on real change
-try:
-    _st = {'ts': time.strftime('%F %T'), 'mt': n1, 'ai': n2, 'moved': moved,
-           'changed': bool(c1 or c2), 'reload': _r_ok if (c1 or c2) else None}
-    _s_tmp = '/tmp/geomask-sync.state.tmp.%d' % os.getpid()
-    with open(_s_tmp, 'w') as f:
-        json.dump(_st, f)
-    os.replace(_s_tmp, '/tmp/geomask-sync.state')
-except Exception:
-    pass
 if c1 or c2:
     try:
         with open('/root/geo-sync.log', 'a') as f:
-            f.write('%s SYNC changed: VPN=%d AI=%d moved-to-AI=%d reload=%s\n' %
-                    (_st['ts'], n1, n2, moved, 'ok' if _r_ok else 'FAILED'))
+            f.write('%s SYNC changed: VPN=%d AI=%d moved-to-AI=%d reload=%s pending=%s\n' %
+                    (_st['ts'], n1, n2, moved,
+                     'ok' if _r_ok else ('FAILED' if _r_ok is False else 'n/a'),
+                     'yes' if _pending else 'no'))
     except Exception:
         pass
+
+sys.exit(1 if _pending else 0)
 PYEOF

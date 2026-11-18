@@ -1127,6 +1127,10 @@ ASSET_EOF
   save_stream /usr/lib/geomask/geomask-mihomo-adopt.py 755 <<'ASSET_EOF'
 @@ASSET:geomask-mihomo-adopt.py@@
 ASSET_EOF
+  # C04/C07: reload verdict + pending marker shared by the sync and the AI-DNS apply.
+  save_stream /usr/lib/geomask/geomask-reload-state.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-reload-state.py@@
+ASSET_EOF
   save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
 @@ASSET:geo-backend.sh@@
 ASSET_EOF
@@ -3449,7 +3453,7 @@ geomask_uninstall() {
   for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
             geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
             geomask-sync-youtube.py geomask-audit-scheduler.py geomask-subscription-status.py \
-            geomask-slot-patch.py geomask-mihomo-adopt.py geomask-console.py geomask-dnsguard.sh \
+            geomask-slot-patch.py geomask-mihomo-adopt.py geomask-reload-state.py geomask-console.py geomask-dnsguard.sh \
             geomask-diag-spool.py; do
     rm -f "$(P /usr/lib/geomask/$_m)"
   done
@@ -5761,6 +5765,7 @@ REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-o
 /usr/lib/geomask/geomask-subscription-status.py|regular-or-absent
 /usr/lib/geomask/geomask-slot-patch.py|regular-or-absent
 /usr/lib/geomask/geomask-mihomo-adopt.py|regular-or-absent
+/usr/lib/geomask/geomask-reload-state.py|regular-or-absent
 /usr/lib/geomask/geomask-console.py|regular-or-absent
 /usr/lib/geomask/geomask-dnsguard.sh|regular-or-absent
 /usr/lib/geomask/geomask-diag-spool.py|regular-or-absent

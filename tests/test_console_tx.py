@@ -347,6 +347,45 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), foreign)
         self.assertEqual(self.recorded(), [], 'the restore committed bytes anyway')
 
+    def test_a_state_failure_never_leaves_an_active_rule(self):
+        """C02: four failed state writes still produced ok:true with the rule installed."""
+        body = (
+            '_console_set() { printf \'set %s=%s\\n\' "$1" "$2" >> "$CASE/order"; '
+            '[ "$1" = enabled ] && return 1; return 0; }\n'
+            '_console_rule_on() { printf \'rule-on %s\\n\' "$1" >> "$CASE/order"; return 0; }\n'
+            '_console_rule_off() { printf \'rule-off %s\\n\' "${1:-all}" >> "$CASE/order"; return 0; }\n'
+            'cmd_console on 192.168.1.177 "" ""; printf "\\nRC=%s\\n" "$?"')
+        result = self.run_backend(body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('RC=1', result.stdout)
+        self.assertIn('"ok":false', result.stdout)
+        self.assertNotIn('"ok":true', result.stdout)
+        order = (self.case / 'order').read_text(encoding='utf-8').splitlines()
+        self.assertIn('rule-on 192.168.1.177', order)
+        self.assertIn('rule-off 192.168.1.177', order,
+                      'the rule installed without a commit marker was left active')
+        self.assertLess(order.index('rule-on 192.168.1.177'),
+                        order.index('rule-off 192.168.1.177'))
+        self.assertIn('set ip=192.168.1.177', order)
+        self.assertLess(order.index('set ip=192.168.1.177'),
+                        order.index('rule-on 192.168.1.177'),
+                        'the rule was installed before the state could describe it')
+
+    def test_a_failed_address_write_installs_no_rule(self):
+        body = (
+            '_console_set() { printf \'set %s=%s\\n\' "$1" "$2" >> "$CASE/order"; '
+            '[ "$1" = ip ] && return 1; return 0; }\n'
+            '_console_rule_on() { printf \'rule-on %s\\n\' "$1" >> "$CASE/order"; return 0; }\n'
+            'cmd_console on 192.168.1.177 "" ""; printf "\\nRC=%s\\n" "$?"')
+        original = self.config.read_bytes()
+        result = self.run_backend(body)
+        self.assertIn('RC=1', result.stdout, result.stdout + result.stderr)
+        self.assertFalse((self.case / 'order').exists()
+                         and 'rule-on' in (self.case / 'order').read_text(encoding='utf-8'))
+        self.assertEqual(self.config.read_bytes(), original,
+                         'a failed state write did not restore the config')
+        self.assertIn('"restored":true', result.stdout)
+
     def test_the_switch_writes_only_through_the_transaction_cli(self):
         # Static: no `cp` of the live config into a backup, no `mv` of the candidate over it.
         # `assertFalse(x in text)` keeps the failure message readable (the text is 2000 lines).

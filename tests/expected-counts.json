@@ -15,10 +15,10 @@
   "test_console_reboot.py": 5,
   "test_console_reset.py": 6,
   "test_console_route_budget.py": 8,
-  "test_console_rules.py": 3,
+  "test_console_rules.py": 8,
   "test_console_status.py": 3,
   "test_console_status_contract.py": 13,
-  "test_console_tx.py": 12,
+  "test_console_tx.py": 14,
   "test_controller_auth.py": 4,
   "test_diag_bundle.py": 9,
   "test_diag_redact.py": 32,
@@ -87,5 +87,6 @@
   "test_tx_verify.py": 6,
   "test_updater_backup.py": 4,
   "test_yaml_roundtrip.py": 6,
-  "test_ytwatch_stall.py": 12
+  "test_ytwatch_stall.py": 12,
+  "test_route_rules.py": 4
 }

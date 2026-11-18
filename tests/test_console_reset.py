@@ -157,8 +157,9 @@ class ConsoleProviderResetTests(unittest.TestCase):
         # asked for `--url default` when no subscription was chosen.
         self.assertNotIn('[ -n "$_countries" ] && _console_set countries', BACKEND_TEXT)
         self.assertNotIn('[ -n "${3:-}" ] && _console_set sub', BACKEND_TEXT)
-        self.assertRegex(BACKEND_TEXT, r'(?m)^\s*_console_set countries "\$_countries"$')
-        self.assertRegex(BACKEND_TEXT, r'(?m)^\s*_console_set sub "\$_sub"$')
+        self.assertRegex(BACKEND_TEXT,
+                         r'(?m)^\s*_console_set countries "\$_countries"( \|\| [a-z_]+=1)?$')
+        self.assertRegex(BACKEND_TEXT, r'(?m)^\s*_console_set sub "\$_sub"( \|\| [a-z_]+=1)?$')
         self.assertIn('apply "$_cand" --url default --countries "$_countries"', BACKEND_TEXT)
         # Patcher side: an empty list removes the filter it installed earlier.
         code = self.run_main('apply', str(self.config), '--countries', '')

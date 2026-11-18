@@ -98,7 +98,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "9263db220a2e24e72a21b5ee0ca1084bb385672be732e33915d229b688e09a4f"
+          "sha256": "4f96d1697964e9829ccdb2a380ee844c98a6c49e981e7d1f279ee3cda874e82d"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -212,7 +212,7 @@
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "df56e3299be4008f423f99316084a3d8282513ad030851393d17984d99f65e46"
+          "sha256": "cdea5b8f4deb79cb4ffaab2c17cb3a032f7818c2e8191550d84115ce15022a58"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",

@@ -8825,7 +8825,7 @@ _console_fw_ensure() {
   /etc/init.d/firewall reload >/dev/null 2>&1
 }
 
-_console_rule_on() { # _console_rule_on <ip> -> 0, 75/76 (retryable) or 77 (mutation failed)
+_console_rule_on() { # _console_rule_on <ip> -> 0, 75/76 (retryable), 2 (unobservable) or 77
   # Short route budget, restored afterwards: other callers of the shared helper keep the
   # default. A busy table is reported, never waited out under the console lock (R05 D6).
   _cro_saved=${GM_ROUTE_LOCK_WAIT-}
@@ -8839,29 +8839,67 @@ _console_rule_on() { # _console_rule_on <ip> -> 0, 75/76 (retryable) or 77 (muta
   export GM_ROUTE_LOCK_WAIT
   [ "$_cro" = 0 ] || return "$_cro"
   ip route replace table "$CONSOLE_TABLE" default dev "$CONSOLE_TUN_DEV" 2>/dev/null || return 77
-  while ip rule del from "$1" lookup "$CONSOLE_TABLE" 2>/dev/null; do :; done
-  ip rule add pref "$CONSOLE_RULE_PREF" from "$1" lookup "$CONSOLE_TABLE" 2>/dev/null
+  # A switch keeps exactly one console rule: the previous address must not keep its own path
+  # (audit C03: A->B left both rules and the next owner of A's DHCP lease got the policy).
+  if ! ip rule show > "${TMPDIR:-/tmp}/geomask-console-on.$$" 2>/dev/null; then
+    rm -f "${TMPDIR:-/tmp}/geomask-console-on.$$"
+    return 2
+  fi
+  for _con_old in $(_console_own_rules < "${TMPDIR:-/tmp}/geomask-console-on.$$"); do
+    [ "$_con_old" = "$1" ] && continue
+    ip rule del pref "$CONSOLE_RULE_PREF" from "$_con_old" lookup "$CONSOLE_TABLE" 2>/dev/null || true
+  done
+  rm -f "${TMPDIR:-/tmp}/geomask-console-on.$$"
+  ip rule del pref "$CONSOLE_RULE_PREF" from "$1" lookup "$CONSOLE_TABLE" 2>/dev/null || true
+  ip rule add pref "$CONSOLE_RULE_PREF" from "$1" lookup "$CONSOLE_TABLE" 2>/dev/null || return 77
 }
 
-_console_rule_off() { # remove only OUR rules: `from <ipv4> lookup 102`, never a bare pref
-  _tmp="${TMPDIR:-/tmp}/geomask-console-rules.$$"
-  ip rule show 2>/dev/null | grep -E 'lookup 102$' > "$_tmp" 2>/dev/null
+# Ownership is exact: our rule is `pref <CONSOLE_RULE_PREF> from <ipv4> lookup <CONSOLE_TABLE>`
+# and nothing else. A rule of another writer that happens to point at table 102 (foreign
+# pref 15000, per the audit C08) is never touched.
+_console_own_rules() { # stdin: `ip rule show` -> one source IP per owned rule
+  awk -v want_pref="$CONSOLE_RULE_PREF" -v want_tbl="$CONSOLE_TABLE" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      n = split(line, f, /[ \t]+/)
+      if (n != 5) next
+      pref = f[1]; sub(/:$/, "", pref)
+      if (pref != want_pref) next
+      if (f[2] != "from" || f[4] != "lookup") next
+      if (f[5] != want_tbl) next
+      if (f[3] !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
+      print f[3]
+    }'
+}
+
+_console_rule_off() { # remove only the rules we can prove are ours; 0 ok, 1 left, 2 unknown
+  _cro_tmp="${TMPDIR:-/tmp}/geomask-console-rules.$$"
+  # A failed `ip rule show` used to look like "there is no rule": the kill switch then reported
+  # success while an active rule kept the console off the normal path (audit C09).
+  if ! ip rule show > "$_cro_tmp" 2>/dev/null; then
+    rm -f "$_cro_tmp" 2>/dev/null
+    return 2
+  fi
   _had=0
-  while IFS= read -r _line; do
-    # `lookup 102` also matches tables 1020/1021 with a loose pattern, and deleting by
-    # priority alone can drop somebody else's rule that happens to share the number.
-    _from=$(printf '%s\n' "$_line" | sed -n 's/.* from \([0-9][0-9.]*\) lookup 102$/\1/p')
-    [ -n "$_from" ] || continue
-    ip rule del from "$_from" lookup 102 2>/dev/null && _had=1
-  done < "$_tmp"
-  rm -f "$_tmp" 2>/dev/null
-  [ -n "${1:-}" ] && while ip rule del from "$1" lookup "$CONSOLE_TABLE" 2>/dev/null; do _had=1; done
+  for _cro_from in $(_console_own_rules < "$_cro_tmp"); do
+    ip rule del pref "$CONSOLE_RULE_PREF" from "$_cro_from" lookup "$CONSOLE_TABLE" 2>/dev/null \
+      && _had=1
+  done
+  rm -f "$_cro_tmp" 2>/dev/null
   if [ "$_had" = 1 ] && [ -n "${1:-}" ]; then
     conntrack -D -s "$1" >/dev/null 2>&1
     conntrack -D -d "$1" >/dev/null 2>&1
   fi
-  # The caller decides what to report: an unremoved rule is a failure, not a silent "ok".
-  ip rule show 2>/dev/null | grep -qE 'lookup 102$' && return 1
+  # The caller decides what to report: an unremoved rule is a failure, an unreadable table is
+  # "unknown" - and unknown is never success.
+  if ! ip rule show > "$_cro_tmp" 2>/dev/null; then
+    rm -f "$_cro_tmp" 2>/dev/null
+    return 2
+  fi
+  _left=$(_console_own_rules < "$_cro_tmp" | head -1)
+  rm -f "$_cro_tmp" 2>/dev/null
+  [ -z "$_left" ] || return 1
   return 0
 }
 
@@ -8992,11 +9030,17 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
       "$CONSOLE_INITD" stop >/dev/null 2>&1 || _rc=1
       "$CONSOLE_INITD" disable >/dev/null 2>&1 || _rc=1
     fi
-    _console_rule_off "$_ip" || _rc=1
-    _console_rule_off "" || _rc=1
+    _console_rule_off "$_ip"; _off_rc=$?
+    [ "$_off_rc" = 0 ] || _rc=1
+    _console_rule_off ""; _off2_rc=$?
+    [ "$_off2_rc" = 0 ] || _rc=1
     _console_unlock
     if [ "$_rc" != 0 ]; then
-      printf '{"ok":false,"enabled":false,"error":"console is marked off, but a rule or the tunnel did not stop - check ip rule and hev-console"}\n'
+      if [ "$_off_rc" = 2 ] || [ "$_off2_rc" = 2 ]; then
+        printf '{"ok":false,"enabled":false,"unknown":true,"error":"console is marked off, but the rule table could not be read - a rule may still be active; check ip rule show"}\n'
+      else
+        printf '{"ok":false,"enabled":false,"error":"console is marked off, but a rule or the tunnel did not stop - check ip rule and hev-console"}\n'
+      fi
       return 1
     fi
     echo "$(date +%FT%T) CONSOLE off (ip ${_ip:-none}) - console back on the normal path" >> "$LOG"
@@ -9101,6 +9145,18 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
   }
   _console_tun_ensure || { _console_on_fail tun "console tunnel did not come up"; return 1; }
   _console_fw_ensure || { _console_on_fail firewall "console firewall zone not created"; return 1; }
+  # State before the rule (audit C02): with the rule first, four failed writes still produced
+  # `ok:true` and left an active policy with no state for the watchdog or the kill switch.
+  # `countries` and `sub` are written ALWAYS, empty string included: an empty field is the
+  # reset the panel offers. `enabled` stays the COMMIT MARKER and is written after the rule.
+  _cst_fail=0
+  _console_set countries "$_countries" || _cst_fail=1
+  _console_set sub "$_sub" || _cst_fail=1
+  _console_set ip "$_ip" || _cst_fail=1
+  if [ "$_cst_fail" != 0 ]; then
+    _console_on_fail state "console state could not be written"
+    return 1
+  fi
   _console_rule_on "$_ip"
   _crr=$?
   if [ "$_crr" != 0 ]; then
@@ -9109,19 +9165,24 @@ cmd_console() { # cmd_console <on|off|status> [ip] [sub-id] [countries]
         # The table is owned by another writer right now. Do not turn that into a generic
         # failure: the caller can retry as soon as the table is free (R05 D6).
         _console_on_fail rule "console route table $CONSOLE_TABLE is busy - retry" retryable ;;
+      2)
+        # The rule table could not be read: the switch did not install a rule, and nothing can
+        # be claimed about the previous one either (audit C09).
+        _console_on_fail rule "the rule table could not be read" ;;
       *)
         _console_on_fail rule "console route rule not installed (rc=$_crr)" ;;
     esac
     return 1
   fi
+  if ! _console_set enabled 1; then
+    # The rule is the only enforcement; without the commit marker the watchdog and the kill
+    # switch cannot find it. Undo our own rule rather than report a lane we cannot describe.
+    _console_rule_off "$_ip" >/dev/null 2>&1 || true
+    _console_unlock
+    printf '{"ok":false,"step":"state","restored":false,"error":"console state could not be committed - the new rule was removed"}\n'
+    return 1
+  fi
   rm -f "$_orig" "$_cand" 2>/dev/null
-  # enabled is the COMMIT MARKER: written last, so a crash never leaves "on" without an address
-  # for the watchdog and the kill switch to work with. `countries` and `sub` are written ALWAYS,
-  # empty string included: an empty field is the reset the panel offers.
-  _console_set countries "$_countries"
-  _console_set sub "$_sub"
-  _console_set ip "$_ip"
-  _console_set enabled 1
   _console_unlock
   echo "$(date +%FT%T) CONSOLE on ip=$_ip countries=${_countries:-any} sub=${_sub:-vpn}" >> "$LOG"
   printf '{"ok":true,"enabled":true,"ip":"%s","sub":"%s","countries":"%s"}\n' "$_ip" "$_sub" "$_countries"
@@ -10362,6 +10423,22 @@ _gm_route_lan_dev() {
   printf '%s' "$_rld"
 }
 
+# Every policy rule is installed by one helper, because ignoring the exit of `ip rule add`
+# reported a healthy apply while no rule existed (audit C05). rc: 0 present/installed,
+# 1 refused (the rule is still absent), 2 the table could not be read.
+_gm_route_rule_ensure() { # <label> <grep-ere> <ip rule add args...>
+  _rre_lbl=$1; _rre_pat=$2; shift 2
+  _rre_rules=$(ip rule show 2>/dev/null) || return 2
+  printf '%s\n' "$_rre_rules" | grep -qE "$_rre_pat" && return 0
+  ip rule add "$@" 2>/dev/null && return 0
+  # Another writer may have added the same rule between the read and the add: the state, not
+  # the exit code, is what decides.
+  _rre_rules=$(ip rule show 2>/dev/null) || return 2
+  printf '%s\n' "$_rre_rules" | grep -qE "$_rre_pat" && return 0
+  printf 'geomask-routes: rule %s could not be installed\n' "$_rre_lbl" >&2
+  return 1
+}
+
 # Table 100: the normal LAN policy - LAN prefixes locally, everything else through Mihomo.
 # The rules were moved here from the hotplug script (R05): the netifd path may not run ip.
 _gm_route_apply_100() {
@@ -10371,22 +10448,23 @@ _gm_route_apply_100() {
   [ "$_ra_rc" = 0 ] || return "$_ra_rc"
   ip route replace table 100 default dev "$_ra_tun" 2>/dev/null || return 77
   _ra_lan=$(_gm_route_lan_dev)
-  ip rule show 2>/dev/null | grep -q '32760:' \
-    || ip rule add priority 32760 iif "$_ra_lan" lookup 100 2>/dev/null
+  _ra_fail=0
+  _gm_route_rule_ensure lan-100 "32760:.*iif $_ra_lan lookup 100" \
+    priority 32760 iif "$_ra_lan" lookup 100 || _ra_fail=1
   # WireGuard peers are remote LAN clients (10.10.0.0/24). Without this rule their traffic
   # falls through to main (real WAN IP). The rule needs the device to exist.
   if ip link show Wireguard >/dev/null 2>&1; then
-    ip rule show 2>/dev/null | grep -q 'iif Wireguard lookup 100' \
-      || ip rule add priority 32759 iif Wireguard lookup 100 2>/dev/null
+    _gm_route_rule_ensure wg-100 'iif Wireguard lookup 100' \
+      priority 32759 iif Wireguard lookup 100 || _ra_fail=1
   fi
   # ICMP bypass: above the dynamic magitrickle fwmark base; presence checked by semantics.
-  ip rule show 2>/dev/null | grep -q "iif $_ra_lan ipproto icmp lookup main" \
-    || ip rule add priority 19901 iif "$_ra_lan" ipproto icmp lookup main 2>/dev/null
+  _gm_route_rule_ensure icmp-bypass "iif $_ra_lan ipproto icmp lookup main" \
+    priority 19901 iif "$_ra_lan" ipproto icmp lookup main || _ra_fail=1
   # AI-DNS: the DoH worker's sockets are marked 0x64 and sent to table 101.
   if [ ! -f "${GM_AIDNS_OFF:-/etc/geomask-aidns.off}" ] \
      && [ -f "${GM_AIDNS_UID:-/etc/geomask-aidns.uid}" ]; then
-    ip rule show 2>/dev/null | grep -q 'fwmark 0x64' \
-      || ip rule add pref 19902 fwmark 0x64 table 101 2>/dev/null
+    _gm_route_rule_ensure aidns-101 'fwmark 0x64' \
+      pref 19902 fwmark 0x64 table 101 || _ra_fail=1
   fi
   # Per-device bypass rules: a low pref keeps them above the magitrickle fwmark base.
   _ra_dev=${DEVICES:-/etc/geo-devices.list}
@@ -10394,10 +10472,11 @@ _gm_route_apply_100() {
     while read -r _dip _dmode _dname; do
       case "$_dip" in ''|'#'*) continue ;; esac
       [ "$_dmode" = "bypass" ] || continue
-      ip rule show 2>/dev/null | grep -q "from $_dip" \
-        || ip rule add priority 19900 from "$_dip" lookup main 2>/dev/null
+      _gm_route_rule_ensure "bypass-$_dip" "from $_dip lookup main" \
+        priority 19900 from "$_dip" lookup main || _ra_fail=1
     done < "$_ra_dev"
   fi
+  [ "$_ra_fail" = 0 ] || return 77
   return 0
 }
 
@@ -10410,14 +10489,16 @@ _gm_route_apply_101() {
   [ "$_rb_rc" = 0 ] || return "$_rb_rc"
   ip route replace table 101 default dev "$_rb_tun" 2>/dev/null || return 77
   _rb_dev=${DEVICES:-/etc/geo-devices.list}
+  _rb_fail=0
   if [ -f "$_rb_dev" ] && grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' "$_rb_dev" 2>/dev/null; then
     while read -r _dip _dmode _dname; do
       case "$_dip" in ''|'#'*) continue ;; esac
       [ "$_dmode" = "ai" ] || continue
-      ip rule show 2>/dev/null | grep -q "from $_dip" \
-        || ip rule add priority 19900 from "$_dip" lookup 101 2>/dev/null
+      _gm_route_rule_ensure "ai-$_dip" "from $_dip lookup 101" \
+        priority 19900 from "$_dip" lookup 101 || _rb_fail=1
     done < "$_rb_dev"
   fi
+  [ "$_rb_fail" = 0 ] || return 77
   return 0
 }
 
@@ -17251,7 +17332,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "9263db220a2e24e72a21b5ee0ca1084bb385672be732e33915d229b688e09a4f"
+          "sha256": "4f96d1697964e9829ccdb2a380ee844c98a6c49e981e7d1f279ee3cda874e82d"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -17365,7 +17446,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-routes.sh",
           "source": "assets/geomask-routes.sh",
           "mode": "0644",
-          "sha256": "df56e3299be4008f423f99316084a3d8282513ad030851393d17984d99f65e46"
+          "sha256": "cdea5b8f4deb79cb4ffaab2c17cb3a032f7818c2e8191550d84115ce15022a58"
         },
         {
           "path": "/usr/lib/geomask/geomask-slot-patch.py",

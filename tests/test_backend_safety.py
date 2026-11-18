@@ -387,23 +387,43 @@ uci() {
                          % ('%s', posix(self.case / 'initd-calls')), encoding='utf-8',
                          newline='\n')
         initd.chmod(0o755)
+        # A stateful rule table: the kill switch must be able to read it and to see the rule
+        # disappear, otherwise the fixture would only prove that an unreadable table fails.
+        rules = self.case / 'rules'
+        rules.write_text('19903:\tfrom 192.0.2.50 lookup 102\n', encoding='utf-8')
         return ('CONSOLE_STATE="%s"\nCONSOLE_INITD="%s"\nCONSOLE_TABLE=102\n'
                 'CONSOLE_TUN_DEV=Console\nCONSOLE_RULE_PREF=19903\n'
                 'CONSOLE_SOCKS_PORT=7893\nCONSOLE_TUN_IP=198.21.0.1\n'
                 'CONSOLE_LOCK="%s"\nCONSOLE_LOCK_TRIES=1\nTMPDIR="%s"\n'
                 'CONSOLE_PY=/nonexistent/geomask-console.py\n'
                 '_require_backup() { return 0; }\n'
-                'ip() { printf "IP %%s\\n" "$*" >> "%s"; return 1; }\n'
+                'ip() {\n'
+                '  printf "IP %%s\\n" "$*" >> "%s"\n'
+                '  case "$1 $2" in\n'
+                '    "rule show") cat "%s" 2>/dev/null; return 0 ;;\n'
+                '    "rule del")\n'
+                '      shift 2\n'
+                '      _d_from=""; _d_tbl=""\n'
+                '      while [ $# -gt 0 ]; do\n'
+                '        case "$1" in from) _d_from=$2; shift 2 ;; lookup) _d_tbl=$2; shift 2 ;; *) shift ;; esac\n'
+                '      done\n'
+                '      grep -vE "from ${_d_from} lookup ${_d_tbl}$" "%s" > "%s.new" 2>/dev/null\n'
+                '      mv -f "%s.new" "%s"; return 0 ;;\n'
+                '  esac\n'
+                '  return 1\n'
+                '}\n'
                 'conntrack() { printf "CT %%s\\n" "$*" >> "%s"; }\n'
                 % (posix(self.case / 'console.state'), posix(initd),
                    posix(self.case / 'console.lock'), posix(self.case),
-                   posix(self.case / 'ip-calls'), posix(self.case / 'ct-calls')))
+                   posix(self.case / 'ip-calls'), posix(rules),
+                   posix(rules), posix(rules), posix(rules), posix(rules),
+                   posix(self.case / 'ct-calls')))
 
     def test_console_off_is_a_real_kill_switch(self):
         (self.case / 'console.state').write_text('enabled=1\nip=192.0.2.50\n', encoding='utf-8')
         result = self.run_backend(
             'cmd_console off 192.0.2.50; printf "\\nRC=%s\\n" "$?"',
-            functions=['_console_get', '_console_set', '_console_rule_off',
+            functions=['_console_get', '_console_set', '_console_own_rules', '_console_rule_off',
                        '_console_lock', '_console_unlock', 'cmd_console'],
             extra=self.console_extra())
         self.assertIn('"enabled":false', result.stdout)
@@ -412,7 +432,7 @@ uci() {
         self.assertIn('enabled=0', state)
         self.assertIn('ip=192.0.2.50', state)          # remembered for the next switch-on
         ip_calls = (self.case / 'ip-calls').read_text(encoding='utf-8')
-        self.assertIn('rule del from 192.0.2.50 lookup 102', ip_calls)
+        self.assertIn('rule del pref 19903 from 192.0.2.50 lookup 102', ip_calls)
         initd = (self.case / 'initd-calls').read_text(encoding='utf-8')
         self.assertIn('stop', initd)
         self.assertIn('disable', initd)

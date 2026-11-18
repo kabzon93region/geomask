@@ -616,6 +616,22 @@ _gm_route_lan_dev() {
   printf '%s' "$_rld"
 }
 
+# Every policy rule is installed by one helper, because ignoring the exit of `ip rule add`
+# reported a healthy apply while no rule existed (audit C05). rc: 0 present/installed,
+# 1 refused (the rule is still absent), 2 the table could not be read.
+_gm_route_rule_ensure() { # <label> <grep-ere> <ip rule add args...>
+  _rre_lbl=$1; _rre_pat=$2; shift 2
+  _rre_rules=$(ip rule show 2>/dev/null) || return 2
+  printf '%s\n' "$_rre_rules" | grep -qE "$_rre_pat" && return 0
+  ip rule add "$@" 2>/dev/null && return 0
+  # Another writer may have added the same rule between the read and the add: the state, not
+  # the exit code, is what decides.
+  _rre_rules=$(ip rule show 2>/dev/null) || return 2
+  printf '%s\n' "$_rre_rules" | grep -qE "$_rre_pat" && return 0
+  printf 'geomask-routes: rule %s could not be installed\n' "$_rre_lbl" >&2
+  return 1
+}
+
 # Table 100: the normal LAN policy - LAN prefixes locally, everything else through Mihomo.
 # The rules were moved here from the hotplug script (R05): the netifd path may not run ip.
 _gm_route_apply_100() {
@@ -625,22 +641,23 @@ _gm_route_apply_100() {
   [ "$_ra_rc" = 0 ] || return "$_ra_rc"
   ip route replace table 100 default dev "$_ra_tun" 2>/dev/null || return 77
   _ra_lan=$(_gm_route_lan_dev)
-  ip rule show 2>/dev/null | grep -q '32760:' \
-    || ip rule add priority 32760 iif "$_ra_lan" lookup 100 2>/dev/null
+  _ra_fail=0
+  _gm_route_rule_ensure lan-100 "32760:.*iif $_ra_lan lookup 100" \
+    priority 32760 iif "$_ra_lan" lookup 100 || _ra_fail=1
   # WireGuard peers are remote LAN clients (10.10.0.0/24). Without this rule their traffic
   # falls through to main (real WAN IP). The rule needs the device to exist.
   if ip link show Wireguard >/dev/null 2>&1; then
-    ip rule show 2>/dev/null | grep -q 'iif Wireguard lookup 100' \
-      || ip rule add priority 32759 iif Wireguard lookup 100 2>/dev/null
+    _gm_route_rule_ensure wg-100 'iif Wireguard lookup 100' \
+      priority 32759 iif Wireguard lookup 100 || _ra_fail=1
   fi
   # ICMP bypass: above the dynamic magitrickle fwmark base; presence checked by semantics.
-  ip rule show 2>/dev/null | grep -q "iif $_ra_lan ipproto icmp lookup main" \
-    || ip rule add priority 19901 iif "$_ra_lan" ipproto icmp lookup main 2>/dev/null
+  _gm_route_rule_ensure icmp-bypass "iif $_ra_lan ipproto icmp lookup main" \
+    priority 19901 iif "$_ra_lan" ipproto icmp lookup main || _ra_fail=1
   # AI-DNS: the DoH worker's sockets are marked 0x64 and sent to table 101.
   if [ ! -f "${GM_AIDNS_OFF:-/etc/geomask-aidns.off}" ] \
      && [ -f "${GM_AIDNS_UID:-/etc/geomask-aidns.uid}" ]; then
-    ip rule show 2>/dev/null | grep -q 'fwmark 0x64' \
-      || ip rule add pref 19902 fwmark 0x64 table 101 2>/dev/null
+    _gm_route_rule_ensure aidns-101 'fwmark 0x64' \
+      pref 19902 fwmark 0x64 table 101 || _ra_fail=1
   fi
   # Per-device bypass rules: a low pref keeps them above the magitrickle fwmark base.
   _ra_dev=${DEVICES:-/etc/geo-devices.list}
@@ -648,10 +665,11 @@ _gm_route_apply_100() {
     while read -r _dip _dmode _dname; do
       case "$_dip" in ''|'#'*) continue ;; esac
       [ "$_dmode" = "bypass" ] || continue
-      ip rule show 2>/dev/null | grep -q "from $_dip" \
-        || ip rule add priority 19900 from "$_dip" lookup main 2>/dev/null
+      _gm_route_rule_ensure "bypass-$_dip" "from $_dip lookup main" \
+        priority 19900 from "$_dip" lookup main || _ra_fail=1
     done < "$_ra_dev"
   fi
+  [ "$_ra_fail" = 0 ] || return 77
   return 0
 }
 
@@ -664,14 +682,16 @@ _gm_route_apply_101() {
   [ "$_rb_rc" = 0 ] || return "$_rb_rc"
   ip route replace table 101 default dev "$_rb_tun" 2>/dev/null || return 77
   _rb_dev=${DEVICES:-/etc/geo-devices.list}
+  _rb_fail=0
   if [ -f "$_rb_dev" ] && grep -qE '^[0-9.]+[[:space:]]+ai[[:space:]]' "$_rb_dev" 2>/dev/null; then
     while read -r _dip _dmode _dname; do
       case "$_dip" in ''|'#'*) continue ;; esac
       [ "$_dmode" = "ai" ] || continue
-      ip rule show 2>/dev/null | grep -q "from $_dip" \
-        || ip rule add priority 19900 from "$_dip" lookup 101 2>/dev/null
+      _gm_route_rule_ensure "ai-$_dip" "from $_dip lookup 101" \
+        priority 19900 from "$_dip" lookup 101 || _rb_fail=1
     done < "$_rb_dev"
   fi
+  [ "$_rb_fail" = 0 ] || return 77
   return 0
 }
 

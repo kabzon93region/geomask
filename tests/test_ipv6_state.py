@@ -46,6 +46,10 @@ STUBS = r'''uci() {
     delete) _k=$(printf '%s' "$2" | tr '.' '_')
             grep -v "^$_k=" "$CASE/uci" > "$CASE/uci.new" 2>/dev/null
             mv -f "$CASE/uci.new" "$CASE/uci" ;;
+    show) case "$2" in
+            network) sed -n 's/^network_\([A-Za-z0-9_]*\)_\([A-Za-z0-9_]*\)=\(.*\)$/network.\1.\2=\3/p' \
+                       "$CASE/uci" ;;
+          esac ;;
     commit) return 0 ;;
   esac
   return 0
@@ -161,6 +165,34 @@ class Ipv6StateTests(unittest.TestCase):
         self.assertEqual(self.uci('network.lan.ip6assign'), '56')
         self.assertEqual(self.proc('all'), '0', 'IPv6 must really be enabled again')
         self.assertFalse(self.nft.exists(), 'our drop rule must not stay when IPv6 is on')
+
+    # --------------------------------------------------- C06/P06: per-interface restore
+    def test_a_renamed_lan_section_is_restored_by_name(self):
+        """The restore used to hardcode lan, so a lan1 router came back on the wrong section."""
+        self.set_uci({'network.lan1.ip6assign': '56', 'dhcp.lan1.ra': 'server',
+                      'dhcp.lan1.dhcpv6': 'server', 'dhcp.lan1.ndp': 'hybrid'})
+        out = self.run_block('_ipv6_apply_off && echo OFF-OK\n'
+                             'printf "OFF=%s\\n" "$(uci -q get network.lan1.ip6assign)"\n'
+                             '_ipv6_apply_on && echo ON-OK')
+        self.assertIn('OFF-OK', out)
+        self.assertIn('OFF=0', out, 'the real LAN section was never disabled')
+        self.assertIn('ON-OK', out)
+        self.assertEqual(self.uci('network.lan1.ip6assign'), '56',
+                         'the real LAN section was not restored')
+        self.assertEqual(self.uci('dhcp.lan1.ra'), 'server')
+        self.assertEqual(self.uci('network.lan.ip6assign'), '',
+                         'our own network.lan key was left behind on a lan1 router')
+
+    def test_a_disappeared_interface_is_not_recreated(self):
+        self.set_uci({'network.lan.ip6assign': '56', 'dhcp.lan.ra': 'server',
+                      'dhcp.lan.dhcpv6': 'server', 'dhcp.lan.ndp': 'hybrid'})
+        self.state.write_text('ip6assign=56\nra=server\ndhcpv6=server\nndp=hybrid\n'
+                              'sysctl_all=0\nsysctl_default=0\nnft=absent\n'
+                              'ifv|wan9|ip6assign|56\n', encoding='utf-8', newline='\n')
+        result_stdout = self.run_block('_ipv6_apply_on && echo ON-OK')
+        self.assertIn('ON-OK', result_stdout)
+        self.assertEqual(self.uci('network.wan9.ip6assign'), '',
+                         'a vanished interface was re-created from the record')
 
 
 if __name__ == '__main__':

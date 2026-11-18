@@ -6750,6 +6750,15 @@ _ipv6_state_get() { # recorded value for one key ('' when the record has no such
   sed -n "s/^$1=//p" "$IPV6_STATE" 2>/dev/null | head -1
 }
 
+# C06/P06 (audit 18.11.2026): the restore used to hardcode network.lan/dhcp.lan. A router whose
+# LAN section is named differently (`lan1`) got its IPv6 enabled on an interface that never had
+# it, while the real one stayed recorded nowhere. Every interface that carries a value is
+# recorded separately and restored by name.
+_ipv6_interfaces() {
+  uci -q show network 2>/dev/null \
+    | sed -n 's/^network\.\([A-Za-z0-9_]*\)\.ip6assign=.*/\1/p' | sort -u
+}
+
 _ipv6_record_ok() { # a complete record is what makes `on` possible; a partial one is garbage
   [ -f "$IPV6_STATE" ] || return 1
   for _k in $IPV6_KEYS; do
@@ -6780,6 +6789,19 @@ _ipv6_save() { # record the current values once; never overwrite a valid record
     [ -n "$_v" ] || _v=unset
     printf '%s=%s\n' "$_k" "$_v" >> "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
   done
+  # Per-interface values (C06/P06), one line per name so a renamed LAN section is restored by
+  # name instead of being replaced with `lan`.
+  for _if in $(_ipv6_interfaces); do
+    _iv=$(uci -q get "network.$_if.ip6assign" 2>/dev/null)
+    printf 'ifv|%s|ip6assign|%s\n' "$_if" "${_iv:-unset}" >> "$_tmp" 2>/dev/null \
+      || { rm -f "$_tmp"; return 1; }
+    for _k in ra dhcpv6 ndp; do
+      _dv=$(uci -q get "dhcp.$_if.$_k" 2>/dev/null)
+      [ -n "$_dv" ] || continue
+      printf 'ifv|%s|%s|%s\n' "$_if" "$_k" "$_dv" >> "$_tmp" 2>/dev/null \
+        || { rm -f "$_tmp"; return 1; }
+    done
+  done
   _ipv6_read_kernel >> "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return 1; }
   chmod 600 "$_tmp" 2>/dev/null
   mv -f "$_tmp" "$IPV6_STATE" 2>/dev/null || { rm -f "$_tmp"; return 1; }
@@ -6806,6 +6828,37 @@ _ipv6_restore() { # restore the recorded values; no record at all -> nothing to 
         ;;
     esac
   done
+  # Per-interface values by name. An interface that no longer exists is reported and skipped -
+  # restoring into a re-created section would invent configuration the owner never had.
+  while IFS='|' read -r _tag _if _k _v; do
+    [ "$_tag" = ifv ] || continue
+    [ "$_if" = lan ] && continue     # the legacy block above already restored lan
+    [ -n "$_if" ] && [ -n "$_k" ] || continue
+    _if_exists=0
+    for _probe in "network.$_if.ip6assign" "network.$_if.proto" "network.$_if.device" \
+                  "dhcp.$_if.ra" "dhcp.$_if.dhcpv6" "dhcp.$_if.ndp"; do
+      [ -n "$(uci -q get "$_probe" 2>/dev/null)" ] && { _if_exists=1; break; }
+    done
+    if [ "$_if_exists" = 0 ]; then
+      printf 'ipv6: interface %s no longer exists - its value is not restored\n' "$_if" >&2
+      continue
+    fi
+    case "$_k" in
+      ip6assign)
+        case "$_v" in
+          ''|unset) uci -q delete "network.$_if.ip6assign" 2>/dev/null ;;
+          *[!0-9]*) ;;
+          *) uci set "network.$_if.ip6assign=$_v" 2>/dev/null || return 1 ;;
+        esac
+        ;;
+      ra|dhcpv6|ndp)
+        case "$_v" in
+          ''|unset) uci -q delete "dhcp.$_if.$_k" 2>/dev/null ;;
+          *) uci set "dhcp.$_if.$_k=$_v" 2>/dev/null || return 1 ;;
+        esac
+        ;;
+    esac
+  done < "$IPV6_STATE"
   return 0
 }
 
@@ -6882,6 +6935,15 @@ _ipv6_apply_off() { # every write of the disabled state; no commit, no reload
   uci set dhcp.lan.ra='disabled' 2>/dev/null || return 1
   uci set dhcp.lan.dhcpv6='disabled' 2>/dev/null || return 1
   uci set dhcp.lan.ndp='disabled' 2>/dev/null || return 1
+  # The real LAN section may not be called `lan` (C06/P06): disabling only the hardcoded name
+  # left IPv6 running on the interface that actually serves the LAN.
+  for _if in $(_ipv6_interfaces); do
+    [ "$_if" = lan ] && continue
+    uci set "network.$_if.ip6assign=0" 2>/dev/null || return 1
+    uci set "dhcp.$_if.ra=disabled" 2>/dev/null || return 1
+    uci set "dhcp.$_if.dhcpv6=disabled" 2>/dev/null || return 1
+    uci set "dhcp.$_if.ndp=disabled" 2>/dev/null || return 1
+  done
   _ipv6_guard_install || return 1
   return 0
 }
@@ -17355,7 +17417,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "4f96d1697964e9829ccdb2a380ee844c98a6c49e981e7d1f279ee3cda874e82d"
+          "sha256": "2bce2785f6155f3ef429eb526be8a13c4cc1c6a8be3bffe384ec3593fbd3fd0c"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",

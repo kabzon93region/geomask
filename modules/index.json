@@ -98,7 +98,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "4f96d1697964e9829ccdb2a380ee844c98a6c49e981e7d1f279ee3cda874e82d"
+          "sha256": "2bce2785f6155f3ef429eb526be8a13c4cc1c6a8be3bffe384ec3593fbd3fd0c"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",

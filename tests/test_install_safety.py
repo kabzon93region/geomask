@@ -135,6 +135,10 @@ if ! command -v python3 >/dev/null 2>&1 && command -v python >/dev/null 2>&1; th
   GM_PYTHON=python
 fi
 MIHOMO_CONF=/etc/mihomo/config.yaml
+# Product constant used by the selection functions (I10); the harness extracts functions only.
+MODULES_STATE=/etc/geomask/modules.json
+# The product probes the interpreter; the fixture must offer the same helper.
+_mihomo_py() { if [ -n "${GM_PYTHON:-}" ]; then "$GM_PYTHON" - "$@" 2>/dev/null; return; fi; python3 - "$@" 2>/dev/null; }
 BACKUP_DIR=/root/geomask-backups
 BACKUP_KEEP=1
 BACKUP_RECOVERY=/etc/geomask/backup-recovery
@@ -795,6 +799,39 @@ step_fn() { case "$2" in check) return 1 ;; apply) printf 'APPLIED\n' ;; esac; r
         result = self.run_script(body, extra=extra, functions=['save_stream'])
         self.assertIn('RC=1', result.stdout, result.stdout + result.stderr)
         self.assertIn('SAVE=1', result.stdout)
+
+    def test_a_damaged_selection_is_not_treated_as_all(self):
+        """I10: 'no selection' means install everything, so a broken file must not look like it."""
+        sel = self.case / 'etc/geomask/modules.json'
+        sel.parent.mkdir(parents=True)
+        sel.write_text('{not json', encoding='utf-8')
+        result = self.run_script('modules_state_read; printf "RC=%s\\n" "$?"',
+                                 functions=['modules_state_read'])
+        self.assertIn('RC=2', result.stdout, result.stdout + result.stderr)
+        self.assertEqual(sel.read_text(encoding='utf-8'), '{not json')
+
+    def test_the_selection_sync_refuses_a_damaged_file(self):
+        sel = self.case / 'etc/geomask/modules.json'
+        sel.parent.mkdir(parents=True)
+        sel.write_text('{not json', encoding='utf-8')
+        body = ('GM_MODULES="core"; modules_state_sync; printf "RC=%s\\n" "$?"; '
+                'cat "$(P /etc/geomask/modules.json)"')
+        result = self.run_script(body, functions=['modules_state_read', 'modules_state_write',
+                                                 'module_effective_list', 'modules_state_sync'])
+        self.assertIn('RC=1', result.stdout, result.stdout + result.stderr)
+        self.assertIn('{not json', result.stdout, 'the damaged file was overwritten')
+        self.assertIn('повреждён', result.stdout)
+
+    def test_the_selection_is_published_atomically(self):
+        body = ('modules_state_write core luci; printf "RC=%s\\n" "$?"; '
+                'cat "$(P /etc/geomask/modules.json)"; '
+                'ls "$(P /etc/geomask)" | tr "\\n" " "; printf "\\n"')
+        result = self.run_script(body, functions=['modules_state_write'])
+        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
+        self.assertIn('"core"', result.stdout)
+        self.assertIn('"luci"', result.stdout)
+        self.assertNotIn('.tmp', result.stdout.split('RC=0')[1],
+                         'a temp file survived the publish')
 
     def test_core_owns_the_backend_so_a_headless_install_can_disable_ipv6(self):
         """I02: with core/path_vpn the backend was not installed, so IPv6-off never ran."""

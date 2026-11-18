@@ -564,27 +564,42 @@ ruleset_stub() { # ruleset_stub <module> <install-path> - keep `mihomo -t` valid
 # router carry": the installer writes it, the panel and the per-module updater read it.
 MODULES_STATE=/etc/geomask/modules.json
 
-modules_state_read() { # prints the stored selection; rc=1 when there is none
-  [ -s "$(P $MODULES_STATE)" ] || return 1
-  python3 - "$(P $MODULES_STATE)" <<'PYEOF' 2>/dev/null
+modules_state_read() { # prints the stored selection; rc 1 = absent, 2 = damaged, 3 = no python
+  # A damaged file used to be indistinguishable from "no selection", and "no selection" means
+  # "install everything" - so one broken byte silently widened the install (audit I10).
+  [ -e "$(P $MODULES_STATE)" ] || return 1
+  [ -s "$(P $MODULES_STATE)" ] || return 2
+  command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1 || return 3
+  _msr=$(_mihomo_py "$(P $MODULES_STATE)" <<'PYEOF'
 import json, sys
 try:
     data = json.load(open(sys.argv[1], encoding='utf-8'))
 except Exception:
     raise SystemExit(1)
-print(' '.join(str(item) for item in (data.get('selected') or [])))
+selected = data.get('selected') if isinstance(data, dict) else None
+if not isinstance(selected, list) or not selected:
+    raise SystemExit(1)
+print(' '.join(str(item) for item in selected))
 PYEOF
+  ) || return 2
+  [ -n "$_msr" ] || return 2
+  printf '%s' "$_msr"
 }
 
 modules_state_write() { # modules_state_write <module>...
   [ $# -gt 0 ] || return 0
   mkdir -p "$(P /etc/geomask)" 2>/dev/null || true
-  python3 - "$(P $MODULES_STATE)" "$@" <<'PYEOF' 2>/dev/null || warn "modules: не удалось записать $MODULES_STATE"
+  # Publish atomically: the panel and the updater read this file, and a truncated write would
+  # look like a damaged selection. The temp lives next to the target for an atomic rename.
+  _msw_tmp="$(P $MODULES_STATE).tmp.$$"
+  _mihomo_py "$_msw_tmp" "$@" <<'PYEOF' || { rm -f "$_msw_tmp" 2>/dev/null; warn "modules: не удалось записать $MODULES_STATE"; return 1; }
 import json, sys
-json.dump({'selected': sys.argv[2:]},
-          open(sys.argv[1], 'w', encoding='utf-8', newline='\n'),
-          ensure_ascii=False, indent=2)
+with open(sys.argv[1], 'w', encoding='utf-8', newline='\n') as handle:
+    json.dump({'selected': sys.argv[2:]}, handle, ensure_ascii=False, indent=2)
+    handle.write('\n')
 PYEOF
+  mv -f "$_msw_tmp" "$(P $MODULES_STATE)" 2>/dev/null \
+    || { rm -f "$_msw_tmp" 2>/dev/null; warn "modules: не удалось опубликовать $MODULES_STATE"; return 1; }
 }
 
 module_effective_list() { # the modules this run installs (all, unless --modules narrowed it)
@@ -593,7 +608,17 @@ module_effective_list() { # the modules this run installs (all, unless --modules
 
 modules_state_sync() { # remember the effective selection, only when it changed
   _want=$(module_effective_list)
-  _have=$(modules_state_read 2>/dev/null || true)
+  _msr_rc=0
+  _have=$(modules_state_read) || _msr_rc=$?
+  if [ "$_msr_rc" = 2 ]; then
+    # Refuse: overwriting a damaged selection would erase the owner's choice on a guess.
+    bad "modules: $MODULES_STATE повреждён - выбор не меняю (исправьте файл или удалите его для выбора всех модулей)"
+    return 1
+  fi
+  if [ "$_msr_rc" = 3 ]; then
+    warn "modules: python недоступен - сохранённый выбор не проверен"
+    return 0
+  fi
   [ "$_want" = "$_have" ] && return 0
   # Narrowing the selection does not delete anything: say it once, with the way out.
   for _m in $_have; do
@@ -606,8 +631,16 @@ modules_state_sync() { # remember the effective selection, only when it changed
 }
 
 choose_modules() { # interactive picker; required modules are always installed
-  _cur=$(modules_state_read 2>/dev/null || true)
-  [ -n "$_cur" ] || _cur="$GM_ALL_MODULES"
+  _cm_rc=0
+  _cur=$(modules_state_read) || _cm_rc=$?
+  if [ "$_cm_rc" = 2 ]; then
+    bad "modules: $MODULES_STATE повреждён - выбор не начинаю (исправьте файл или удалите его)"
+    return 1
+  fi
+  if [ "$_cm_rc" = 3 ]; then
+    warn "modules: python недоступен - показываю полный список"
+  fi
+  if [ "$_cm_rc" = 1 ] || [ -z "$_cur" ]; then _cur="$GM_ALL_MODULES"; fi
   echo
   printf '%sМодули%s: обязательные ставятся всегда, остальные — по выбору.\n' "$C_Y" "$NC"
   _i=0
@@ -6048,6 +6081,18 @@ normalize_modules() { # normalize_modules <selection> -> validated selection wit
 
 if [ -n "$GM_MODULES" ]; then
   GM_MODULES=$(normalize_modules "$GM_MODULES") || exit 2
+fi
+
+# I10: the stored selection is an input to every entrypoint (check, step N, reinstall, auto).
+# A damaged file must stop the run before the first write instead of silently meaning "all".
+_msr_pre_rc=0
+modules_state_read >/dev/null || _msr_pre_rc=$?
+if [ "$_msr_pre_rc" = 2 ]; then
+  log "ERROR: $MODULES_STATE damaged - refusing to continue (fix the file, or remove it to install every module)"
+  exit 2
+fi
+if [ "$_msr_pre_rc" = 3 ]; then
+  log "NOTE: no python interpreter - the stored module selection could not be validated"
 fi
 
 case "$GM_IPV6" in

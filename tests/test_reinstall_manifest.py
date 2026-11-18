@@ -125,8 +125,9 @@ class ManifestGateTests(unittest.TestCase):
         temp file with a different name is not silently absorbed.
         """
         augmented = self.source.replace(
-            '  _tmp="$_t.zmnew"\n',
-            '  _tmp="$_t.zmnew"\n  cat > "$_t.whole-new-shape" 2>/dev/null\n', 1)
+            '  _tmp=$(mktemp "$_t.zmnew.XXXXXX" 2>/dev/null) || _tmp="$_t.zmnew.$$"\n',
+            '  _tmp=$(mktemp "$_t.zmnew.XXXXXX" 2>/dev/null) || _tmp="$_t.zmnew.$$"\n'
+            '  cat > "$_t.whole-new-shape" 2>/dev/null\n', 1)
         self.assertNotEqual(augmented, self.source, 'injection point not found')
         original = rm.INSTALLER
         handle = tempfile.NamedTemporaryFile('w', suffix='.sh.in', delete=False,

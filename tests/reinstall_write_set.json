@@ -1990,6 +1990,21 @@
       "snapshot": "SNAP",
       "restore": "RV",
       "notes": "snapshot pins the resolved target and dev:ino of every allowed symlink component; restore/verify compare them before any external action"
+    },
+    {
+      "id": "dyn.selection-publish",
+      "path_regex": "/etc/geomask/modules\\.json(\\.tmp\\.[0-9]+)?",
+      "functions": [
+        "modules_state_write"
+      ],
+      "effects": [
+        "script-write",
+        "write",
+        "rm",
+        "mv"
+      ],
+      "site_regex": "_msw_tmp|modules\\.json|handle\\.write\\(|sys\\.argv\\[1\\]",
+      "notes": "атомарная публикация выбора модулей: временный файл рядом с целью, затем переименование (I10)"
     }
   ],
   "services": [

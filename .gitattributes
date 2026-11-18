@@ -10,3 +10,6 @@ zm-setup.sh text eol=lf
 *.yaml text eol=lf
 *.json text eol=lf
 *.js text eol=lf
+# authored source parts (stage 0): byte-exact composition, so LF in the index and the tree
+*.part text eol=lf
+src/** text eol=lf

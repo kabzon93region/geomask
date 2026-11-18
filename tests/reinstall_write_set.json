@@ -2598,6 +2598,16 @@
       "id": "policy.tmp.geomask-reload.pending",
       "path": "/tmp/geomask-reload.pending",
       "reason": "volatile runtime file of a callee (last-run state / pending-reload marker): recreated by the next run, and a reboot re-reads the generated includes, so there is nothing to restore"
+    },
+    {
+      "id": "policy.tmp.geomask-locks",
+      "path": "/tmp/geomask-locks",
+      "reason": "lock directory/file of the kernel writer locks (rank table in geomask-lock.sh): volatile, recreated on demand, nothing to snapshot or restore"
+    },
+    {
+      "id": "policy.tmp.geomask-module-update.lock",
+      "path": "/tmp/geomask-module-update.lock",
+      "reason": "lock directory/file of the kernel writer locks (rank table in geomask-lock.sh): volatile, recreated on demand, nothing to snapshot or restore"
     }
   ],
   "callees": [

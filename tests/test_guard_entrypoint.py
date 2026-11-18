@@ -45,6 +45,7 @@ IP_STUB = r'''#!/bin/sh
 printf '%s\n' "$*" >> "$CASE/ip.calls"
 case "$1 $2" in
   "rule show")
+    [ -f "$CASE/fail-rule-show" ] && exit 1
     cat "$CASE/rules" 2>/dev/null
     exit 0 ;;
   "rule add")
@@ -69,9 +70,16 @@ case "$1 $2" in
     awk -v pref="$_pref" -v pat="$_rest" '
       BEGIN { n=split(pat, t, " "); done=0 }
       {
-        hit=1
-        if (pref != "" && index($0, pref ":") != 1) hit=0
-        for (i=1; i<=n; i++) if (hit && index($0, t[i]) == 0) hit=0
+        # Token-exact match: 10.20.30.4 must not match the substring of 10.20.30.40,
+        # otherwise the fixture deletes another address rule and hides a product bug.
+        m = split($0, f, /[ \t]+/)
+        hit = 0
+        for (i = 1; i + n - 1 <= m; i++) {
+          ok = 1
+          for (j = 1; j <= n; j++) if (f[i + j - 1] != t[j]) { ok = 0; break }
+          if (ok) { hit = 1; break }
+        }
+        if (pref != "" && index($0, pref ":") != 1) hit = 0
         if (hit && !done) { done=1; next }
         print
       }
@@ -386,6 +394,59 @@ class GuardEntrypointTests(unittest.TestCase):
         self.assertIn('console rule removed', self.read('logger.log'))
         self.assertEqual(result.returncode, 0, result.stdout + self.read('logger.log'))
 
+    def test_a_lookalike_table_is_not_our_console_rule(self):
+        """G06: `lookup 102` must not match a rule that points at table 1020."""
+        self.write('console.state', 'enabled=1\nip=10.20.30.40\n')
+        self.write('rules', BASE_RULES
+                   + '15000:\tfrom 10.20.30.40 lookup 1020\n')
+        result = self.run_guard()
+        rules = '\n'.join(self.lines('rules'))
+        self.assertIn('lookup 1020', rules, 'a foreign table-1020 rule was removed')
+        self.assertIn('rule add pref 19903 from 10.20.30.40 lookup 102',
+                      '\n'.join(self.lines('ip.calls')),
+                      'the console rule was not added next to the lookalike')
+        self.assertEqual(result.returncode, 0, result.stdout + self.read('logger.log'))
+
+    def test_a_lookalike_source_is_not_a_match(self):
+        """`from 10.20.30.40` is not `from 10.20.30.4`."""
+        self.write('console.state', 'enabled=1\nip=10.20.30.4\n')
+        self.write('rules', BASE_RULES
+                   + '19903:\tfrom 10.20.30.40 lookup 102\n')
+        result = self.run_guard()
+        rules = '\n'.join(self.lines('rules'))
+        self.assertIn('19903:\tfrom 10.20.30.40 lookup 102', rules,
+                      'the longer address rule was treated as ours and removed')
+        self.assertIn('rule add pref 19903 from 10.20.30.4 lookup 102',
+                      '\n'.join(self.lines('ip.calls')),
+                      'the rule for the configured address was not added')
+        self.assertEqual(result.returncode, 0, result.stdout + self.read('logger.log'))
+        self.assertIn('rule add pref 19903 from 10.20.30.4 lookup 102',
+                      '\n'.join(self.lines('ip.calls')))
+        self.assertEqual(result.returncode, 0, result.stdout + self.read('logger.log'))
+
+    def test_an_unreadable_rule_table_is_degraded_and_not_mutated(self):
+        """G06: an unreadable table is unknown, not "everything missing"."""
+        self.write('console.state', 'enabled=1\nip=10.20.30.40\n')
+        self.write('rules', BASE_RULES)
+        self.write('fail-rule-show', '1\n')
+        result = self.run_guard()
+        self.assertEqual(result.returncode, 1,
+                         'an unreadable rule table was reported as healthy')
+        self.assertNotIn('rule add', '\n'.join(self.lines('ip.calls')),
+                         'rules were re-seated on a guess')
+        self.assertIn('DEGRADED', self.read('logger.log'))
+
+    def test_a_longer_lookup_does_not_satisfy_the_lan_rule(self):
+        """`lookup 1010` must not satisfy a rule that requires `lookup 101`."""
+        self.write('console.state', 'enabled=0\nip=\n')
+        self.write('rules', '19901:\tiif br-lan ipproto icmp lookup main\n'
+                   + '19902:\tfwmark 0x64 lookup 1010\n')
+        result = self.run_guard()
+        calls = '\n'.join(self.lines('ip.calls'))
+        self.assertIn('rule add priority', calls,
+                      'the real rule was considered present because of a lookalike')
+        self.assertIn('fwmark 0x64 table 101', calls)
+        self.assertEqual(result.returncode, 0, result.stdout + self.read('logger.log'))
     def test_enabled_console_keeps_a_foreign_rule_with_the_same_lookup(self):
         # R10a P3: the enabled=1 repair deleted every `from <ip> lookup 102` rule, not only
         # our pref 19903. A foreign 15000 rule must survive; ours is added next to it.

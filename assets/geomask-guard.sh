@@ -196,7 +196,27 @@ for _gm_lan in $LAN_DEV; do LAN_DEV=$_gm_lan; break; done
 [ -n "$LAN_DEV" ] || LAN_DEV=br-lan
 
 RULES_NOW=$(ip rule show 2>/dev/null)
+RULES_READ=$?
 MT_MIN=$(printf '%s\n' "$RULES_NOW" | grep 'fwmark 0x4d61' | awk -F: '{print $1}' | sort -n | head -1)
+# G06 (audit 18.11.2026): presence used to be `grep -F "<tokens>"`, so `lookup 101` matched
+# `lookup 1010`, `from 1.2.3.4` matched `from 1.2.3.40` and a foreign rule looked like ours.
+# Matching is token-exact now; the helper prints the priority of a matching rule.
+guard_rule_pref() { # guard_rule_pref <token>... -> prints pref, rc 1 when absent
+  awk -v want="$*" '
+    BEGIN { n = split(want, w, " ") }
+    {
+      line = $0; sub(/\r$/, "", line)
+      m = split(line, f, /[ \t]+/)
+      pref = f[1]; sub(/:$/, "", pref)
+      if (pref !~ /^[0-9]+$/) next
+      for (i = 2; i + n - 1 <= m; i++) {
+        ok = 1
+        for (j = 1; j <= n; j++) if (f[i + j - 1] != w[j]) { ok = 0; break }
+        if (ok) { print pref; exit 0 }
+      }
+    }
+    END { exit 1 }'
+}
 
 CHECKLIST="iif $LAN_DEV ipproto icmp lookup main
 fwmark 0x64 lookup 101"
@@ -216,16 +236,23 @@ RULES_OK=1
 OLDIFS=$IFS
 IFS='
 '
-for pat in $CHECKLIST; do
-  [ -z "$pat" ] && continue
-  LINE=$(printf '%s\n' "$RULES_NOW" | grep -F "$pat" | head -1)
-  if [ -z "$LINE" ]; then RULES_OK=0; break; fi
-  PREF=${LINE%%:*}
-  case "$PREF" in
-    ''|*[!0-9]*) RULES_OK=0; break ;;
-  esac
-  if [ -n "$MT_MIN" ] && [ "$PREF" -ge "$MT_MIN" ]; then RULES_OK=0; break; fi
-done
+if [ "$RULES_READ" != 0 ]; then
+  # G06: an unreadable table is not "everything is missing". Re-seating blind would delete
+  # rules on a guess, so the run reports DEGRADED and the next one retries.
+  RC_DEGRADED=1
+  log "DEGRADED: ip rule show failed - rules not checked and not re-seated"
+  RULES_OK=1
+else
+  for pat in $CHECKLIST; do
+    [ -z "$pat" ] && continue
+    PREF=$(printf '%s\n' "$RULES_NOW" | guard_rule_pref $pat)
+    if [ -z "$PREF" ]; then RULES_OK=0; break; fi
+    case "$PREF" in
+      ''|*[!0-9]*) RULES_OK=0; break ;;
+    esac
+    if [ -n "$MT_MIN" ] && [ "$PREF" -ge "$MT_MIN" ]; then RULES_OK=0; break; fi
+  done
+fi
 IFS=$OLDIFS
 
 if [ "$RULES_OK" = "0" ]; then
@@ -314,6 +341,8 @@ fi
 # reboot left the console leaving with the real address (review 15.11, #9).
 CTUN=${GM_CONSOLE_TUN:-Console}
 CTBL=${GM_CONSOLE_TABLE:-102}
+# Ownership of the console rule: one priority, one table, one source address.
+CRULE=${GM_CONSOLE_RULE_PREF:-19903}
 # Kept here as well as at the drain above: the console block is exercised on its own by the
 # tests, and a missing variable must not turn a watchdog run into a crash.
 CROUTES=${GM_ROUTES_LIB:-/usr/lib/geomask/geomask-routes.sh}
@@ -350,9 +379,27 @@ valid_ipv4() {
   [ "$_vi_n" = 4 ]
 }
 # Only OUR pref-19903 rule counts: a foreign rule with the same from/lookup must never be
-# reported as the console lane, and must never be deleted either.
-console_rule_present() { # console_rule_present <ip>
-  ip rule show 2>/dev/null | grep -q "^19903:.*from $1 lookup $CTBL"
+# reported as the console lane, and must never be deleted either. Matching is token-exact, and
+# an unreadable table is "unknown" (rc 2), not "absent" (G06).
+console_rule_present() { # console_rule_present <ip> -> 0 present, 1 absent, 2 unreadable
+  _crp_rules=$(ip rule show 2>/dev/null) || return 2
+  printf '%s\n' "$_crp_rules" | awk -v ip="$1" -v pref="$CRULE" -v tbl="$CTBL" '
+    {
+      line = $0; sub(/\r$/, "", line)
+      n = split(line, f, /[ \t]+/)
+      p = f[1]; sub(/:$/, "", p)
+      if (n == 5 && p == pref && f[2] == "from" && f[3] == ip && f[4] == "lookup" && f[5] == tbl) found = 1
+    }
+    END { exit(found ? 0 : 1) }'
+}
+
+# The console default must point at our tunnel. `grep "^default dev Console"` also matched
+# `default dev Console0`, so the check is token-exact and the table read is observed.
+console_default_ok() { # console_default_ok <table> <device> -> 0 ok, 1 wrong/absent, 2 unreadable
+  _cdo_routes=$(ip route show table "$1" 2>/dev/null) || return 2
+  printf '%s\n' "$_cdo_routes" | awk -v dev="$2" '
+    $1 == "default" { for (i = 2; i < NF; i++) if ($i == "dev" && $(i + 1) == dev) ours = 1 }
+    END { exit(ours ? 0 : 1) }'
 }
 if console_lock; then
   if [ -f "$CS" ] && [ -r "$CS" ]; then
@@ -380,12 +427,16 @@ if console_lock; then
           RC_DEGRADED=1
           log "WARN console routes helper missing ($CROUTES)"
         fi
-        if ! console_rule_present "$CIP"; then
+        console_rule_present "$CIP"; _crp=$?
+        if [ "$_crp" = 2 ]; then
+          RC_DEGRADED=1
+          log "DEGRADED: ip rule show failed - console rule not checked and not re-seated"
+        elif [ "$_crp" = 1 ]; then
           # Only our own stale 19903 rule may be removed. Deleting `from <ip> lookup 102`
           # without a pref also deleted a foreign rule (15000: from <ip> lookup 102) and
           # then claimed the lane was "re-seated" (R10a P3).
-          while ip rule del pref 19903 from "$CIP" lookup "$CTBL" 2>/dev/null; do :; done
-          if ip rule add pref 19903 from "$CIP" lookup "$CTBL" 2>/dev/null; then
+          while ip rule del pref "$CRULE" from "$CIP" lookup "$CTBL" 2>/dev/null; do :; done
+          if ip rule add pref "$CRULE" from "$CIP" lookup "$CTBL" 2>/dev/null; then
             log "console rule re-seated for $CIP"
             conntrack -D -s "$CIP" >/dev/null 2>&1
             conntrack -D -d "$CIP" >/dev/null 2>&1
@@ -396,7 +447,11 @@ if console_lock; then
         fi
         # A default through another device is not "a default": after a reboot netifd can leave
         # one via the WAN in every table, and the console would use the real address.
-        if ! ip route show table "$CTBL" 2>/dev/null | grep -q "^default dev $CTUN"; then
+        console_default_ok "$CTBL" "$CTUN"; _cdo=$?
+        if [ "$_cdo" = 2 ]; then
+          RC_DEGRADED=1
+          log "WARN console table $CTBL could not be read - default not checked"
+        elif [ "$_cdo" = 1 ]; then
           if ip route replace table "$CTBL" default dev "$CTUN" 2>/dev/null; then
             log "console table $CTBL default restored (dev $CTUN)"
           else
@@ -408,14 +463,20 @@ if console_lock; then
     elif [ "$CEN" = "0" ]; then
       # The lane was switched off. Remove only the rule this guard owns (pref 19903): a
       # foreign rule with the same from/lookup is somebody else's and must survive.
-      if [ -n "$CIP" ] && console_rule_present "$CIP"; then
-        if ip rule del pref 19903 from "$CIP" lookup "$CTBL" 2>/dev/null; then
-          log "console rule removed for $CIP (lane off)"
-          conntrack -D -s "$CIP" >/dev/null 2>&1
-          conntrack -D -d "$CIP" >/dev/null 2>&1
-        else
+      if [ -n "$CIP" ]; then
+        console_rule_present "$CIP"; _crp_off=$?
+        if [ "$_crp_off" = 2 ]; then
           RC_DEGRADED=1
-          log "FAIL console rule removal $CIP"
+          log "DEGRADED: ip rule show failed - console rule removal not attempted"
+        elif [ "$_crp_off" = 0 ]; then
+          if ip rule del pref "$CRULE" from "$CIP" lookup "$CTBL" 2>/dev/null; then
+            log "console rule removed for $CIP (lane off)"
+            conntrack -D -s "$CIP" >/dev/null 2>&1
+            conntrack -D -d "$CIP" >/dev/null 2>&1
+          else
+            RC_DEGRADED=1
+            log "FAIL console rule removal $CIP"
+          fi
         fi
       fi
     else

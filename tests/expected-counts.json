@@ -62,6 +62,7 @@
   "test_reinstall_phase2e.py": 9,
   "test_reinstall_phase2f.py": 14,
   "test_reinstall_preflight.py": 23,
+  "test_release_tooling.py": 5,
   "test_reload_state.py": 10,
   "test_report_method_retention.py": 7,
   "test_resource_bounds.py": 5,

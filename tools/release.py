@@ -134,7 +134,7 @@ def check_ready(version):
         problems.append('текущая ветка не master')
     if git('rev-parse', 'HEAD') != git('rev-parse', 'origin/master'):
         problems.append('master и origin/master разошлись (сначала push)')
-    if run([sys.executable, 'tools/check_build.py']).returncode:
+    if run([sys.executable, 'tools/check_build.py', '--verify-only']).returncode:
         problems.append('geomask.sh не совпадает со сборкой (build.py)')
     tag = 'v' + version
     if tag_exists(tag) or remote_tag_exists(tag):
@@ -144,11 +144,17 @@ def check_ready(version):
 
 def run_tests():
     print('  проверки перед публикацией (это займёт пару минут)')
+    logs = tempfile.mkdtemp(prefix='geomask-release-gate-')
+    # R01 (audit 18.11.2026): publishing used a raw `unittest discover` and a mutating
+    # check_build, so the release could pass while testgate's own contract - per-module
+    # minimum counts, allowlisted skips, per-module timeout - was never applied. The gate is
+    # the authority now, and check_build only verifies (it used to rewrite the artifact it
+    # was judging).
     steps = [
-        ('сборка == исходники', [sys.executable, 'tools/check_build.py']),
+        ('сборка == исходники', [sys.executable, 'tools/check_build.py', '--verify-only']),
         ('RPC-манифест', [sys.executable, 'tools/gen-geo-rpc.py', '--check']),
-        ('python-тесты', [sys.executable, '-B', '-m', 'unittest', 'discover',
-                          '-s', 'tests', '-p', 'test_*.py']),
+        ('testgate', [sys.executable, '-B', 'tests/testgate.py', 'run',
+                      '--tests-dir', 'tests', '--log-dir', logs]),
         ('песочница', [bash(), 'tests/run_tests.sh']),
     ]
     failed = []
@@ -174,7 +180,8 @@ def release_notes(version, previous_tag):
         lines.extend(commits)
         lines.append('')
     lines.append('Артефакт: `geomask.sh` (sha256 в digest ассета). Проверки перед публикацией: '
-                 'check_build, RPC-манифест, python-тесты, песочница.')
+                 'check_build --verify-only, RPC-манифест, testgate (counts/skips/timeouts), '
+                 'песочница.')
     return '\n'.join(lines) + '\n'
 
 
@@ -261,7 +268,7 @@ def verify(full=False):
                                                     modules))
     ok = ok and listing.returncode == 0
     if full:
-        print('  полная песочница на скачанном файле (416 проверок)')
+        print('  полная песочница на скачанном файле (tests/run_tests.sh)')
         env = dict(os.environ, GM_SCRIPT=target)
         suite = subprocess.run([bash(), 'tests/run_tests.sh'], cwd=ROOT, env=env,
                                capture_output=True, text=True, encoding='utf-8',
@@ -269,9 +276,18 @@ def verify(full=False):
         tail = [line for line in (suite.stdout or '').splitlines() if 'SANDBOX RESULT' in line]
         print('    %s' % (tail[-1] if tail else (suite.stdout or '')[-300:]))
         ok = ok and suite.returncode == 0
-    print('вывод: %s' % ('релиз %s устанавливается и совпадает со сборкой' % tag if ok
-                         else 'релиз НЕ прошёл проверку'))
-    return 0 if ok else 1
+    # R01: without --full nothing was installed or executed beyond `sh -n` and
+    # `--list-modules`, yet the summary claimed the release "installs". Name the proof.
+    if not ok:
+        print('вывод: релиз НЕ прошёл проверку')
+        return 1
+    if full:
+        print('вывод: релиз %s скачан, совпадает со сборкой, синтаксис и список модулей '
+              'читаются, песочница на скачанном файле прошла' % tag)
+    else:
+        print('вывод: релиз %s скачан, совпадает со сборкой, синтаксис и список модулей '
+              'читаются; установка НЕ проверялась (запустите verify --full)' % tag)
+    return 0
 
 
 def drift():

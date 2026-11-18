@@ -6061,6 +6061,18 @@ done
 # validate --modules: a typo would otherwise install nothing and report success.
 # A function, not an inline block: the regression test used to re-implement this logic and
 # could pass while the installer itself was broken.
+# Dependencies the modules declare (modules/*.json). The installer cannot read the catalogue
+# before it is installed, so the edges live here; a test keeps this list and the metadata in
+# step (audit I07: ai_dns was installed without path_ai).
+module_deps() {
+  for _md_mod in "$@"; do
+    case "$_md_mod" in
+      ai_dns)  printf ' core path_ai' ;;
+      path_ai) printf ' core admission_service' ;;
+    esac
+  done
+}
+
 normalize_modules() { # normalize_modules <selection> -> validated selection with required modules
   _sel="$1"
   _valid=""
@@ -6071,6 +6083,19 @@ normalize_modules() { # normalize_modules <selection> -> validated selection wit
     esac
   done
   _sel=$(printf '%s' "$_valid" | sed 's/^ *//;s/  */ /g')
+  # Dependency closure: a selected module pulls what it needs, exactly as the manifest says.
+  _changed=1
+  while [ "$_changed" = 1 ]; do
+    _changed=0
+    for _m in $_sel; do
+      for _d in $(module_deps "$_m"); do
+        case " $_sel " in
+          *" $_d "*) ;;
+          *) _sel="$_sel $_d"; _changed=1 ;;
+        esac
+      done
+    done
+  done
   # core and path_vpn are not optional: the interactive picker adds them, the CLI used to
   # accept a set without them and install a product that cannot route anything.
   for _m in $GM_REQUIRED_MODULES; do

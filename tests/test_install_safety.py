@@ -518,6 +518,36 @@ mv() {
         self.assertIn('RC=2', result.stdout)
         self.assertIn('unknown module: nope', result.stdout + result.stderr)
 
+    def test_selecting_ai_dns_pulls_the_tunnel_it_needs(self):
+        """I07: ai_dns was installed without path_ai, which the manifest requires."""
+        result = self.run_script('printf "MODULES=%s\\n" "$(normalize_modules ai_dns)"',
+                                 functions=['module_deps', 'normalize_modules'])
+        self.assertIn('ai_dns', result.stdout)
+        self.assertIn('path_ai', result.stdout)
+        self.assertIn('admission_service', result.stdout)
+        self.assertIn('core', result.stdout)
+
+    def test_the_installer_dependency_edges_match_the_manifests(self):
+        """The shell edges are a copy of modules/*.json; a drift would break a clean install."""
+        import json as _json
+        result = self.run_script('for m in ai_dns path_ai; do printf "%s:" "$m"; '
+                                 'module_deps "$m"; printf "\\n"; done',
+                                 functions=['module_deps'])
+        shell = {}
+        for line in result.stdout.splitlines():
+            if ':' in line:
+                name, _, deps = line.partition(':')
+                shell[name] = sorted(deps.split())
+        self.assertTrue(shell)
+        for module_id, deps in shell.items():
+            manifest = _json.loads((ROOT / 'modules' / ('%s.json' % module_id))
+                                   .read_text(encoding='utf-8'))
+            # subscription:sub is a capability, not a module the installer can select.
+            declared = sorted(dep['module_id'] for dep in manifest.get('dependencies') or []
+                              if dep.get('required')
+                              and not str(dep.get('module_id', '')).startswith('subscription:'))
+            self.assertEqual(deps, declared, 'shell deps drifted for %s' % module_id)
+
     # ---------------------------------------------------------------- T05
     #
     # R03 phase 2b: the snapshot is manifest-driven, every restored object is verified and an

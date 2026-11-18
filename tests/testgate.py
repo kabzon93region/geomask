@@ -33,6 +33,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -212,10 +213,23 @@ def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
         status = 'ok'
         raw = ''
         try:
-            completed = subprocess.run(
-                cmd, cwd=os.path.dirname(tests_dir), env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                encoding='utf-8', errors='replace', timeout=timeout)
+            try:
+                completed = subprocess.run(
+                    cmd, cwd=os.path.dirname(tests_dir), env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    encoding='utf-8', errors='replace', timeout=timeout)
+            except FileNotFoundError:
+                # Windows CreateProcess intermittently fails with WinError 2 (seen after the
+                # host killed a long run): retry once with an explicitly resolved interpreter
+                # before a module is reported as a load error.
+                other = shutil.which('python') or shutil.which('python3')
+                if not other or other == cmd[0]:
+                    raise
+                cmd = [other] + cmd[1:]
+                completed = subprocess.run(
+                    cmd, cwd=os.path.dirname(tests_dir), env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    encoding='utf-8', errors='replace', timeout=timeout)
             raw = (completed.stdout or '') + (completed.stderr or '')
             payload = _parse_child(completed.stdout, completed.stderr)
             elapsed = time.time() - started

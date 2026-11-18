@@ -21,7 +21,7 @@
   "test_console_tx.py": 14,
   "test_controller_auth.py": 4,
   "test_diag_bundle.py": 9,
-  "test_diag_redact.py": 32,
+  "test_diag_redact.py": 37,
   "test_diag_spool.py": 51,
   "test_diagnostics.py": 20,
   "test_dnscheck_contract.py": 11,

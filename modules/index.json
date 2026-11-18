@@ -170,7 +170,7 @@
           "path": "/usr/lib/geomask/geomask-diag-redact.py",
           "source": "assets/geomask-diag-redact.py",
           "mode": "0755",
-          "sha256": "686399b833619f513ab9d3bf9ec13e67d927720fba4b07439e636e7c4b9b16ed"
+          "sha256": "12b27acc6ea32d2378a8ac6a6bad2102a6247edff3f0586ab23b1df812036aef"
         },
         {
           "path": "/usr/lib/geomask/geomask-diag-spool.py",

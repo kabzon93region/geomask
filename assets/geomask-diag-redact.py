@@ -208,11 +208,29 @@ _SECRET_KEYS = {
     'token', 'uuid', 'auth', 'authentication', 'authorization', 'header',
     'headers', 'username', 'user', 'x-hwid', 'url', 'subscribe-url',
     'obfs-password', 'key', 'auth-str', 'auth-string', 'proxy-authorization',
+    # The audit of 18.11.2026 found short values under these names left untouched: the whole
+    # key was not in the set, and the value was too short for the token heuristics.
+    'api-key', 'apikey', 'access-key', 'secret-key', 'access-token',
+    'refresh-token', 'session-token', 'auth-token', 'client-secret',
+    'client-key', 'subscription-url', 'sub-url', 'hwid',
+}
+
+# A key is secret when its LAST component is one of these, or when its last two components
+# form one of the pairs below. `public-key` stays visible on purpose (the UCI fixture asserts
+# it), while `api_key`, `my access token` and `clientSecret` do not.
+_SECRET_SUFFIXES = ('token', 'secret', 'password', 'passwd', 'credential', 'credentials')
+_SECRET_PAIRS = {
+    ('api', 'key'), ('access', 'key'), ('private', 'key'), ('secret', 'key'),
+    ('auth', 'key'), ('client', 'key'), ('client', 'secret'),
+    ('access', 'token'), ('refresh', 'token'), ('session', 'token'), ('auth', 'token'),
+    ('subscription', 'url'), ('subscribe', 'url'), ('sub', 'url'),
 }
 
 
 def _normalise_key(name):
-    return re.sub(r'[^a-z0-9]+', '-', str(name).strip().lower()).strip('-')
+    # camelCase splits into components: `clientSecret` is the same key as `client-secret`.
+    text = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '-', str(name).strip())
+    return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
 
 
 def _key_is_secret(name):
@@ -224,6 +242,11 @@ def _key_is_secret(name):
     for part in re.split(r'[.\s]+', str(name).strip()):
         if _normalise_key(part) in _SECRET_KEYS:
             return True
+    tokens = [token for token in normalised.split('-') if token]
+    if tokens and tokens[-1] in _SECRET_SUFFIXES:
+        return True
+    if len(tokens) >= 2 and (tokens[-2], tokens[-1]) in _SECRET_PAIRS:
+        return True
     return False
 
 

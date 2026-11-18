@@ -577,5 +577,58 @@ class ValueBoundaryRound4Tests(RedactorTestCase):
         self.assertIn('sub: url=https://a', text)
 
 
+class ShortKeyRound5Tests(RedactorTestCase):
+    """Audit 18.11.2026: short values under api_key/access_token/client_secret leaked.
+
+    The key set only knew whole names, and the value heuristics need a long token, a URL or a
+    bearer scheme - a synthetic short value under `api_key:` therefore stayed readable.
+    """
+
+    YAML = ('mixed-port: 7890\n'
+            'api_key: short-api-1\n'
+            'access_token: short-token-2\n'
+            'client_secret: short-secret-3\n'
+            'Api-Key: short-api-4\n'
+            'clientSecret: short-secret-5\n'
+            'public_key: PUBKEY-visible\n')
+    YAML_SENTINELS = ('short-api-1', 'short-token-2', 'short-secret-3',
+                      'short-api-4', 'short-secret-5')
+
+    JSON = json.dumps({'api_key': 'short-api-6', 'accessToken': 'short-token-7',
+                       'client_secret': 'short-secret-8', 'public_key': 'PUBKEY-visible'})
+    JSON_SENTINELS = ('short-api-6', 'short-token-7', 'short-secret-8')
+
+    TEXT = ('mihomo: api_key=short-api-9 token: short-token-10 '
+            'client_secret=short-secret-11 public_key=PUBKEY-visible\n')
+
+    def test_yaml_short_secret_names_are_masked(self):
+        text = self.assert_redacted(redact('yaml', self.YAML), self.YAML_SENTINELS)
+        self.assertIn('PUBKEY-visible', text, 'a public key is not a secret')
+
+    def test_json_camel_case_secret_names_are_masked(self):
+        text = self.assert_redacted(redact('json', self.JSON), self.JSON_SENTINELS)
+        self.assertIn('PUBKEY-visible', text)
+
+    def test_log_text_short_secret_names_are_masked(self):
+        text = self.assert_redacted(redact('text', self.TEXT),
+                                    ('short-api-9', 'short-token-10', 'short-secret-11'))
+        self.assertIn('PUBKEY-visible', text)
+
+    def test_verify_rejects_the_short_key_forms(self):
+        for mode, source, _ in (('yaml', self.YAML, self.YAML_SENTINELS),
+                                ('json', self.JSON, self.JSON_SENTINELS)):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'bundle.txt'
+                path.write_text(source, encoding='utf-8', newline='\n')
+                self.assertEqual(verify(directory).returncode, 1, source)
+
+    def test_a_query_string_short_key_is_masked(self):
+        # The URL policy keeps scheme+host (that is what makes a diagnosis possible) and drops
+        # the rest, so the credential cannot survive either way.
+        source = 'GET https://api.example.com/v1?api_key=short-q-12&lang=en HTTP/1.1\n'
+        text = self.assert_redacted(redact('text', source), ('short-q-12',))
+        self.assertIn('api.example.com', text, 'the host was removed as well')
+
+
 if __name__ == '__main__':
     unittest.main()

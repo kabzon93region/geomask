@@ -919,13 +919,34 @@ mod_skipped() { # mod_skipped <module> -> 0 (and a note) when the module is not 
 # Every rewrite of /etc/crontabs/root is a read-modify-write: the panel (nodes_set,
 # sync_set), the installer and uninstall must take the same kernel `cron` lock or one writer
 # silently drops the other's line (report R09). cron_ensure is used by step5 many times.
-_cron_begin() { command -v gm_lock_acquire >/dev/null 2>&1 || return 1; gm_lock_acquire cron 20; }
-_cron_end() { command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release cron; return 0; }
+# Nesting matters: uninstall/restore run with the `cron` lock already held by an outer caller,
+# and the kernel lock treats a second acquire as refusal (rc 3). The depth counter makes the
+# pair re-entrant inside one shell while still releasing exactly once.
+_CRON_LOCK_DEPTH=${_CRON_LOCK_DEPTH:-0}
+_cron_begin() {
+  command -v gm_lock_acquire >/dev/null 2>&1 || return 1
+  gm_lock_acquire cron 20
+  _cbl_rc=$?
+  case "$_cbl_rc" in
+    0|3) _CRON_LOCK_DEPTH=$(( ${_CRON_LOCK_DEPTH:-0} + 1 )); return 0 ;;
+  esac
+  return 1
+}
+_cron_end() {
+  [ "${_CRON_LOCK_DEPTH:-0}" -gt 0 ] || return 0
+  _CRON_LOCK_DEPTH=$(( ${_CRON_LOCK_DEPTH:-0} - 1 ))
+  [ "$_CRON_LOCK_DEPTH" -eq 0 ] || return 0
+  command -v gm_lock_release >/dev/null 2>&1 && gm_lock_release cron
+  return 0
+}
 
 cron_ensure() { # cron_ensure <module> <marker-ere> <cron-line>
   mod_skipped "$1" && return 0
   if crontab -l 2>/dev/null | grep -qE -- "$2"; then info "cron: уже есть ($2)"; return 0; fi
-  if ! _cron_begin; then warn "cron: блокировка недоступна ($2)"; return 0; fi
+  if ! _cron_begin; then
+    warn "cron: блокировка недоступна ($2) - строка не добавлена"
+    return 1
+  fi
   ( crontab -l 2>/dev/null; printf '%s\n' "$3" ) | crontab - 2>/dev/null \
     && info "cron: добавлен ($2)" || warn "cron: не удалось записать ($2)"
   _cron_end
@@ -40727,9 +40748,12 @@ ASSET_EOF
   if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     info "cron already present"
   else
-    _cron_begin
-    ( crontab -l 2>/dev/null; echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' ) | crontab - 2>/dev/null && info "cron added: */5 sync" || warn "cannot set crontab"
-    _cron_end
+    if _cron_begin; then
+      ( crontab -l 2>/dev/null; echo '*/5 * * * * /root/sync_mtrickle_mihomo.sh' ) | crontab - 2>/dev/null && info "cron added: */5 sync" || warn "cannot set crontab"
+      _cron_end
+    else
+      warn "cron: lock unavailable - the */5 sync line was not added"
+    fi
   fi
   # v1.11.0: nightly node audit (registry check of every subscription server)
   save_stream /usr/bin/geomask-node-scan.sh 755 <<'ASSET_EOF'
@@ -41436,9 +41460,12 @@ PYEOF
   elif [ "$(nodescan_schedule_active)" = "1" ]; then
     info "per-path scheduler is active: not adding the legacy nodescan cron"
   else
-    _cron_begin
-    ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
-    _cron_end
+    if _cron_begin; then
+      ( crontab -l 2>/dev/null; echo '30 3 * * * /usr/bin/geomask-node-scan.sh >/dev/null 2>&1 # geomask-nodescan' ) | crontab - 2>/dev/null && info "cron added: 03:30 nodescan" || warn "cannot set crontab"
+      _cron_end
+    else
+      warn "cron: lock unavailable - the legacy nodescan line was not added"
+    fi
   fi
   # v1.14.0: YouTube edge watchdog - failing *.googlevideo.com edges get pinned to VPN,
   # released back to zapret nightly. Source of truth stays in MagiTrickle (group feeds ytvpn.yaml).
@@ -41953,10 +41980,13 @@ PYEOF
   # v1.29.0: the migration only runs for a selected module, and cron_ensure owns creation.
   if module_selected youtube \
      && crontab -l 2>/dev/null | grep -qE '^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch\.sh.*# geomask-ytwatch$'; then
-    _cron_begin
-    ( crontab -l 2>/dev/null | sed 's|^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch.sh|*/1 * * * * /usr/bin/geomask-ytwatch.sh|' ) | crontab - 2>/dev/null \
-      && info "ytwatch cron migrated */5 -> */1" || warn "cannot migrate the ytwatch cron"
-    _cron_end
+    if _cron_begin; then
+      ( crontab -l 2>/dev/null | sed 's|^\*/5 \* \* \* \* /usr/bin/geomask-ytwatch.sh|*/1 * * * * /usr/bin/geomask-ytwatch.sh|' ) | crontab - 2>/dev/null \
+        && info "ytwatch cron migrated */5 -> */1" || warn "cannot migrate the ytwatch cron"
+      _cron_end
+    else
+      warn "cron: lock unavailable - the ytwatch migration was not attempted"
+    fi
   fi
   cron_ensure youtube '# geomask-ytwatch$' '*/1 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch'
   cron_ensure youtube '# geomask-ytwatch-reset$' '20 4 * * * /usr/bin/geomask-ytwatch.sh --reset >/dev/null 2>&1 # geomask-ytwatch-reset'
@@ -42523,7 +42553,11 @@ geomask_uninstall() {
   # the uninstall removes it (report R09). --reinstall calls this with the maintenance lock
   # already held; the fixed order allows maintenance(10) -> cron(50).
   _un_cron=0
-  _cron_begin && _un_cron=1
+  if _cron_begin; then
+    _un_cron=1
+  else
+    warn "cron: блокировка недоступна - строки cron не трогаю"
+  fi
   for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
            /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
            /usr/share/luci/menu.d/luci-app-geo-sync.json; do
@@ -42541,7 +42575,7 @@ geomask_uninstall() {
     info "removed: syncd watchdog"
   fi
   # v1.11.0: node audit removal
-  if crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'geomask-node-scan'; then
     crontab -l 2>/dev/null | grep -v 'geomask-node-scan' | crontab - 2>/dev/null || true
   fi
   rm -f "$(P /usr/bin/geomask-node-scan.sh)"
@@ -42552,7 +42586,7 @@ geomask_uninstall() {
   if [ -z "$1" ] && [ -x "$(P /usr/bin/geomask-ytwatch.sh)" ]; then
     "$(P /usr/bin/geomask-ytwatch.sh)" --reset >/dev/null 2>&1
   fi
-  if crontab -l 2>/dev/null | grep -q 'geomask-ytwatch'; then
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'geomask-ytwatch'; then
     crontab -l 2>/dev/null | grep -v 'geomask-ytwatch' | crontab - 2>/dev/null || true
   fi
   rm -f "$(P /usr/bin/geomask-ytwatch.sh)"
@@ -42561,7 +42595,7 @@ geomask_uninstall() {
   rm -f "$(P /usr/bin/geomask-torrent.sh)"
   info "removed: torrent admin (lists in /etc/geomask/torrent and the ruleset kept for reference)"
   # v1.18.0: vpnwatch removal (the audit log is kept - it is the evidence the operator collected)
-  if crontab -l 2>/dev/null | grep -q 'geomask-vpnwatch'; then
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'geomask-vpnwatch'; then
     crontab -l 2>/dev/null | grep -v 'geomask-vpnwatch' | crontab - 2>/dev/null || true
   fi
   rm -f "$(P /usr/bin/geomask-vpnwatch.sh)"
@@ -42585,11 +42619,11 @@ geomask_uninstall() {
             geomask-diag-spool.py; do
     rm -f "$(P /usr/lib/geomask/$_m)"
   done
-  if crontab -l 2>/dev/null | grep -q 'geomask-audit-schedule'; then
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'geomask-audit-schedule'; then
     crontab -l 2>/dev/null | grep -v 'geomask-audit-schedule' | crontab - 2>/dev/null || true
   fi
   info "removed: node-audit modules (settings, events and reports kept under /etc/geomask)"
-  if crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
+  if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi
   [ "$1" = "noreload" ] || initd rpcd reload 2>/dev/null || true
@@ -44114,24 +44148,31 @@ _rs_restore_services() { # _rs_restore_services <dir> - back to the recorded run
 }
 
 _rs_restore_cron() { # _rs_restore_cron <dir> - exact crontab, foreign lines are a conflict
+  # I03/I04 (audit 18.11.2026): the read, the foreign-line comparison and the write must all
+  # happen under the same kernel `cron` lock. The old version compared before taking it, so a
+  # panel write between the compare and the restore was silently overwritten; it also wrote
+  # the snapshot even when the lock could not be taken.
+  _cron_begin || {
+    bad "rollback: crontab lock unavailable - not overwriting"
+    _rr=1
+    return 1
+  }
   _rs_cur=$(crontab -l 2>/dev/null)
   _rs_cr=$?
   case "$_rs_cr" in
     0|1) : ;;
-    *) bad "rollback: crontab state unobservable (rc=$_rs_cr)"; _rr=1; return 1 ;;
+    *) _cron_end; bad "rollback: crontab state unobservable (rc=$_rs_cr)"; _rr=1; return 1 ;;
   esac
   _rs_want=$(cat "$_rs_snap/cron" 2>/dev/null)
   _rs_re='# geomask-(guard|ytwatch|ytwatch-reset|doctor-prune|vpnwatch|nodescan|audit-schedule)|sync_mtrickle_mihomo|geomask-node-scan'
   _rs_p1=$(printf '%s\n' "$_rs_cur" | grep -vE "$_rs_re" 2>/dev/null)
   _rs_p2=$(printf '%s\n' "$_rs_want" | grep -vE "$_rs_re" 2>/dev/null)
   if [ "$_rs_p1" != "$_rs_p2" ]; then
+    _cron_end
     bad "conflict: crontab changed by another writer after the snapshot - not overwriting"
     _rr=1
     return 1
   fi
-  # Same kernel `cron` lock as every other crontab writer: a panel nodes_set/sync_set must not
-  # interleave with this exact restore (report R09).
-  _cron_begin
   crontab "$_rs_snap/cron" 2>/dev/null \
     || { _cron_end; bad "rollback: crontab write failed"; _rr=1; return 1; }
   _cron_end

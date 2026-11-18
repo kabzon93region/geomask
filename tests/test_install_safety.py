@@ -56,13 +56,18 @@ def reinstall_tables():
 def reinstall_function_names():
     found = re.findall(r'^(_rs_[A-Za-z0-9_]+|_reinstall_(?:save|snapshot|restore))\(\) \{',
                        SOURCE, re.MULTILINE)
-    return [name for name in found if extract(name)]
+    names = [name for name in found if extract(name)]
+    # The cron lock helpers are part of every restore path but are not _rs_*/_reinstall_*.
+    return names + ['_cron_begin', '_cron_end']
 
 
 def install_safety_stubs():
     """Injected runtime adapters for the reinstall snapshot/restore tests."""
     return r'''
 RUNTIME='@RUNTIME@'
+# The cron lock helpers keep their nesting depth in this variable; a fixture that extracts the
+# helpers without the product's top-level assignment would trip `set -u`.
+_CRON_LOCK_DEPTH=0
 # The fixture root has no shared append files and no uci: phase 2b covers both with the
 # dedicated fixture suite, this file keeps testing the byte/links/services contract.
 REINSTALL_SHARED_APPEND=''
@@ -79,6 +84,9 @@ nft() { return 1; }
 uci() { return 1; }
 sysctl() { return 0; }
 pidof() { [ -f "$RUNTIME/$1" ] && return 0; return 1; }
+# pgrep covers script-based services and must follow the fixture, not the host: the reinstall
+# test stops the service (its pid file goes away with /etc/init.d) and expects the rollback to
+# start it again. A stub that always answers "running" would silently stop testing that path.
 pgrep() {
   case "$*" in
     *geomask-syncd.sh*) [ -f "$RUNTIME/geomask-syncd" ] && return 0 ;;
@@ -91,11 +99,28 @@ netstat() { return 1; }
 
 
 def extract(name):
-    match = re.search(r'^' + re.escape(name) + r'\(\) \{.*?^\}\s*$', SOURCE,
-                      re.MULTILINE | re.DOTALL)
-    if not match:
+    """Whole function body; a one-line helper stays a one-liner.
+
+    The old regex stopped at the first line that was exactly `}`. A one-line function such as
+    `_cron_end() { ...; }` has no such line, so the match ran on into the next function and
+    silently pulled unrelated code into the fixture. One-liners are returned as the single
+    line they are; everything else keeps the documented "ends at a column-0 brace" rule.
+    """
+    lines = SOURCE.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.startswith(name + '() {'):
+            start = index
+            break
+    if start is None:
         raise AssertionError('function %s not found in the template' % name)
-    return match.group(0)
+    head = lines[start].rstrip()
+    if head != name + '() {' and head.endswith('}'):
+        return head
+    for index in range(start + 1, len(lines)):
+        if lines[index].rstrip() == '}':
+            return '\n'.join(lines[start:index + 1])
+    raise AssertionError('function %s has no closing brace' % name)
 
 
 SUPPORT = r'''set -u
@@ -545,6 +570,8 @@ mv() {
 'rm -f "%s/etc/rc.d"/*\n'
                 'rm -f "%s/root/sync_mtrickle_mihomo.sh"\n'
                 "crontab -l 2>/dev/null | grep -v '# geomask-guard' | crontab - 2>/dev/null\n"
+                # The uninstall stopped the service: its pid marker is gone with it, while the
+                # rollback has to bring both the script and the running state back.
                 'rm -f "%s/geomask-syncd"\n'
                 'mkdir -p "%s/usr/bin"; printf "new\\n" > "%s/usr/bin/geomask-leftover"\n'
                 'printf "NEW_BACKEND\\n" > "%s/usr/bin/geo-backend.sh"\n'
@@ -685,6 +712,92 @@ step_fn() { case "$2" in check) return 1 ;; apply) printf 'APPLIED\n' ;; esac; r
         self.assertNotIn('APPLIED', result.stdout,
                          'the services were started although the backup gate refused')
 
+    def test_cron_ensure_without_a_lock_does_not_write(self):
+        """I03 of the 18.11 audit: a refused lock must not still rewrite the crontab."""
+        extra = r"""
+module_selected() { return 0; }
+CRONFILE="@CASE@/cron.txt"
+printf 'MAILTO=""\n' > "$CRONFILE"
+crontab() {
+  case "${1:-}" in
+    -l) cat "$CRONFILE" ;;
+    -) cat > "$CRONFILE" ;;
+    *) : ;;
+  esac
+}
+gm_lock_acquire() { return 1; }
+gm_lock_release() { return 0; }
+_CRON_LOCK_DEPTH=0
+""".replace('@CASE@', posix(self.case))
+        body = ('cron_ensure youtube "# geomask-ytwatch$" '
+                '"*/1 * * * * /usr/bin/geomask-ytwatch.sh >/dev/null 2>&1 # geomask-ytwatch"; '
+                'printf "RC=%s\\n" "$?"; cat "$CRONFILE"')
+        result = self.run_script(body, extra=extra,
+                                 functions=['mod_skipped', 'cron_ensure', '_cron_begin',
+                                            '_cron_end'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('geomask-ytwatch',
+                         (self.case / 'cron.txt').read_text(encoding='utf-8'),
+                         'the crontab was rewritten although the lock was refused')
+        self.assertIn('RC=1', result.stdout, result.stdout)
+
+    def test_the_uninstall_does_not_edit_cron_without_a_lock(self):
+        extra = r"""
+module_selected() { return 0; }
+CRONFILE="@CASE@/cron.txt"
+printf '0 0 * * * /root/keep-me\n*/5 * * * * /root/sync_mtrickle_mihomo.sh\n' > "$CRONFILE"
+crontab() {
+  case "${1:-}" in
+    -l) cat "$CRONFILE" ;;
+    -) cat > "$CRONFILE" ;;
+    *) : ;;
+  esac
+}
+gm_lock_acquire() { return 1; }
+gm_lock_release() { return 0; }
+initd() { return 0; }
+pkill() { return 0; }
+rmdir() { return 0; }
+""".replace('@CASE@', posix(self.case))
+        body = 'geomask_uninstall noreload; printf "RC=%s\\n" "$?"; cat "$CRONFILE"'
+        result = self.run_script(body, extra=extra,
+                                 functions=['_cron_begin', '_cron_end', 'geomask_uninstall'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('/root/keep-me', result.stdout)
+        self.assertIn('sync_mtrickle_mihomo', result.stdout,
+                      'the cron line was removed although the lock was refused')
+
+    def test_the_cron_restore_takes_the_lock_before_it_reads(self):
+        """I04/I03: the foreign-line compare must happen inside the lock, and no lock = no write."""
+        snap = self.case / 'snap'
+        snap.mkdir()
+        (snap / 'cron').write_text('0 0 * * * /root/keep-me\n', encoding='utf-8')
+        extra = r"""
+CRONFILE="@CASE@/cron.txt"
+printf '0 5 * * * /root/foreign-after-snapshot\n' > "$CRONFILE"
+crontab() {
+  case "${1:-}" in
+    -l) cat "$CRONFILE" ;;
+    -) cat > "$CRONFILE" ;;
+    *) cp "$1" "$CRONFILE" ;;
+  esac
+}
+gm_lock_acquire() { printf 'LOCK\n'; return 0; }
+gm_lock_release() { printf 'UNLOCK\n'; return 0; }
+_CRON_LOCK_DEPTH=0
+""".replace('@CASE@', posix(self.case))
+        body = ('_rr=0; _rs_restore_cron "%s"; printf "RC=%%s\\n" "$?"; cat "$CRONFILE"'
+                % posix(snap))
+        result = self.run_script(body, extra=extra,
+                                 functions=['_cron_begin', '_cron_end', '_rs_restore_cron'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        log = result.stdout
+        self.assertIn('LOCK', log)
+        self.assertIn('RC=1', log, log)
+        self.assertIn('foreign-after-snapshot', log,
+                      'the restore overwrote a foreign crontab change')
+        self.assertLess(log.index('LOCK'), log.index('conflict'),
+                        'the crontab was read before the lock was taken')
     def test_reinstall_refuses_a_foreign_config_before_removing_anything(self):
         """The old order uninstalled the panel/cron and only then refused the config."""
         conf = self.case / 'etc/mihomo/config.yaml'

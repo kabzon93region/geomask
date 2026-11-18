@@ -290,6 +290,13 @@ _mihomo_py() {
   else python - "$@" 2>/dev/null; fi
 }
 
+# Run an INSTALLED python asset (a file, not a program on stdin). Same interpreter probe as
+# above so a host with only `python` still works; stderr is left to the caller.
+_gm_py_script() { # _gm_py_script <script> [args...]
+  if [ -n "${GM_PYTHON:-}" ]; then "$GM_PYTHON" "$@"; return; fi
+  if python3 -c 'pass' >/dev/null 2>&1; then python3 "$@"; else python "$@"; fi
+}
+
 # PyYAML is what decides ownership of the mihomo config; ask the same interpreter the parser
 # would use, not a hard-coded `python3`.
 _py_yaml_ok() {
@@ -456,6 +463,7 @@ module_owns_path() { # echoes the module id that owns an install path, if any
     "/usr/lib/geomask/geomask-lane-torrent.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-lists-edit.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-lock.sh") GM_PATH_MODULE="core" ;;
+    "/usr/lib/geomask/geomask-mihomo-adopt.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-node-audit.py") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-routes.sh") GM_PATH_MODULE="core" ;;
     "/usr/lib/geomask/geomask-slot-patch.py") GM_PATH_MODULE="core" ;;
@@ -6113,6 +6121,271 @@ def main(argv):
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))
+ASSET_EOF
+  # I05: adoption of a foreign mihomo config is a real merge, not a silent no-op.
+  save_stream /usr/lib/geomask/geomask-mihomo-adopt.py 755 <<'ASSET_EOF'
+#!/usr/bin/env python3
+"""Adopt a foreign mihomo config without losing the owner's settings (audit I05).
+
+`--adopt-config` used to pass the guard and then do nothing: the in-place patch only
+rewrites geomask-shaped files, so the run reported success without adopting anything and
+the NEXT run refused the same file. This tool is the missing step: it produces a merged
+candidate in a separate file, so the live config is untouched until `mihomo -t` passes.
+
+The merge is additive and comment-preserving: only the pieces geomask needs are inserted
+(the managed marker, `proxy-providers.sub`, the `VPN-noP2P`/`AI` groups and the
+`ai-devices`/`torrent-direct` listeners). Every other line stays byte-identical, so the
+owner keeps tun/dns/secret/rules/proxies as they are.
+
+An ambiguous file is refused (rc 3) before anything is written: a half-merged config would
+be worse than an honest refusal. Nothing here talks to the network or to the router.
+
+    geomask-mihomo-adopt.py <src> <dst> --vpn-url URL --lan-ip IP [--hwid H]
+
+rc 0 merged candidate written; rc 3 refused (reason on stderr); rc 4 PyYAML missing;
+rc 5 the merged text does not parse or does not satisfy the shaped contract.
+"""
+import argparse
+import os
+import re
+import sys
+
+MARKER = '# geomask-managed: 1'
+GROUP_NAMES = ('VPN-noP2P', 'AI')
+KEY_RE = re.compile(r'^([A-Za-z0-9_.-]+):(?:\s|$)')
+VPN_EXCLUDE = (
+    'Россия|Мобильный|РФ|Авто|Russia|Mobile|Auto|Албания|Хорватия|Литва|Латвия|Дания|'
+    'Финляндия|Нидерланды-(5|13|16|18)($|[^0-9])|Германия-[234]($|[^0-9])|'
+    'США-1($|[^0-9])|Турция'
+)
+
+
+def refuse(message):
+    print(message, file=sys.stderr)
+    return 3
+
+
+def load_yaml(text):
+    try:
+        import yaml
+    except Exception:
+        return None, 4, 'PyYAML is missing: adoption needs the parser before any write'
+    try:
+        return yaml.safe_load(text), 0, ''
+    except Exception as exc:
+        return None, 3, 'config is not valid YAML: %s' % exc
+
+
+def section_bounds(lines, key):
+    """Return (start, end) of a top-level key, or None. `end` trims trailing blanks."""
+    start = None
+    for index, line in enumerate(lines):
+        match = KEY_RE.match(line)
+        if match and match.group(1) == key:
+            start = index
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if KEY_RE.match(lines[index]):
+            end = index
+            break
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    return start, end
+
+
+def provider_block(url, hwid):
+    out = ['  sub:', '    type: http', '    proxy: DIRECT']
+    if hwid:
+        out += ['    header:', '      x-hwid:', '        - "%s"' % hwid]
+    out += ['    url: "%s"' % url, '    interval: 3600']
+    return out
+
+
+def group_lines():
+    return [
+        '  - name: VPN-noP2P',
+        '    type: url-test',
+        '    use:',
+        '      - sub',
+        '    exclude-filter: "%s"' % VPN_EXCLUDE,
+        '    url: "https://www.gstatic.com/generate_204"',
+        '    interval: 180',
+        '    tolerance: 99999',
+        '    lazy: false',
+        '  - name: AI',
+        '    type: url-test',
+        '    use:',
+        '      - sub',
+        '    filter: "USA"',
+        '    exclude-filter: "HY2"',
+        '    url: "https://www.gstatic.com/generate_204"',
+        '    interval: 180',
+        '    tolerance: 99999',
+        '    lazy: false',
+    ]
+
+
+def listener_item(name, port, listen, proxy):
+    return [
+        '  - name: %s' % name,
+        '    type: mixed',
+        '    port: %d' % port,
+        '    listen: %s' % listen,
+        '    proxy: %s' % proxy,
+    ]
+
+
+def wanted_listeners(lan_ip):
+    return [
+        ('ai-devices', 7891, '127.0.0.1', 'AI', listener_item('ai-devices', 7891, '127.0.0.1', 'AI')),
+        ('torrent-direct', 7894, lan_ip, 'DIRECT', listener_item('torrent-direct', 7894, lan_ip, 'DIRECT')),
+    ]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument('src')
+    parser.add_argument('dst')
+    parser.add_argument('--vpn-url', default='')
+    parser.add_argument('--lan-ip', default='')
+    parser.add_argument('--hwid', default='')
+    args = parser.parse_args(argv)
+
+    try:
+        with open(args.src, encoding='utf-8') as handle:
+            text = handle.read()
+    except OSError as exc:
+        return refuse('cannot read %s: %s' % (args.src, exc))
+    if not text.strip():
+        return refuse('config is empty - nothing to adopt')
+
+    data, rc, message = load_yaml(text)
+    if rc:
+        return refuse(message)
+    if not isinstance(data, dict):
+        return refuse('config is not a YAML mapping - refusing to guess its structure')
+
+    providers = data.get('proxy-providers')
+    if providers is not None and not isinstance(providers, dict):
+        return refuse('proxy-providers is not a mapping - refusing to merge into it')
+    groups = data.get('proxy-groups')
+    if groups is not None:
+        if not isinstance(groups, list):
+            return refuse('proxy-groups is not a list - refusing to merge into it')
+        names = []
+        for item in groups:
+            if not isinstance(item, dict):
+                return refuse('proxy-groups contains a non-mapping item - refusing')
+            name = item.get('name')
+            if isinstance(name, str):
+                names.append(name)
+        clash = [name for name in GROUP_NAMES if name in names]
+        if clash:
+            return refuse('the config already has %s with its own meaning - '
+                          'rename it or use --replace-config' % ', '.join(clash))
+    if isinstance(providers, dict) and 'sub' in providers:
+        return refuse('proxy-providers.sub already exists with another meaning - '
+                      'use --replace-config instead of adoption')
+    proxies = data.get('proxies')
+    if not proxies and not providers:
+        return refuse('the config has no proxies and no proxy-providers - '
+                      'adoption would leave nothing to route')
+    listeners = data.get('listeners')
+    if listeners is not None:
+        if not isinstance(listeners, list):
+            return refuse('listeners is not a list - refusing to merge into it')
+        for item in listeners:
+            if not isinstance(item, dict):
+                return refuse('listeners contains a non-mapping item - refusing')
+            name = item.get('name')
+            for want, _port, _listen, proxy, _block in wanted_listeners(args.lan_ip):
+                if name != want:
+                    continue
+                if item.get('proxy') != proxy:
+                    return refuse('listener %s already exists with proxy %r, geomask needs %s'
+                                  % (want, item.get('proxy'), proxy))
+
+    eol = '\r\n' if '\r\n' in text else '\n'
+    lines = text.replace('\r\n', '\n').split('\n')
+    while lines and lines[-1] == '':
+        lines.pop()
+
+    added = []
+    if MARKER not in [line.strip() for line in lines]:
+        lines[0:0] = [MARKER]
+        added.append('marker')
+
+    sub_block = provider_block(args.vpn_url, args.hwid)
+    bounds = section_bounds(lines, 'proxy-providers')
+    if bounds is None:
+        lines += ['', 'proxy-providers:'] + sub_block
+        added.append('proxy-providers.sub')
+    else:
+        lines[bounds[0] + 1:bounds[0] + 1] = sub_block
+        added.append('proxy-providers.sub')
+
+    have_groups = set()
+    bounds = section_bounds(lines, 'proxy-groups')
+    if bounds is not None:
+        for line in lines[bounds[0]:bounds[1]]:
+            match = re.match(r'^\s*-\s*name:\s*(\S+)\s*$', line)
+            if match:
+                have_groups.add(match.group(1))
+    missing = [name for name in GROUP_NAMES if name not in have_groups]
+    if missing:
+        block = group_lines()
+        if len(missing) == 1:
+            block = block[10:] if missing[0] == 'AI' else block[:10]
+        bounds = section_bounds(lines, 'proxy-groups')
+        if bounds is None:
+            lines += ['', 'proxy-groups:'] + block
+        else:
+            lines[bounds[1]:bounds[1]] = block
+        added.append('groups:%s' % ','.join(missing))
+
+    bounds = section_bounds(lines, 'listeners')
+    live = set()
+    if bounds is not None:
+        for line in lines[bounds[0]:bounds[1]]:
+            match = re.match(r'^\s*-\s*name:\s*(\S+)\s*$', line)
+            if match:
+                live.add(match.group(1))
+    for name, _port, _listen, _proxy, block in wanted_listeners(args.lan_ip):
+        if name in live:
+            continue
+        bounds = section_bounds(lines, 'listeners')
+        if bounds is None:
+            lines += ['', 'listeners:'] + block
+        else:
+            lines[bounds[1]:bounds[1]] = block
+        added.append('listener:%s' % name)
+
+    merged = eol.join(lines) + eol
+    data, rc, message = load_yaml(merged)
+    if rc:
+        return refuse('the merged candidate does not parse (%s) - nothing written' % message)
+    providers = data.get('proxy-providers') or {}
+    groups = data.get('proxy-groups') or []
+    names = {item.get('name') for item in groups if isinstance(item, dict)}
+    if 'sub' not in providers or not set(GROUP_NAMES) <= names:
+        return refuse('the merged candidate is still not geomask-shaped - nothing written')
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        handle = os.open(args.dst, flags, 0o600)
+    except OSError as exc:
+        return refuse('cannot create %s: %s' % (args.dst, exc))
+    with os.fdopen(handle, 'w', encoding='utf-8', newline='') as out:
+        out.write(merged)
+    print('adopted: %s' % ', '.join(added))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
 ASSET_EOF
   save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
 #!/bin/sh
@@ -17591,6 +17864,12 @@ ASSET_EOF
           "sha256": "e2c6843e8f2534129367aedc468e17ec0584fdd4dc91b95282e74f58a4117e1b"
         },
         {
+          "path": "/usr/lib/geomask/geomask-mihomo-adopt.py",
+          "source": "assets/geomask-mihomo-adopt.py",
+          "mode": "0755",
+          "sha256": "84af58d0749af95c6fb47c778aad8f2cae2a8574fbe00d6f2af968b1d0e562db"
+        },
+        {
           "path": "/usr/lib/geomask/geomask-node-audit.py",
           "source": "assets/geomask-node-audit.py",
           "mode": "0755",
@@ -20247,6 +20526,35 @@ _write_mihomo_config_unlocked() { # the actual writer; called only under config-
     info "  Взять его под управление без потери настроек: --adopt-config"
     info "  Полная замена шаблоном (tun/dns/secret и ваши правила будут потеряны): --replace-config"
     return 1
+  fi
+  # I05 (audit 18.11.2026): --adopt-config used to pass the guard above and then do nothing -
+  # the in-place patch below only rewrites geomask-shaped files, so the run reported success
+  # without adopting anything and the NEXT run refused the same file. Adoption is a real step
+  # now, and it happens before the first write: the tool merges into a separate candidate
+  # (owner's tun/dns/secret/rules/proxies stay byte-identical), `mihomo -t` must accept it and
+  # only then is the live config replaced. A refusal names the reason and changes nothing.
+  if [ -s "$_c" ] && [ "${GM_ADOPT:-0}" = 1 ] && ! geomask_config_shaped "$_c"; then
+    _adopt="$_c.adopt.$_wpid"
+    _adopt_tool="$(P /usr/lib/geomask/geomask-mihomo-adopt.py)"
+    _adopt_msg=$(_gm_py_script "$_adopt_tool" "$_c" "$_adopt" --vpn-url "$_vpnu" \
+                   --lan-ip "$_lanip" ${_hwid:+--hwid "$_hwid"} 2>&1 >/dev/null)
+    if [ ! -s "$_adopt" ]; then
+      rm -f "$_adopt"
+      bad "adopt невозможен: конфиг не удаётся слить без потери смысла"
+      [ -n "$_adopt_msg" ] && info "  $_adopt_msg"
+      info "  Ничего не изменено. Полная замена: --replace-config (настройки будут потеряны)"
+      return 1
+    fi
+    if ! mihomo_validate "$_adopt"; then
+      rm -f "$_adopt"
+      bad "adopt: mihomo -t не принял объединённый конфиг - живой файл не тронут"
+      return 1
+    fi
+    cp -p "$_c" "$_c.bak_geomask_$(date +%s 2>/dev/null || echo bak)" 2>/dev/null || true
+    chmod 600 "$_adopt" 2>/dev/null
+    mv -f "$_adopt" "$_c" || { rm -f "$_adopt"; bad "adopt: не удалось заменить конфиг"; return 1; }
+    chmod 600 "$_c" 2>/dev/null
+    info "конфиг взят под управление (adopt): $_adopt_msg"
   fi
   # --- existing 2-subscription config: keep it as-is (custom rules, headers, sniffer)
   #     and only patch provider urls / ensure the ai-devices listener ---
@@ -43028,7 +43336,7 @@ geomask_uninstall() {
   for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
             geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
             geomask-sync-youtube.py geomask-audit-scheduler.py geomask-subscription-status.py \
-            geomask-slot-patch.py geomask-console.py geomask-dnsguard.sh \
+            geomask-slot-patch.py geomask-mihomo-adopt.py geomask-console.py geomask-dnsguard.sh \
             geomask-diag-spool.py; do
     rm -f "$(P /usr/lib/geomask/$_m)"
   done
@@ -45332,6 +45640,7 @@ REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-o
 /usr/lib/geomask/geomask-audit-scheduler.py|regular-or-absent
 /usr/lib/geomask/geomask-subscription-status.py|regular-or-absent
 /usr/lib/geomask/geomask-slot-patch.py|regular-or-absent
+/usr/lib/geomask/geomask-mihomo-adopt.py|regular-or-absent
 /usr/lib/geomask/geomask-console.py|regular-or-absent
 /usr/lib/geomask/geomask-dnsguard.sh|regular-or-absent
 /usr/lib/geomask/geomask-diag-spool.py|regular-or-absent

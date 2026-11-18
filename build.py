@@ -22,6 +22,7 @@ MAP = {
     "geomask-audit-scheduler.py": "geomask-audit-scheduler.py",
     "geomask-subscription-status.py": "geomask-subscription-status.py",
     "geomask-slot-patch.py": "geomask-slot-patch.py",
+    "geomask-mihomo-adopt.py": "geomask-mihomo-adopt.py",
     "geo-sync":              "geo-sync",
     "acl.json":              "acl-geo-sync.json",
     "menu.json":             "menu-geo-sync.json",

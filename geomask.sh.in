@@ -290,6 +290,13 @@ _mihomo_py() {
   else python - "$@" 2>/dev/null; fi
 }
 
+# Run an INSTALLED python asset (a file, not a program on stdin). Same interpreter probe as
+# above so a host with only `python` still works; stderr is left to the caller.
+_gm_py_script() { # _gm_py_script <script> [args...]
+  if [ -n "${GM_PYTHON:-}" ]; then "$GM_PYTHON" "$@"; return; fi
+  if python3 -c 'pass' >/dev/null 2>&1; then python3 "$@"; else python "$@"; fi
+}
+
 # PyYAML is what decides ownership of the mihomo config; ask the same interpreter the parser
 # would use, not a hard-coded `python3`.
 _py_yaml_ok() {
@@ -977,6 +984,10 @@ ASSET_EOF
   save_stream /usr/lib/geomask/geomask-slot-patch.py 755 <<'ASSET_EOF'
 @@ASSET:geomask-slot-patch.py@@
 ASSET_EOF
+  # I05: adoption of a foreign mihomo config is a real merge, not a silent no-op.
+  save_stream /usr/lib/geomask/geomask-mihomo-adopt.py 755 <<'ASSET_EOF'
+@@ASSET:geomask-mihomo-adopt.py@@
+ASSET_EOF
   save_stream /usr/bin/geo-backend.sh 755 <<'ASSET_EOF'
 @@ASSET:geo-backend.sh@@
 ASSET_EOF
@@ -1288,6 +1299,35 @@ _write_mihomo_config_unlocked() { # the actual writer; called only under config-
     info "  Взять его под управление без потери настроек: --adopt-config"
     info "  Полная замена шаблоном (tun/dns/secret и ваши правила будут потеряны): --replace-config"
     return 1
+  fi
+  # I05 (audit 18.11.2026): --adopt-config used to pass the guard above and then do nothing -
+  # the in-place patch below only rewrites geomask-shaped files, so the run reported success
+  # without adopting anything and the NEXT run refused the same file. Adoption is a real step
+  # now, and it happens before the first write: the tool merges into a separate candidate
+  # (owner's tun/dns/secret/rules/proxies stay byte-identical), `mihomo -t` must accept it and
+  # only then is the live config replaced. A refusal names the reason and changes nothing.
+  if [ -s "$_c" ] && [ "${GM_ADOPT:-0}" = 1 ] && ! geomask_config_shaped "$_c"; then
+    _adopt="$_c.adopt.$_wpid"
+    _adopt_tool="$(P /usr/lib/geomask/geomask-mihomo-adopt.py)"
+    _adopt_msg=$(_gm_py_script "$_adopt_tool" "$_c" "$_adopt" --vpn-url "$_vpnu" \
+                   --lan-ip "$_lanip" ${_hwid:+--hwid "$_hwid"} 2>&1 >/dev/null)
+    if [ ! -s "$_adopt" ]; then
+      rm -f "$_adopt"
+      bad "adopt невозможен: конфиг не удаётся слить без потери смысла"
+      [ -n "$_adopt_msg" ] && info "  $_adopt_msg"
+      info "  Ничего не изменено. Полная замена: --replace-config (настройки будут потеряны)"
+      return 1
+    fi
+    if ! mihomo_validate "$_adopt"; then
+      rm -f "$_adopt"
+      bad "adopt: mihomo -t не принял объединённый конфиг - живой файл не тронут"
+      return 1
+    fi
+    cp -p "$_c" "$_c.bak_geomask_$(date +%s 2>/dev/null || echo bak)" 2>/dev/null || true
+    chmod 600 "$_adopt" 2>/dev/null
+    mv -f "$_adopt" "$_c" || { rm -f "$_adopt"; bad "adopt: не удалось заменить конфиг"; return 1; }
+    chmod 600 "$_c" 2>/dev/null
+    info "конфиг взят под управление (adopt): $_adopt_msg"
   fi
   # --- existing 2-subscription config: keep it as-is (custom rules, headers, sniffer)
   #     and only patch provider urls / ensure the ai-devices listener ---
@@ -3279,7 +3319,7 @@ geomask_uninstall() {
   for _m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
             geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
             geomask-sync-youtube.py geomask-audit-scheduler.py geomask-subscription-status.py \
-            geomask-slot-patch.py geomask-console.py geomask-dnsguard.sh \
+            geomask-slot-patch.py geomask-mihomo-adopt.py geomask-console.py geomask-dnsguard.sh \
             geomask-diag-spool.py; do
     rm -f "$(P /usr/lib/geomask/$_m)"
   done
@@ -5583,6 +5623,7 @@ REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-o
 /usr/lib/geomask/geomask-audit-scheduler.py|regular-or-absent
 /usr/lib/geomask/geomask-subscription-status.py|regular-or-absent
 /usr/lib/geomask/geomask-slot-patch.py|regular-or-absent
+/usr/lib/geomask/geomask-mihomo-adopt.py|regular-or-absent
 /usr/lib/geomask/geomask-console.py|regular-or-absent
 /usr/lib/geomask/geomask-dnsguard.sh|regular-or-absent
 /usr/lib/geomask/geomask-diag-spool.py|regular-or-absent

@@ -203,6 +203,12 @@
           "sha256": "e2c6843e8f2534129367aedc468e17ec0584fdd4dc91b95282e74f58a4117e1b"
         },
         {
+          "path": "/usr/lib/geomask/geomask-mihomo-adopt.py",
+          "source": "assets/geomask-mihomo-adopt.py",
+          "mode": "0755",
+          "sha256": "84af58d0749af95c6fb47c778aad8f2cae2a8574fbe00d6f2af968b1d0e562db"
+        },
+        {
           "path": "/usr/lib/geomask/geomask-node-audit.py",
           "source": "assets/geomask-node-audit.py",
           "mode": "0755",

@@ -106,6 +106,9 @@ case "$1 $2" in
       esac
     done
     [ -f "$CASE/fail-route-$_tbl" ] && exit 1
+    if [ -f "$CASE/fail-route-dev-$_tbl" ]; then
+      case "$_rest" in *" dev "*) exit 1 ;; esac
+    fi
     _pfx=${_rest%% *}
     if [ -f "$CASE/tbl-$_tbl" ]; then
       awk -v p="$_pfx" '$1 != p' "$CASE/tbl-$_tbl" > "$CASE/tbl-$_tbl.new" \
@@ -506,7 +509,29 @@ class GuardEntrypointTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1,
                          'a down console tun was reported as healthy:\n'
                          + result.stdout + self.read('logger.log'))
-        self.assertIn('tunnel down', self.read('logger.log'))
+        self.assertIn('has no default', self.read('logger.log'))
+
+    def test_tunnel_down_closes_the_lane_instead_of_leaking_to_the_wan(self):
+        """P01: a WAN default in table 102 must not carry the console out the real address."""
+        self.write('console.state', 'enabled=1\nip=10.20.30.40\n')
+        self.write('tbl-102', 'default via 192.168.1.1 dev br-lan\n')
+        (self.case / 'fail-route-dev-102').write_text('1\n', encoding='utf-8')
+        result = self.run_guard()
+        self.assertEqual(self.lines('tbl-102'), ['default unreachable'],
+                         'the console table stayed on the WAN default after the tunnel failed')
+        log = self.read('logger.log')
+        self.assertIn('not sent via WAN', log)
+        self.assertIn('-D -s 10.20.30.40', self.read('conntrack.calls'),
+                      'established flows of the console client were left on the old path')
+        self.assertEqual(result.returncode, 1, result.stdout + log)
+
+    def test_the_lane_is_restored_when_the_tunnel_returns(self):
+        """The fail-closed default is not sticky: a live tun replaces it again."""
+        self.write('console.state', 'enabled=1\nip=10.20.30.40\n')
+        self.write('tbl-102', 'default unreachable\n')
+        result = self.run_guard()
+        self.assertEqual(self.lines('tbl-102'), ['default dev Console'])
+        self.assertEqual(result.returncode, 0, result.stdout + self.read('logger.log'))
 
 
 if __name__ == '__main__':

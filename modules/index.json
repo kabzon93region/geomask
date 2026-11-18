@@ -312,7 +312,7 @@
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "6f6cb2e624588f7700cfcb00950ac9fc85489d0a77601b1118d07566ff1c591e"
+          "sha256": "0de619a542bc335e61b00326ac81477ce1bc1c02df582b35e46365da15a299ef"
         }
       ]
     },

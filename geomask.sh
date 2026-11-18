@@ -17700,7 +17700,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-guard.sh",
           "source": "assets/geomask-guard.sh",
           "mode": "0755",
-          "sha256": "6f6cb2e624588f7700cfcb00950ac9fc85489d0a77601b1118d07566ff1c591e"
+          "sha256": "0de619a542bc335e61b00326ac81477ce1bc1c02df582b35e46365da15a299ef"
         }
       ]
     },
@@ -41020,7 +41020,18 @@ if console_lock; then
             log "console table $CTBL default restored (dev $CTUN)"
           else
             RC_DEGRADED=1
-            log "WARN console table $CTBL has no default (tunnel down?)"
+            # P01 (audit 18.11.2026): a table whose default is the WAN one (or which has no
+            # default at all) still matched the console rule, so the console quietly left with
+            # the real address while the guard reported only a warning. Fail closed instead:
+            # the lane's own default becomes unreachable, established flows of that client are
+            # dropped, and the next run restores the tunnel as soon as the device is back.
+            if ip route replace table "$CTBL" default unreachable 2>/dev/null; then
+              log "FAIL console lane closed: table $CTBL default is unreachable (tunnel $CTUN is down) - traffic is rejected, not sent via WAN"
+            else
+              log "FAIL console table $CTBL has no default and could not be closed (tunnel $CTUN down?)"
+            fi
+            conntrack -D -s "$CIP" >/dev/null 2>&1
+            conntrack -D -d "$CIP" >/dev/null 2>&1
           fi
         fi
       fi

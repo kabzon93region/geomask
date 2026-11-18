@@ -340,6 +340,9 @@ info() { :; }
 ask() { return 0; }
 df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 100000 1 90000 1%% /\n'; }
 geomask_config_shaped() { return 0; }
+# N04: ownership is decided by the tri-state verdict now; the fixture must answer it.
+geomask_config_verdict() { return 0; }
+_mihomo_guard() { return 0; }
 _mihomo_py() { :; }
 _prov_url() { printf 'https://example.invalid/sub'; }
 _py_yaml_ok() { return 0; }

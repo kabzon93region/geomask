@@ -1643,6 +1643,21 @@
       "snapshot": "NONE",
       "restore": "NR",
       "notes": "transient-квитанция аудита"
+    },
+    {
+      "id": "/usr/lib/geomask/geomask-mihomo-adopt.py",
+      "path": "/usr/lib/geomask/geomask-mihomo-adopt.py",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "755",
+      "phase": "step2+uninstall-removes",
+      "writers": [
+        "save_stream step2_apply",
+        "uninstall removes"
+      ],
+      "snapshot": "SB",
+      "restore": "RB",
+      "notes": "I05: adoption merge tool; executed by _write_mihomo_config_unlocked"
     }
   ],
   "dynamic": [
@@ -1698,13 +1713,13 @@
         "cp",
         "chmod"
       ],
-      "site_regex": "\\.de5rm|\\.urlnew|\\.tdnew|\\.ecnew|\\.zmnew|pre-run-|\\$_pre\\b|\\$_wpid\\b|\\$_tmpconf\\b",
-      "path_regex": ".*\\.(de5rm|urlnew|tdnew|ecnew|zmnew|pre-run-[^/]*)(\\.[0-9]+|\\.\\*)?$",
+      "site_regex": "\\.de5rm|\\.urlnew|\\.tdnew|\\.ecnew|\\.zmnew|pre-run-|\\$_pre\\b|\\$_wpid\\b|\\$_tmpconf\\b|adopt",
+      "path_regex": ".*\\.(de5rm|urlnew|tdnew|ecnew|zmnew|adopt|pre-run-[^/]*)(\\.[0-9]+|\\.\\*)?$",
       "type": "dynamic",
       "owner": "ours",
       "snapshot": "SBA",
       "restore": "RB",
-      "notes": "временные файлы точечного патча конфига + pre-run-копия GM_PRE_CONFIG"
+      "notes": "временные файлы точечного патча конфига + pre-run-копия GM_PRE_CONFIG; I05: <config>.adopt.<pid> - candidate of --adopt-config (removed on refusal/rejected validation)"
     },
     {
       "id": "dyn.mihomo-preimage-restore",
@@ -2005,6 +2020,25 @@
       ],
       "site_regex": "_msw_tmp|modules\\.json|handle\\.write\\(|sys\\.argv\\[1\\]",
       "notes": "атомарная публикация выбора модулей: временный файл рядом с целью, затем переименование (I10)"
+    },
+    {
+      "id": "dyn.selection-prune",
+      "functions": [
+        "modules_remove_runtime"
+      ],
+      "effects": [
+        "rm",
+        "cron",
+        "nft",
+        "service"
+      ],
+      "site_regex": "\\$_mrr_f|\\$_mrr_path|crontab",
+      "path_regex": "^(/usr/bin|/usr/sbin)/geomask-[a-z0-9-]+\\.sh$|^/etc/init\\.d/(ai-doh|dnsmasq-ai)$|^/etc/hotplug\\.d/[a-z0-9-]+/[0-9]+-geomask-[a-z0-9-]+$",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SBA",
+      "restore": "NR",
+      "notes": "I11: only the entrypoints/init scripts/hotplug hooks a module declares in owned_resources; /usr/lib/geomask modules and owner state/config files are never in that list"
     }
   ],
   "services": [
@@ -2419,6 +2453,16 @@
       "restore": "NR",
       "owner": "ours",
       "notes": "провал refresh НЕ является откатом; preflight обязан требовать наблюдаемость результата или отказываться"
+    },
+    {
+      "id": "net.nft-selection-prune",
+      "kind": "nft-table",
+      "object": "nft",
+      "pattern": "modules_remove_runtime|nft delete table inet",
+      "detail": "modules_remove_runtime deletes exactly the table a dropped module declares as owned (e.g. geomask_ai_dns); nothing else is touched",
+      "snapshot": "NFT",
+      "restore": "NR",
+      "owner": "ours"
     }
   ],
   "processes": [
@@ -2561,6 +2605,12 @@
       "scope": "all",
       "invoked_by": "geomask_uninstall (ytwatch --reset); cron */1 и */4 в обычной эксплуатации",
       "notes": "пишет /etc/geomask/ytwatch.state, управляется через /etc/geomask-ytwatch.conf (script-evidence), /var/run/magitrickle.sock - read-only IPC"
+    },
+    {
+      "file": "assets/geomask-mihomo-adopt.py",
+      "scope": "all",
+      "invoked_by": "_write_mihomo_config_unlocked (--adopt-config), step2_apply installs it",
+      "notes": "adoption merge: reads the live mihomo config, writes only a separate <config>.adopt.<pid> candidate; the caller validates it with mihomo -t and then replaces the live file"
     }
   ],
   "read_only": [

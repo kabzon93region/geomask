@@ -2242,11 +2242,12 @@
     {
       "id": "uci.network",
       "package": "network",
-      "keys": "network.lanai=interface (proto/device/ipaddr/netmask); network.lan.ip6assign",
+      "keys": "network.lanai=interface (proto/device/ipaddr/netmask); network.lan.ip6assign; network.<iface>.ip6assign (IPv6 off/restore per interface)",
       "key_patterns": [
         "^network\\.lanai(\\.(proto|device|ipaddr|netmask))?$",
         "^network\\.lanai\\.\\$_rs_o$",
         "^network\\.lan(\\.ip6assign)?$",
+        "^network\\.\\$_if\\.ip6assign$",
         "^commit:network$"
       ],
       "delta_file": "/etc/config/network",
@@ -2261,9 +2262,10 @@
     {
       "id": "uci.dhcp",
       "package": "dhcp",
-      "keys": "dhcp.lan.ra, dhcp.lan.dhcpv6, dhcp.lan.ndp",
+      "keys": "dhcp.lan.ra, dhcp.lan.dhcpv6, dhcp.lan.ndp; dhcp.<iface>.ra/dhcpv6/ndp (IPv6 off/restore per interface)",
       "key_patterns": [
         "^dhcp\\.lan(\\.(ra|dhcpv6|ndp|\\$_k))?$",
+        "^dhcp\\.\\$_if\\.(ra|dhcpv6|ndp|\\$_k)$",
         "^commit:dhcp$"
       ],
       "delta_file": "/etc/config/dhcp",

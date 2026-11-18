@@ -187,9 +187,11 @@ class DynamicTests(GateHarness):
                         + '\n'.join(problems))
 
     def test_d1_new_unresolvable_writer_in_save_stream_is_not_absorbed(self):
+        # The temp name is mkstemp-unique now, so the anchor is the mktemp line itself.
         augmented = self.source.replace(
-            '  _tmp="$_t.zmnew"\n',
-            '  _tmp="$_t.zmnew"\n  cat > "$_r03_brand_new_shape" 2>/dev/null\n', 1)
+            '  _tmp=$(mktemp "$_t.zmnew.XXXXXX" 2>/dev/null) || _tmp="$_t.zmnew.$$"\n',
+            '  _tmp=$(mktemp "$_t.zmnew.XXXXXX" 2>/dev/null) || _tmp="$_t.zmnew.$$"\n'
+            '  cat > "$_r03_brand_new_shape" 2>/dev/null\n', 1)
         self.assertNotEqual(augmented, self.source, 'injection point not found')
         self._assert_uncovered(self.problems_with(installer_text=augmented),
                                'r03_brand_new_shape')

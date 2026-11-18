@@ -791,7 +791,9 @@ class UpdaterTrustTests(unittest.TestCase):
                             ('CACHE_ROOT', str(self.private)),
                             ('CACHE', str(self.cache)),
                             ('INSTALL_ROOTS', (str(self.root) + os.sep,))):
-            patcher = mock.patch.object(updater, name, value)
+            # create=True: on the pre-fix code these names do not exist, and the point of the
+            # tests is a behavioural RED (root write refused), not a setUp AttributeError.
+            patcher = mock.patch.object(updater, name, value, create=True)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -884,6 +886,33 @@ class UpdaterTrustTests(unittest.TestCase):
                                     fetcher=self.fetch_body(b'x\n'))
         self.assertIn('absolute', str(caught.exception))
 
+    def test_the_shipped_policy_accepts_every_catalogue_destination(self):
+        # The allow-list must cover the real catalogue, otherwise a legal module update breaks
+        # on every router until a full reinstall. This uses the shipped constant, not a patch.
+        spec = importlib.util.spec_from_file_location('module_update_fresh', HELPER)
+        fresh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh)
+        index = json.loads((ROOT / 'modules' / 'index.json').read_text(encoding='utf-8'))
+        paths = [entry['path'] for module in index['modules'].values()
+                 for entry in module.get('files') or []]
+        self.assertTrue(paths)
+        for path in paths:
+            self.assertEqual('', fresh.destination_problem(path),
+                             'the shipped policy refuses a real catalogue path: %s' % path)
+
+    @unittest.skipUnless(NATIVE_SYMLINKS, 'native symlinks unavailable: ' + SYMLINK_REASON)
+    def test_a_symlinked_cache_directory_is_refused(self):
+        # The directory decides who may replace the cache file, so it is checked too.
+        real = self.root / 'real-cache'
+        real.mkdir()
+        link = self.root / 'cache-link'
+        os.symlink(str(real), str(link))
+        with mock.patch.object(updater, 'CACHE_ROOT', str(link), create=True), \
+                mock.patch.object(updater, 'CACHE', str(link / 'modules-index.json')):
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.load_index(self.config, offline=True, fetcher=self.no_network)
+        self.assertIn('not trusted', str(caught.exception))
+
     # --- U02: the commit re-validates what it overwrites ------------------
     def test_owner_edit_between_stage_and_commit_is_not_lost(self):
         self.dest.write_bytes(b'old\n')
@@ -919,6 +948,19 @@ class UpdaterTrustTests(unittest.TestCase):
                                    str(self.state_path))
         self.assertIn('changed while the update was staged', str(caught.exception))
         self.assertFalse(self.dest.exists(), 'a refused commit recreated the file')
+
+    def test_a_file_created_after_staging_is_not_overwritten(self):
+        # A module may add a new file; while the rest of the module downloads, the owner (or
+        # the installer) can create that path. The commit must not silently replace it.
+        index = self.catalogue(self.dest, b'new\n')
+        _module, staged, _changed = updater.download_module(
+            index, {'modules': {}}, 'core', self.config, fetcher=self.fetch_body(b'new\n'))
+        self.dest.write_bytes(b'created meanwhile\n')
+        with self.assertRaises(updater.UpdateError) as caught:
+            updater.install_staged('core', staged, {'modules': {}}, '2.0.0',
+                                   str(self.state_path))
+        self.assertIn('changed while the update was staged', str(caught.exception))
+        self.assertEqual(self.dest.read_bytes(), b'created meanwhile\n')
 
     # --- U03: symlink identity -------------------------------------------
     @unittest.skipUnless(NATIVE_SYMLINKS, 'native symlinks unavailable: ' + SYMLINK_REASON)

@@ -225,6 +225,36 @@ class ManifestGateTests(unittest.TestCase):
         self.assertEqual('RK', entry['restore'])
         self.assertIn('interface', entry['detail'])
 
+    # --------------------------------------------------- callee path policy (U01)
+    def test_callee_path_policy_is_declared_with_reasons(self):
+        policy = self.manifest.get('callee_path_policy') or []
+        self.assertTrue(policy, 'the updater install-root policy is not declared')
+        self.assertIn('/etc/geomask/cache', {entry['path'] for entry in policy})
+        for entry in policy:
+            self.assertTrue(entry.get('reason'), 'policy entry without a reason: %s'
+                            % entry.get('id'))
+
+    def test_gate_rejects_a_policy_entry_without_a_reason(self):
+        manifest = copy.deepcopy(self.manifest)
+        manifest['callee_path_policy'][0]['reason'] = ''
+        problems = rm.check(manifest)
+        self.assertTrue(any('without a reason' in problem for problem in problems),
+                        'a policy entry without a reason passed the gate')
+
+    def test_gate_rejects_a_stale_policy_entry(self):
+        manifest = copy.deepcopy(self.manifest)
+        manifest['callee_path_policy'].append({'id': 'stale', 'path': '/etc/not-in-any-callee/',
+                                               'reason': 'stale declaration'})
+        problems = rm.check(manifest)
+        self.assertTrue(any('without any literal' in problem for problem in problems),
+                        'a policy entry that names no real literal passed the gate')
+
+    def test_a_policy_path_does_not_excuse_an_installer_write_site(self):
+        # Policy entries classify literals inside a callee. If they also covered the
+        # installer's own writer sites, a save_stream aimed at a bare root would pass.
+        self.assertFalse(rm._covered_by_files(self.manifest, '/etc/geomask/'))
+        self.assertTrue(rm._covered_by_files(self.manifest, '/etc/geomask/', allow_policy=True))
+
 
 if __name__ == '__main__':
     unittest.main()

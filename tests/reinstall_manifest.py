@@ -489,16 +489,19 @@ def callee_texts(manifest: dict) -> dict:
 # the gate
 
 
-def _covered_by_files(manifest: dict, path: str) -> bool:
+def _covered_by_files(manifest: dict, path: str, allow_policy=False) -> bool:
     for entry in manifest.get('files') or []:
         if entry.get('path') == path:
             return True
     for entry in manifest.get('read_only') or []:
         if entry.get('path') == path:
             return True
-    for entry in manifest.get('callee_path_policy') or []:
-        if entry.get('path') == path:
-            return True
+    # The updater's install-root policy classifies literals inside a *callee*; it must never
+    # excuse an installer write site, so only the callee pass sets allow_policy.
+    if allow_policy:
+        for entry in manifest.get('callee_path_policy') or []:
+            if entry.get('path') == path:
+                return True
     return _covered_by_dynamic(manifest, path)
 
 
@@ -687,7 +690,7 @@ def check(manifest: dict) -> list[str]:
             problems.append('callee scope body is empty: %s' % label)
             continue
         for path in sorted(path_literals(body)):
-            if not _covered_by_files(manifest, path):
+            if not _covered_by_files(manifest, path, allow_policy=True):
                 problems.append('unclassified path in callee %s: %s' % (label, path))
         # 4b. uci/net/sysctl/process effects inside the callee bodies are covered by
         #     concrete declarations too (review E): a new key/rule/process fails here

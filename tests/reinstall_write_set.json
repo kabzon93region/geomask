@@ -1526,7 +1526,8 @@
       "owner": "ours",
       "mode": "700",
       "writers": [
-        "callee geomask-module-update.py (catalogue cache)"
+        "callee geomask-module-update.py (catalogue cache)",
+        "mkdir/chmod step2_apply"
       ],
       "snapshot": "NONE",
       "restore": "NR",
@@ -1534,6 +1535,20 @@
       "evidence": {
         "kind": "callee"
       }
+    },
+    {
+      "id": "/etc/geomask/cache/modules-index.json",
+      "path": "/etc/geomask/cache/modules-index.json",
+      "type": "regular",
+      "owner": "ours",
+      "mode": "600",
+      "writers": [
+        "callee geomask-module-update.py (catalogue cache)",
+        "rm step2_apply"
+      ],
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "кеш каталога модулей; установщик удаляет его сразу после установки, иначе он описывает предыдущий релиз и модули выглядят изменёнными"
     },
     {
       "id": "/tmp/geomask-ytwatch.conf.new",

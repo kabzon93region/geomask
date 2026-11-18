@@ -243,6 +243,16 @@ def cache_problem(path=None):
     target = os.path.abspath(path)
     if not (target == root or target.startswith(root + os.sep)):
         return 'it is outside the private cache directory %s' % root
+    # The directory decides who may replace the file, so it is part of the trust boundary: a
+    # symlinked or writable CACHE_ROOT makes the file check above moot (TOCTOU).
+    if os.path.islink(root):
+        return 'the cache directory %s is a symlink' % root
+    if os.path.exists(root):
+        if not os.path.isdir(root):
+            return 'the cache directory %s is not a directory' % root
+        reason = _unsafe_owner_or_mode(os.stat(root), 'the cache directory %s' % root)
+        if reason:
+            return reason
     if os.path.islink(target):
         return 'it is a symlink'
     if os.path.exists(target):
@@ -665,11 +675,13 @@ def preflight_staged(staged, force=False):
         if os.path.exists(path) and not os.path.isfile(path):
             raise UpdateError('%s: the destination is not a regular file' % path)
         before = item.get('before')
-        if before is not None and not force:
+        if not force:
             now = digest_file(path)
             # Re-committing bytes that are already installed is harmless; anything else
-            # means the file moved under us after staging (an owner edit, a deletion or
-            # another writer) and must not be overwritten from a stale snapshot.
+            # means the file moved under us after staging - an owner edit, a deletion or a
+            # file created at a path that did not exist yet - and must not be overwritten
+            # from a stale snapshot. `before` is None for a path that did not exist then, so
+            # the comparison is `now != before` for that case too.
             if now != before and now != item['sha256']:
                 raise UpdateError('%s changed while the update was staged; '
                                   're-run the update' % path)

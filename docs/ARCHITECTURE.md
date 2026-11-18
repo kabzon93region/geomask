@@ -59,7 +59,8 @@ geomask ставит на OpenWrt-роутер домашний стек обх�
 | `/usr/lib/geomask/geomask-doctor.py` | Диагностика: проверки, маршрут домена, логи (модуль `doctor`) |
 | `/usr/lib/geomask/geomask-lists-edit.py` | Точечная правка списков MagiTrickle (`groups/add/move/remove`) |
 | `/usr/lib/geomask/geomask-module-update.py` | Обновление модулей по каталогу (sha256, откат) |
-| `/etc/geomask/modules-index.json` | Каталог модулей: файлы, режимы, хеши, версии |
+| `/etc/geomask/modules-index.json` | Каталог модулей, поставленный установщиком (источник статуса) |
+| `/etc/geomask/cache/modules-index.json` | Кеш каталога, скачанного апдейтером (0700, ротация по TTL; установщик удаляет его после установки) |
 | `/etc/geomask/modules.json` | Выбранный набор модулей |
 | `/etc/geomask/version` | Релиз этого роутера (панель сравнивает с GitHub) |
 | `/etc/geomask/modules-state.json` | Базовая линия для «изменён локально» и версии частей |

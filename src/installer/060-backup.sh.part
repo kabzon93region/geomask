@@ -19,12 +19,37 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
         return 1
       fi
       _bnote "восстановлены ранее отложенные копии из $_prev"
+      _backup_recovery_clear
+    elif ls "$_dir"/*.tar.gz >/dev/null 2>&1; then
+      # The marker was written before anything moved and the copy never left $_dir: nothing lost.
+      _backup_recovery_clear
+    else
+      # The park is gone and $_dir holds no archive: the previous run parked the only copy in a
+      # location that no longer exists. Report it; a new archive must not pretend the old one
+      # never existed.
+      _bbad "прежняя резервная копия была отложена в $_prev, но этой папки больше нет"
+      _bbad "  в $_dir архивов нет: копия потеряна (например, из-за перезагрузки старой версии)"
+      _bbad "  снимите отметку вручную после проверки: rm -f $(P $BACKUP_RECOVERY)"
+      return 1
     fi
-    _backup_recovery_clear
   fi
-  # Unique park per attempt, created with mktemp: never reuse (and never remove) a directory
-  # that may still hold the last copy.
-  _park=$(mktemp -d "$(P /tmp)/geomask-bk-park-XXXXXX" 2>/dev/null) || { _bbad "cannot create a park directory"; return 1; }
+  # P06/P09 (audit 18.11.2026): the park used to live in /tmp, which is tmpfs on OpenWrt - a
+  # power loss or kill between parking the only copy and publishing the new archive lost it,
+  # because we deliberately park instead of delete. The park is persistent now (inside
+  # /etc/geomask, which sysupgrade does not archive, so no nesting either), and the recovery
+  # marker is written BEFORE anything moves: after a crash the next run knows exactly where the
+  # only copy is, restores it, or says it is gone instead of continuing without one.
+  mkdir -p "$(P /etc/geomask)" 2>/dev/null
+  _park=$(mktemp -d "$(P /etc/geomask)/.backup-park-XXXXXX" 2>/dev/null)
+  if [ -z "$_park" ] || [ ! -d "$_park" ]; then
+    _park=$(mktemp -d "$(P /tmp)/geomask-bk-park-XXXXXX" 2>/dev/null) \
+      || { _bbad "cannot create a park directory"; return 1; }
+  fi
+  if ! _backup_recovery_write "$_park" "parking"; then
+    rm -rf "$_park" 2>/dev/null
+    _bbad "cannot record where the previous backup is parked - nothing was created"
+    return 1
+  fi
   _park_fail=0
   for _old in "$_dir"/router-backup-*.tar.gz; do
     [ -f "$_old" ] || continue
@@ -33,7 +58,11 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
     mv -f "$_old" "$_park/" 2>/dev/null || _park_fail=1
   done
   if [ "$_park_fail" = 1 ]; then
-    _backup_park_restore "$_park" "$_dir" || _backup_keep_failed "$_park"
+    if _backup_park_restore "$_park" "$_dir"; then
+      _backup_recovery_clear
+    else
+      _backup_keep_failed "$_park"
+    fi
     _bbad "не удалось убрать прежние копии из $_dir - бэкап не создавался"
     return 1
   fi
@@ -82,13 +111,25 @@ ensure_backup() { # ensure_backup [full|any] -> path on stdout, rc=1 on failure
   mkdir -p "$(dirname "$(P /etc/geomask/backup-ok)")" 2>/dev/null
   { printf 'file=%s\n' "$_dest"; printf 'ts=%s\n' "$(date +%s)"; } > "$(P /etc/geomask/backup-ok).tmp" 2>/dev/null \
     && mv -f "$(P /etc/geomask/backup-ok).tmp" "$(P /etc/geomask/backup-ok)" 2>/dev/null
+  # P06/P09: parked copies come back before rotation. Parking exists only to keep the new
+  # archive from swallowing its predecessor; what is kept is decided by rotation, not by
+  # deleting the park (with BACKUP_KEEP > 1 the old copy used to disappear here).
+  if [ -d "$_park" ] && ls "$_park"/*.tar.gz >/dev/null 2>&1; then
+    _backup_park_restore "$_park" "$_dir" || _backup_keep_failed "$_park"
+  fi
   # rotation happens only now, and never touches the copy just written
   _n=0
   for _old in $(ls -1t "$_dir"/router-backup-*.tar.gz 2>/dev/null); do
     _n=$((_n+1))
     [ "$_n" -gt "$BACKUP_KEEP" ] && [ "$_old" != "$_dest" ] && rm -f "$_old"
   done
-  rm -rf "$_park"
+  if [ -d "$_park" ] && ls "$_park"/*.tar.gz >/dev/null 2>&1; then
+    # the restore failed: the copy stays in the park and _backup_keep_failed recorded where
+    _bwarn "прежняя копия не вернулась в $_dir - путь записан в $(P $BACKUP_RECOVERY)"
+  else
+    _backup_recovery_clear
+    rm -rf "$_park"
+  fi
   printf '%s' "$_dest"
   return 0
 }

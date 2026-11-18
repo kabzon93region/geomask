@@ -719,13 +719,85 @@ mv() {
                                  extra=extra)
         self.assertIn('FIRST=1', result.stdout)
         self.assertIn('SECOND=1', result.stdout)
-        parks = list((self.case / 'tmp').glob('geomask-bk-park-*'))
+        parks = list((self.case / 'etc/geomask').glob('.backup-park-*'))
         self.assertEqual(len(parks), 1, 'the park directory was recreated or deleted')
         kept = list(parks[0].glob('*.tar.gz'))
         self.assertEqual(len(kept), 1, 'the only backup copy was destroyed')
         self.assertEqual(kept[0].read_bytes(), before)
         # the second attempt must say where the copy is, not just "failed"
         self.assertIn(posix(parks[0]), result.stdout + result.stderr)
+
+    def test_a_kill_after_parking_does_not_lose_the_only_backup(self):
+        """P09: the park lived in /tmp (tmpfs) and had no marker until a restore failed.
+
+        A power loss or SIGKILL between parking the only copy and publishing the new archive
+        therefore lost it: /tmp is cleared on reboot and nothing recorded where the copy went.
+        """
+        backups = self.case / 'root/geomask-backups'
+        backups.mkdir(parents=True)
+        old = backups / 'router-backup-20260101-000000.tar.gz'
+        subprocess.run(['tar', 'czf', str(old), '-C', str(self.case), 'etc'], check=True)
+        before = old.read_bytes()
+        funcs = ['_backup_park_restore', 'archive_ok', 'ensure_backup',
+                 '_backup_recovery_write', '_backup_recovery_park',
+                 '_backup_recovery_clear', '_backup_keep_failed',
+                 '_bnote', '_bwarn', '_bbad']
+        crash = r'''
+have() { case "$1" in sysupgrade|tar|gzip) return 0 ;; esac; command -v "$1" >/dev/null 2>&1; }
+sysupgrade() { kill -9 $$; }
+'''
+        self.run_script('ensure_backup full', functions=funcs, extra=crash)
+        parks = list((self.case / 'etc/geomask').glob('.backup-park-*'))
+        self.assertEqual(len(parks), 1, 'the parked copy is not in persistent storage')
+        self.assertTrue(list(parks[0].glob('*.tar.gz')), 'the only backup was not parked')
+        marker = self.case / 'etc/geomask/backup-recovery'
+        self.assertTrue(marker.exists(), 'nothing says where the only copy is after a kill')
+        self.assertIn(posix(parks[0]), marker.read_text(encoding='utf-8'))
+        # the "next boot": the parked copy comes back before a new archive is created
+        second = r'''
+have() { case "$1" in sysupgrade|tar|gzip) return 0 ;; esac; command -v "$1" >/dev/null 2>&1; }
+sysupgrade() { tar czf "$2" -C @CASE@ etc; }
+BACKUP_KEEP=2
+'''.replace('@CASE@', posix(self.case))
+        result = self.run_script('ensure_backup full; printf "RC=%s\\n" "$?"',
+                                 functions=funcs, extra=second)
+        self.assertIn('RC=0', result.stdout)
+        self.assertTrue(old.exists(), 'the parked copy did not come back')
+        self.assertEqual(old.read_bytes(), before)
+        self.assertFalse(marker.exists(), 'the recovery marker was left behind')
+        self.assertEqual(list((self.case / 'etc/geomask').glob('.backup-park-*')), [])
+
+    def test_a_marker_whose_park_is_gone_refuses_instead_of_ignoring_it(self):
+        """A park in /tmp did not survive a reboot of an older build: say the copy is lost.
+
+        Creating a fresh archive anyway would silently pretend the previous one never existed
+        and leave the marker behind forever.
+        """
+        backups = self.case / 'root/geomask-backups'
+        backups.mkdir(parents=True)
+        gone = self.case / 'tmp/geomask-bk-park-gone01'
+        etc = self.case / 'etc/geomask'
+        etc.mkdir(parents=True)
+        (etc / 'backup-recovery').write_text('park=%s\nreason=parking\n' % posix(gone),
+                                             encoding='utf-8')
+        extra = r'''
+have() { case "$1" in sysupgrade|tar|gzip) return 0 ;; esac; command -v "$1" >/dev/null 2>&1; }
+sysupgrade() { tar czf "$2" -C @CASE@ etc; }
+'''.replace('@CASE@', posix(self.case))
+        result = self.run_script(
+            'ensure_backup full; printf "RC=%s\\n" "$?"',
+            functions=['_backup_park_restore', 'archive_ok', 'ensure_backup',
+                       '_backup_recovery_write', '_backup_recovery_park',
+                       '_backup_recovery_clear', '_backup_keep_failed',
+                       '_bnote', '_bwarn', '_bbad'],
+            extra=extra)
+        self.assertIn('RC=1', result.stdout)
+        self.assertIn(posix(gone), result.stdout + result.stderr)
+        self.assertIn('потеряна', result.stdout + result.stderr)
+        self.assertEqual(list(backups.glob('*.tar.gz')), [],
+                         'a new archive was created over a lost previous one')
+        self.assertTrue((etc / 'backup-recovery').exists(),
+                        'the marker was cleared without the copy')
 
     # ---------------------------------------------------------------- B5b
     def test_both_yaml_list_styles_count_as_a_geomask_config(self):

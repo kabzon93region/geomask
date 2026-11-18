@@ -6,6 +6,7 @@ throwaway root, and checks the bytes and the exit code. Nothing here touches the
 parser so a malformed template cannot pass.
 """
 import gzip
+import json
 import os
 from pathlib import Path
 import re
@@ -501,6 +502,103 @@ module_selected() { return 0; }
         self.assertIn('свой конфиг mihomo', result.stdout)
         self.assertIn('--replace-config', result.stdout)
         self.assertEqual(conf.read_bytes(), before)
+
+    # ---------------------------------------------------------------- I11 selection prune
+    def _catalogue(self, modules):
+        path = self.case / 'etc/geomask/modules-index.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'schema': 1, 'modules': modules}, indent=2),
+                        encoding='utf-8', newline='\n')
+        return path
+
+    def test_narrowing_the_selection_removes_the_dropped_module_runtime(self):
+        """I11: a module dropped from the selection must not keep running behind the claim.
+
+        The guard used to keep its hotplug hook and its 5-minute cron line, and AI-DNS kept its
+        services and nft table, after `--modules` narrowed the selection.
+        """
+        self._catalogue({
+            'core': {'id': 'core', 'owned_resources': []},
+            'guard': {'id': 'guard', 'owned_resources': [
+                {'type': 'file', 'path': '/usr/bin/geomask-guard.sh'},
+                {'type': 'file', 'path': '/etc/hotplug.d/iface/99-geomask-guard'},
+                {'type': 'cron', 'path': 'geomask-guard'}]},
+            'ai_dns': {'id': 'ai_dns', 'owned_resources': [
+                {'type': 'service', 'path': 'ai-doh'},
+                {'type': 'file', 'path': '/etc/init.d/ai-doh'},
+                {'type': 'nft', 'path': 'geomask_ai_dns'}]},
+        })
+        guard = self.case / 'usr/bin/geomask-guard.sh'
+        hook = self.case / 'etc/hotplug.d/iface/99-geomask-guard'
+        initd = self.case / 'etc/init.d/ai-doh'
+        calls = self.case / 'initd.calls'
+        for path in (guard, hook):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8', newline='\n')
+            path.chmod(0o755)
+        # The real init script is what the product runs: it must log stop+disable itself.
+        initd.parent.mkdir(parents=True, exist_ok=True)
+        initd.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "' + posix(calls) + '"\nexit 0\n',
+                         encoding='utf-8', newline='\n')
+        initd.chmod(0o755)
+        cron_state = self.case / 'crontab.txt'
+        cron_state.write_text('*/5 * * * * /usr/bin/geomask-guard.sh >/dev/null 2>&1\n'
+                              '0 3 * * * /usr/bin/other-thing\n', encoding='utf-8', newline='\n')
+        state = self.case / 'etc/geomask/modules.json'
+        state.write_text(json.dumps({'selected': ['core', 'guard', 'ai_dns']}),
+                         encoding='utf-8', newline='\n')
+        extra = r"""
+GM_MODULES="core"
+crontab() {
+  if [ "${1:-}" = "-l" ]; then cat "@CRON@"; else cat > "@CRON@"; fi
+}
+"""
+        extra = extra.replace('@CRON@', posix(cron_state))
+        body = ('modules_state_sync; printf "RC=%s\\n" "$?"'
+                '\nprintf "STATE=%s\\n" "$(cat ' + posix(state) + ')"\n')
+        result = self.run_script(
+            body,
+            functions=['_mihomo_py', 'modules_state_read', 'modules_state_write',
+                       'module_effective_list', 'module_owned_resources',
+                       'modules_remove_runtime', 'modules_prune_selection',
+                       'modules_state_sync', '_cron_begin', '_cron_end'],
+            extra=extra)
+        self.assertIn('RC=0', result.stdout, result.stderr)
+        self.assertFalse(guard.exists(), 'the guard script of a dropped module stayed')
+        self.assertFalse(hook.exists(), 'the hotplug hook of a dropped module stayed')
+        self.assertFalse(initd.exists(), 'the AI-DNS init script stayed')
+        cron = cron_state.read_text(encoding='utf-8')
+        self.assertNotIn('geomask-guard', cron, 'the guard cron line stayed')
+        self.assertIn('other-thing', cron, 'an unrelated cron line was removed')
+        service_calls = calls.read_text(encoding='utf-8')
+        self.assertIn('stop', service_calls,
+                      'the AI-DNS service was not stopped')
+        self.assertIn('disable', service_calls,
+                      'the AI-DNS service was not disabled (autostart link stayed)')
+        self.assertIn('core', state.read_text(encoding='utf-8'))
+
+    def test_a_still_selected_module_keeps_its_runtime(self):
+        self._catalogue({
+            'core': {'id': 'core', 'owned_resources': []},
+            'guard': {'id': 'guard', 'owned_resources': [
+                {'type': 'file', 'path': '/usr/bin/geomask-guard.sh'}]},
+        })
+        guard = self.case / 'usr/bin/geomask-guard.sh'
+        guard.parent.mkdir(parents=True, exist_ok=True)
+        guard.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8', newline='\n')
+        state = self.case / 'etc/geomask/modules.json'
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({'selected': ['core', 'guard']}), encoding='utf-8', newline='\n')
+        extra = 'GM_MODULES="core guard"\n'
+        result = self.run_script('modules_state_sync; printf "RC=%s\\n" "$?"',
+                                 functions=['_mihomo_py', 'modules_state_read',
+                                            'modules_state_write', 'module_effective_list',
+                                            'module_owned_resources', 'modules_remove_runtime',
+                                            'modules_prune_selection', 'modules_state_sync',
+                                            '_cron_begin', '_cron_end'],
+                                 extra=extra)
+        self.assertIn('RC=0', result.stdout, result.stderr)
+        self.assertTrue(guard.exists(), 'a module that is still selected lost its files')
 
     # ---------------------------------------------------------------- B9
     def test_save_stream_repairs_a_lost_mode(self):

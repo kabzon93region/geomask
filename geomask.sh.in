@@ -647,6 +647,109 @@ module_effective_list() { # the modules this run installs (all, unless --modules
   if [ -n "$GM_MODULES" ]; then printf '%s\n' "$GM_MODULES"; else printf '%s\n' "$GM_ALL_MODULES"; fi
 }
 
+# I11 (audit 18.11.2026): narrowing the selection used to leave the removed module's runtime
+# behind - the guard kept its hotplug hook, its 5-minute cron job and therefore kept re-seating
+# rules, AI-DNS kept its two services and its nft table - so a "subset" router went on running
+# components it no longer claimed to have. The catalogue already declares what a module owns,
+# so removal is data-driven instead of a hardcoded list that drifts from the metadata.
+module_owned_resources() { # module_owned_resources <module> -> "<type>|<path>" lines
+  _mor_idx="$(P /etc/geomask/modules-index.json)"
+  [ -s "$_mor_idx" ] || return 1
+  _mihomo_py "$_mor_idx" "$1" <<'PYEOF'
+import json, sys
+# Windows checkouts run these helpers under a Python whose stdout is CRLF; the shell `read`
+# would then carry a trailing CR into every path and `[ -e ]` would fail silently.
+try:
+    sys.stdout.reconfigure(newline='\n')
+except Exception:
+    pass
+try:
+    with open(sys.argv[1], encoding='utf-8') as fh:
+        data = json.load(fh)
+except Exception:
+    raise SystemExit(1)
+mods = data.get('modules') if isinstance(data, dict) else None
+if isinstance(mods, list):
+    mods = {item.get('id'): item for item in mods if isinstance(item, dict)}
+if not isinstance(mods, dict):
+    raise SystemExit(1)
+mod = mods.get(sys.argv[2])
+if not isinstance(mod, dict):
+    raise SystemExit(1)
+for res in mod.get('owned_resources') or []:
+    if not isinstance(res, dict):
+        continue
+    kind, path = res.get('type'), res.get('path')
+    if isinstance(kind, str) and isinstance(path, str) and kind and path:
+        print('%s|%s' % (kind, path))
+PYEOF
+}
+
+modules_remove_runtime() { # modules_remove_runtime <module> [reason] -> 0 when something was removed
+  _mrr_why=${2:-снят с выбора}
+  _mrr_res=$(module_owned_resources "$1") || {
+    warn "modules: '$1' $_mrr_why, но каталог модулей не прочитан - runtime не снят"
+    return 1
+  }
+  [ -n "$_mrr_res" ] || return 1
+  _mrr_did=0
+  while IFS='|' read -r _mrr_kind _mrr_path; do
+    _mrr_kind=${_mrr_kind%\r}
+    _mrr_path=${_mrr_path%\r}
+    [ -n "${_mrr_kind:-}" ] || continue
+    case "$_mrr_kind" in
+      service)
+        _mrr_init="$(P "/etc/init.d/$_mrr_path")"
+        if [ -f "$_mrr_init" ]; then
+          "$_mrr_init" stop >/dev/null 2>&1
+          "$_mrr_init" disable >/dev/null 2>&1
+          info "снят сервис $_mrr_path ($1: $_mrr_why)"
+          _mrr_did=1
+        fi ;;
+      file)
+        _mrr_f="$(P "$_mrr_path")"
+        if [ -e "$_mrr_f" ] || [ -L "$_mrr_f" ]; then
+          rm -f "$_mrr_f" 2>/dev/null && { info "снят файл $_mrr_path ($1: $_mrr_why)"; _mrr_did=1; }
+        fi ;;
+      cron)
+        if have crontab; then
+          _cron_begin || true
+          _mrr_cron=$(crontab -l 2>/dev/null)
+          if printf '%s\n' "$_mrr_cron" | grep -q -- "$_mrr_path"; then
+            if printf '%s\n' "$_mrr_cron" | grep -v -- "$_mrr_path" | crontab - 2>/dev/null; then
+              info "снята cron-запись $_mrr_path ($1: $_mrr_why)"
+              _mrr_did=1
+            fi
+          fi
+          _cron_end
+        fi ;;
+      nft)
+        if have nft && nft list table inet "$_mrr_path" >/dev/null 2>&1; then
+          if nft delete table inet "$_mrr_path" >/dev/null 2>&1; then
+            info "снята nft-таблица $_mrr_path ($1: $_mrr_why)"
+            _mrr_did=1
+          fi
+        fi ;;
+      *)
+        info "ресурс '$_mrr_kind $_mrr_path' модуля $1 не снят автоматически - проверьте вручную" ;;
+    esac
+  done <<EOF
+$_mrr_res
+EOF
+  [ "$_mrr_did" = 1 ]
+}
+
+modules_prune_selection() { # modules_prune_selection <old selection> <new selection>
+  _mps_did=0
+  for _mps_mod in $1; do
+    case " $2 " in
+      *" $_mps_mod "*) continue ;;
+    esac
+    modules_remove_runtime "$_mps_mod" "снят с выбора" && _mps_did=1
+  done
+  [ "$_mps_did" = 1 ]
+}
+
 modules_state_sync() { # remember the effective selection, only when it changed
   _want=$(module_effective_list)
   _msr_rc=0
@@ -661,13 +764,10 @@ modules_state_sync() { # remember the effective selection, only when it changed
     return 0
   fi
   [ "$_want" = "$_have" ] && return 0
-  # Narrowing the selection does not delete anything: say it once, with the way out.
-  for _m in $_have; do
-    case " $_want " in
-      *" $_m "*) ;;
-      *) warn "модуль '$_m' снят с выбора, его файлы остались на роутере (удалит --reinstall)" ;;
-    esac
-  done
+  # Narrowing the selection now removes what the dropped modules own (files, services, cron
+  # entries, nft tables) instead of leaving the runtime running behind a smaller claim. Owner
+  # state and config files are not in owned_resources, so they stay.
+  modules_prune_selection "$_have" "$_want" || true
   modules_state_write $_want
 }
 
@@ -3360,6 +3460,13 @@ geomask_uninstall() {
   if [ "$_un_cron" = 1 ] && crontab -l 2>/dev/null | grep -q 'sync_mtrickle_mihomo'; then
     crontab -l 2>/dev/null | grep -v 'sync_mtrickle_mihomo' | crontab - 2>/dev/null && info "cron entry removed"
   fi
+  # I11 (audit 18.11.2026): the uninstall left the guard (script, hotplug hook, 5-minute cron
+  # line) and AI-DNS (two services, their init scripts and the nft table) behind, so an
+  # "uninstalled" router kept re-seating rules and answering DNS. The catalogue declares what
+  # each module owns, so exactly that is removed - the cron lock is already held here.
+  for _un_mod in guard ai_dns; do
+    modules_remove_runtime "$_un_mod" "удаление geomask" || true
+  done
   [ "$1" = "noreload" ] || initd rpcd reload 2>/dev/null || true
   [ "$_un_cron" = 1 ] && _cron_end
   return 0

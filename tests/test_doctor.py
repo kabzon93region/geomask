@@ -214,6 +214,80 @@ class DoctorParserTests(unittest.TestCase):
         self.assertTrue(doctor.domain_matches('api.claude.ai', 'claude', 'keyword'))
 
 
+    # ---------------------------------------------------------------- G02 AND/OR semantics
+    def route_for(self, rules, domain='site.example', ips=None):
+        cfg = self.write('g02.yaml', 'rules:\n' + ''.join('  - %s\n' % r for r in rules))
+        doctor.MIHOMO_CONF = cfg
+        return doctor.mihomo_route(domain, ips or [])
+
+    def test_and_requires_every_evaluable_condition(self):
+        """G02: one true sub-condition was enough, so an AND rule matched on a partial check."""
+        hit = self.route_for([
+            'AND,((DOMAIN-SUFFIX,site.example),(DOMAIN-SUFFIX,other.example)),REJECT',
+            'MATCH,DIRECT'])
+        self.assertEqual(hit['policy'], 'DIRECT',
+                         'an AND rule matched although one condition is false')
+
+    def test_and_with_an_undecidable_condition_is_conditional_not_matched(self):
+        hit = self.route_for([
+            'AND,((NETWORK,UDP),(DOMAIN-SUFFIX,site.example)),REJECT',
+            'MATCH,DIRECT'])
+        self.assertTrue(hit.get('conditional'),
+                        'a packet-decided condition was treated as a confirmed match')
+        self.assertEqual(hit['policy'], 'REJECT')
+        self.assertIn('NETWORK', hit['note'])
+
+    def test_or_matches_on_one_true_condition(self):
+        hit = self.route_for([
+            'OR,((DOMAIN-SUFFIX,other.example),(DOMAIN-SUFFIX,site.example)),VPN',
+            'MATCH,DIRECT'])
+        self.assertEqual(hit['policy'], 'VPN')
+        self.assertFalse(hit.get('conditional'))
+
+    def test_or_with_only_false_and_unknown_conditions_is_conditional(self):
+        hit = self.route_for([
+            'OR,((DOMAIN-SUFFIX,other.example),(NETWORK,UDP)),VPN',
+            'MATCH,DIRECT'])
+        self.assertTrue(hit.get('conditional'),
+                        'an OR with no true condition but an unknown one was skipped as false')
+        self.assertEqual(hit['policy'], 'VPN')
+
+    def test_or_with_only_false_conditions_falls_through(self):
+        hit = self.route_for([
+            'OR,((DOMAIN-SUFFIX,other.example),(DOMAIN-SUFFIX,third.example)),VPN',
+            'MATCH,DIRECT'])
+        self.assertEqual(hit['policy'], 'DIRECT')
+
+    def test_a_rule_set_inside_and_is_evaluated(self):
+        ai = self.write('g02-ai.yaml', 'payload:\n  - DOMAIN-SUFFIX,site.example\n')
+        cfg = self.write('g02-cfg.yaml',
+                         'rule-providers:\n  ai:\n    type: file\n    path: %s\nrules:\n'
+                         '  - AND,((RULE-SET,ai),(DOMAIN-SUFFIX,site.example)),AI\n'
+                         '  - MATCH,DIRECT\n' % ai)
+        doctor.MIHOMO_CONF = cfg
+        hit = doctor.mihomo_route('site.example', [])
+        self.assertEqual(hit['policy'], 'AI')
+        self.assertFalse(hit.get('conditional'))
+
+    def test_a_port_rule_is_not_silently_false(self):
+        """A plain rule decided by the packet must not be walked past as 'no match'."""
+        hit = self.route_for(['DST-PORT,443,REJECT', 'MATCH,DIRECT'])
+        self.assertTrue(hit.get('conditional'),
+                        'a port rule was treated as a definite non-match')
+        self.assertEqual(hit['policy'], 'REJECT')
+
+    def test_an_ip_rule_without_a_resolved_address_does_not_stop_the_walk(self):
+        hit = self.route_for(['IP-CIDR,203.0.113.0/24,VPN', 'MATCH,DIRECT'])
+        self.assertEqual(hit['policy'], 'DIRECT')
+        self.assertIn('не проверено', hit['note'])
+
+    def test_an_ip_rule_with_a_resolved_address_matches(self):
+        hit = self.route_for(['IP-CIDR,203.0.113.0/24,VPN', 'MATCH,DIRECT'],
+                             ips=['203.0.113.9'])
+        self.assertEqual(hit['policy'], 'VPN')
+        self.assertIn('203.0.113.9', hit['note'])
+
+
 class DoctorCountryTests(unittest.TestCase):
     def test_russian_node_names_map_to_countries(self):
         self.assertEqual(doctor.node_country('США-1')[0], 'US')

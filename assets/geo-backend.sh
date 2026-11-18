@@ -3576,10 +3576,16 @@ _console_diag_build() { # $1 = console|bundle
     "$PYTHON_BIN" -B "$CONSOLE_PY" status "$MIHOMO_CONF" 2>/dev/null \
       | _console_diag_redact json json:console-config "$_dir/console-config.json" || return 1
   fi
-  controller_curl -s -m5 "$MIHOMO_API/proxies/CONSOLE" > "$_dir/.raw-group.$$" 2>/dev/null
+  # P12 (audit 18.11.2026): the controller answer was written to the overlay in full and the
+  # byte cap was applied afterwards by the redactor - a hostile or broken controller could fill
+  # /tmp before any limit was consulted. The stream is cut at cap+1, so a huge answer costs a
+  # bounded file and the size check still reports it as "response too large" (bytes = cap+1).
+  controller_curl -s -m5 "$MIHOMO_API/proxies/CONSOLE" 2>/dev/null \
+    | head -c $((65536 + 1)) > "$_dir/.raw-group.$$"
   _console_diag_json json:group-CONSOLE "$_dir/.raw-group.$$" \
     "$_dir/group-CONSOLE.json" 65536 || return 1
-  controller_curl -s -m5 "$MIHOMO_API/connections" > "$_dir/.raw-connections.$$" 2>/dev/null
+  controller_curl -s -m5 "$MIHOMO_API/connections" 2>/dev/null \
+    | head -c $((524288 + 1)) > "$_dir/.raw-connections.$$"
   _console_diag_json json:connections "$_dir/.raw-connections.$$" \
     "$_dir/connections.json" 524288 || return 1
   # The mihomo config carries subscription URLs and the controller secret. It is the one

@@ -502,23 +502,48 @@ def ruleset_payload(path):
     return entries
 
 
-def match_condition(condition, domain, ips):
-    """Does one rule condition match? Returns (matched, note)."""
+# G02 (audit 18.11.2026): the walk used `any()` for AND and OR alike, and an unevaluable
+# condition returned False - so NETWORK/DST-PORT/PROCESS conditions silently became "does not
+# match" and an AND rule was reported as matching on one true sub-condition. Conditions now
+# return one of three verdicts, and the caller distinguishes "certain", "may match, cannot be
+# checked here" and "does not match".
+TRUE, FALSE, UNKNOWN, UNRESOLVED = 'true', 'false', 'unknown', 'unresolved'
+
+
+def match_condition(condition, domain, ips, providers=None):
+    """Verdict for one rule condition: (TRUE|FALSE|UNKNOWN, note)."""
     parts = split_rule(condition)
     kind = (parts[0] or '').upper()
     if kind in ('DOMAIN-SUFFIX', 'DOMAIN', 'DOMAIN-KEYWORD'):
         target = parts[1] if len(parts) > 1 else ''
         ok = domain_matches(domain, target, kind)
-        return ok, '%s,%s' % (kind, target)
-    if kind == 'IP-CIDR' or kind == 'IP-CIDR6':
+        return (TRUE if ok else FALSE), '%s,%s' % (kind, target)
+    if kind in ('IP-CIDR', 'IP-CIDR6'):
         target = parts[1] if len(parts) > 1 else ''
-        hit = ''
+        if not ips:
+            # "no address to compare" is not "address does not match", but it also does not
+            # stop the walk: the domain trace continues and the skipped check is reported.
+            return UNRESOLVED, 'IP-CIDR,%s (адрес не разрешён)' % target
         for ip in ips:
             if ip_in_cidr(ip, target):
-                hit = ip
-                break
-        return bool(hit), 'IP-CIDR,%s%s' % (target, (' ← ' + hit) if hit else '')
-    return False, ''
+                return TRUE, 'IP-CIDR,%s ← %s' % (target, ip)
+        return FALSE, 'IP-CIDR,%s' % target
+    if kind == 'RULE-SET':
+        name = parts[1] if len(parts) > 1 else ''
+        path = (providers or {}).get(name, '')
+        if not path:
+            return UNKNOWN, 'RULE-SET,%s (файл неизвестен)' % name
+        for entry in ruleset_payload(path):
+            verdict, note = match_condition(entry, domain, ips, providers)
+            if verdict == TRUE:
+                return TRUE, '%s в списке %s' % (note, name)
+        return FALSE, 'RULE-SET,%s' % name
+    if kind in ('NETWORK', 'DST-PORT', 'SRC-PORT', 'PROCESS-NAME', 'PROCESS-PATH',
+                'SRC-IP-CIDR', 'SRC-IP-CIDR6', 'IN-PORT', 'IN-TYPE', 'IN-USER', 'IN-NAME',
+                'DST-PORT-RANGE', 'SRC-PORT-RANGE', 'UID', 'DSCP', 'IP-SUFFIX'):
+        # Decided by the packet, the process or the kernel - not by the doctor's inputs.
+        return UNKNOWN, '%s — не проверяется' % (','.join(parts[:-1]) if len(parts) > 1 else kind)
+    return UNKNOWN, '%s — неизвестное условие' % (kind or condition)
 
 
 def ip_in_cidr(ip, cidr):
@@ -532,20 +557,41 @@ def ip_in_cidr(ip, cidr):
 def mihomo_route(domain, ips):
     """Walk the rule list in order and return the first matching rule."""
     providers, rules = parse_mihomo(read_text(MIHOMO_CONF))
+    skipped = []
     for index, rule in enumerate(rules, 1):
         if rule.upper().startswith('MATCH'):
             parts = split_rule(rule)
-            return {'index': index, 'rule': rule, 'policy': parts[1] if len(parts) > 1 else 'GLOBAL'}
+            hit = {'index': index, 'rule': rule,
+                   'policy': parts[1] if len(parts) > 1 else 'GLOBAL'}
+            if skipped:
+                hit['note'] = 'не проверено: %s' % '; '.join(skipped)
+            return hit
         if rule.upper().startswith(('AND,', 'OR,')):
-            # only the domain-shaped sub-conditions can be evaluated here
+            is_and = rule.upper().startswith('AND,')
             inner = rule[rule.find('(') + 1:rule.rfind(')')]
             conditions = [c.strip().strip('()') for c in split_rule(inner)]
-            hits = [match_condition(c, domain, ips) for c in conditions]
-            if any(hit[0] for hit in hits):
-                parts = split_rule(rule)
-                policy = parts[-1]
-                note = next(hit[1] for hit in hits if hit[0])
-                return {'index': index, 'rule': rule, 'policy': policy, 'note': note}
+            hits = [match_condition(c, domain, ips, providers) for c in conditions]
+            parts = split_rule(rule)
+            policy = parts[-1] if len(parts) > 1 else ''
+            if is_and:
+                if any(verdict == FALSE for verdict, _ in hits):
+                    continue
+                undecided = [note for verdict, note in hits
+                             if verdict in (UNKNOWN, UNRESOLVED)]
+                if not undecided:
+                    return {'index': index, 'rule': rule, 'policy': policy,
+                            'note': '; '.join(note for _, note in hits)}
+                return {'index': index, 'rule': rule, 'policy': policy, 'conditional': True,
+                        'note': 'сработает при: %s' % '; '.join(undecided)}
+            winners = [note for verdict, note in hits if verdict == TRUE]
+            if winners:
+                return {'index': index, 'rule': rule, 'policy': policy,
+                        'note': '; '.join(winners)}
+            undecided = [note for verdict, note in hits
+                         if verdict in (UNKNOWN, UNRESOLVED)]
+            if undecided:
+                return {'index': index, 'rule': rule, 'policy': policy, 'conditional': True,
+                        'note': 'возможно при: %s' % '; '.join(undecided)}
             continue
         parts = split_rule(rule)
         kind = (parts[0] or '').upper()
@@ -554,15 +600,23 @@ def mihomo_route(domain, ips):
             policy = parts[2] if len(parts) > 2 else ''
             path = providers.get(name, '')
             for entry in ruleset_payload(path):
-                ok, note = match_condition(entry, domain, ips)
-                if ok:
+                verdict, note = match_condition(entry, domain, ips, providers)
+                if verdict == TRUE:
                     return {'index': index, 'rule': rule, 'policy': policy,
                             'note': 'строка «%s» в списке %s' % (note, name), 'ruleset': path}
             continue
-        ok, note = match_condition(rule, domain, ips)
-        if ok:
+        verdict, note = match_condition(rule, domain, ips, providers)
+        if verdict == UNRESOLVED:
+            skipped.append('№%d %s' % (index, note))
+            continue
+        if verdict == TRUE:
             policy = parts[-1] if len(parts) > 1 else ''
             return {'index': index, 'rule': rule, 'policy': policy, 'note': note}
+        if verdict == UNKNOWN:
+            # The rule may decide this traffic and only the router can tell: "unknown" must not
+            # be walked past as if it were false (G02).
+            return {'index': index, 'rule': rule, 'policy': parts[-1] if len(parts) > 1 else '',
+                    'conditional': True, 'note': note}
     return None
 
 
@@ -1574,9 +1628,19 @@ def trace_domain(domain, live=False):
              'Домен не покрыт ни одним списком mihomo: добавьте его в список нужной группы.')
     else:
         route_path.append('mihomo: %s' % plain_rule(hit['rule']))
-        step('Правило mihomo', 'ok', '№%d %s → группа %s%s'
-             % (hit['index'], plain_rule(hit['rule']), hit['policy'],
-                (' — %s' % hit['note']) if hit.get('note') else ''))
+        if hit.get('conditional'):
+            # G02: a rule whose other conditions are decided by the packet is "may apply",
+            # never a confirmed route.
+            step('Правило mihomo', 'warn',
+                 '№%d %s → вероятно %s — %s'
+                 % (hit['index'], plain_rule(hit['rule']), hit['policy'] or '?',
+                    hit.get('note') or 'условие вне проверки'),
+                 'Правило содержит условие, которое doctor проверить не может '
+                 '(протокол, порт, процесс). Направление зависит от реального трафика.')
+        else:
+            step('Правило mihomo', 'ok', '№%d %s → группа %s%s'
+                 % (hit['index'], plain_rule(hit['rule']), hit['policy'],
+                    (' — %s' % hit['note']) if hit.get('note') else ''))
 
     # 3b. where that rule set comes from - the owner asked whether it duplicates MagiTrickle
     if hit and hit.get('ruleset'):

@@ -320,6 +320,44 @@ logread() { cat '@LOG@'; }
         self.assertEqual(members['config.masked.yaml'].decode('utf-8').strip(),
                          'error: config too large')
 
+    def test_the_controller_answer_is_cut_before_it_reaches_the_disk(self):
+        """P12: the raw answer was written in full and only then measured.
+
+        A controller that streams without end must cost a bounded temp file, and the member
+        must still be the explicit "response too large" placeholder (bytes = cap+1 proves the
+        stream was cut, not read to the end).
+        """
+        stubs = r'''
+uci() { return 0; }
+nft() { return 0; }
+conntrack() { return 0; }
+controller_curl() {
+  case "$*" in
+    *proxies/CONSOLE*|*connections*)
+      # 4 MiB of never-ending JSON: unbounded reads would fill the overlay.
+      head -c 4194304 /dev/zero | tr '\0' 'x'
+      ;;
+  esac
+}
+ip() { printf '10: from 192.168.1.177 lookup 102\n'; }
+logread() { printf 'mihomo: quiet\n'; }
+'''
+        answer = self.run_diag(stubs=stubs)
+        self.assertTrue(answer['ok'], answer)
+        members = {}
+        with tarfile.open(self.spool / self.bundle_name(answer), 'r:gz') as bundle:
+            for member in bundle.getmembers():
+                if member.isfile():
+                    members[member.name.rsplit('/', 1)[-1]] = bundle.extractfile(member).read()
+        connections = json.loads(members['connections.json'])
+        group = json.loads(members['group-CONSOLE.json'])
+        self.assertEqual(connections['error'], 'response too large')
+        self.assertEqual(group['error'], 'response too large')
+        self.assertEqual(connections['bytes'], 524288 + 1,
+                         'the connections answer was not cut at the cap')
+        self.assertEqual(group['bytes'], 65536 + 1,
+                         'the group answer was not cut at the cap')
+
     def test_staging_budget_refuses_before_tar(self):
         big = self.case / 'big-ip.txt'
 

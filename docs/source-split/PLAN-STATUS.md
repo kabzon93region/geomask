@@ -47,10 +47,10 @@ Linux/OpenWrt-стенд; **OPEN-OWNER** = нужно решение владе�
 | P03 | CLOSED-LOCAL (код) + OPEN-STAND | `2d6ad2a`: maintenance-lock + `activation`; SIGKILL/parallel installer — стенд |
 | P04 | OPEN-OWNER | канал обновлений/доверие мастер-ветке — решение владельца, новые ключи не назначались |
 | P05 | OPEN-STAND | alias absent vs invalid на netifd |
-| P06 | OPEN-STAND | ENOSPC/backup/rotation/owner data по этапам |
+| P06 | CLOSED-LOCAL (код) + OPEN-STAND | `734b97f`: persistent парк + отметка до первого `mv`, возврат до ротации; ENOSPC/owner data по этапам — стенд |
 | P07 | OPEN-STAND | настоящий rpcd/ubus, роли ACL, полный retrieval до 2 MiB с base64 |
 | P08 | OPEN-STAND | late failure после смены runtime: graph/registry/argv/egress |
-| P09 | OPEN-STAND | kill/reboot park/publish/rename/start, durable backup |
+| P09 | CLOSED-LOCAL (код) + OPEN-STAND | `734b97f`: kill после парковки восстанавливается, исчезнувший парк = отказ; reboot/power loss — стенд |
 | P10 | CLOSED-LOCAL (порядок) + OPEN-STAND | `1aef885`: hook до старта mihomo; already-up/empty queue и LAN dataplane — стенд |
 | P11 | CLOSED-LOCAL | `c0bf739`: startup reconcile, catch-up по digest содержимого |
 | P12 | CLOSED-LOCAL | `1f7baba`: `head -c cap+1`, placeholder «response too large» |
@@ -74,13 +74,13 @@ B-020 — `2422295` (бюджет 15 с, partial, probe path). D14 — искл�
 | 5 DNS/rulesets (C04/C07/G02/G03/G05/B-020/P10/P11) | CLOSED-LOCAL, кроме G05 и P10-dataplane — стенд |
 | 6 IPv6 (C06/P06) | код CLOSED-LOCAL; kernel/reboot — стенд |
 | 7 diagnostics (C10/P07/P12/R07) | C10/P12 CLOSED-LOCAL; P07 — стенд; R07 — стенд |
-| 8 tooling/recovery (R01/P06–P10) | R01 CLOSED-LOCAL; P06/P08/P09, CI-187, матрица SHA — стенд/владелец |
+| 8 tooling/recovery (R01/P06–P10) | R01/P06/P09 CLOSED-LOCAL; P06/P09-power-loss, P08, CI-187, матрица SHA — стенд/владелец |
 | Этап 0 (0а–0д) | 0а/0б/0в/0г/0д CLOSED-LOCAL; gate этапа 0 — стенд |
 
 ## Доказательный baseline
 
-- Полный gate (`testgate --timeout 4200`): **96 модулей, 1398 тестов, 1368 выполнено,
-  30 allowlisted skip, 0 fail, 0 timeout** — лог `gate23`, запись в
+- Полный gate (`testgate --timeout 4200`): **96 модулей, 1403 теста, 1373 выполнено,
+  30 allowlisted skip, 0 fail, 0 timeout** — лог `gate24`, запись в
   [execution log](<superpowers/plans/2026-11-18-execution-log.md>).
 - Сборка/паритет: `check_build --verify-only` → ok (`ecdb81065121fe82`), `gen-geo-rpc --check`
   → ok, `compose_sources --check` → ok для 16 целей, `repo_check --strict` → 0 authored

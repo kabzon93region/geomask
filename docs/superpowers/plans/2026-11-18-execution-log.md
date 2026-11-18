@@ -74,6 +74,13 @@
   мутирующий `check_build`: `--verify-only`, RPC-манифест, `tests/testgate.py run`,
   песочница; `verify` без `--full` честно пишет «установка НЕ проверялась», а с `--full`
   называет песочницу, прогнанную на скачанном файле.
+- I08: присутствие больше не выдаётся за актуальность. `STEP2_FILES` — ровно тот набор из
+  27 путей, который пишет `step2_apply` (включая doctor, lock-helper, updater, помощники
+  adopt/reload и каталог); проверка шага 2 идёт по нему и пропускает пути снятых модулей так
+  же, как `save_stream`. `step_check_is_authoritative`: для шага 2 пройденный check больше не
+  отменяет apply (presence не доказывает свежесть), остальные шаги сохраняют быстрый путь.
+- Test-infra: `test_sandbox_guard` один раз упал в полном прогоне на `WinError 2` при запуске
+  python (в отдельном прогоне проходит), добавлен один повтор с явным путём интерпретатора.
 - Доказательства: новый `test_reload_state` 10, `test_backend_safety` 17 → 22 → 25,
   `test_sync_ytvpn` 3 → 5, `test_doctor` 64 → 73, `test_console_diag` 29 → 30, новый
   `test_release_tooling` 5, `test_initd_contract` 11 → 14, `test_install_safety` 46 → 49.

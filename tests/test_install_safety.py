@@ -309,7 +309,8 @@ module_selected() { return 0; }
 '''
         result = self.run_script('write_mihomo_config "https://example.invalid/x" ""; '
                                  'printf "RC=%s\\n" "$?"',
-                                 functions=['_mihomo_py', 'geomask_config_shaped', 'write_mihomo_config'],
+                                 functions=['_mihomo_py', 'geomask_config_verdict', '_mihomo_guard',
+                                            'geomask_config_shaped', 'write_mihomo_config'],
                                  extra=extra)
         self.assertIn('RC=1', result.stdout)
         self.assertIn('свой конфиг mihomo', result.stdout)
@@ -329,8 +330,8 @@ GM_REPLACE=1
 '''
         result = self.run_script('write_mihomo_config "https://example.invalid/x" ""; '
                                  'printf "RC=%s\\n" "$?"',
-                                 functions=['_mihomo_py', 'geomask_config_shaped',
-                                            'write_mihomo_config'],
+                                 functions=['_mihomo_py', 'geomask_config_verdict', '_mihomo_guard',
+                                            'geomask_config_shaped', 'write_mihomo_config'],
                                  extra=extra)
         self.assertIn('RC=0', result.stdout)
         data = conf.read_text(encoding='utf-8')
@@ -359,7 +360,8 @@ GM_ADOPT=1
 '''
         result = self.run_script('write_mihomo_config "https://example.invalid/x" ""; '
                                  'printf "RC=%s\\n" "$?"',
-                                 functions=['_mihomo_py', 'geomask_config_shaped', 'write_mihomo_config'],
+                                 functions=['_mihomo_py', 'geomask_config_verdict', '_mihomo_guard',
+                                            'geomask_config_shaped', 'write_mihomo_config'],
                                  extra=extra)
         self.assertIn('RC=1', result.stdout)
         self.assertIn('--replace-config', result.stdout)
@@ -399,8 +401,9 @@ GM_ADOPT=1
         conf = self.adopt_fixture(self.FOREIGN_CONF)
         result = self.run_script('write_mihomo_config "https://example.invalid/x" ""; '
                                  'printf "RC=%s\\n" "$?"',
-                                 functions=['_mihomo_py', '_gm_py_script',
-                                            'geomask_config_shaped', 'write_mihomo_config'],
+                                 functions=['_mihomo_py', '_gm_py_script', 'geomask_config_verdict',
+                                            '_mihomo_guard', 'geomask_config_shaped',
+                                            'write_mihomo_config'],
                                  extra=self.ADOPT_EXTRA)
         self.assertIn('RC=0', result.stdout)
         data = conf.read_text(encoding='utf-8')
@@ -417,8 +420,9 @@ GM_ADOPT=1
         before = conf.read_bytes()
         result = self.run_script('write_mihomo_config "https://example.invalid/x" ""; '
                                  'printf "RC=%s\\n" "$?"',
-                                 functions=['_mihomo_py', '_gm_py_script',
-                                            'geomask_config_shaped', 'write_mihomo_config'],
+                                 functions=['_mihomo_py', '_gm_py_script', 'geomask_config_verdict',
+                                            '_mihomo_guard', 'geomask_config_shaped',
+                                            'write_mihomo_config'],
                                  extra=self.ADOPT_EXTRA)
         self.assertIn('RC=1', result.stdout)
         self.assertIn('adopt', result.stdout)
@@ -434,8 +438,9 @@ GM_ADOPT=1
                                          'mihomo_validate() { return 1; }')
         result = self.run_script('write_mihomo_config "https://example.invalid/x" ""; '
                                  'printf "RC=%s\\n" "$?"',
-                                 functions=['_mihomo_py', '_gm_py_script',
-                                            'geomask_config_shaped', 'write_mihomo_config'],
+                                 functions=['_mihomo_py', '_gm_py_script', 'geomask_config_verdict',
+                                            '_mihomo_guard', 'geomask_config_shaped',
+                                            'write_mihomo_config'],
                                  extra=extra)
         self.assertIn('RC=1', result.stdout)
         self.assertIn('mihomo -t', result.stdout)
@@ -443,6 +448,59 @@ GM_ADOPT=1
                          'a candidate rejected by mihomo -t replaced the live config')
         leftovers = [p.name for p in conf.parent.iterdir() if '.adopt.' in p.name]
         self.assertEqual(leftovers, [], 'a rejected candidate was left behind')
+
+    # ---------------------------------------------------------------- N04 ownership verdict
+    def test_an_unreadable_config_is_not_treated_as_a_foreign_one(self):
+        """N04: no PyYAML must refuse on its own terms, never offer --replace-config.
+
+        A missing parser used to make every config "not shaped", so the operator was told the
+        file was somebody else's and offered a destructive replacement of what may well be
+        geomask's own config.
+        """
+        conf = self.case / 'etc/mihomo/config.yaml'
+        conf.parent.mkdir(parents=True)
+        conf.write_text('mixed-port: 7890\nsecret: "owner"\n', encoding='utf-8')
+        before = conf.read_bytes()
+        extra = r"""
+_mihomo_py() { return 2; }
+_prov_url() { printf ''; }
+any_provider_url() { printf ''; }
+mihomo_validate() { return 0; }
+module_selected() { return 0; }
+"""
+        result = self.run_script('write_mihomo_config "https://example.invalid/x" ""; '
+                                 'printf "RC=%s\\n" "$?"',
+                                 functions=['geomask_config_verdict', '_mihomo_guard',
+                                            'geomask_config_shaped', 'write_mihomo_config'],
+                                 extra=extra)
+        self.assertIn('RC=1', result.stdout)
+        self.assertIn('не читается', result.stdout)
+        self.assertNotIn('--replace-config', result.stdout,
+                         'an unreadable config was offered for replacement')
+        self.assertEqual(conf.read_bytes(), before, 'an unreadable config was modified')
+
+    def test_a_foreign_config_still_gets_the_ownership_message(self):
+        """The tri-state verdict must not weaken the foreign-config guard."""
+        conf = self.case / 'etc/mihomo/config.yaml'
+        conf.parent.mkdir(parents=True)
+        conf.write_text('mixed-port: 7890\nsecret: "owner"\n', encoding='utf-8')
+        before = conf.read_bytes()
+        extra = r"""
+_prov_url() { printf ''; }
+any_provider_url() { printf ''; }
+mihomo_validate() { return 0; }
+module_selected() { return 0; }
+"""
+        result = self.run_script('write_mihomo_config "https://example.invalid/x" ""; '
+                                 'printf "RC=%s\\n" "$?"',
+                                 functions=['_mihomo_py', 'geomask_config_verdict',
+                                            '_mihomo_guard', 'geomask_config_shaped',
+                                            'write_mihomo_config'],
+                                 extra=extra)
+        self.assertIn('RC=1', result.stdout)
+        self.assertIn('свой конфиг mihomo', result.stdout)
+        self.assertIn('--replace-config', result.stdout)
+        self.assertEqual(conf.read_bytes(), before)
 
     # ---------------------------------------------------------------- B9
     def test_save_stream_repairs_a_lost_mode(self):
@@ -579,7 +637,7 @@ mv() {
             'geomask_config_shaped "$f" && printf "%%s SHAPED\\n" "$f" '
             '|| printf "%%s FOREIGN\\n" "$f"; done'
             % (posix(indented), posix(flat), posix(foreign)),
-            functions=['_mihomo_py', 'geomask_config_shaped'])
+            functions=['_mihomo_py', 'geomask_config_verdict', 'geomask_config_shaped'])
         self.assertIn('indented.yaml SHAPED', result.stdout)
         self.assertIn('flat.yaml SHAPED', result.stdout)
         self.assertIn('foreign.yaml FOREIGN', result.stdout)
@@ -1054,7 +1112,8 @@ geomask_uninstall() { printf 'UNINSTALLED\n'; }
 df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 100000 1 90000 1%% /\n'; }
 '''
         result = self.run_script('menu_reinstall; printf "RC=%s\\n" "$?"',
-                                 functions=['_mihomo_py', 'geomask_config_shaped', 'menu_reinstall'],
+                                 functions=['_mihomo_py', 'geomask_config_verdict', '_mihomo_guard',
+                                            'geomask_config_shaped', 'menu_reinstall'],
                                  extra=extra)
         self.assertIn('RC=1', result.stdout)
         self.assertNotIn('UNINSTALLED', result.stdout)
@@ -1075,7 +1134,9 @@ safe_mihomo_restart() { return 1; }
 api_refresh_provider() { return 0; }
 '''
         result = self.run_script('step3_apply; printf "RC=%s\\n" "$?"',
-                                 functions=['geomask_config_shaped', 'step3_apply'], extra=extra)
+                                 functions=['geomask_config_verdict', '_mihomo_guard',
+                                            'geomask_config_shaped', 'step3_apply'],
+                                 extra=extra)
         self.assertIn('RC=1', result.stdout)
         self.assertIn('шаг 3 не завершён', result.stdout)
 

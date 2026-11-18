@@ -305,7 +305,10 @@ _py_yaml_ok() {
   python -c 'import yaml' >/dev/null 2>&1
 }
 
-geomask_config_shaped() { # geomask_config_shaped <file>
+geomask_config_verdict() { # geomask_config_verdict <file> -> 0 ours, 1 foreign, 2 cannot judge
+  # N04 (audit 18.11.2026): "cannot parse" used to mean "foreign", so a missing PyYAML turned a
+  # geomask config into somebody else's and the operator was offered --replace-config on it.
+  # The verdict is tri-state now: only a readable, parsed, non-shaped file is foreign.
   _f="$1"
   [ -s "$_f" ] || return 1
   grep -qxF '# geomask-managed: 1' "$_f" 2>/dev/null && return 0
@@ -314,12 +317,12 @@ import sys
 try:
     import yaml
 except Exception:
-    raise SystemExit(1)
+    raise SystemExit(2)
 try:
     with open(sys.argv[1], encoding='utf-8') as fh:
         data = yaml.safe_load(fh)
 except Exception:
-    raise SystemExit(1)
+    raise SystemExit(2)
 if not isinstance(data, dict):
     raise SystemExit(1)
 providers = data.get('proxy-providers')
@@ -331,6 +334,37 @@ if not isinstance(groups, list):
 names = {g.get('name') for g in groups if isinstance(g, dict)}
 raise SystemExit(0 if {'VPN-noP2P', 'AI'} <= names else 1)
 PYEOF
+}
+
+# Backwards-compatible predicate: "is this file ours?". Callers that must distinguish
+# "foreign" from "cannot judge" use geomask_config_verdict directly (N04).
+geomask_config_shaped() { # geomask_config_shaped <file> -> 0 only when the file is ours
+  geomask_config_verdict "$1"
+  _gcs=$?
+  [ "$_gcs" = 0 ]
+}
+
+# One ownership decision for every writer that is about to touch the live mihomo config.
+# --replace-config is the owner's explicit consent; --adopt-config means "merge, keep mine".
+# Everything else refuses, and an unreadable file is refused with its own reason: it is NOT
+# "somebody else's config" and must never be offered for replacement.
+_mihomo_guard() { # _mihomo_guard <file> <where> -> 0 may proceed, 1 refuse
+  [ -s "$1" ] || return 0
+  [ "${GM_REPLACE:-0}" = 1 ] && return 0
+  geomask_config_verdict "$1"
+  _mg_rc=$?
+  case "$_mg_rc" in
+    0) return 0 ;;
+    2)
+      bad "$2: конфиг mihomo не читается (нет python3-yaml или файл повреждён) - владение не определить"
+      info "  Ничего не изменено. Установите python3 python3-yaml и повторите."
+      return 1 ;;
+  esac
+  [ "${GM_ADOPT:-0}" = 1 ] && return 0
+  bad "$2: на роутере свой конфиг mihomo - шаблон поверх него не пишется"
+  info "  Взять его под управление без потери настроек: --adopt-config"
+  info "  Полная замена шаблоном (tun/dns/secret и ваши правила будут потеряны): --replace-config"
+  return 1
 }
 
 _mihomo_has_provider() { # _mihomo_has_provider <file> <provider> -> 0 when it exists
@@ -755,8 +789,13 @@ preflight() {
     [ -s "$_c" ] && _u=$(_prov_url "$_c" sub)
     if [ -z "$_u" ] && [ -s "$_c" ]; then _u=$(any_provider_url "$_c"); fi
     if [ -z "$_u" ]; then
-      if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ] \
-         && [ "${GM_REPLACE:-0}" != 1 ]; then
+      _mo=0
+      [ -s "$_c" ] && { geomask_config_verdict "$_c" || _mo=$?; }
+      if [ "$_mo" = 2 ]; then
+        # N04: an unreadable file is not "somebody else's config" - say what is missing.
+        bad "preflight: конфиг mihomo не читается (python3-yaml отсутствует или файл повреждён)"
+        info "  Владение конфигом определить нельзя; установка не начинается."
+      elif [ "$_mo" = 1 ] && [ "${GM_ADOPT:-0}" != 1 ] && [ "${GM_REPLACE:-0}" != 1 ]; then
         bad "preflight: на роутере свой конфиг mihomo, подписка не задана"
         info "  Либо --vpn-url '<ссылка>' (геомаск перепишет конфиг по шаблону),"
         info "  либо --adopt-config (взять текущий конфиг под управление, сохранив его),"
@@ -1201,10 +1240,7 @@ step3_apply() {
   _c="$(P $MIHOMO_CONF)"
   # v1.30.15: a foreign config is not "an existing config" - rewriting it loses tun, dns,
   # secret and every custom rule. Taking it over must be an explicit decision.
-  if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ] \
-     && [ "${GM_REPLACE:-0}" != 1 ]; then
-    bad "на роутере свой конфиг mihomo, и он не от geomask"
-    info "  Перезапись шаблоном потеряет tun/dns/secret и ваши правила - этого не будет."
+  if ! _mihomo_guard "$_c" "step3"; then
     info "  Варианты:"
     info "    sh $0 --adopt-config --vpn-url '<ссылка>' --auto   взять конфиг под управление"
     info "    полная замена шаблоном (потеря tun/dns/secret): --replace-config"
@@ -1293,13 +1329,7 @@ _write_mihomo_config_unlocked() { # the actual writer; called only under config-
   # function directly) rewrote an owner's config with the template. It belongs here.
   # --replace-config IS the owner's explicit decision to replace a foreign config, so it must
   # pass this guard - the flag used to be offered in the message and then rejected (F16).
-  if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ] \
-     && [ "${GM_REPLACE:-0}" != 1 ]; then
-    bad "на роутере свой конфиг mihomo - шаблон поверх него не пишется"
-    info "  Взять его под управление без потери настроек: --adopt-config"
-    info "  Полная замена шаблоном (tun/dns/secret и ваши правила будут потеряны): --replace-config"
-    return 1
-  fi
+  _mihomo_guard "$_c" "mihomo config" || return 1
   # I05 (audit 18.11.2026): --adopt-config used to pass the guard above and then do nothing -
   # the in-place patch below only rewrites geomask-shaped files, so the run reported success
   # without adopting anything and the NEXT run refused the same file. Adoption is a real step
@@ -5976,12 +6006,7 @@ menu_reinstall() {
   if [ -s "$_c" ]; then _curv=$(_prov_url "$_c" sub); fi
   # Every refusal is decided BEFORE the first removal: a foreign config, no room for the
   # snapshot, no way to reach the LAN. Nothing has been touched at this point.
-  if [ -s "$_c" ] && ! geomask_config_shaped "$_c" && [ "${GM_ADOPT:-0}" != 1 ] \
-     && [ "${GM_REPLACE:-0}" != 1 ]; then
-    bad "на роутере свой конфиг mihomo - переустановка его не перезапишет"
-    info "  Точечное управление: --adopt-config; полная замена с потерей настроек: --replace-config"
-    return 1
-  fi
+  _mihomo_guard "$_c" "reinstall" || return 1
   _free=$(df -k "$(P /tmp)" 2>/dev/null | awk 'NR==2{print $4}')
   case "$_free" in
     ''|*[!0-9]*) ;;

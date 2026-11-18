@@ -82,6 +82,7 @@
   "test_slot_patch.py": 12,
   "test_source_delete_guard.py": 7,
   "test_status_contract.py": 14,
+  "test_step_freshness.py": 4,
   "test_subscription_bindings.py": 33,
   "test_subscription_status_backend.py": 6,
   "test_sync_ytvpn.py": 5,

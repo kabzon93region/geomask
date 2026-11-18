@@ -1427,31 +1427,47 @@ step1_verify() { step1_check; }
 # ============================================================ STEP 2: geo overlay (ours)
 
 # ============================================================ STEP 2: geo overlay (ours)
+# I08 (audit 18.11.2026): the check knew 13 of the files step2 installs, and nothing about the
+# doctor. A router with an old doctor/lock/updater asset therefore printed "check: ALL GOOD"
+# and step2_apply was skipped - the old bytes stayed. The presence list below is exactly the
+# set step2_apply writes (a test keeps them equal), and a passing step-2 check no longer
+# skips the apply (see step_check_is_authoritative): presence cannot prove freshness.
+STEP2_FILES="/usr/lib/geomask/geomask-node-audit.py
+/usr/lib/geomask/geomask-audit-state.py
+/usr/lib/geomask/geomask-config-tx.py
+/usr/lib/geomask/geomask-config-owner.py
+/usr/lib/geomask/geomask-apply.py
+/usr/lib/geomask/geomask-lane-torrent.py
+/usr/lib/geomask/geomask-sync-youtube.py
+/usr/lib/geomask/geomask-audit-scheduler.py
+/usr/lib/geomask/geomask-subscription-status.py
+/usr/lib/geomask/geomask-slot-patch.py
+/usr/lib/geomask/geomask-mihomo-adopt.py
+/usr/lib/geomask/geomask-reload-state.py
+/usr/bin/geo-backend.sh
+/usr/lib/geomask/geomask-routes.sh
+/usr/lib/geomask/geomask-lock.sh
+/usr/lib/geomask/geomask-module-update.py
+/usr/lib/geomask/geomask-lists-edit.py
+/usr/lib/geomask/geomask-doctor.py
+/usr/lib/geomask/geomask-dnsguard.sh
+/usr/lib/geomask/geomask-console.py
+/usr/lib/geomask/geomask-diag-redact.py
+/usr/lib/geomask/geomask-diag-spool.py
+/etc/geomask/modules-index.json
+/usr/libexec/rpcd/geo-sync
+/usr/share/rpcd/acl.d/luci-app-geo-sync.json
+/usr/share/luci/menu.d/luci-app-geo-sync.json
+/www/luci-static/resources/view/geo-sync/main.js"
+
 step2_check() {
   _need=0
-  for f in /usr/lib/geomask/geomask-node-audit.py \
-           /usr/lib/geomask/geomask-audit-state.py \
-           /usr/lib/geomask/geomask-config-tx.py \
-           /usr/lib/geomask/geomask-config-owner.py \
-           /usr/lib/geomask/geomask-apply.py \
-           /usr/lib/geomask/geomask-lane-torrent.py \
-           /usr/lib/geomask/geomask-sync-youtube.py \
-           /usr/lib/geomask/geomask-audit-scheduler.py \
-           /usr/lib/geomask/geomask-subscription-status.py \
-           /usr/lib/geomask/geomask-slot-patch.py \
-           /usr/lib/geomask/geomask-console.py \
-           /usr/lib/geomask/geomask-dnsguard.sh \
-           /usr/lib/geomask/geomask-routes.sh; do
+  for f in $STEP2_FILES; do
+    module_skip_path "$f" && continue
     if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
   done
   # v1.30.0: the panel is its own module; without it there is nothing to register in ubus
   if module_selected luci; then
-    for f in /usr/bin/geo-backend.sh /usr/libexec/rpcd/geo-sync \
-             /usr/share/rpcd/acl.d/luci-app-geo-sync.json \
-             /usr/share/luci/menu.d/luci-app-geo-sync.json \
-             /www/luci-static/resources/view/geo-sync/main.js; do
-      if [ -s "$(P "$f")" ]; then info "present: $f"; else bad "missing: $f"; _need=1; fi
-    done
     if have ubus && ubus list 2>/dev/null | grep -qx 'geo-sync'; then info "ubus geo-sync: registered"; else bad "ubus geo-sync not registered"; _need=1; fi
   else
     mod_skipped luci
@@ -43679,18 +43695,32 @@ step_fn() { # step_fn N action -> call stepN_action
   esac
 }
 
+# I08: which steps may answer "nothing to do" from their check alone. Step 2 (panel/LuCI and the
+# /usr/lib assets) checks presence only, so an old asset passes it; save_stream compares bytes and
+# keeps unchanged ones, which makes a re-apply cheap and honest.
+step_check_is_authoritative() { # step_check_is_authoritative <n> -> 0 when check may skip apply
+  case "$1" in
+    2) return 1 ;;
+  esac
+  return 0
+}
+
 run_step() { # run_step N  (interactive/auto common logic)
   _n=$1
   _name=$(echo "$STEP_NAMES" | cut -d' ' -f"$_n")
   hdr "$_n/7" "$_name"
   _fc_before=$FAILCNT
   if step_fn "$_n" check; then
-    info "check: ALL GOOD"
-    PASS=$((PASS+1))
-    SKIP=$((SKIP+1))
-    return 0
+    if step_check_is_authoritative "$_n"; then
+      info "check: ALL GOOD"
+      PASS=$((PASS+1))
+      SKIP=$((SKIP+1))
+      return 0
+    fi
+    info "check: presence OK - apply still runs to prove the bytes are current"
+  else
+    info "check: issues found - apply needed"
   fi
-  info "check: issues found - apply needed"
   # A missing lock primitive (step 1 sets GM_STEP1_FATAL) is not something "apply" can fix:
   # refuse to apply ANY step, in the interactive wizard as well as in --auto. Without this the
   # wizard printed the step-1 error and still installed steps 2-7 into a system whose writers

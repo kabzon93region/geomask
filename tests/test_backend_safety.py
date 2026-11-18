@@ -195,6 +195,115 @@ uci() {
         self.assertIn('bad ip', result.stdout)
         self.assertFalse(self.devices.exists() and self.devices.read_text(encoding='utf-8').strip())
 
+    # ---------------------------------------------------------------- G03 dhcp lease
+    def dhcp_fixture(self, set_fails=None, commit_fails=False):
+        """Stateful uci stub with dhcp sections; `set_fails` is a substring that must fail."""
+        db = self.case / 'uci-db2'
+        db.mkdir(exist_ok=True)
+        (db / 'dhcp_lan_ra').write_text('server', encoding='utf-8')
+        calls = self.case / 'uci.calls'
+        extra = r"""
+uci() {
+  printf '%s\n' "$*" >> '@CALLS@'
+  _u_db='@DB@'
+  [ "${1:-}" = "-q" ] && shift
+  case "${1:-}" in
+    show)
+      printf "dhcp.lan.ra='server'\n"
+      for _f in "$_u_db"/host_*_mac; do
+        [ -f "$_f" ] || continue
+        _s=$(basename "$_f" _mac)
+        printf "dhcp.%s.mac='%s'\n" "$_s" "$(cat "$_f")"
+        [ -f "$_u_db/${_s}_ip" ] && printf "dhcp.%s.ip='%s'\n" "$_s" "$(cat "$_u_db/${_s}_ip")"
+      done
+      return 0 ;;
+    get)
+      _k=${2#dhcp.}
+      _s=${_k%%.*}; _o=${_k#*.}
+      _f="$_u_db/${_s}_${_o}"
+      [ -f "$_f" ] && { cat "$_f"; return 0; }
+      return 1 ;;
+    add)
+      printf 'host-%s\n' "${RANDOM}${RANDOM}"
+      return 0 ;;
+    set)
+      _assn=$2
+      _key=${_assn%%=*}
+      _val=${_assn#*=}
+      _s=${_key%%.*}; _o=${_key#*.}
+      case "$_val" in *'@FAIL@'*) return 1 ;; esac
+      printf '%s' "$_val" > "$_u_db/${_s}_${_o}"
+      return 0 ;;
+    delete)
+      rm -f "$_u_db/$(basename "${2:-x}" 2>/dev/null)_"* 2>/dev/null
+      return 0 ;;
+    commit)
+      return @COMMIT@ ;;
+  esac
+  return 0
+}
+"""
+        extra = (extra.replace('@CALLS@', posix(calls))
+                 .replace('@DB@', posix(db))
+                 .replace('@FAIL@', set_fails or 'NOPE-NOT-A-KEY')
+                 .replace('@COMMIT@', '1' if commit_fails else '0'))
+        return calls, db, extra
+
+    def test_a_failed_lease_write_does_not_commit_or_claim_ownership(self):
+        """G03: failed `uci set` calls were ignored, an empty host section was committed."""
+        calls, db, extra = self.dhcp_fixture(set_fails='aa:bb:cc:dd:ee:ff')
+        owned = self.case / 'dhcp-owned'
+        extra += 'DHCP_OWNED="%s"\n' % posix(owned)
+        result = self.run_backend(
+            'cmd_dev_add 192.168.1.60 ai aa:bb:cc:dd:ee:ff tv; printf "\\nRC=%s\\n" "$?"',
+            functions=['cmd_dev_add', '_ipv4_ok', '_require_backup', '_write_gate',
+                       '_devices_lock', '_devices_unlock', '_dhcp_host_section',
+                       '_dhcp_owned_add'],
+            extra=extra + '_apply_routing() { :; }\ncmd_status() { :; }\n')
+        output = result.stdout + result.stderr
+        self.assertIn('RC=0', output, output)
+        self.assertIn('static lease not created', output,
+                      'a failed lease write was reported as done')
+        self.assertFalse(owned.exists() and owned.read_text(encoding='utf-8').strip(),
+                         'ownership was recorded for a lease that was never written')
+
+    def test_an_existing_lease_for_the_mac_is_updated_in_place(self):
+        """The old probe skipped a MAC that already had a lease with another IP."""
+        calls, db, extra = self.dhcp_fixture()
+        (db / 'host_abc_mac').write_text('aa:bb:cc:dd:ee:ff', encoding='utf-8')
+        (db / 'host_abc_ip').write_text('192.168.1.10', encoding='utf-8')
+        owned = self.case / 'dhcp-owned'
+        extra += 'DHCP_OWNED="%s"\n' % posix(owned)
+        result = self.run_backend(
+            'cmd_dev_add 192.168.1.60 ai aa:bb:cc:dd:ee:ff tv; printf "\\nRC=%s\\n" "$?"',
+            functions=['cmd_dev_add', '_ipv4_ok', '_require_backup', '_write_gate',
+                       '_devices_lock', '_devices_unlock', '_dhcp_host_section',
+                       '_dhcp_owned_add'],
+            extra=extra + '_apply_routing() { :; }\ncmd_status() { :; }\n')
+        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr + '')
+        self.assertEqual((db / 'host_abc_ip').read_text(encoding='utf-8'), '192.168.1.60',
+                         'the existing lease kept the old address')
+        calls_text = calls.read_text(encoding='utf-8')
+        self.assertNotIn('add dhcp host', calls_text,
+                         'a second host section was created for the same MAC')
+        self.assertIn('192.168.1.60', owned.read_text(encoding='utf-8'))
+
+    def test_a_mac_that_only_shares_a_prefix_is_not_ours(self):
+        """`grep '.mac=<mac>'` matched a longer MAC; ownership must be exact."""
+        calls, db, extra = self.dhcp_fixture()
+        (db / 'host_other_mac').write_text('aa:bb:cc:dd:ee:ff:11', encoding='utf-8')
+        owned = self.case / 'dhcp-owned'
+        extra += 'DHCP_OWNED="%s"\n' % posix(owned)
+        result = self.run_backend(
+            'cmd_dev_add 192.168.1.60 ai aa:bb:cc:dd:ee:ff tv; printf "\\nRC=%s\\n" "$?"',
+            functions=['cmd_dev_add', '_ipv4_ok', '_require_backup', '_write_gate',
+                       '_devices_lock', '_devices_unlock', '_dhcp_host_section',
+                       '_dhcp_owned_add'],
+            extra=extra + '_apply_routing() { :; }\ncmd_status() { :; }\n')
+        self.assertIn('RC=0', result.stdout, result.stdout + result.stderr)
+        self.assertIn('add dhcp host', calls.read_text(encoding='utf-8'),
+                      'a lookalike MAC was treated as our lease')
+
     # ---------------------------------------------------------------- AI-DNS
     def test_unknown_listen_address_fails_closed(self):
         dest = self.case / '98-geomask-ai-dns.nft'

@@ -935,6 +935,19 @@ _devices_unlock() {
   gm_lock_release devices
 }
 
+# G03: find the dhcp host section for an exact MAC (not a substring of the whole uci dump).
+_dhcp_host_section() { # _dhcp_host_section <mac> -> section id, empty when absent
+  _dhs_out=$(uci -q show dhcp 2>/dev/null) || return 0
+  printf '%s\n' "$_dhs_out" | awk -F= -v mac="$1" '
+    $1 ~ /\.mac$/ {
+      value = $2
+      gsub(/^\047|\047$/, "", value)
+      if (value != mac) next
+      section = $1; sub(/\.mac$/, "", section); sub(/^[^.]+\./, "", section)
+      print section; exit
+    }'
+}
+
 _dhcp_owned_add() { # _dhcp_owned_add <section> <ip> <mac>
   mkdir -p "$(dirname "$DHCP_OWNED")" 2>/dev/null
   _do_tmp="$DHCP_OWNED.tmp.$$"
@@ -977,18 +990,33 @@ cmd_dev_add() {
   _devices_unlock
   # stable lease if mac given (strict MAC format only)
   if [ -n "$MAC" ] && echo "$MAC" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'; then
-    if ! uci show dhcp 2>/dev/null | grep -q "\.mac='$MAC'"; then
-      SEC=$(uci add dhcp host 2>/dev/null)
-      if [ -n "$SEC" ]; then
-        uci set "$SEC.mac=$MAC"; uci set "$SEC.ip=$IP"; uci set "$SEC.name=$NAME"
-        if uci commit dhcp 2>/dev/null; then
-          _dhcp_owned_add "$SEC" "$IP" "$MAC"
-        else
-          uci -q delete "$SEC" 2>/dev/null
-          warn "dhcp host commit failed - static lease not created"
-        fi
+    # G03 (audit 18.11.2026): the old probe was `uci show dhcp | grep ".mac=<mac>"` - a substring
+    # match that also skipped updating a lease whose IP changed - and every `uci set` ran with its
+    # exit code ignored, so a failed set still committed a host section with an empty ip/name and
+    # recorded ownership for it. Section lookup, writes and ownership are now explicit.
+    _dh_section=$(_dhcp_host_section "$MAC")
+    if [ -z "$_dh_section" ]; then
+      _dh_section=$(uci add dhcp host 2>/dev/null)
+    fi
+    if [ -n "$_dh_section" ]; then
+      _dh_ok=1
+      uci set "$_dh_section.mac=$MAC" 2>/dev/null || _dh_ok=0
+      [ "$_dh_ok" = 1 ] && { uci set "$_dh_section.ip=$IP" 2>/dev/null || _dh_ok=0; }
+      [ "$_dh_ok" = 1 ] && { uci set "$_dh_section.name=$NAME" 2>/dev/null || _dh_ok=0; }
+      if [ "$_dh_ok" = 1 ] && uci commit dhcp 2>/dev/null \
+         && [ "$(uci -q get "$_dh_section.mac" 2>/dev/null)" = "$MAC" ] \
+         && [ "$(uci -q get "$_dh_section.ip" 2>/dev/null)" = "$IP" ]; then
+        _dhcp_owned_add "$_dh_section" "$IP" "$MAC"
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+      else
+        # Nothing half-written survives: the section is removed and no ownership is recorded,
+        # so a later run retries instead of trusting an empty host entry.
+        uci -q delete "$_dh_section" 2>/dev/null
+        uci commit dhcp 2>/dev/null
+        warn "dhcp host set/commit failed - static lease not created (no ownership recorded)"
       fi
-      /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    else
+      warn "dhcp host section could not be created - static lease not created"
     fi
   fi
   _apply_routing || warn "routing not fully applied - see $LOG"

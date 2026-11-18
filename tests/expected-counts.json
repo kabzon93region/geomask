@@ -6,7 +6,7 @@
   "test_apply_safety.py": 10,
   "test_audit_source.py": 6,
   "test_audit_state.py": 12,
-  "test_backend_safety.py": 22,
+  "test_backend_safety.py": 25,
   "test_backup_gate.py": 7,
   "test_config_owner.py": 9,
   "test_config_tx.py": 22,

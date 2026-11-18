@@ -187,7 +187,11 @@ FOREIGN = '10.0.0.0/24 via 9.9.9.9 dev eth9'
 @unittest.skipIf(BASH is None or not LIB.exists(), 'bash and the routes helper are required')
 class _RoutesCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        # The lock fixture leaves a helper process holding a file inside the temp dir; on
+        # Windows the cleanup then races with the process exit and raises WinError 32/5,
+        # which turned a green test into an ERROR in a loaded gate run. Cleanup tolerance
+        # changes nothing about the assertions.
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.tmp.cleanup)
         self.case = Path(self.tmp.name)
         (self.case / 'calls.log').write_text('', encoding='utf-8')

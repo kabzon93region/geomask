@@ -231,5 +231,20 @@ ssh ... "sh /tmp/geomask-canary.sh --auto --yes --restart" | Tee-Object install.
 # 3) монитор с авто-откатом (реализуется как tools/canary/run-canary.ps1)
 ```
 
-Скрипты `tools/canary/run-canary.ps1` и `tools/canary/probe.sh` создаются отдельной партией
-после согласования этого плана (они меняют только ПК и `/tmp` роутера).
+Скрипты уже в репозитории: `tools/canary/run-canary.ps1` (оркестратор + сторож на ПК),
+`tools/canary/probe.sh` (read-only JSON-проверки на роутере), `tools/canary/restore.sh`
+(восстановление архивов и очистка лишнего на роутере). Покрытие — `tests/test_canary_scripts.py`
+(ASCII, `sh -n`, контракт ключей probe, обязательный `StrictHostKeyChecking=yes`, установка
+только с `-Execute`, откат только после `-FailThreshold` кругов).
+
+Безопасный прогон без установки (только бэкап + репетиция восстановления):
+
+```powershell
+powershell -File Y:\openwrt\geomask\tools\canary\run-canary.ps1
+```
+
+Полный прогон (установка + монитор + авто-откат) — только когда владелец рядом:
+
+```powershell
+powershell -File Y:\openwrt\geomask\tools\canary\run-canary.ps1 -Execute
+```

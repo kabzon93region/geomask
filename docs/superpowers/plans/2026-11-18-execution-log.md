@@ -369,6 +369,26 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 21 — скрипты канарейки (ПК-сторож, probe, restore)
+
+- `tools/canary/run-canary.ps1`: бэкап (sysupgrade + overlay-bundle из
+  `tests/reinstall_write_set.json`, потому что keep-list не берёт `/etc/mihomo` и
+  `/etc/geomask`), сверка sha256 на обеих сторонах, репетиция restore в `/tmp`, read-only
+  `--check`, установка `--auto --yes --restart` и монитор каждые 60 с (ping, SSH-probe,
+  интернет с ПК через роутер, DNS через роутер, mihomo, TUN, ip-rule 100/102, egress самого
+  роутера). После 3 подряд нездоровых кругов — restore обоих архивов, очистка
+  geomask-файлов, которых нет в архивах, `reboot`, ожидание 120 с и 5 проверочных кругов.
+  Без `-Execute` не устанавливает ничего; при недоступном SSH не перезагружает роутер, а
+  пишет `MANUAL-ACTION-REQUIRED.txt`.
+- `tools/canary/probe.sh`: read-only проверки, key=value, для разбора на ПК.
+- `tools/canary/restore.sh`: восстановление архивов и удаление только geomask-путей, которых
+  нет в списке файлов архива и которые новее маркера старта установки.
+- `tests/test_canary_scripts.py` (7 тестов): ASCII, `sh -n`, контракт ключей probe, все
+  ssh/scp с `StrictHostKeyChecking=yes` и `BatchMode=yes`, установка только с `-Execute`,
+  откат только после `FailThreshold`, restore без архивов отказывает, очистка не трогает
+  `/etc/config`.
+- Ограничение: скрипты не запускались на роутере; это следующий шаг с владельцем.
+
 ## Партия 20 — план канареечного прогона на роутере и промпт для Linux-агента
 
 - `docs/stand/ROUTER-CANARY-PLAN.md`: исполнимый план проверки на живом роутере с

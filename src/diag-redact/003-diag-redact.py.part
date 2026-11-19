@@ -1,6 +1,52 @@
+def _batch_text(manifest):
+    """Redact many saved logs in one process: N separate starts cost ~0.5 s each.
+
+    The bundle used to redact 30 logs one by one, which took 16 s of its 30 s ubus budget.
+    Manifest lines are `src<TAB>dst<TAB>cap`; only the last `cap` bytes of `src` are kept.
+    """
+    try:
+        handle = open(manifest, encoding='utf-8', errors='surrogateescape')
+    except OSError as exc:
+        return fail('batch: cannot read the manifest: %s' % exc)
+    done = 0
+    with handle:
+        for raw in handle:
+            parts = raw.rstrip('\n').split('\t')
+            if len(parts) != 3:
+                return fail('batch: malformed manifest line: %r' % raw[:80])
+            src, dst, cap = parts
+            try:
+                cap = int(cap)
+            except ValueError:
+                return fail('batch: bad cap for %s' % src)
+            try:
+                with open(src, 'rb') as source:
+                    source.seek(0, os.SEEK_END)
+                    size = source.tell()
+                    source.seek(max(0, size - cap))
+                    data = source.read()
+            except OSError as exc:
+                return fail('batch: cannot read %s: %s' % (src, exc))
+            try:
+                result = redact_text(data.decode('utf-8', 'replace'))
+            except RedactionError as exc:
+                return fail('batch: %s: %s' % (src, exc))
+            tmp = dst + '.tmp'
+            try:
+                with open(tmp, 'w', encoding='utf-8', newline='') as out:
+                    out.write(result)
+                os.replace(tmp, dst)
+            except OSError as exc:
+                return fail('batch: cannot write %s: %s' % (dst, exc))
+            done += 1
+    emit('{"ok":true,"files":%d}\n' % done)
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
-        return fail('usage: geomask-diag-redact.py redact <uci|yaml|json|text|nft> | verify <dir>')
+        return fail('usage: geomask-diag-redact.py redact <uci|yaml|json|text|nft> | '
+                    'batch text <manifest> | verify <dir>')
     command = argv[1]
     if command == 'redact':
         if len(argv) != 3 or argv[2] not in _REDACTORS:
@@ -13,6 +59,10 @@ def main(argv):
             return fail('{"ok":false,"error":"%s"}' % exc)
         emit(result)
         return 0
+    if command == 'batch':
+        if len(argv) != 4 or argv[2] != 'text':
+            return fail('usage: geomask-diag-redact.py batch text <manifest>')
+        return _batch_text(argv[3])
     if command == 'verify':
         if len(argv) != 3:
             return fail('usage: geomask-diag-redact.py verify <dir>')

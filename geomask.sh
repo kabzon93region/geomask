@@ -10255,6 +10255,16 @@ for check in data.get("checks") or []:
   fi
   [ "$_diag_cap" -gt "$_diag_log_max" ] && _diag_cap=$_diag_log_max
   [ "$_diag_cap" -lt "$_diag_log_min" ] && _diag_cap=$_diag_log_min
+  # One redactor process for all saved logs: 30 separate starts took 16 s of the 30 s ubus
+  # budget and the panel call timed out (live router, 19.11.2026).
+  _diag_manifest="$_tmpd/geomask-diag-redact.$$"
+  : > "$_diag_manifest" 2>/dev/null || {
+    rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot create the redaction manifest"}\n'
+    return 1
+  }
+  chmod 600 "$_diag_manifest" 2>/dev/null
   while IFS='|' read -r _diag_id _diag_log; do
     case "$_diag_id" in ''|*[!A-Za-z0-9_]*) continue ;; esac
     [ -n "$_diag_log" ] || continue
@@ -10263,16 +10273,17 @@ for check in data.get("checks") or []:
     [ -f "$_diag_log" ] || continue
     [ -L "$_diag_log" ] && continue
     [ -s "$_diag_log" ] || continue
-    # The tail is the part worth keeping; the block headers are at the start of each block.
-    if ! tail -c "$_diag_cap" "$_diag_log" 2>/dev/null \
-        | _console_diag_redact text "diag:$_diag_id" "$_dir/diagnostics/$_diag_id.log" >/dev/null; then
-      rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
-      rm -rf "$_dir" 2>/dev/null
-      printf '{"ok":false,"error":"cannot mask the saved check log %s - nothing was packed"}\n' \
-        "$_diag_id"
-      return 1
-    fi
+    printf '%s\t%s\t%s\n' "$_diag_log" "$_dir/diagnostics/$_diag_id.log" "$_diag_cap" \
+      >> "$_diag_manifest" 2>/dev/null
   done < "$_diag_pairs_file"
+  if ! "$PYTHON_BIN" -B "$DIAG_PY" batch text "$_diag_manifest" >/dev/null 2>&1; then
+    rm -f "$_diag_list_file" "$_diag_pairs_file" "$_diag_manifest" 2>/dev/null
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot mask the saved check logs - nothing was packed"}\n'
+    return 1
+  fi
+  rm -f "$_diag_manifest" 2>/dev/null
+
   _diag_counts=$(_diag_index_json "$_diag_list_file" "$_dir" \
     "$_dir/diagnostics/index.json")
   _diag_index_rc=$?
@@ -17227,9 +17238,55 @@ _REDACTORS = {
 }
 
 
+def _batch_text(manifest):
+    """Redact many saved logs in one process: N separate starts cost ~0.5 s each.
+
+    The bundle used to redact 30 logs one by one, which took 16 s of its 30 s ubus budget.
+    Manifest lines are `src<TAB>dst<TAB>cap`; only the last `cap` bytes of `src` are kept.
+    """
+    try:
+        handle = open(manifest, encoding='utf-8', errors='surrogateescape')
+    except OSError as exc:
+        return fail('batch: cannot read the manifest: %s' % exc)
+    done = 0
+    with handle:
+        for raw in handle:
+            parts = raw.rstrip('\n').split('\t')
+            if len(parts) != 3:
+                return fail('batch: malformed manifest line: %r' % raw[:80])
+            src, dst, cap = parts
+            try:
+                cap = int(cap)
+            except ValueError:
+                return fail('batch: bad cap for %s' % src)
+            try:
+                with open(src, 'rb') as source:
+                    source.seek(0, os.SEEK_END)
+                    size = source.tell()
+                    source.seek(max(0, size - cap))
+                    data = source.read()
+            except OSError as exc:
+                return fail('batch: cannot read %s: %s' % (src, exc))
+            try:
+                result = redact_text(data.decode('utf-8', 'replace'))
+            except RedactionError as exc:
+                return fail('batch: %s: %s' % (src, exc))
+            tmp = dst + '.tmp'
+            try:
+                with open(tmp, 'w', encoding='utf-8', newline='') as out:
+                    out.write(result)
+                os.replace(tmp, dst)
+            except OSError as exc:
+                return fail('batch: cannot write %s: %s' % (dst, exc))
+            done += 1
+    emit('{"ok":true,"files":%d}\n' % done)
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
-        return fail('usage: geomask-diag-redact.py redact <uci|yaml|json|text|nft> | verify <dir>')
+        return fail('usage: geomask-diag-redact.py redact <uci|yaml|json|text|nft> | '
+                    'batch text <manifest> | verify <dir>')
     command = argv[1]
     if command == 'redact':
         if len(argv) != 3 or argv[2] not in _REDACTORS:
@@ -17242,6 +17299,10 @@ def main(argv):
             return fail('{"ok":false,"error":"%s"}' % exc)
         emit(result)
         return 0
+    if command == 'batch':
+        if len(argv) != 4 or argv[2] != 'text':
+            return fail('usage: geomask-diag-redact.py batch text <manifest>')
+        return _batch_text(argv[3])
     if command == 'verify':
         if len(argv) != 3:
             return fail('usage: geomask-diag-redact.py verify <dir>')
@@ -18376,7 +18437,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "c8a69b057750c79fcacee7e068aa87dd46b2fb225779a2713b1ea56774531c3c"
+          "sha256": "a3e20ee7eaf6698b2c3d16506dd94c3fe881b38865843823f51c6a9fed95eb0b"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -18448,7 +18509,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-diag-redact.py",
           "source": "assets/geomask-diag-redact.py",
           "mode": "0755",
-          "sha256": "12b27acc6ea32d2378a8ac6a6bad2102a6247edff3f0586ab23b1df812036aef"
+          "sha256": "6f67539b8252b9c3ceaae332d4b53c08853824eb109b2a0041941647932a01fd"
         },
         {
           "path": "/usr/lib/geomask/geomask-diag-spool.py",
@@ -43879,9 +43940,14 @@ step_fn() { # step_fn N action -> call stepN_action
 # I08: which steps may answer "nothing to do" from their check alone. Step 2 (panel/LuCI and the
 # /usr/lib assets) checks presence only, so an old asset passes it; save_stream compares bytes and
 # keeps unchanged ones, which makes a re-apply cheap and honest.
+# Steps that install code files must always apply: a presence-only check cannot see stale
+# bytes, and an update with the same router state used to leave the old files forever (the
+# panel then showed "module updates available" for months, live router 19.11.2026). Steps 2,
+# 4 and 5 own save_stream blocks; step 4 also rewrites the AI-DNS init scripts, step 5 the
+# sync/node-scan/seed/lane files. Their apply paths are idempotent.
 step_check_is_authoritative() { # step_check_is_authoritative <n> -> 0 when check may skip apply
   case "$1" in
-    2) return 1 ;;
+    2|4|5) return 1 ;;
   esac
   return 0
 }

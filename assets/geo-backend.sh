@@ -3538,6 +3538,16 @@ for check in data.get("checks") or []:
   fi
   [ "$_diag_cap" -gt "$_diag_log_max" ] && _diag_cap=$_diag_log_max
   [ "$_diag_cap" -lt "$_diag_log_min" ] && _diag_cap=$_diag_log_min
+  # One redactor process for all saved logs: 30 separate starts took 16 s of the 30 s ubus
+  # budget and the panel call timed out (live router, 19.11.2026).
+  _diag_manifest="$_tmpd/geomask-diag-redact.$$"
+  : > "$_diag_manifest" 2>/dev/null || {
+    rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot create the redaction manifest"}\n'
+    return 1
+  }
+  chmod 600 "$_diag_manifest" 2>/dev/null
   while IFS='|' read -r _diag_id _diag_log; do
     case "$_diag_id" in ''|*[!A-Za-z0-9_]*) continue ;; esac
     [ -n "$_diag_log" ] || continue
@@ -3546,16 +3556,17 @@ for check in data.get("checks") or []:
     [ -f "$_diag_log" ] || continue
     [ -L "$_diag_log" ] && continue
     [ -s "$_diag_log" ] || continue
-    # The tail is the part worth keeping; the block headers are at the start of each block.
-    if ! tail -c "$_diag_cap" "$_diag_log" 2>/dev/null \
-        | _console_diag_redact text "diag:$_diag_id" "$_dir/diagnostics/$_diag_id.log" >/dev/null; then
-      rm -f "$_diag_list_file" "$_diag_pairs_file" 2>/dev/null
-      rm -rf "$_dir" 2>/dev/null
-      printf '{"ok":false,"error":"cannot mask the saved check log %s - nothing was packed"}\n' \
-        "$_diag_id"
-      return 1
-    fi
+    printf '%s\t%s\t%s\n' "$_diag_log" "$_dir/diagnostics/$_diag_id.log" "$_diag_cap" \
+      >> "$_diag_manifest" 2>/dev/null
   done < "$_diag_pairs_file"
+  if ! "$PYTHON_BIN" -B "$DIAG_PY" batch text "$_diag_manifest" >/dev/null 2>&1; then
+    rm -f "$_diag_list_file" "$_diag_pairs_file" "$_diag_manifest" 2>/dev/null
+    rm -rf "$_dir" 2>/dev/null
+    printf '{"ok":false,"error":"cannot mask the saved check logs - nothing was packed"}\n'
+    return 1
+  fi
+  rm -f "$_diag_manifest" 2>/dev/null
+
   _diag_counts=$(_diag_index_json "$_diag_list_file" "$_dir" \
     "$_dir/diagnostics/index.json")
   _diag_index_rc=$?

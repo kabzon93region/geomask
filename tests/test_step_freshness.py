@@ -45,8 +45,19 @@ class Step2FreshnessTests(unittest.TestCase):
         self.assertIn('step_check_is_authoritative', function('run_step'),
                       'run_step still trusts the check alone')
         body = function('step_check_is_authoritative')
-        self.assertRegex(body, r'2\)\s*return 1',
-                         'step 2 is still allowed to skip its apply on presence')
+        self.assertIn('2|4|5) return 1', body,
+                      'a step that installs files is still allowed to skip its apply')
+
+    def test_the_file_owning_steps_are_authoritative_too(self):
+        """Steps 4 and 5 own save_stream blocks; a passing presence check skipped them.
+
+        An update with the same router state therefore kept the old syncd/lane/seed bytes and
+        the panel showed module updates forever (live router, 19.11.2026).
+        """
+        body = function('step_check_is_authoritative')
+        self.assertIn('2|4|5) return 1', body,
+                      'steps that install files may still skip their apply')
+        self.assertNotIn('6)', body, 'steps without save_stream blocks need no re-apply')
 
     def test_other_steps_may_still_skip(self):
         body = function('step_check_is_authoritative')

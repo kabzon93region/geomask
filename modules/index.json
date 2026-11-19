@@ -98,7 +98,7 @@
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "c8a69b057750c79fcacee7e068aa87dd46b2fb225779a2713b1ea56774531c3c"
+          "sha256": "a3e20ee7eaf6698b2c3d16506dd94c3fe881b38865843823f51c6a9fed95eb0b"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -170,7 +170,7 @@
           "path": "/usr/lib/geomask/geomask-diag-redact.py",
           "source": "assets/geomask-diag-redact.py",
           "mode": "0755",
-          "sha256": "12b27acc6ea32d2378a8ac6a6bad2102a6247edff3f0586ab23b1df812036aef"
+          "sha256": "6f67539b8252b9c3ceaae332d4b53c08853824eb109b2a0041941647932a01fd"
         },
         {
           "path": "/usr/lib/geomask/geomask-diag-spool.py",

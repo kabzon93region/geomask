@@ -159,9 +159,14 @@ step_fn() { # step_fn N action -> call stepN_action
 # I08: which steps may answer "nothing to do" from their check alone. Step 2 (panel/LuCI and the
 # /usr/lib assets) checks presence only, so an old asset passes it; save_stream compares bytes and
 # keeps unchanged ones, which makes a re-apply cheap and honest.
+# Steps that install code files must always apply: a presence-only check cannot see stale
+# bytes, and an update with the same router state used to leave the old files forever (the
+# panel then showed "module updates available" for months, live router 19.11.2026). Steps 2,
+# 4 and 5 own save_stream blocks; step 4 also rewrites the AI-DNS init scripts, step 5 the
+# sync/node-scan/seed/lane files. Their apply paths are idempotent.
 step_check_is_authoritative() { # step_check_is_authoritative <n> -> 0 when check may skip apply
   case "$1" in
-    2) return 1 ;;
+    2|4|5) return 1 ;;
   esac
   return 0
 }

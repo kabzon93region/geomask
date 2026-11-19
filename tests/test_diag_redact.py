@@ -630,5 +630,59 @@ class ShortKeyRound5Tests(RedactorTestCase):
         self.assertIn('api.example.com', text, 'the host was removed as well')
 
 
+class BatchTests(RedactorTestCase):
+    """One redactor process for all saved logs: 30 starts took 16 s of the 30 s ubus budget."""
+
+    def run_batch(self, manifest):
+        return subprocess.run(
+            [sys.executable, '-B', str(REDACT), 'batch', 'text', str(manifest)],
+            capture_output=True, timeout=120)
+
+    def test_one_process_redacts_every_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            outputs = []
+            lines = []
+            for index in range(3):
+                source = base / ('check%d.log' % index)
+                source.write_text('ok line\nsecret %d: password=BATCH-SENTINEL-%d\n'
+                                  % (index, index), encoding='utf-8')
+                target = base / ('out%d.log' % index)
+                outputs.append(target)
+                lines.append('%s\t%s\t65536' % (source, target))
+            manifest = base / 'manifest.txt'
+            manifest.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+            result = self.run_batch(manifest)
+            self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', 'replace'))
+            self.assertIn(b'"files":3', result.stdout)
+            for index, target in enumerate(outputs):
+                text = target.read_text(encoding='utf-8')
+                self.assertIn('ok line', text)
+                self.assertNotIn('BATCH-SENTINEL-%d' % index, text)
+
+    def test_batch_keeps_the_tail_and_refuses_a_missing_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / 'check.log'
+            source.write_text('OLD-PREFIX\n' + 'x' * 4096 + '\nTAILMARK password=SECRET\n',
+                              encoding='utf-8')
+            target = base / 'out.log'
+            manifest = base / 'manifest.txt'
+            manifest.write_text('%s\t%s\t64\n' % (source, target), encoding='utf-8')
+            result = self.run_batch(manifest)
+            self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', 'replace'))
+            text = target.read_text(encoding='utf-8')
+            self.assertNotIn('OLD-PREFIX', text)
+            self.assertIn('TAILMARK', text)
+            self.assertNotIn('SECRET', text)
+
+            broken = base / 'broken.txt'
+            broken.write_text('%s\t%s\t64\n' % (base / 'missing.log', base / 'x.log'),
+                              encoding='utf-8')
+            result = self.run_batch(broken)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b'cannot read', result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()

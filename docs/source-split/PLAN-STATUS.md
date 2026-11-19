@@ -89,3 +89,7 @@ B-020 — `2422295` (бюджет 15 с, partial, probe path). D14 — искл�
   композиция из чистого `git archive` → байт-в-байт (партия 19: 1 676 554 байта,
   тот же sha256, `check_build --verify-only` ok).
 - Стендовые проверки и порядок их выполнения — [STAND-GATES-RUNBOOK](<../STAND-GATES-RUNBOOK.md>).
+- Порядок закрытия стендовых пунктов без собственного стенда:
+  [ROUTER-CANARY-PLAN](../stand/ROUTER-CANARY-PLAN.md) (канареечный прогон на живом роутере
+  с авто-откатом) и [AGENT-PROMPT-LINUX](../stand/AGENT-PROMPT-LINUX.md) (Linux unit-gate на
+  отдельной машине). Это планы, не evidence: строки выше остаются OPEN до логов прогонов.

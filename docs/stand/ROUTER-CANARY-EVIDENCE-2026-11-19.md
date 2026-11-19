@@ -118,3 +118,33 @@ mediatek/filogic, `root@192.168.0.1`, установлен geomask **1.31.0**.
 
 Остаются стендовыми: power loss/ENOSPC, G05, реальный rpcd/ACL, обновление модулей с
 установкой файлов, переустановка phase2a–2f на устройстве, матрица профилей.
+
+## Переустановка на живом роутере (вечер 19.11.2026)
+
+`--reinstall --yes` под тем же сторожем, что и обновление (бэкап + репетиция restore +
+монитор + авто-откат). Четыре попытки, каждая отказывала **до первой мутации** — preflight
+сработал как задумано, и каждый отказ был ложным:
+
+1. `MagiTrickle state: an empty /etc/magitrickle/state/config.yaml` — проверка искала
+   `- name:`, а 0.8.x пишет `- id:`. Исправлено (`0def5d0`).
+2. `unrestorable object: /etc/geomask/node-audit/state is a directory` — state-каталог
+   объявлен regular-файлом. Переведён в `dir` с `snapshot NONE`, строка byte-таблицы убрана,
+   проба каталога терпит отсутствие (`0def5d0`).
+3. `snapshot: cannot stat /etc/mihomo` — без `stat(1)` фолбэк считал `wc -c < dir` и
+   `ls` без `-d`; каталоги теперь `ls -l -n -d`, uid/inode с `-d`, пустые поля больше не
+   отбрасывают всё значение (`f26a941`).
+4. `pending uci delta for dhcp` — `/tmp/.uci/dhcp` был **пустым**; пустой delta теперь не
+   считается чужой правкой (`e8b5af8`).
+
+Успешный прогон (`canary-20261119-194522`, сборка `261df282…`): установка 70 с,
+`verify: PASS`, `Переустановка geomask завершена`, rc=0; `--check` после — rc=0; монитор
+10/10 здоров. mihomo не перезапускался (маркер владельца `/root/.geomask-norestart`).
+
+После перезагрузки (19:58): `uptime` 1841 с, `version=1.31.0`, сборка `261df282…`,
+`table inet fw4` + `chain geomask_no_v6`, mihomo pid 5750, три hev, magitrickle,
+`geomask-syncd` running, TUN `Mihomo/AI/VPN-noP2P/Wireguard`, ip-rule 100/101, IPv6 off,
+интернет/DNS ok, 15/15 модулей `current`, `--check` rc=0 — переустановка пережила reboot.
+
+Бэкап перед reboot: `router-backup-20261119-194611.tar.gz` (sha256 `ab0f6287…`) +
+`sysupgrade.tar.gz` `14718552…` и `overlay.tar.gz` `1fd77e3a…` на ПК
+(`Y:\openwrt\backup\preboot4-20261119-195821`).

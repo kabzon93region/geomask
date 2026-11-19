@@ -384,6 +384,25 @@
 - Тест-гейт: прогресс в консоль и `progress.txt` (`6abb0d2`, `245de7b`); `gate33` упал только
   на `test_diag_bundle` из-за MSYS-путей, `gate34` — PASS.
 
+## Партия 30 — переустановка на живом роутере: четыре отказа preflight и успех
+
+- `--reinstall --yes` под канарейкой (бэкап + репетиция restore + монитор + авто-откат):
+  четыре попытки, все отказы — **до первой мутации**, и все были ложными:
+  1. `MagiTrickle state: an empty config.yaml` — проверка искала `- name:`, 0.8.x пишет
+     `- id:` (`0def5d0`);
+  2. `node-audit/state is a directory` — state-каталог объявлен regular; переведён в `dir`
+     с `snapshot NONE`, byte-строка убрана, проба терпит отсутствие (`0def5d0`);
+  3. `snapshot: cannot stat /etc/mihomo` — каталоги: `ls -l -n -d`, uid/inode с `-d`,
+     пустые поля не отбрасывают значение (`f26a941`);
+  4. `pending uci delta for dhcp` — пустой `/tmp/.uci/dhcp` считался чужой правкой; теперь
+     только непустой delta блокирует (`e8b5af8`).
+- Успех: установка 70 с, `verify: PASS`, rc=0; `--check` rc=0; монитор 10/10. mihomo не
+  перезапускался (`/root/.geomask-norestart`). После reboot: fw4+guard, mihomo/3 hev/
+  magitrickle/syncd, TUN, ip-rule 100/101, IPv6 off, интернет/DNS, 15/15 модулей `current`,
+  `--check` rc=0. Бэкап `router-backup-20261119-194611` + overlay, sha256 на ПК.
+- Инструмент: `run-canary.ps1 -Reinstall` (`0ed5d87`), чтобы гонять этот путь так же
+  безопасно, как обновление.
+
 ## Партия 29 — финальная сборка на роутере и третья перезагрузка
 
 - Установлена сборка `705eea0d…` (sha256 сверен), `--auto --yes --restart` rc=0,

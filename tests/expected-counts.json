@@ -88,7 +88,7 @@
   "test_subscription_bindings.py": 33,
   "test_subscription_status_backend.py": 6,
   "test_sync_ytvpn.py": 5,
-  "test_testgate.py": 5,
+  "test_testgate.py": 8,
   "test_tx_journal_retention.py": 5,
   "test_tx_provider.py": 6,
   "test_tx_verify.py": 6,

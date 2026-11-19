@@ -62,6 +62,16 @@ class GateTests(unittest.TestCase):
         summary = (logs / 'summary.txt').read_text(encoding='utf-8')
         return rc, output.getvalue(), summary
 
+    def test_progress_is_printed_for_every_module(self):
+        """A full gate prints nothing for an hour; a run must say what it is doing."""
+        rc, output, summary = self.run_gate({'test_one.py': PASSING},
+                                            {'test_one.py': 1})
+        self.assertEqual(rc, 0)
+        self.assertIn('gate: 1 modules', output)
+        self.assertIn('[1/1] test_one.py', output)
+        self.assertRegex(output, r'ok\s+1 tests')
+        self.assertIn('gate: 1 modules done', output)
+
     def test_a_module_that_ran_no_tests_is_a_failure(self):
         rc, output, summary = self.run_gate({'test_empty.py': EMPTY},
                                             {'test_empty.py': 1})

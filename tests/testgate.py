@@ -202,12 +202,17 @@ def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
         return summarize([], tests_dir, log_dir, timeout, expected, expected_path, problem)
     modules = sorted(os.path.basename(p) for p in glob.glob(os.path.join(tests_dir, 'test_*.py')))
     python = python or sys.executable
+    # Console progress: a full gate runs for an hour and used to print nothing until the end,
+    # so from the outside it looked hung. One line per module, flushed.
+    print('gate: %d modules, log dir: %s' % (len(modules), log_dir), flush=True)
 
     results = []
     for module in modules:
         stem = module[:-3]
         log_path = Path(log_dir) / (stem + '.log')
         started = time.time()
+        print('  [%d/%d] %-38s ' % (len(results) + 1, len(modules), module),
+              end='', flush=True)
         env = _module_env(log_dir, module, [tests_dir])
         cmd = [python, '-B', os.path.abspath(__file__), '_run-one', tests_dir, module]
         status = 'ok'
@@ -225,6 +230,7 @@ def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
                 other = shutil.which('python') or shutil.which('python3')
                 if not other or other == cmd[0]:
                     raise
+                print('retry ', end='', flush=True)
                 cmd = [other] + cmd[1:]
                 completed = subprocess.run(
                     cmd, cwd=os.path.dirname(tests_dir), env=env,
@@ -285,6 +291,9 @@ def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
             else:
                 status = 'ok'
 
+        print('%s  %d tests  %.1fs%s' % (
+            status, tests_run, payload.get('duration', time.time() - started),
+            '' if status == 'ok' else '  -> ' + str(log_path.name)), flush=True)
         results.append({
             'module': module, 'status': status, 'tests': tests_run, 'pass': passed,
             'fail': failures + errors, 'skip': skipped, 'timeout': status == 'timeout',
@@ -293,6 +302,8 @@ def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
             'log': str(log_path),
         })
 
+    print('gate: %d modules done in %.1fs' % (
+        len(results), sum(r['duration'] for r in results)), flush=True)
     return summarize(results, tests_dir, log_dir, timeout, expected, expected_path)
 
 

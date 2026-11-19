@@ -79,8 +79,10 @@ class CanaryToolingTests(unittest.TestCase):
         watchdog = text(WATCHDOG)
         self.assertIn('[switch]$Execute', watchdog)
         self.assertIn('if (-not $Execute)', watchdog)
-        # The install command must be the only place that runs --auto on the router.
-        self.assertEqual(watchdog.count('geomask.sh --auto --yes --restart'), 1)
+        # Both install modes exist, and only Invoke-Install selects one.
+        self.assertIn("$mode = '--auto --yes --restart'", watchdog)
+        self.assertIn("$mode = '--reinstall --yes --restart'", watchdog)
+        self.assertEqual(watchdog.count("' > /tmp/canary/install.log 2>&1"), 1)
         # A rollback is never triggered by a single bad round.
         self.assertIn('[int]$FailThreshold = 3', watchdog)
         self.assertIn('$fails -ge $FailThreshold', watchdog)

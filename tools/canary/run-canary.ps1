@@ -31,6 +31,7 @@ param(
     [int]$BootWaitSec = 120,
     [int]$HealthyRounds = 10,
     [switch]$Execute,
+    [switch]$Reinstall,
     [switch]$NoRollback
 )
 
@@ -308,8 +309,16 @@ function Invoke-ReadOnlyCheck {
 }
 
 function Invoke-Install {
-    Log 'INFO' 'install: --auto --yes --restart'
-    $r = Invoke-Ssh 'touch /tmp/canary/install-start.ref; sh /tmp/canary/geomask.sh --auto --yes --restart > /tmp/canary/install.log 2>&1; rc=$?; tail -n 120 /tmp/canary/install.log; echo RC=$rc' 1800
+    # -Reinstall exercises the destructive path (delete -> install -> configure) with the same
+    # backup/rehearsal/monitor/rollback around it; the default is the in-place --auto update.
+    if ($Reinstall) {
+        $mode = '--reinstall --yes --restart'
+    } else {
+        $mode = '--auto --yes --restart'
+    }
+    Log 'INFO' ('install: ' + $mode)
+    $r = Invoke-Ssh ('touch /tmp/canary/install-start.ref; sh /tmp/canary/geomask.sh ' + $mode +
+        ' > /tmp/canary/install.log 2>&1; rc=$?; tail -n 120 /tmp/canary/install.log; echo RC=$rc') 1800
     $file = Join-Path $script:RunDir 'install.log'
     Set-Content -LiteralPath $file -Value $r.Out -Encoding ASCII
     Log 'INFO' ('install rc=' + $r.Rc + ' log saved to ' + $file)
@@ -440,7 +449,7 @@ function Write-Report {
         '- when: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'),
         '- router: ' + $Router,
         '- installer sha256: ' + $script:InstallerSha,
-        '- mode: ' + $(if ($Execute) { 'execute' } else { 'plan-only' }),
+        '- mode: ' + $(if (-not $Execute) { 'plan-only' } elseif ($Reinstall) { 'reinstall' } else { 'auto-update' }),
         '- verdict: ' + $Verdict,
         '- note: ' + $Note,
         '',

@@ -369,6 +369,22 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 17 — полный gate после P06/P09: PASS
+
+- `gate25` на Windows-хосте, `testgate run --timeout 4200`: **96 модулей, 1405 тестов,
+  1375 выполнено, 30 allowlisted skip, 0 fail, 0 timeout, 0 unknown** — PASS
+  (`R:\Games\SkyrimMO2\_tmp\gate25\summary.txt`).
+- Долгие модули прошли без повторов: `test_reinstall_phase2b` 44 теста / 1733.8 с (ровно та
+  проверка переустановки, которую затрагивает новая парковка), `test_reinstall_phase2c`
+  475.5 с, `test_sandbox_guard` 395.8 с, `test_dnsguard` 264.7 с.
+- 30 skip — только allowlisted Windows-ограничения (`posix-only`, `no-native-symlink`,
+  `no-bash`, …), то есть ровно те места, которые закрывает Linux-стенд.
+- RED новых тестов подтверждён отдельно на до-фиксовом `geomask.sh.in` (`734b97f^`): оба
+  падают по заявленной причине (парк в `/tmp` — «not in persistent storage»; потерянный парк
+  игнорируется — `RC=0` и новый архив вместо отказа).
+- Минимум `test_install_safety` в `tests/expected-counts.json` поднят 49 → 51 (`5b8cc41`);
+  gate25 стартовал до этого коммита и всё равно прошёл (51 > 49).
+
 ## Партия 15 — P02: версия протокола helper'а на стороне вызывающего
 
 - `geomask-module-update.py` объявляет `PROTOCOL = 2` и отдаёт его командой `protocol` —
@@ -424,5 +440,5 @@ Linux-unit-gate (CI-лог 187), gate этапа 0, R06/R11 и phase2a–2f на
 
 ## Состояние ветки
 
-`master` впереди `origin/master` на 57 коммитов; незакоммиченным остаётся только
+`master` впереди `origin/master` на 60 коммитов; незакоммиченным остаётся только
 раздел «ранний этап 0» в плане (добавлен владельцем до начала работ — не трогать).

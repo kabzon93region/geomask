@@ -79,8 +79,8 @@ B-020 — `2422295` (бюджет 15 с, partial, probe path). D14 — искл�
 
 ## Доказательный baseline
 
-- Полный gate (`testgate --timeout 4200`): **96 модулей, 1403 теста, 1373 выполнено,
-  30 allowlisted skip, 0 fail, 0 timeout** — лог `gate24`, запись в
+- Полный gate (`testgate --timeout 4200`): **96 модулей, 1405 тестов, 1375 выполнено,
+  30 allowlisted skip, 0 fail, 0 timeout** — лог `gate25`, запись в
   [execution log](<superpowers/plans/2026-11-18-execution-log.md>).
 - Сборка/паритет: `check_build --verify-only` → ok (`ecdb81065121fe82`), `gen-geo-rpc --check`
   → ok, `compose_sources --check` → ok для 16 целей, `repo_check --strict` → 0 authored

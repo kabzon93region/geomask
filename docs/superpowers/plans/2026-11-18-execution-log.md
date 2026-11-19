@@ -369,6 +369,31 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 28 — перезагрузка после установки: что нашлось и что исправлено
+
+- Firewall: drop-in писался как `table inet fw4 { ... }`, fw4 включает его внутри своей
+  таблицы — после reboot NAT пропал. Исправлено на `chain` (`e9ebf0f`), тест
+  `test_backend_safety::test_the_ipv6_guard_is_a_chain_not_a_table`.
+- Обновление: шаги 4/5 пропускали apply при «check: ALL GOOD», поэтому старые
+  `syncd/lane/node-scan/seed/hotplug` оставались на роутере и панель показывала обновления.
+  `step_check_is_authoritative` теперь 2, 4, 5 (`1688927`), тест `test_step_freshness` 4 → 5.
+- Диагностика: 30 отдельных запусков редактора = 16 с; добавлен `batch text <manifest>`
+  (`1688927`), затем MSYS-пути для Windows-тестов (`afbd67a`); бандл 16 с, 34.5 КБ.
+- `stat(1)` нет в busybox: гейт записей и snapshot получили фолбэки (`e3f787d`), в т.ч.
+  `ls -l -n` вместо `ls -ln` — слитный токен сканер манифеста принимал за `ln` (`a54d640`).
+- Тест-гейт: прогресс в консоль и `progress.txt` (`6abb0d2`, `245de7b`); `gate33` упал только
+  на `test_diag_bundle` из-за MSYS-путей, `gate34` — PASS.
+
+## Партия 29 — финальная сборка на роутере и третья перезагрузка
+
+- Установлена сборка `705eea0d…` (sha256 сверен), `--auto --yes --restart` rc=0,
+  `--check` pass=4 fail=0; шаги 2/4/5 применились, 15/15 модулей `current`.
+- Бэкап перед reboot: `router-backup-20261119-181307.tar.gz` + overlay, sha256 на ПК
+  (`preboot3-20261119-181509`).
+- После reboot: fw4/guard chain на месте, NAT/интернет/DNS с ПК и роутера, mihomo+3 hev,
+  TUN/AI/VPN-noP2P/Wireguard, ip-rule 100/101, диагностика 16 с, `--check` rc=0.
+- `gate34`: 97 модулей, 1424 теста, 1394 выполнено, 30 allowlisted skip, 0 fail — PASS.
+
 ## Партия 27 — reboot сломал firewall: `/etc/nftables.d` — не таблица, а chain
 
 - После перезагрузки (13:50) firewall не поднялся: fw4 ругался на

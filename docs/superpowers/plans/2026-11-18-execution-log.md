@@ -384,6 +384,14 @@
 - Тест-гейт: прогресс в консоль и `progress.txt` (`6abb0d2`, `245de7b`); `gate33` упал только
   на `test_diag_bundle` из-за MSYS-путей, `gate34` — PASS.
 
+## Партия 31 — gate35 после переустановки: PASS
+
+- `gate35`: **97 модулей, 1427 тестов, 1397 выполнено, 30 allowlisted skip, 0 fail,
+  0 timeout** — PASS. Выросли счётчики `test_install_safety` 55 (каталог без `stat`),
+  `test_diag_redact` 40 (batch), `test_testgate` 9 (progress.txt), `test_step_freshness` 5.
+- Самый долгий `test_reinstall_phase2b` 44 теста / 1758.1 с; `phase2c` 509.1 с;
+  `test_sandbox_guard` 388.7 с.
+
 ## Партия 30 — переустановка на живом роутере: четыре отказа preflight и успех
 
 - `--reinstall --yes` под канарейкой (бэкап + репетиция restore + монитор + авто-откат):

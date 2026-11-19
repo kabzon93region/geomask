@@ -362,20 +362,25 @@ _rs_ls_mode() { # symbolic mode from ls -> octal
 _rs_ls_uid() {
   # `ls -l -n`, not `ls -ln`: the manifest scanner reads a combined `-ln` token as a write
   # by ln(1) and rejects the writer set (found by test_reinstall_manifest, gate32).
-  _rs_lu=$(ls -l -n "$1" 2>/dev/null) || return 1
+  _rs_lu=$(ls -l -n -d "$1" 2>/dev/null) || return 1
   [ -n "${_rs_lu:-}" ] || return 1
   printf '%s' "$_rs_lu" | awk '{ print $3 }'
 }
 
 _rs_ls_size() {
-  _rs_ls=$(wc -c < "$1" 2>/dev/null) || return 1
-  _rs_ls=$(printf '%s' "$_rs_ls" | tr -d ' ')
+  if [ -d "$1" ]; then
+    # `wc -c < dir` fails; a directory's size comes from ls (identity only, not content).
+    _rs_ls=$(ls -l -n -d "$1" 2>/dev/null | awk '{ print $5 }')
+  else
+    _rs_ls=$(wc -c < "$1" 2>/dev/null) || return 1
+    _rs_ls=$(printf '%s' "$_rs_ls" | tr -d ' ')
+  fi
   [ -n "${_rs_ls:-}" ] || return 1
   printf '%s' "$_rs_ls"
 }
 
 _rs_ls_devino() {
-  _rs_li=$(ls -i "$1" 2>/dev/null | awk '{ print $1; exit }')
+  _rs_li=$(ls -i -d "$1" 2>/dev/null | awk '{ print $1; exit }')
   [ -n "${_rs_li:-}" ] || return 1
   printf '0:%s' "$_rs_li"
 }
@@ -413,7 +418,7 @@ _rs_stat4() { # _rs_stat4 <abs-path> -> "mode|uid|dev:ino|size"
   _rs_p4=$(stat -c '%a|%u|%d:%i|%s' "$1" 2>/dev/null)
   if [ -z "${_rs_p4:-}" ]; then
     _rs_p4="$(_rs_mode "$1")|$(_rs_uid "$1")|$(_rs_devino "$1")|$(_rs_size "$1")"
-    case "$_rs_p4" in *'||'*|*'|'*'|') return 1 ;; esac
+    case "$_rs_p4" in *'||'*|'|'*|*'|') return 1 ;; esac
   fi
   [ -n "${_rs_p4:-}" ] || return 1
   printf '%s' "$_rs_p4"

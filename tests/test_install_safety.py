@@ -847,6 +847,21 @@ done
         self.assertRegex(result.stdout, r'DEVINO=0:\d+')
         self.assertRegex(result.stdout, r'FOUR=[0-7]{3}\|\d+\|0:\d+\|5')
 
+    def test_snapshot_metadata_of_a_directory_without_stat(self):
+        """/etc/mihomo is a directory; `wc -c < dir` fails and aborted the reinstall."""
+        target = self.case / 'state-dir'
+        target.mkdir()
+        t = posix(target)
+        body = ('stat() { return 127; }\n'
+                'printf "SIZE=%s\\n" "$(_rs_size ' + t + ')"\n'
+                'printf "FOUR=%s\\n" "$(_rs_stat4 ' + t + ')"\n')
+        result = self.run_script(
+            body,
+            functions=['_rs_size', '_rs_stat4', '_rs_mode', '_rs_uid', '_rs_devino',
+                       '_rs_ls_mode', '_rs_ls_uid', '_rs_ls_size', '_rs_ls_devino'])
+        self.assertRegex(result.stdout, r'SIZE=\d+', result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r'FOUR=[0-7]{3}\|\d+\|0:\d+\|\d+')
+
     # ---------------------------------------------------------------- B5b
     def test_both_yaml_list_styles_count_as_a_geomask_config(self):
         """mihomo and panel tools write groups at column 0; the template uses two spaces."""

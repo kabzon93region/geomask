@@ -1269,18 +1269,18 @@
     {
       "id": "/etc/geomask/node-audit/state",
       "path": "/etc/geomask/node-audit/state",
-      "type": "regular",
+      "type": "dir",
       "owner": "ours",
-      "mode": "644",
+      "mode": "755",
       "writers": [
         "callee geomask-node-audit.py"
       ],
       "evidence": {
         "kind": "callee"
       },
-      "snapshot": "SBA",
-      "restore": "RB",
-      "notes": "состояние аудита"
+      "snapshot": "NONE",
+      "restore": "NR",
+      "notes": "state-каталог (locks + json); не восстанавливается"
     },
     {
       "id": "/etc/geomask/node-audit/events.jsonl",
@@ -2976,6 +2976,15 @@
       "kind": "dir",
       "expected": "observable",
       "observe": "mktemp -d в $(P /tmp) успешен и удаляем",
+      "snapshot": "NONE",
+      "restore": "NR",
+      "owner": "ours"
+    },
+    {
+      "id": "dir.node-audit-state",
+      "kind": "dir",
+      "expected": "observable",
+      "observe": "state-каталог node-audit (locks + json); создаётся по требованию",
       "snapshot": "NONE",
       "restore": "NR",
       "owner": "ours"

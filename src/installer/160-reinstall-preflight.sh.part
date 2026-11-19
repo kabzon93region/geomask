@@ -57,6 +57,7 @@ shared.zapret-exclude|file-shared|/opt/zapret/ipset/zapret-hosts-user-exclude.tx
 shared.zapret-force|file-shared|/opt/zapret/ipset/zapret-hosts-user.txt|regular-or-absent|-
 file.mihomo-config|file|/etc/mihomo/config.yaml|regular-or-absent|-
 dir.tracked|dirs|-|-|-
+dir.node-audit-state|dir|/etc/geomask/node-audit/state|-|-
 tmp.scratch|dir|/tmp|-|-"
 
 # R03 phase 2a (review G): every write-set object whose snapshot stores BYTES
@@ -147,7 +148,6 @@ REINSTALL_PREFLIGHT_BYTE_FILES="/usr/lib/geomask/geomask-node-audit.py|regular-o
 /etc/geomask/lists|dir-or-absent
 /etc/geomask/torrent|dir-or-absent
 /etc/geomask/node-audit.json|regular-or-absent
-/etc/geomask/node-audit/state|regular-or-absent
 /etc/geomask/ipv6.state|regular-or-absent
 /etc/hev-socks5-tunnel/nop2p.yml|regular-or-absent
 /etc/init.d/hev-nop2p|regular-or-absent
@@ -351,8 +351,10 @@ reinstall_preflight() {
         if [ "$_pf_f3" = seed-risk ]; then
           # The seeder rewrites an EMPTY MagiTrickle config; that write is not covered by a
           # proven rollback, so it must be refused before the transaction starts.
+          # MagiTrickle 0.8.x writes `- id:`; older releases wrote `- name:`. An empty
+          # config is one with no list items at all, not one that misses the old key.
           if [ -f "$(P "$_pf_f1")" ] \
-             && ! grep -qE '^[[:space:]]*-[[:space:]]*name:' "$(P "$_pf_f1")" 2>/dev/null; then
+             && ! grep -qE '^[[:space:]]*-[[:space:]]*(name|id):' "$(P "$_pf_f1")" 2>/dev/null; then
             _pf_reason "MagiTrickle state: an empty $_pf_f1 would be rewritten by the seeder - rollback unprovable"
           fi
         fi
@@ -360,9 +362,12 @@ reinstall_preflight() {
       dirs)
         : ;;      # checked above
       dir)
-        _pf_probe=$(mktemp -d "$(P "$_pf_f1")/geomask-pf-XXXXXX" 2>/dev/null)
-        if [ -n "${_pf_probe:-}" ]; then rm -rf "$_pf_probe"; else
-          _pf_reason "snapshot observer broken: probe directory in $_pf_f1"
+        # A state directory is created on demand; only probe when it already exists.
+        if [ -d "$(P "$_pf_f1")" ]; then
+          _pf_probe=$(mktemp -d "$(P "$_pf_f1")/geomask-pf-XXXXXX" 2>/dev/null)
+          if [ -n "${_pf_probe:-}" ]; then rm -rf "$_pf_probe"; else
+            _pf_reason "snapshot observer broken: probe directory in $_pf_f1"
+          fi
         fi
         ;;
       *)

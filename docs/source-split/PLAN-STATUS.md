@@ -86,5 +86,6 @@ B-020 — `2422295` (бюджет 15 с, partial, probe path). D14 — искл�
   `geomask.sh` sha256 `12e94ff9980ecf0a498325e655d2ac46b8bb712362483c3faa3d063d2e1d1fc1`
   (продуктовый коммит `734b97f`), `gen-geo-rpc --check` → ok, `compose_sources --check` → ok
   для 16 целей, `repo_check --strict` → 0 authored oversize (2 объяснённых исключения),
-  композиция из чистого `git archive` → байт-в-байт.
+  композиция из чистого `git archive` → байт-в-байт (партия 19: 1 676 554 байта,
+  тот же sha256, `check_build --verify-only` ok).
 - Стендовые проверки и порядок их выполнения — [STAND-GATES-RUNBOOK](<../STAND-GATES-RUNBOOK.md>).

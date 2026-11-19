@@ -369,6 +369,19 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 19 — чистая сборка из `git archive` (финальный локальный SHA)
+
+- Экспорт HEAD (`d0f68d7`) в пустой каталог через `git archive --format=zip` (426 файлов, без
+  `.git`, без локальных артефактов), затем полный штатный порядок:
+  `python build.py` → `python tools/build_module_index.py` → `python build.py`.
+- `check_build.py --verify-only` → ok sha256 `12e94ff9980ecf0a`; `compose_sources.py --check` →
+  без расхождений; `gen-geo-rpc.py --check` → ok.
+- Итоговый `geomask.sh` в чистом дереве: 1 676 554 байта,
+  sha256 `12e94ff9980ecf0a498325e655d2ac46b8bb712362483c3faa3d063d2e1d1fc1` — совпадает с
+  рабочей копией байт-в-байт (немутирующая проверка не пересобирала ничего молча).
+- Это закрывает локальную часть пункта «final clean/build/hash»; изоляция Linux/BusyBox и
+  матрица профилей остаются стенду.
+
 ## Партия 18 — P04: trust/channel/release gate задокументирован
 
 - План для P04 требует ровно документирования («новые подписи/ключи не назначать фичей без
@@ -456,5 +469,5 @@ Linux-unit-gate (CI-лог 187), gate этапа 0, R06/R11 и phase2a–2f на
 
 ## Состояние ветки
 
-`master` впереди `origin/master` на 61 коммит; незакоммиченным остаётся только
+`master` впереди `origin/master` на 63 коммита; незакоммиченным остаётся только
 раздел «ранний этап 0» в плане (добавлен владельцем до начала работ — не трогать).

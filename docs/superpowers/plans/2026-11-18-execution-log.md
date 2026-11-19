@@ -369,6 +369,23 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 24 — канарейка на роутере: ложный FAIL AI-DNS из-за padding в nft
+
+- Первый полный прогон установил 1.31.0, но `--auto` оборвался на шаге 4:
+  `[FAIL] AI-DNS: mark rule for 0x64 missing`, затем `aborting on step 4 failure` (rc=1);
+  шаги 5–7 не выполнялись. Монитор при этом 10/10 кругов здоров (TUN, ip-rule, DNS,
+  интернет), откат не сработал.
+- Причина: nft печатает mark с padding — `meta mark set 0x00000064`, а проверка шага 4
+  искала буквальную строку `mark set 0x64`. Правило было на месте, проверка его не видела
+  (на 1.30.21 — то же самое: `--check` падал до установки).
+- Исправление: `_aidns_mark_present` сравнивает значение численно и принимает
+  `0x0*64`, `0x64`, `100` (hex/dec, любой padding); шаг 4 использует её.
+- RED: на старом коде `printf 'meta ... mark set 0x00000064' | grep -q 'mark set 0x64'`
+  → rc 1; GREEN: `test_install_safety` 51 → 52, новый тест на padded/plain/decimal/other/none.
+- Проверка на роутере до установки: `--check` с исправленной сборкой даёт
+  `[4/7] aidns check: ALL GOOD`; остаётся один FAIL — IPv6 (`ip6assign=0, ra=server`), это
+  штатный триггер шага 7 (default «IPv6 off»), а не дефект проверки.
+
 ## Партия 23 — gate27 после канарейки: PASS
 
 - `gate27` (`testgate --timeout 4200`, Windows): **97 модулей, 1414 тестов, 1384 выполнено,

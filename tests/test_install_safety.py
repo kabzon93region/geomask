@@ -799,6 +799,31 @@ sysupgrade() { tar czf "$2" -C @CASE@ etc; }
         self.assertTrue((etc / 'backup-recovery').exists(),
                         'the marker was cleared without the copy')
 
+    def test_the_ai_dns_mark_check_accepts_zero_padded_hex(self):
+        """nft prints "mark set 0x00000064"; the installer greps for "mark set 0x64".
+
+        On the live router the rule existed and step 4 still failed, aborting the install
+        before steps 5-7. The check must compare the value, not the spelling.
+        """
+        body = r'''
+padded='meta skuid 65533 meta mark set 0x00000064'
+plain='meta skuid 65533 meta mark set 0x64'
+decimal='meta skuid 65533 meta mark set 100'
+other='meta skuid 65533 meta mark set 0x65'
+none='meta skuid 65533 counter accept'
+for _p in "padded:$padded" "plain:$plain" "decimal:$decimal" "other:$other" "none:$none"; do
+  _name=${_p%%:*}
+  _val=${_p#*:}
+  _aidns_mark_present "$_val" 0x64 && printf '%s=1\n' "$_name" || printf '%s=0\n' "$_name"
+done
+'''
+        result = self.run_script(body, functions=['_aidns_mark_present'])
+        self.assertIn('padded=1', result.stdout)
+        self.assertIn('plain=1', result.stdout)
+        self.assertIn('decimal=1', result.stdout)
+        self.assertIn('other=0', result.stdout)
+        self.assertIn('none=0', result.stdout)
+
     # ---------------------------------------------------------------- B5b
     def test_both_yaml_list_styles_count_as_a_geomask_config(self):
         """mihomo and panel tools write groups at column 0; the template uses two spaces."""

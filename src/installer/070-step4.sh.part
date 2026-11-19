@@ -1,3 +1,16 @@
+# nft prints marks zero-padded to 32 bits ("mark set 0x00000064"), while the rule source and
+# the configuration use "0x64". A literal grep made step 4 fail on a healthy router (found on
+# the live router, 19.11.2026): the rule existed, the check did not see it. Compare the value
+# numerically, accepting both bases and any zero padding.
+_aidns_mark_present() { # _aidns_mark_present <nft dump> <mark> -> 0 when a "mark set" matches
+  _amp_dump=$1
+  _amp_mark=$2
+  _amp_dec=$((_amp_mark)) 2>/dev/null || return 1
+  _amp_hex=$(printf '%x' "$_amp_dec" 2>/dev/null)
+  [ -n "$_amp_hex" ] || return 1
+  printf '%s' "$_amp_dump" | grep -qE "mark set (0x0*${_amp_hex}|${_amp_dec})([^0-9a-f]|$)"
+}
+
 step4_check() {
   _need=0
   mod_skipped ai_dns && return 0
@@ -35,7 +48,7 @@ step4_check() {
   # client DNS. Both halves are required, and the DNAT target must be the address this router
   # actually computed (audit 14.11.2026, F08).
   if [ -n "$_tbl" ]; then
-    printf '%s' "$_tbl" | grep -q "mark set $AIDNS_MARK" \
+    _aidns_mark_present "$_tbl" "$AIDNS_MARK" \
       && info "AI-DNS: dnsai sockets are marked $AIDNS_MARK" \
       || { bad "AI-DNS: mark rule for $AIDNS_MARK missing"; _need=1; }
   fi

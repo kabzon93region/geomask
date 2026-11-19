@@ -369,6 +369,15 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 23 — gate27 после канарейки: PASS
+
+- `gate27` (`testgate --timeout 4200`, Windows): **97 модулей, 1414 тестов, 1384 выполнено,
+  30 allowlisted skip, 0 fail, 0 timeout, 0 unknown** — PASS.
+- Новый модуль `test_canary_scripts.py` — 9 тестов, ok; самый долгий
+  `test_reinstall_phase2b` 44 теста / 1981.3 с, `test_sandbox_guard` 363.5 с.
+- 30 skip — те же allowlisted Windows-ограничения (`posix-only`, `no-native-symlink`), которые
+  закрывает Linux-стенд/промпт `AGENT-PROMPT-LINUX.md`.
+
 ## Партия 22 — первый безопасный прогон канарейки на живом роутере (read-only)
 
 - Роутер: OpenWrt 25.12.5, geomask 1.30.21, overlay 185 МБ. Бэкап: sysupgrade 24 524 281 Б,
@@ -524,5 +533,5 @@ Linux-unit-gate (CI-лог 187), gate этапа 0, R06/R11 и phase2a–2f на
 
 ## Состояние ветки
 
-`master` впереди `origin/master` на 63 коммита; незакоммиченным остаётся только
+`master` впереди `origin/master` на 69 коммитов; незакоммиченным остаётся только
 раздел «ранний этап 0» в плане (добавлен владельцем до начала работ — не трогать).

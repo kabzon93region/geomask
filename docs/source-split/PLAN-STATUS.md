@@ -79,8 +79,8 @@ B-020 — `2422295` (бюджет 15 с, partial, probe path). D14 — искл�
 
 ## Доказательный baseline
 
-- Полный gate (`testgate --timeout 4200`): **96 модулей, 1405 тестов, 1375 выполнено,
-  30 allowlisted skip, 0 fail, 0 timeout** — лог `gate25`, запись в
+- Полный gate (`testgate --timeout 4200`): **97 модулей, 1414 тестов, 1384 выполнено,
+  30 allowlisted skip, 0 fail, 0 timeout** — лог `gate27`, запись в
   [execution log](<superpowers/plans/2026-11-18-execution-log.md>).
 - Сборка/паритет (после P04/P06/P09, HEAD `5a55c93`): `check_build --verify-only` → ok,
   `geomask.sh` sha256 `12e94ff9980ecf0a498325e655d2ac46b8bb712362483c3faa3d063d2e1d1fc1`

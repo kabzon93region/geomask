@@ -9,6 +9,7 @@ harmless fields have to survive.
 from pathlib import Path
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -659,6 +660,25 @@ class BatchTests(RedactorTestCase):
                 text = target.read_text(encoding='utf-8')
                 self.assertIn('ok line', text)
                 self.assertNotIn('BATCH-SENTINEL-%d' % index, text)
+
+    def test_batch_accepts_msys_style_paths_on_windows(self):
+        """The shell harness passes /c/... while Python needs C:/... (Windows tests only)."""
+        if os.name != 'nt':
+            self.skipTest('windows-only path translation')
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / 'check.log'
+            source.write_text('line password=MSYS-SENTINEL\n', encoding='utf-8')
+            target = base / 'out.log'
+            msys = lambda p: '/' + str(p).replace(':', '').replace('\\', '/')
+            manifest = base / 'manifest.txt'
+            manifest.write_text('%s\t%s\t4096\n' % (msys(source), msys(target)),
+                                encoding='utf-8')
+            result = self.run_batch(manifest)
+            self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', 'replace'))
+            text = target.read_text(encoding='utf-8')
+            self.assertNotIn('MSYS-SENTINEL', text)
+            self.assertIn('line', text)
 
     def test_batch_keeps_the_tail_and_refuses_a_missing_input(self):
         with tempfile.TemporaryDirectory() as tmp:

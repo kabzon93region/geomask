@@ -17238,6 +17238,17 @@ _REDACTORS = {
 }
 
 
+def _fs_path(path):
+    """Windows test harnesses pass MSYS paths (`/c/Users/...`); Python cannot open those.
+
+    The router is Linux, so this branch never runs there. It only keeps the shell-driven
+    tests on Windows able to exercise the batch path.
+    """
+    if os.name == 'nt' and len(path) > 2 and path[0] == '/' and path[1].isalpha() and path[2] == '/':
+        return path[1].upper() + ':/' + path[3:]
+    return path
+
+
 def _batch_text(manifest):
     """Redact many saved logs in one process: N separate starts cost ~0.5 s each.
 
@@ -17259,6 +17270,8 @@ def _batch_text(manifest):
                 cap = int(cap)
             except ValueError:
                 return fail('batch: bad cap for %s' % src)
+            src = _fs_path(src)
+            dst = _fs_path(dst)
             try:
                 with open(src, 'rb') as source:
                     source.seek(0, os.SEEK_END)
@@ -18509,7 +18522,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-diag-redact.py",
           "source": "assets/geomask-diag-redact.py",
           "mode": "0755",
-          "sha256": "6f67539b8252b9c3ceaae332d4b53c08853824eb109b2a0041941647932a01fd"
+          "sha256": "aa5e031184af825a08859e23deed8116049649a15b91545fb3d17176d644de69"
         },
         {
           "path": "/usr/lib/geomask/geomask-diag-spool.py",

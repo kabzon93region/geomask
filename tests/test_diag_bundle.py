@@ -88,6 +88,51 @@ ip() { printf '10: from 192.168.1.177 lookup 102\n'; return 0; }
 '''
 
 
+PASSTHROUGH_BATCH = r'''import os, subprocess, sys
+REAL = %r
+def fs(p):
+    if os.name == "nt" and len(p) > 2 and p[0] == "/" and p[1].isalpha() and p[2] == "/":
+        return p[1].upper() + ":/" + p[3:]
+    return p
+def batch(manifest):
+    for raw in open(fs(manifest), encoding="utf-8"):
+        src, dst, cap = raw.rstrip("\n").split("\t")
+        data = open(fs(src), "rb").read()[-int(cap):]
+        open(fs(dst), "wb").write(data)
+    print('{"ok":true}')
+if len(sys.argv) > 2 and sys.argv[1] == "redact":
+    sys.stdout.buffer.write(sys.stdin.buffer.read())
+elif len(sys.argv) > 2 and sys.argv[1] == "batch":
+    batch(sys.argv[3])
+else:
+    sys.exit(subprocess.run([sys.executable, REAL] + sys.argv[1:]).returncode)
+'''
+
+FAILING_BATCH = r'''import os, subprocess, sys
+REAL = %r
+def fs(p):
+    if os.name == "nt" and len(p) > 2 and p[0] == "/" and p[1].isalpha() and p[2] == "/":
+        return p[1].upper() + ":/" + p[3:]
+    return p
+def batch(manifest):
+    for raw in open(fs(manifest), encoding="utf-8"):
+        src, dst, cap = raw.rstrip("\n").split("\t")
+        data = open(fs(src), "rb").read()[-int(cap):]
+        if b"FAIL-REDACTOR" in data:
+            sys.exit(1)
+        open(fs(dst), "wb").write(data)
+    print('{"ok":true}')
+if len(sys.argv) > 2 and sys.argv[1] == "redact":
+    data = sys.stdin.buffer.read()
+    if b"FAIL-REDACTOR" in data:
+        sys.exit(1)
+    sys.stdout.buffer.write(data)
+elif len(sys.argv) > 2 and sys.argv[1] == "batch":
+    batch(sys.argv[3])
+else:
+    sys.exit(subprocess.run([sys.executable, REAL] + sys.argv[1:]).returncode)
+'''
+
 @unittest.skipIf(BASH is None, 'bash is required')
 class DiagBundleTests(unittest.TestCase):
     def setUp(self):
@@ -315,14 +360,7 @@ class DiagBundleTests(unittest.TestCase):
 
     def test_the_verify_gate_refuses_an_unmasked_diagnostic_log(self):
         passthrough = self.case / 'passthrough-redact.py'
-        passthrough.write_text(
-            'import subprocess, sys\n'
-            'REAL = %r\n'
-            'if len(sys.argv) > 1 and sys.argv[1] == "redact":\n'
-            '    sys.stdout.buffer.write(sys.stdin.buffer.read())\n'
-            'else:\n'
-            '    sys.exit(subprocess.run([sys.executable, REAL] + sys.argv[1:]).returncode)\n'
-            % native(REDACT), encoding='utf-8')
+        passthrough.write_text(PASSTHROUGH_BATCH % native(REDACT), encoding='utf-8')
         answer = self.run_body(
             'GM_DIAG_PY="%s"; DIAG_PY="$GM_DIAG_PY"\n'
             'cmd_diag_bundle; printf "\\nRC=%%s\\n" "$?"' % native(passthrough))
@@ -336,17 +374,7 @@ class DiagBundleTests(unittest.TestCase):
         # Final review: this branch returned 1 with an empty stdout and left
         # `$TMPDIR/geomask-console-diag.XXXXXX` behind, so ubus got no JSON.
         wrapper = self.case / 'failing-redact.py'
-        wrapper.write_text(
-            'import subprocess, sys\n'
-            'REAL = %r\n'
-            'data = sys.stdin.buffer.read()\n'
-            'if len(sys.argv) > 1 and sys.argv[1] == "redact" '
-            'and b"FAIL-REDACTOR" in data:\n'
-            '    sys.exit(1)\n'
-            'proc = subprocess.run([sys.executable, REAL] + sys.argv[1:], input=data,\n'
-            '                      stdout=subprocess.PIPE)\n'
-            'sys.stdout.buffer.write(proc.stdout)\n'
-            'sys.exit(proc.returncode)\n' % native(REDACT), encoding='utf-8')
+        wrapper.write_text(FAILING_BATCH % native(REDACT), encoding='utf-8')
         (self.logs / 'net_dns.log').write_text(
             '=== 2026-11-17T10:00:00+0300 fail ===\nFAIL-REDACTOR\n',
             encoding='utf-8', newline='\n')

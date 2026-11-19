@@ -6803,8 +6803,11 @@ _write_gate() { # _write_gate [max-age-seconds]
   [ -n "$_wg_file" ] || return 1
   [ -f "$_wg_file" ] || return 1
   case "$_wg_file" in "$BACKUP_DIR"/router-backup-*.tar.gz) ;; *) return 1 ;; esac
-  _wg_m=$(stat -c %Y "$_wg_file" 2>/dev/null || echo 0)
-  case "$_wg_m" in ''|*[!0-9]*) return 1 ;; esac
+  # This firmware's busybox has no stat(1) (live router, 19.11.2026): without the date -r
+  # fallback the gate saw age 0 and refused every write as "no fresh backup".
+  _wg_m=$(stat -c %Y "$_wg_file" 2>/dev/null)
+  [ -n "${_wg_m:-}" ] || _wg_m=$(date -r "$_wg_file" +%s 2>/dev/null)
+  case "${_wg_m:-}" in ''|*[!0-9]*) return 1 ;; esac
   _wg_now=$(date +%s 2>/dev/null || echo 0)
   [ $((_wg_now - _wg_m)) -le "$_wg_max" ]
 }
@@ -18371,7 +18374,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "481da8da6f5478faa2a095444981c4397c359c64116b71bb5bad73b52072a0c1"
+          "sha256": "21ff43cf9b13a7f7eb16cab07e769fb10ab897196a488812fd6a108d1d7a2527"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",
@@ -44461,33 +44464,71 @@ _rs_type() { # _rs_type <install-path> -> regular|symlink|dir|absent|unknown
   printf 'absent'
 }
 
+# busybox on the live router has no stat(1) (19.11.2026): the snapshot recorded empty
+# metadata for every object, so a reinstall could neither verify nor restore it. These
+# fallbacks use ls/wc, which exist everywhere; dev is unknown there and reported as 0.
+_rs_ls_mode() { # symbolic mode from ls -> octal
+  _rs_lm=$(ls -ld "$1" 2>/dev/null) || return 1
+  [ -n "${_rs_lm:-}" ] || return 1
+  printf '%s' "$_rs_lm" | awk '{ m=substr($1,1,10); v=0;
+    for (i=2; i<=10; i++) { v*=2; if (substr(m,i,1) != "-") v+=1 }
+    printf "%o", v }'
+}
+
+_rs_ls_uid() {
+  _rs_lu=$(ls -ln "$1" 2>/dev/null) || return 1
+  [ -n "${_rs_lu:-}" ] || return 1
+  printf '%s' "$_rs_lu" | awk '{ print $3 }'
+}
+
+_rs_ls_size() {
+  _rs_ls=$(wc -c < "$1" 2>/dev/null) || return 1
+  _rs_ls=$(printf '%s' "$_rs_ls" | tr -d ' ')
+  [ -n "${_rs_ls:-}" ] || return 1
+  printf '%s' "$_rs_ls"
+}
+
+_rs_ls_devino() {
+  _rs_li=$(ls -i "$1" 2>/dev/null | awk '{ print $1; exit }')
+  [ -n "${_rs_li:-}" ] || return 1
+  printf '0:%s' "$_rs_li"
+}
+
 _rs_mode() { # _rs_mode <abs-path> -> octal mode
   _rs_mv=$(stat -c '%a' "$1" 2>/dev/null)
   if [ -z "${_rs_mv:-}" ]; then _rs_mv=$(stat -f '%Lp' "$1" 2>/dev/null); fi
+  [ -n "${_rs_mv:-}" ] || _rs_mv=$(_rs_ls_mode "$1")
   [ -n "${_rs_mv:-}" ] || return 1
   printf '%s' "$_rs_mv"
 }
 
 _rs_uid() { # _rs_uid <abs-path>
   _rs_uv=$(stat -c '%u' "$1" 2>/dev/null)
+  [ -n "${_rs_uv:-}" ] || _rs_uv=$(_rs_ls_uid "$1")
   [ -n "${_rs_uv:-}" ] || return 1
   printf '%s' "$_rs_uv"
 }
 
 _rs_devino() { # _rs_devino <abs-path>
   _rs_dv=$(stat -c '%d:%i' "$1" 2>/dev/null)
+  [ -n "${_rs_dv:-}" ] || _rs_dv=$(_rs_ls_devino "$1")
   [ -n "${_rs_dv:-}" ] || return 1
   printf '%s' "$_rs_dv"
 }
 
 _rs_size() { # _rs_size <abs-path>
   _rs_sv=$(stat -c '%s' "$1" 2>/dev/null)
+  [ -n "${_rs_sv:-}" ] || _rs_sv=$(_rs_ls_size "$1")
   [ -n "${_rs_sv:-}" ] || return 1
   printf '%s' "$_rs_sv"
 }
 
-_rs_stat4() { # _rs_stat4 <abs-path> -> "mode|uid|dev:ino|size" in one stat call
+_rs_stat4() { # _rs_stat4 <abs-path> -> "mode|uid|dev:ino|size"
   _rs_p4=$(stat -c '%a|%u|%d:%i|%s' "$1" 2>/dev/null)
+  if [ -z "${_rs_p4:-}" ]; then
+    _rs_p4="$(_rs_mode "$1")|$(_rs_uid "$1")|$(_rs_devino "$1")|$(_rs_size "$1")"
+    case "$_rs_p4" in *'||'*|*'|'*'|') return 1 ;; esac
+  fi
   [ -n "${_rs_p4:-}" ] || return 1
   printf '%s' "$_rs_p4"
 }

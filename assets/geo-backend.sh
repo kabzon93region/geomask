@@ -86,8 +86,11 @@ _write_gate() { # _write_gate [max-age-seconds]
   [ -n "$_wg_file" ] || return 1
   [ -f "$_wg_file" ] || return 1
   case "$_wg_file" in "$BACKUP_DIR"/router-backup-*.tar.gz) ;; *) return 1 ;; esac
-  _wg_m=$(stat -c %Y "$_wg_file" 2>/dev/null || echo 0)
-  case "$_wg_m" in ''|*[!0-9]*) return 1 ;; esac
+  # This firmware's busybox has no stat(1) (live router, 19.11.2026): without the date -r
+  # fallback the gate saw age 0 and refused every write as "no fresh backup".
+  _wg_m=$(stat -c %Y "$_wg_file" 2>/dev/null)
+  [ -n "${_wg_m:-}" ] || _wg_m=$(date -r "$_wg_file" +%s 2>/dev/null)
+  case "${_wg_m:-}" in ''|*[!0-9]*) return 1 ;; esac
   _wg_now=$(date +%s 2>/dev/null || echo 0)
   [ $((_wg_now - _wg_m)) -le "$_wg_max" ]
 }

@@ -755,6 +755,17 @@ uci() {
         result = self.run_backend('_mask_url "$URL"', functions=['_mask_url'], extra=extra)
         self.assertEqual(result.stdout, 'https://sub.example.org/…')
 
+    def test_the_write_gate_survives_a_missing_stat(self):
+        """The live router has no stat(1); the gate then saw age 0 and refused every write."""
+        body = '_write_gate 1800; printf "GATE=%s\\n" "$?"'
+        result = self.run_backend(body, functions=['_write_gate'],
+                                  extra='stat() { return 127; }\n')
+        self.assertIn('GATE=0', result.stdout, result.stdout + result.stderr)
+        # No fallback at all must still refuse instead of accepting a stale archive.
+        result = self.run_backend(body, functions=['_write_gate'],
+                                  extra='stat() { return 127; }\ndate() { return 1; }\n'
+                                        'printf "\n"')
+        self.assertNotIn('GATE=0', result.stdout, result.stdout + result.stderr)
 
 if __name__ == '__main__':
     unittest.main()

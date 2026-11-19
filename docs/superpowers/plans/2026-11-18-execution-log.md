@@ -369,6 +369,25 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 25 — на роутере нет `stat(1)`: гейт записей и snapshot без метаданных
+
+- Второй полный прогон канарейки: шаг 4 теперь проходит (`ALL GOOD`), шаги 5–6 тоже, но
+  шаг 7 (`IPv6 off`) отказал: `{"ok":false,"error":"нужен свежий полный бэкап"}`. Бэкап был
+  свежим (создан за минуту до этого); отказ дал `_write_gate`.
+- Корень: в этой прошивке OpenWrt у busybox **нет applet `stat`** (`stat: not found`,
+  rc 127). `_write_gate` делал `stat -c %Y` → пусто → возраст 0 → «нет свежего бэкапа»;
+  то же самое ломало бы `safe_write.sh` и `_rs_mode/_rs_uid/_rs_devino/_rs_size/_rs_stat4`
+  в snapshot'е переустановки (метаданные объектов записывались пустыми).
+- Исправление: гейт использует `stat -c %Y`, а при его отсутствии `date -r FILE +%s`
+  (есть в busybox); snapshot-функции получили фолбэки через `ls -ld` (символьный режим →
+  octal awk'ом), `ls -ln` (uid), `ls -i` (inode, device честно `0:`), `wc -c` (размер).
+  Fallback-и срабатывают только когда `stat` недоступен, поэтому поведение на обычных
+  системах не меняется.
+- Тесты: `test_backend_safety` 28 → 29 (`_write_gate` проходит при сломанном `stat` и
+  отказывает, когда недоступны оба источника); `test_install_safety` 52 → 53
+  (`_rs_stat4` = mode|uid|0:ino|size при сломанном `stat`).
+- Проверено на роутере: `date -r`, `ls -ln`, `ls -i`, `wc -c` дают те же mtime/uid/size.
+
 ## Партия 24 — канарейка на роутере: ложный FAIL AI-DNS из-за padding в nft
 
 - Первый полный прогон установил 1.31.0, но `--auto` оборвался на шаге 4:

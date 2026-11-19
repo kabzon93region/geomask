@@ -348,33 +348,71 @@ _rs_type() { # _rs_type <install-path> -> regular|symlink|dir|absent|unknown
   printf 'absent'
 }
 
+# busybox on the live router has no stat(1) (19.11.2026): the snapshot recorded empty
+# metadata for every object, so a reinstall could neither verify nor restore it. These
+# fallbacks use ls/wc, which exist everywhere; dev is unknown there and reported as 0.
+_rs_ls_mode() { # symbolic mode from ls -> octal
+  _rs_lm=$(ls -ld "$1" 2>/dev/null) || return 1
+  [ -n "${_rs_lm:-}" ] || return 1
+  printf '%s' "$_rs_lm" | awk '{ m=substr($1,1,10); v=0;
+    for (i=2; i<=10; i++) { v*=2; if (substr(m,i,1) != "-") v+=1 }
+    printf "%o", v }'
+}
+
+_rs_ls_uid() {
+  _rs_lu=$(ls -ln "$1" 2>/dev/null) || return 1
+  [ -n "${_rs_lu:-}" ] || return 1
+  printf '%s' "$_rs_lu" | awk '{ print $3 }'
+}
+
+_rs_ls_size() {
+  _rs_ls=$(wc -c < "$1" 2>/dev/null) || return 1
+  _rs_ls=$(printf '%s' "$_rs_ls" | tr -d ' ')
+  [ -n "${_rs_ls:-}" ] || return 1
+  printf '%s' "$_rs_ls"
+}
+
+_rs_ls_devino() {
+  _rs_li=$(ls -i "$1" 2>/dev/null | awk '{ print $1; exit }')
+  [ -n "${_rs_li:-}" ] || return 1
+  printf '0:%s' "$_rs_li"
+}
+
 _rs_mode() { # _rs_mode <abs-path> -> octal mode
   _rs_mv=$(stat -c '%a' "$1" 2>/dev/null)
   if [ -z "${_rs_mv:-}" ]; then _rs_mv=$(stat -f '%Lp' "$1" 2>/dev/null); fi
+  [ -n "${_rs_mv:-}" ] || _rs_mv=$(_rs_ls_mode "$1")
   [ -n "${_rs_mv:-}" ] || return 1
   printf '%s' "$_rs_mv"
 }
 
 _rs_uid() { # _rs_uid <abs-path>
   _rs_uv=$(stat -c '%u' "$1" 2>/dev/null)
+  [ -n "${_rs_uv:-}" ] || _rs_uv=$(_rs_ls_uid "$1")
   [ -n "${_rs_uv:-}" ] || return 1
   printf '%s' "$_rs_uv"
 }
 
 _rs_devino() { # _rs_devino <abs-path>
   _rs_dv=$(stat -c '%d:%i' "$1" 2>/dev/null)
+  [ -n "${_rs_dv:-}" ] || _rs_dv=$(_rs_ls_devino "$1")
   [ -n "${_rs_dv:-}" ] || return 1
   printf '%s' "$_rs_dv"
 }
 
 _rs_size() { # _rs_size <abs-path>
   _rs_sv=$(stat -c '%s' "$1" 2>/dev/null)
+  [ -n "${_rs_sv:-}" ] || _rs_sv=$(_rs_ls_size "$1")
   [ -n "${_rs_sv:-}" ] || return 1
   printf '%s' "$_rs_sv"
 }
 
-_rs_stat4() { # _rs_stat4 <abs-path> -> "mode|uid|dev:ino|size" in one stat call
+_rs_stat4() { # _rs_stat4 <abs-path> -> "mode|uid|dev:ino|size"
   _rs_p4=$(stat -c '%a|%u|%d:%i|%s' "$1" 2>/dev/null)
+  if [ -z "${_rs_p4:-}" ]; then
+    _rs_p4="$(_rs_mode "$1")|$(_rs_uid "$1")|$(_rs_devino "$1")|$(_rs_size "$1")"
+    case "$_rs_p4" in *'||'*|*'|'*'|') return 1 ;; esac
+  fi
   [ -n "${_rs_p4:-}" ] || return 1
   printf '%s' "$_rs_p4"
 }

@@ -824,6 +824,29 @@ done
         self.assertIn('other=0', result.stdout)
         self.assertIn('none=0', result.stdout)
 
+    def test_snapshot_metadata_works_without_stat(self):
+        """This router's busybox has no stat(1); the snapshot then recorded empty metadata."""
+        target = self.case / 'payload.bin'
+        target.write_bytes(b'abcde')
+        os.chmod(target, 0o640)
+        t = posix(target)
+        body = ('stat() { return 127; }\n'
+                'printf "MODE=%s\\n" "$(_rs_mode ' + t + ')"\n'
+                'printf "SIZE=%s\\n" "$(_rs_size ' + t + ')"\n'
+                'printf "OWNER=%s\\n" "$(_rs_uid ' + t + ')"\n'
+                'printf "DEVINO=%s\\n" "$(_rs_devino ' + t + ')"\n'
+                'printf "FOUR=%s\\n" "$(_rs_stat4 ' + t + ')"\n')
+        result = self.run_script(
+            body,
+            functions=['_rs_mode', '_rs_uid', '_rs_devino', '_rs_size', '_rs_stat4',
+                       '_rs_ls_mode', '_rs_ls_uid', '_rs_ls_size', '_rs_ls_devino'])
+        # Windows ignores group bits, so compare the shape, not a fixed 640.
+        self.assertRegex(result.stdout, r'MODE=[0-7]{3}', result.stdout + result.stderr)
+        self.assertIn('SIZE=5', result.stdout, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r'OWNER=\d+')
+        self.assertRegex(result.stdout, r'DEVINO=0:\d+')
+        self.assertRegex(result.stdout, r'FOUR=[0-7]{3}\|\d+\|0:\d+\|5')
+
     # ---------------------------------------------------------------- B5b
     def test_both_yaml_list_styles_count_as_a_geomask_config(self):
         """mihomo and panel tools write groups at column 0; the template uses two spaces."""

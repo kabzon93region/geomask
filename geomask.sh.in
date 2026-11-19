@@ -3845,7 +3845,9 @@ _rs_ls_mode() { # symbolic mode from ls -> octal
 }
 
 _rs_ls_uid() {
-  _rs_lu=$(ls -ln "$1" 2>/dev/null) || return 1
+  # `ls -l -n`, not `ls -ln`: the manifest scanner reads a combined `-ln` token as a write
+  # by ln(1) and rejects the writer set (found by test_reinstall_manifest, gate32).
+  _rs_lu=$(ls -l -n "$1" 2>/dev/null) || return 1
   [ -n "${_rs_lu:-}" ] || return 1
   printf '%s' "$_rs_lu" | awk '{ print $3 }'
 }

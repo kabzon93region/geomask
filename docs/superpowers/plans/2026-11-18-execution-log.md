@@ -369,6 +369,21 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 26 — канарейка завершена успешно (итерация 3)
+
+- Прогон 3: установка 1.31.0 на живой OpenWrt 25.12.5 завершилась `SUMMARY: pass=5 fail=0`,
+  `RC=0`; `--check` после установки — `pass=6 fail=0`, `RC=0`; монитор 10/10 кругов здоров
+  (ping, SSH, интернет через роутер, DNS, mihomo, TUN, ip-rule 100/101, egress роутера).
+- Шаг 7 применил default IPv6-off: `network.lan.ip6assign=0`, `dhcp.lan.ra=disabled`,
+  глобальных адресов нет. Роутер не перезагружался (uptime 4 дня 12 ч), mihomo не
+  перезапускался (pid 5510), overlay 78 МБ свободно.
+- Бэкап установщика: `router-backup-20261119-133435.tar.gz`, `backup-ok` свежий; архивы
+  канарейки на ПК проверены по sha256, репетиция restore — `SAME` для network/firewall/dhcp/
+  mihomo. Evidence: `docs/stand/ROUTER-CANARY-EVIDENCE-2026-11-19.md`.
+- Политика temp: владелец вывел `R:\Games\SkyrimMO2\_tmp` из использования; gate-логи и
+  временные каталоги теперь только в `%LOCALAPPDATA%\Temp`, канарейка принудительно
+  переключает `TEMP`/`TMP` и пишет предупреждение (тест в `test_canary_scripts.py`, 9 → 10).
+
 ## Партия 25 — на роутере нет `stat(1)`: гейт записей и snapshot без метаданных
 
 - Второй полный прогон канарейки: шаг 4 теперь проходит (`ALL GOOD`), шаги 5–6 тоже, но

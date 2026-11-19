@@ -95,5 +95,5 @@
   "test_updater_backup.py": 4,
   "test_yaml_roundtrip.py": 6,
   "test_ytwatch_stall.py": 12,
-  "test_canary_scripts.py": 9
+  "test_canary_scripts.py": 10
 }

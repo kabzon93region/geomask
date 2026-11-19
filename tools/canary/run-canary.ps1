@@ -152,6 +152,18 @@ function New-RunDir {
     Log 'INFO' ('run dir: ' + $dir)
 }
 
+function Set-StandardTemp {
+    # The old shared folder R:\Games\SkyrimMO2\_tmp is retired (owner decision, 19.11.2026).
+    # Any child process this script starts must use the standard Windows temp directory.
+    $legacy = 'R:\Games\SkyrimMO2'
+    if ($env:TEMP -and $env:TEMP.StartsWith($legacy, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $std = Join-Path $env:LOCALAPPDATA 'Temp'
+        $env:TEMP = $std
+        $env:TMP = $std
+        Log 'WARN' ('legacy temp path refused, using ' + $std)
+    }
+}
+
 function Assert-LocalInputs {
     if (-not (Test-Path -LiteralPath $Key)) { Stop-Run ('ssh key not found: ' + $Key) }
     if (-not (Test-Path -LiteralPath $script:ScpPath)) { Stop-Run ('scp.exe not found: ' + $script:ScpPath) }
@@ -441,6 +453,7 @@ function Write-Report {
 }
 
 try {
+    Set-StandardTemp
     Assert-LocalInputs
     New-RunDir
     New-Backup

@@ -110,6 +110,13 @@ class CanaryToolingTests(unittest.TestCase):
         self.assertIn('WriteAllText', watchdog)
         self.assertIn('-join "`n"', watchdog)
 
+    def test_the_watchdog_refuses_the_retired_temp_folder(self):
+        """R:\Games\SkyrimMO2\_tmp is retired; children must use the standard temp dir."""
+        watchdog = text(WATCHDOG)
+        self.assertIn("R:\\Games\\SkyrimMO2", watchdog)
+        self.assertIn('Set-StandardTemp', watchdog)
+        self.assertIn('LOCALAPPDATA', watchdog)
+
     def test_restore_touches_only_geomask_paths_missing_from_the_set(self):
         restore = text(RESTORE)
         self.assertIn('grep -qxF "$p" "$SET" && continue', restore)

@@ -89,6 +89,16 @@ B-020 — `2422295` (бюджет 15 с, partial, probe path). D14 — искл�
   композиция из чистого `git archive` → байт-в-байт (партия 19: 1 676 554 байта,
   тот же sha256, `check_build --verify-only` ok).
 - Стендовые проверки и порядок их выполнения — [STAND-GATES-RUNBOOK](<../STAND-GATES-RUNBOOK.md>).
+## Живой прогон 19.11.2026 (канарейка)
+
+[ROUTER-CANARY-EVIDENCE-2026-11-19](../stand/ROUTER-CANARY-EVIDENCE-2026-11-19.md): три
+итерации на реальном OpenWrt 25.12.5, финальная — установка 1.31.0 завершилась rc=0,
+`--check` после — `pass=6 fail=0`, монитор 10/10 здоров. Найдены и исправлены два дефекта,
+которые не мог поймать Windows-хост: padding mark в nft (`eb6cd55`) и отсутствие `stat(1)`
+в busybox (`e3f787d`). Живой прогон **не закрывает** стендовые строки: reboot, power loss,
+ENOSPC, G05, реальный rpcd/ACL, обновление модулей, переустановка phase2a–2f и матрица
+профилей остаются OPEN-STAND.
+
 - Порядок закрытия стендовых пунктов без собственного стенда:
   [ROUTER-CANARY-PLAN](../stand/ROUTER-CANARY-PLAN.md) (канареечный прогон на живом роутере
   с авто-откатом) и [AGENT-PROMPT-LINUX](../stand/AGENT-PROMPT-LINUX.md) (Linux unit-gate на

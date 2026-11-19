@@ -192,6 +192,17 @@ def _module_env(log_dir, module, extra_paths):
     return env
 
 
+def _progress(log_dir, text):
+    """Live status for a human: the console stream may be buffered, a file is not."""
+    try:
+        target = Path(log_dir) / 'progress.txt'
+        tmp = target.with_name('progress.txt.tmp')
+        tmp.write_text(text + '\n', encoding='utf-8')
+        os.replace(tmp, target)
+    except OSError:
+        pass
+
+
 def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
     tests_dir = os.path.abspath(tests_dir)
     log_dir = os.path.abspath(log_dir)
@@ -205,6 +216,7 @@ def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
     # Console progress: a full gate runs for an hour and used to print nothing until the end,
     # so from the outside it looked hung. One line per module, flushed.
     print('gate: %d modules, log dir: %s' % (len(modules), log_dir), flush=True)
+    _progress(log_dir, 'start %d modules' % len(modules))
 
     results = []
     for module in modules:
@@ -213,6 +225,7 @@ def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
         started = time.time()
         print('  [%d/%d] %-38s ' % (len(results) + 1, len(modules), module),
               end='', flush=True)
+        _progress(log_dir, 'running %d/%d %s' % (len(results) + 1, len(modules), module))
         env = _module_env(log_dir, module, [tests_dir])
         cmd = [python, '-B', os.path.abspath(__file__), '_run-one', tests_dir, module]
         status = 'ok'
@@ -294,6 +307,8 @@ def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
         print('%s  %d tests  %.1fs%s' % (
             status, tests_run, payload.get('duration', time.time() - started),
             '' if status == 'ok' else '  -> ' + str(log_path.name)), flush=True)
+        _progress(log_dir, 'done %d/%d %s %s %d tests' % (
+            len(results) + 1, len(modules), module, status, tests_run))
         results.append({
             'module': module, 'status': status, 'tests': tests_run, 'pass': passed,
             'fail': failures + errors, 'skip': skipped, 'timeout': status == 'timeout',
@@ -304,6 +319,8 @@ def run_modules(tests_dir, log_dir, timeout, python=None, expected_path=None):
 
     print('gate: %d modules done in %.1fs' % (
         len(results), sum(r['duration'] for r in results)), flush=True)
+    _progress(log_dir, 'finished %d modules, %d failed' % (
+        len(results), sum(1 for r in results if r['status'] != 'ok')))
     return summarize(results, tests_dir, log_dir, timeout, expected, expected_path)
 
 

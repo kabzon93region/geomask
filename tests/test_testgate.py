@@ -60,6 +60,7 @@ class GateTests(unittest.TestCase):
             rc = testgate.run_modules(str(suite), str(logs), 60, sys.executable,
                                       str(manifest))
         summary = (logs / 'summary.txt').read_text(encoding='utf-8')
+        self.progress = (logs / 'progress.txt').read_text(encoding='utf-8')
         return rc, output.getvalue(), summary
 
     def test_progress_is_printed_for_every_module(self):
@@ -71,6 +72,15 @@ class GateTests(unittest.TestCase):
         self.assertIn('[1/1] test_one.py', output)
         self.assertRegex(output, r'ok\s+1 tests')
         self.assertIn('gate: 1 modules done', output)
+
+    def test_a_progress_file_tracks_the_running_module(self):
+        """The console stream can be buffered; progress.txt is readable at any moment."""
+        rc, output, summary = self.run_gate({'test_one.py': PASSING},
+                                            {'test_one.py': 1})
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.progress.startswith('finished 1 modules'),
+                        self.progress)
+        self.assertIn('[1/1] test_one.py', output)
 
     def test_a_module_that_ran_no_tests_is_a_failure(self):
         rc, output, summary = self.run_gate({'test_empty.py': EMPTY},

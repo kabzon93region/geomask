@@ -45,7 +45,7 @@ Linux/OpenWrt-стенд; **OPEN-OWNER** = нужно решение владе�
 | P01 | CLOSED-LOCAL (код) + OPEN-STAND | `5cd5112`: fail-closed таблица, conntrack, восстановление; netns-egress — стенд |
 | P02 | OPEN-STAND | совместимость old/new helper и changed hash на реальных модулях |
 | P03 | CLOSED-LOCAL (код) + OPEN-STAND | `2d6ad2a`: maintenance-lock + `activation`; SIGKILL/parallel installer — стенд |
-| P04 | OPEN-OWNER | канал обновлений/доверие мастер-ветке — решение владельца, новые ключи не назначались |
+| P04 | CLOSED-LOCAL (документ) + OPEN-OWNER | [`docs/decisions/P04-trust-channel.md`](../decisions/P04-trust-channel.md): каналы, проверки, release gate; подпись каталога/канал по умолчанию — решение владельца |
 | P05 | OPEN-STAND | alias absent vs invalid на netifd |
 | P06 | CLOSED-LOCAL (код) + OPEN-STAND | `734b97f`: persistent парк + отметка до первого `mv`, возврат до ротации; ENOSPC/owner data по этапам — стенд |
 | P07 | OPEN-STAND | настоящий rpcd/ubus, роли ACL, полный retrieval до 2 MiB с base64 |
@@ -67,7 +67,7 @@ B-020 — `2422295` (бюджет 15 с, partial, probe path). D14 — искл�
 
 | Задача | Статус |
 |---|---|
-| 1 updater trust/integrity (U01–U03/P02–P04) | код CLOSED-LOCAL; P02/P03-стенд и P04 — OPEN |
+| 1 updater trust/integrity (U01–U03/P02–P04) | код CLOSED-LOCAL; P04 закрыт документом; P02/P03 — стенд |
 | 2 install lifecycle (I01/I02/I05–I12/N04) | CLOSED-LOCAL целиком |
 | 3 writers/lifetime rollback (C01/C11/I03/I04/I09) | CLOSED-LOCAL |
 | 4 console/routes (C02/C03/C05/C08/C09/P01/G06) | CLOSED-LOCAL; P01-egress — стенд |

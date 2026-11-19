@@ -369,6 +369,22 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 18 — P04: trust/channel/release gate задокументирован
+
+- План для P04 требует ровно документирования («новые подписи/ключи не назначать фичей без
+  решения владельца»), поэтому продукт не менялся.
+- `docs/decisions/P04-trust-channel.md`: два канала (self-update из GitHub releases с
+  проверкой версии/тега и digest ассета; module update из raw по `ref`, по умолчанию
+  `master`, с sha256 из того же каталога), что именно проверяется и что не защищено
+  (подписи нет, anti-rollback нет, `master` = рабочий канал), release gate
+  (`release.py publish`: `check_build --verify-only` → testgate → тег → релиз → сверка
+  digest), операционные правила и три вопроса владельцу (подпись каталога, ref=тег по
+  умолчанию, публикация helper'а в каталоге).
+- Проверка фактов по коду: digest self-update — `src/backend/060-updates.sh.part:106-117`;
+  allow-list корней и `not-selected` — `src/module-update/001-module-update.py.part:24-26,61-76`;
+  сверка sha256 до записи — `002-module-update.py.part:168-175`.
+- Доказательства: `test_docs_claims.py` и `repo_check.py --strict` — без замечаний.
+
 ## Партия 17 — полный gate после P06/P09: PASS
 
 - `gate25` на Windows-хосте, `testgate run --timeout 4200`: **96 модулей, 1405 тестов,
@@ -440,5 +456,5 @@ Linux-unit-gate (CI-лог 187), gate этапа 0, R06/R11 и phase2a–2f на
 
 ## Состояние ветки
 
-`master` впереди `origin/master` на 60 коммитов; незакоммиченным остаётся только
+`master` впереди `origin/master` на 61 коммит; незакоммиченным остаётся только
 раздел «ранний этап 0» в плане (добавлен владельцем до начала работ — не трогать).

@@ -45003,7 +45003,10 @@ EOF
 
 _rs_snap_uci() { # _rs_snap_uci <dir> - preimage of the managed uci keys
   for _rs_up in network dhcp ksmbd; do
-    if [ -f "$(P "/tmp/.uci/$_rs_up")" ]; then
+    # An empty delta file means "no pending changes": uci leaves one behind after some
+    # commit paths. Only a non-empty file is another writer's mid-edit (live router,
+    # 19.11.2026: an empty /tmp/.uci/dhcp blocked every reinstall).
+    if [ -s "$(P "/tmp/.uci/$_rs_up")" ]; then
       bad "snapshot: pending uci delta for $_rs_up - another writer is mid-edit; reinstall refused"
       return 1
     fi
@@ -45523,7 +45526,10 @@ _rs_restore_shared() { # _rs_restore_shared <dir> - managed subset only, conflic
 
 _rs_restore_uci() { # _rs_restore_uci <dir> - only our keys, only when no foreign delta
   for _rs_up in network dhcp ksmbd; do
-    if [ -f "$(P "/tmp/.uci/$_rs_up")" ]; then
+    # An empty delta file means "no pending changes": uci leaves one behind after some
+    # commit paths. Only a non-empty file is another writer's mid-edit (live router,
+    # 19.11.2026: an empty /tmp/.uci/dhcp blocked every reinstall).
+    if [ -s "$(P "/tmp/.uci/$_rs_up")" ]; then
       bad "conflict: pending uci delta for $_rs_up appeared after the snapshot - not committing"
       _rr=1
       return 1

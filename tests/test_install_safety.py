@@ -862,6 +862,14 @@ done
         self.assertRegex(result.stdout, r'SIZE=\d+', result.stdout + result.stderr)
         self.assertRegex(result.stdout, r'FOUR=[0-7]{3}\|\d+\|0:\d+\|\d+')
 
+    def test_an_empty_uci_delta_does_not_block_the_reinstall(self):
+        """uci leaves an empty /tmp/.uci/<pkg> behind; only non-empty is a mid-edit."""
+        for name in ('110-restore-snapshot-shared.sh.part', '130-restore-shared-uci.sh.part'):
+            part = (TEMPLATE.parent / 'src' / 'installer' / name).read_text(encoding='utf-8')
+            self.assertIn('if [ -s "$(P "/tmp/.uci/$_rs_up")" ]', part,
+                          '%s still treats an empty delta as pending' % name)
+            self.assertNotIn('if [ -f "$(P "/tmp/.uci/$_rs_up")" ]', part)
+
     # ---------------------------------------------------------------- B5b
     def test_both_yaml_list_styles_count_as_a_geomask_config(self):
         """mihomo and panel tools write groups at column 0; the template uses two spaces."""

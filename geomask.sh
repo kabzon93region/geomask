@@ -7467,14 +7467,16 @@ _ipv6_restore() { # restore the recorded values; no record at all -> nothing to 
 
 # Belt and braces for the kernel switch: with IPv6 disabled there is nothing to forward, so a
 # drop rule costs nothing and still holds if a global address appears before sysctl applies.
+#
+# fw4 includes /etc/nftables.d/*.nft INSIDE its own `table inet fw4`, so a file there must
+# contain a chain, not a table: with the `table inet fw4 { ... }` wrapper the whole firewall
+# failed to start after the next reboot and NAT disappeared (live router, 19.11.2026).
 _ipv6_guard_install() {
   mkdir -p "$(dirname "$IPV6_NFT")" 2>/dev/null || return 1
   cat > "$IPV6_NFT" 2>/dev/null <<'EOF'
-table inet fw4 {
-    chain geomask_no_v6 {
-        type filter hook forward priority -10; policy accept;
-        meta nfproto ipv6 counter drop comment "geomask: IPv6 forwarding disabled"
-    }
+chain geomask_no_v6 {
+    type filter hook forward priority -10; policy accept;
+    meta nfproto ipv6 counter drop comment "geomask: IPv6 forwarding disabled"
 }
 EOF
 }
@@ -18374,7 +18376,7 @@ ASSET_EOF
           "path": "/usr/bin/geo-backend.sh",
           "source": "assets/geo-backend.sh",
           "mode": "0755",
-          "sha256": "21ff43cf9b13a7f7eb16cab07e769fb10ab897196a488812fd6a108d1d7a2527"
+          "sha256": "c8a69b057750c79fcacee7e068aa87dd46b2fb225779a2713b1ea56774531c3c"
         },
         {
           "path": "/usr/bin/geomask-lane.sh",

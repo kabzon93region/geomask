@@ -766,6 +766,27 @@ uci() {
                                   extra='stat() { return 127; }\ndate() { return 1; }\n'
                                         'printf "\n"')
         self.assertNotIn('GATE=0', result.stdout, result.stdout + result.stderr)
+    def test_the_ipv6_guard_is_a_chain_not_a_table(self):
+        """fw4 includes /etc/nftables.d/*.nft inside `table inet fw4`.
+
+        A wrapper table there made the whole firewall fail on the next boot (live router,
+        19.11.2026), which took NAT and the internet away.
+        """
+        target = self.case / 'nftables.d' / '99-geomask-no-v6.nft'
+        body = ('_ipv6_guard_install; printf "RC=%s\\n" "$?"; '
+                'cat "' + posix(target) + '"; '
+                '_ipv6_guard_remove; [ -e "' + posix(target) + '" ] && echo LEFT=1 || echo LEFT=0')
+        result = self.run_backend(body, functions=['_ipv6_guard_install', '_ipv6_guard_remove'],
+                                  extra='IPV6_NFT="%s"\n' % posix(target))
+        out = result.stdout
+        self.assertIn('RC=0', out, out + result.stderr)
+        self.assertIn('chain geomask_no_v6', out)
+        self.assertIn('hook forward', out)
+        self.assertIn('nfproto ipv6', out)
+        self.assertNotIn('table inet fw4', out, 'the drop-in must not wrap a table')
+        self.assertNotIn('table inet', out)
+        self.assertIn('LEFT=0', out)
+
 
 if __name__ == '__main__':
     unittest.main()

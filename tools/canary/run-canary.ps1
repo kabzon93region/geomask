@@ -66,24 +66,42 @@ function Invoke-Ssh {
         '-o', 'ServerAliveInterval=5',
         '-o', 'ServerAliveCountMax=2',
         $Router, $Command)
+    # PS 5.1: with ErrorActionPreference=Stop a native command's stderr becomes a terminating
+    # error and truncates the output (sysupgrade writes progress to stderr). Keep it non-fatal.
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     $out = & $script:SshPath @sshArgs 2>&1 | Out-String
-    return [pscustomobject]@{ Rc = $LASTEXITCODE; Out = $out.Trim() }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $oldEap
+    return [pscustomobject]@{ Rc = $code; Out = $out.Trim() }
 }
 
 function Invoke-ScpToRouter {
     param([string]$Source, [string]$Target)
     $scpArgs = @('-i', $Key, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
         $Source, ($Router + ':' + $Target))
+    # PS 5.1: with ErrorActionPreference=Stop a native command's stderr becomes a terminating
+    # error and truncates the output (sysupgrade writes progress to stderr). Keep it non-fatal.
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     $out = & $script:ScpPath @scpArgs 2>&1 | Out-String
-    return [pscustomobject]@{ Rc = $LASTEXITCODE; Out = $out.Trim() }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $oldEap
+    return [pscustomobject]@{ Rc = $code; Out = $out.Trim() }
 }
 
 function Invoke-ScpFromRouter {
     param([string]$Source, [string]$Target)
     $scpArgs = @('-i', $Key, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
         ($Router + ':' + $Source), $Target)
+    # PS 5.1: with ErrorActionPreference=Stop a native command's stderr becomes a terminating
+    # error and truncates the output (sysupgrade writes progress to stderr). Keep it non-fatal.
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     $out = & $script:ScpPath @scpArgs 2>&1 | Out-String
-    return [pscustomobject]@{ Rc = $LASTEXITCODE; Out = $out.Trim() }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $oldEap
+    return [pscustomobject]@{ Rc = $code; Out = $out.Trim() }
 }
 
 function Get-Sha256 {
@@ -153,10 +171,16 @@ function Test-OverlayPath {
 
 function New-Backup {
     Log 'INFO' 'backup: sysupgrade + overlay bundle'
-    $r = Invoke-Ssh 'mkdir -p /root/geomask-backups /tmp/canary; echo ok' 20
-    if ($r.Rc -ne 0) { Stop-Run 'cannot create /root/geomask-backups or /tmp/canary' }
-    $r = Invoke-Ssh 'sysupgrade -b /root/geomask-backups/canary-sysupgrade.tar.gz; echo RC=$?'
-    if ($r.Rc -ne 0 -or $r.Out -notmatch 'RC=0') { Stop-Run ('sysupgrade -b failed: ' + $r.Out) }
+    # /root is in this router's keep-list (geomask parks old copies for the same reason), so
+    # a backup written straight into /root/geomask-backups would include itself while it is
+    # being created. Create in /tmp, then move; park our previous canary archives first.
+    $cmd = 'mkdir -p /root/geomask-backups /tmp/canary/park; ' +
+        'mv /root/geomask-backups/canary-*.tar.gz /tmp/canary/park/ 2>/dev/null; ' +
+        'echo ok'
+    $r = Invoke-Ssh $cmd 30
+    if ($r.Rc -ne 0) { Stop-Run 'cannot prepare /root/geomask-backups and /tmp/canary' }
+    $r = Invoke-Ssh 'sysupgrade -b /tmp/canary/sysupgrade.tar.gz; echo RC=$?'
+    if ($r.Out -notmatch 'RC=0') { Stop-Run ('sysupgrade -b failed: ' + $r.Out) }
 
     $manifest = Join-Path $PSScriptRoot '..\..\tests\reinstall_write_set.json'
     if (-not (Test-Path -LiteralPath $manifest)) { Stop-Run ('write-set manifest not found: ' + $manifest) }
@@ -170,21 +194,26 @@ function New-Backup {
         if (-not $paths.Contains($extra)) { $paths.Add($extra) }
     }
     $localList = Join-Path $script:RunDir 'bundle-paths.txt'
-    Set-Content -LiteralPath $localList -Value $paths -Encoding ASCII
+    # LF, not CRLF: the router's read loop keeps a trailing CR in the path and finds nothing.
+    $text = ($paths -join "`n") + "`n"
+    [System.IO.File]::WriteAllText($localList, $text, (New-Object System.Text.ASCIIEncoding))
     $r = Invoke-ScpToRouter $localList '/tmp/canary/bundle-paths.txt'
     if ($r.Rc -ne 0) { Stop-Run ('scp of the bundle path list failed: ' + $r.Out) }
 
     $remote = 'while IFS= read -r p; do [ -e "$p" ] && printf ''%s\n'' "$p"; done < /tmp/canary/bundle-paths.txt > /tmp/canary/bundle.list; ' +
         'wc -l < /tmp/canary/bundle.list; ' +
-        'tar czf /root/geomask-backups/canary-overlay.tar.gz -C / -T /tmp/canary/bundle.list 2>/dev/null; echo RC=$?'
+        'tar czf /tmp/canary/overlay.tar.gz -C / -T /tmp/canary/bundle.list 2>/dev/null; echo RC=$?'
     $r = Invoke-Ssh $remote 180
     if ($r.Rc -ne 0 -or $r.Out -notmatch 'RC=0') { Stop-Run ('overlay bundle failed: ' + $r.Out) }
     Log 'INFO' ('overlay bundle: ' + (($r.Out -split "`r?`n")[0]) + ' paths')
 
-    $r = Invoke-Ssh 'cd /root/geomask-backups && sha256sum canary-sysupgrade.tar.gz canary-overlay.tar.gz && ' +
+    $cmd = 'mv -f /tmp/canary/sysupgrade.tar.gz /root/geomask-backups/canary-sysupgrade.tar.gz && ' +
+        'mv -f /tmp/canary/overlay.tar.gz /root/geomask-backups/canary-overlay.tar.gz && ' +
+        'cd /root/geomask-backups && sha256sum canary-sysupgrade.tar.gz canary-overlay.tar.gz && ' +
         'tar tzf canary-sysupgrade.tar.gz > /tmp/canary/sys.list && tar tzf canary-overlay.tar.gz > /tmp/canary/ovl.list && ' +
         'cat /tmp/canary/sys.list /tmp/canary/ovl.list | grep -v "/$" | sed "s#^/*##" | sed "s#^#/#" | sort -u > canary-restore-set.txt && ' +
         'wc -l < canary-restore-set.txt'
+    $r = Invoke-Ssh $cmd 120
     if ($r.Rc -ne 0) { Stop-Run ('listing/sha256 failed: ' + $r.Out) }
     $lines = @($r.Out -split "`r?`n")
     $remoteSha = @{}
@@ -192,6 +221,8 @@ function New-Backup {
         if ($line -match '^([0-9a-f]{64})\s+(\S+)$') { $remoteSha[$Matches[2]] = $Matches[1] }
     }
     if (-not $remoteSha.ContainsKey('canary-sysupgrade.tar.gz')) { Stop-Run ('no remote sha256: ' + $r.Out) }
+    $r = Invoke-Ssh 'tar tzf /root/geomask-backups/canary-sysupgrade.tar.gz | grep -c "canary-.*\.tar\.gz" || true'
+    if (($r.Out.Trim()) -ne '0') { Stop-Run ('the sysupgrade archive contains a canary archive (nesting): ' + $r.Out) }
     $script:Archives['sysupgrade'] = 'canary-sysupgrade.tar.gz'
     $script:Archives['overlay'] = 'canary-overlay.tar.gz'
     $script:Archives['sha'] = $remoteSha
@@ -210,26 +241,33 @@ function New-Backup {
     $setCount = (Get-Content -LiteralPath $setLocal).Count
     if ($setCount -lt 50) { Stop-Run ('restore set looks too small: ' + $setCount) }
     Log 'INFO' ('restore set: ' + $setCount + ' paths')
-    $r = Invoke-Ssh 'for f in etc/config/network etc/config/firewall etc/config/dhcp; do ' +
+    $cmd = 'for f in etc/config/network etc/config/firewall etc/config/dhcp; do ' +
         'tar tzf /root/geomask-backups/canary-sysupgrade.tar.gz | grep -qx "$f" && echo "HAVE $f" || echo "MISS $f"; done'
+    $r = Invoke-Ssh $cmd 60
     Log 'INFO' ('keep-list check: ' + ($r.Out -replace "`r?`n", '; '))
     if ($r.Out -match 'MISS etc/config/') { Stop-Run 'the sysupgrade archive lacks a core config file' }
 }
 
 function Test-Rehearsal {
     Log 'INFO' 'restore rehearsal into /tmp (no system changes)'
-    $r = Invoke-Ssh 'rm -rf /tmp/restore-rehearsal; mkdir -p /tmp/restore-rehearsal; ' +
+    $cmd = 'rm -rf /tmp/restore-rehearsal; mkdir -p /tmp/restore-rehearsal; ' +
         'tar xzf /root/geomask-backups/canary-sysupgrade.tar.gz -C /tmp/restore-rehearsal && ' +
         'tar xzf /root/geomask-backups/canary-overlay.tar.gz -C /tmp/restore-rehearsal && echo RC=0'
+    $r = Invoke-Ssh $cmd 180
     if ($r.Rc -ne 0 -or $r.Out -notmatch 'RC=0') { Stop-Run ('rehearsal extract failed: ' + $r.Out) }
-    $r = Invoke-Ssh 'for f in etc/config/network etc/config/firewall etc/config/dhcp etc/mihomo/config.yaml; do ' +
+    $cmd = 'for f in etc/config/network etc/config/firewall etc/config/dhcp etc/mihomo/config.yaml; do ' +
         'if [ -f "/$f" ]; then cmp -s "/$f" "/tmp/restore-rehearsal/$f" && echo "SAME $f" || echo "DIFF $f"; ' +
         'else echo "ABSENT $f"; fi; done'
+    $r = Invoke-Ssh $cmd 60
     Log 'INFO' ('rehearsal: ' + ($r.Out -replace "`r?`n", '; '))
     if ($r.Out -match 'ABSENT etc/config/network') { Stop-Run 'rehearsal lacks etc/config/network' }
     if ($r.Out -match 'ABSENT etc/mihomo/config.yaml') {
         Log 'WARN' 'mihomo config is not in the archives: the canary must not rewrite it (no --replace-config)'
     }
+    # The PC keeps verified copies; the overlay is small (185 MB) and geomask's next backup
+    # would otherwise nest these archives into /root again.
+    $r = Invoke-Ssh 'rm -f /root/geomask-backups/canary-*.tar.gz /root/geomask-backups/canary-restore-set.txt; df -h / | tail -1'
+    Log 'INFO' ('router copies removed: ' + $r.Out.Trim())
 }
 
 function Send-Tools {

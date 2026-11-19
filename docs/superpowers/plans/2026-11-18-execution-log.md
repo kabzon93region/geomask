@@ -369,6 +369,27 @@
   `check_build.py --verify-only` OK, `compose_sources.py --check` OK, `repo_check.py --strict` OK.
 - Осталось (стенд): реальный power loss/reboot и ENOSPC (P06) — в runbook, локально недоказуемо.
 
+## Партия 22 — первый безопасный прогон канарейки на живом роутере (read-only)
+
+- Роутер: OpenWrt 25.12.5, geomask 1.30.21, overlay 185 МБ. Бэкап: sysupgrade 24 524 281 Б,
+  sha256 `5fccc62f…`; overlay-bundle 17 494 683 Б, sha256 `4f6690ea…`; restore-set 862 пути.
+  sha256 сверены на роутере и ПК, `tar tzf` без вложенных архивов.
+- Репетиция restore в `/tmp`: `SAME` для `etc/config/network`, `firewall`, `dhcp` и
+  `etc/mihomo/config.yaml` — на этом роутере keep-list включает `/etc/mihomo`, отдельный
+  bundle нужен для новых `/usr/lib/geomask`/`/etc/geomask`.
+- `--check` до установки: pass=4, fail=11, skipped=4. Ожидаемая часть — разница версий
+  (1.30.21 без новых `geomask-routes.sh`, `geomask-lock.sh`, `dnsguard`, `console.py`,
+  `diag-*`, `mihomo-adopt`, `reload-state`). Два независимых от сборки пункта:
+  `AI-DNS: mark rule for 0x64 missing` и IPv6-предупреждение `ip6assign=0, ra=server` —
+  кандидаты в план починки после установки.
+- Два дефекта самой канарейки, найденные этим прогоном: (1) `sysupgrade -b` в
+  `/root/geomask-backups` вкладывает архив сам в себя (24 МБ → 49 МБ), потому что `/root` в
+  keep-list — теперь staging в `/tmp` и парковка прежних `canary-*`; (2) на OpenWrt нет
+  `paste(1)`, из-за чего probe показывал `tun=none rules=none` — заменено на
+  `ls /sys/class/net` + `grep -o 'lookup 10[0-9]'`.
+- Установка не выполнялась; на роутере удалены только временные `canary-*` архивы после
+  сверки sha256 на ПК (свободно снова 76 МБ overlay). `tests/test_canary_scripts.py` 9 тестов.
+
 ## Партия 21 — скрипты канарейки (ПК-сторож, probe, restore)
 
 - `tools/canary/run-canary.ps1`: бэкап (sysupgrade + overlay-bundle из

@@ -91,6 +91,25 @@ class CanaryToolingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('RESTORE_FAIL', result.stderr)
 
+    def test_the_probe_does_not_depend_on_optional_tools(self):
+        """paste(1) is missing on some OpenWrt builds and silently turned both values into none."""
+        probe = text(PROBE)
+        self.assertNotIn('| paste', probe)
+        self.assertNotIn('paste -s', probe)
+        self.assertIn("ls /sys/class/net", probe)
+        self.assertIn("ip rule show", probe)
+
+    def test_the_backup_is_staged_in_tmp_and_written_with_lf(self):
+        """/root is in this router's keep-list: a backup created there would include itself."""
+        watchdog = text(WATCHDOG)
+        self.assertIn('sysupgrade -b /tmp/canary/sysupgrade.tar.gz', watchdog)
+        self.assertNotIn('sysupgrade -b /root', watchdog)
+        self.assertIn('/tmp/canary/park', watchdog)
+        self.assertIn('mv -f /tmp/canary/sysupgrade.tar.gz /root/geomask-backups/', watchdog)
+        # CRLF in the path list made the router's read loop match nothing.
+        self.assertIn('WriteAllText', watchdog)
+        self.assertIn('-join "`n"', watchdog)
+
     def test_restore_touches_only_geomask_paths_missing_from_the_set(self):
         restore = text(RESTORE)
         self.assertIn('grep -qxF "$p" "$SET" && continue', restore)

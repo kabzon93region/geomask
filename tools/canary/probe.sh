@@ -11,12 +11,14 @@ printf 'uptime=%s\n' "$(cut -d. -f1 /proc/uptime 2>/dev/null)"
 
 if pidof mihomo >/dev/null 2>&1; then printf 'mihomo=1\n'; else printf 'mihomo=0\n'; fi
 
-tuns=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 \
-  | grep -E '^(Mihomo|AI|Console)$' | paste -sd, - 2>/dev/null)
+# No paste(1) here: it is missing on some OpenWrt builds and silently produced "none".
+tuns=$(ls /sys/class/net 2>/dev/null | grep -xE 'Mihomo|AI|Console|VPN-noP2P' | sort | tr '\n' ',')
+tuns=${tuns%,}
 printf 'tun=%s\n' "${tuns:-none}"
 
-rules=$(ip rule show 2>/dev/null | sed -n 's/.*lookup \(10[0-9]\).*/\1/p' \
-  | sort -u | paste -sd, - 2>/dev/null)
+rules=$(ip rule show 2>/dev/null | grep -o 'lookup 10[0-9]' | awk '{print $2}' \
+  | sort -u | tr '\n' ',')
+rules=${rules%,}
 printf 'rules=%s\n' "${rules:-none}"
 
 nft=$(nft list tables 2>/dev/null | grep -c 'inet geomask')

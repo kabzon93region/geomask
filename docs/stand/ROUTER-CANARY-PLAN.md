@@ -66,7 +66,11 @@ OpenWrt `sysupgrade -b` архивирует **не всё**: `/etc/mihomo`, `/e
 `/lib/upgrade/keep.d/*`. Поэтому:
 
 1. `ssh ... 'sysupgrade -b /tmp/canary-sysupgrade.tar.gz'` — штатный LuCI-формат (UCI и
-   системные файлы).
+   системные файлы). Именно в `/tmp`, а не сразу в `/root/geomask-backups`: на этом роутере
+   `/root` входит в keep-list, и бэкап, созданный внутри `/root`, включает сам себя
+   (проверено: 24 МБ → 49 МБ с вложенной копией). После создания архив переносится в
+   `/root/geomask-backups` только для удобства, а на ПК — через `scp`/`fetch_backup.ps1`;
+   проверка `tar tzf | grep -c canary-` обязательна.
 2. `ssh ... 'sysupgrade -l'` — **сохранить список** и убедиться, что в нём есть
    `/etc/config/network`, `/etc/config/firewall`, `/etc/config/dhcp`. Если `/etc/mihomo/`,
    `/etc/geomask/`, `/etc/init.d/geomask*`, `/usr/lib/geomask`, `/etc/hotplug.d/*geomask*`
@@ -208,6 +212,28 @@ OpenWrt `sysupgrade -b` архивирует **не всё**: `/etc/mihomo`, `/e
 - не публиковать релиз/тег по итогам прогона (публикация — отдельным решением);
 - не оставлять на роутере `/tmp/canary-*` после успешного прогона (убрать в конце; при откате
   они исчезнут сами после reboot).
+
+## 10а. Первый безопасный прогон (19.11.2026, без установки)
+
+- Роутер: OpenWrt 25.12.5 (mediatek/filogic), overlay 185 МБ (свободно 76 МБ после уборки),
+  установлен geomask 1.30.21, mihomo/hev/magitrickle/rpcd живы, `tun=AI,Mihomo,VPN-noP2P`,
+  `rules=100,101`.
+- Бэкап: `canary-sysupgrade.tar.gz` 24 524 281 байт (sha256 `5fccc62f…`), overlay-bundle
+  17 494 683 байт (sha256 `4f6690ea…`), restore-set 862 пути; sha256 совпали на роутере и ПК;
+  в архиве есть `etc/config/{network,firewall,dhcp}` и `etc/mihomo/config.yaml`.
+- Репетиция восстановления: `SAME` для network/firewall/dhcp/**mihomo config.yaml** — то есть
+  keep-list этого роутера включает `/etc/mihomo`, отдельный bundle для него не нужен (но
+  остаётся для новых файлов `/usr/lib/geomask` и `/etc/geomask`).
+- `--check` перед установкой: `pass=4 fail=11 skipped=4`. Часть FAIL — ожидаемая разница
+  версий (1.30.21 не содержит новых `geomask-routes.sh`, `geomask-lock.sh`, `dnsguard`,
+  `console.py`, `diag-*`, `mihomo-adopt`, `reload-state`). Неожиданное и не связанное с
+  новой сборкой: `AI-DNS: mark rule for 0x64 missing` (при наличии ip-rule 0x64→101 и
+  загруженной nft-таблицы) и предупреждение IPv6 (`ip6assign=0, ra=server`). Эти два пункта —
+  кандидаты в план починки, если подтвердятся после установки.
+- Найдены и исправлены два дефекта самой канарейки: бэкап писался в `/root` и вкладывал сам
+  себя (теперь staging в `/tmp` + парковка прежних `canary-*`), и `paste(1)` на этом OpenWrt
+  отсутствует, из-за чего probe показывал `tun=none rules=none` (теперь `ls /sys/class/net`
+  и `grep -o 'lookup 10[0-9]'`).
 
 ## 11. Чек-лист команд (сокращённо)
 

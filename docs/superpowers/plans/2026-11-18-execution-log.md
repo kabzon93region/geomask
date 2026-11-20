@@ -673,3 +673,23 @@ Linux-unit-gate (CI-лог 187), gate этапа 0, R06/R11 и phase2a–2f на
 
 `master` впереди `origin/master` на 69 коммитов; незакоммиченным остаётся только
 раздел «ранний этап 0» в плане (добавлен владельцем до начала работ — не трогать).
+
+## Партия 33 — релиз v1.31.0 и отчёт по CI-187
+
+- Релиз: `release.py publish` на `af3f8d0`; гейт 97 модулей / 1429 тестов / 1399 выполнено /
+  30 allowlisted skip / 0 fail за 3989 с. Создан тег `v1.31.0` и GitHub release с asset
+  `geomask.sh` sha256 `261df282…`; в notes отдельно указан красный Linux CI (CI-187).
+  Владельческий план на время публикации уходил в stash и восстановлен без потерь
+  (`plan diff preserved: True`).
+- Отчёт для анализатора/планировщика: `docs/CI-187-ANALYSIS-2026-11-20.md`. Внутри: факты
+  прогона `44652597472` (Ubuntu 26.04, Python 3.15.2, 1428 тестов, pass 1370, fail 52
+  в 16 модулях, 1 unknown-skip, timeout=0), классификация падений по группам A–G с точными
+  traceback и файлами/строками, партии исправлений B1–B7 с критериями приёмки и вопросы
+  планировщику.
+- Ключевые выводы: 19 падений — отсутствие hermetic-окружения (`GM_AUDIT_STATE` и другие
+  пути ведут в `/etc/geomask`); 17 — `test_module_update` (PermissionError при staged
+  install, единственная группа с возможным дефектом продукта); 7 — `test_console_tx`
+  ищет `/usr/lib/geomask` вместо `assets/`; 4 — семантика flock/kill; 2 — симлинки и
+  pin-swap; 1 — каскад `test_sandbox_guard`; 1 — unknown-skip `windows-only` вне allowlist.
+- `docs/source-split/PLAN-STATUS.md`: строка задачи 8 обновлена — CI-187 разобран и ждёт
+  решения планировщика.

@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import sys
 import tempfile
 import urllib.request
@@ -142,8 +143,40 @@ def check_ready(version):
     return problems
 
 
+# The full gate takes ~68 minutes on a Windows host (phase2b alone is ~29 min). The old
+# publish call used testgate's 600 s default and a 1800 s outer limit, so it could never
+# finish here. Keep the per-module limit in one place and give the step more room than the
+# whole gate.
+GATE_TIMEOUT = 4200
+GATE_WALL = 7500
+
+
+def run_stream(cmd, timeout, log_path):
+    """Run a child and echo its lines as they arrive (a 68-minute silent step looks hung)."""
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    with open(log_path, 'w', encoding='utf-8') as log:
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                encoding='utf-8', errors='replace')
+        try:
+            for line in proc.stdout:
+                log.write(line)
+                log.flush()
+                print('    ' + line.rstrip(), flush=True)
+                if time.time() - started > timeout:
+                    proc.kill()
+                    log.write('timeout after %s s\n' % timeout)
+                    return 124
+            return proc.wait()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+
 def run_tests():
-    print('  проверки перед публикацией (это займёт пару минут)')
+    print('  проверки перед публикацией (~70 минут на этом хосте)')
     logs = tempfile.mkdtemp(prefix='geomask-release-gate-')
     # R01 (audit 18.11.2026): publishing used a raw `unittest discover` and a mutating
     # check_build, so the release could pass while testgate's own contract - per-module
@@ -151,15 +184,22 @@ def run_tests():
     # the authority now, and check_build only verifies (it used to rewrite the artifact it
     # was judging).
     steps = [
-        ('сборка == исходники', [sys.executable, 'tools/check_build.py', '--verify-only']),
-        ('RPC-манифест', [sys.executable, 'tools/gen-geo-rpc.py', '--check']),
+        ('сборка == исходники', [sys.executable, 'tools/check_build.py', '--verify-only'], 600),
+        ('RPC-манифест', [sys.executable, 'tools/gen-geo-rpc.py', '--check'], 600),
         ('testgate', [sys.executable, '-B', 'tests/testgate.py', 'run',
-                      '--tests-dir', 'tests', '--log-dir', logs]),
-        ('песочница', [bash(), 'tests/run_tests.sh']),
+                      '--tests-dir', 'tests', '--log-dir', logs,
+                      '--timeout', str(GATE_TIMEOUT)], GATE_WALL),
+        ('песочница', [bash(), 'tests/run_tests.sh'], 1800),
     ]
     failed = []
-    for name, cmd in steps:
-        result = run(cmd, timeout=1800)
+    for name, cmd, limit in steps:
+        if name == 'testgate':
+            log_path = os.path.join(logs, 'release-testgate.log')
+            print('    %-22s (лог: %s)' % (name, log_path))
+            code = run_stream(cmd, limit, log_path)
+            result = type('Result', (), {'returncode': code, 'stdout': '', 'stderr': ''})()
+        else:
+            result = run(cmd, timeout=limit)
         print('    %-22s %s' % (name, 'ok' if result.returncode == 0 else 'FAIL'))
         if result.returncode:
             failed.append((name, (result.stdout or '')[-1500:] + (result.stderr or '')[-800:]))

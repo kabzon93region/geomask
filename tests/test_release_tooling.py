@@ -14,6 +14,13 @@ RELEASE = (ROOT / 'tools' / 'release.py').read_text(encoding='utf-8')
 
 
 class ReleaseToolingTests(unittest.TestCase):
+    def test_the_release_gate_uses_the_real_timeout_and_streams(self):
+        """Defaults were 600 s per module and 1800 s per step - a 68-minute gate could not pass."""
+        self.assertIn('GATE_TIMEOUT = 4200', RELEASE)
+        self.assertIn("'--timeout', str(GATE_TIMEOUT)", RELEASE)
+        self.assertIn('run_stream', RELEASE)
+        self.assertGreater(7500, 4200, 'the wall limit must exceed one module timeout')
+
     def test_publish_uses_the_gate_not_a_raw_discovery_run(self):
         body = RELEASE
         self.assertIn("tests/testgate.py", body,

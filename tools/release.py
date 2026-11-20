@@ -153,8 +153,9 @@ GATE_WALL = 7500
 
 def run_stream(cmd, timeout, log_path):
     """Run a child and echo its lines as they arrive (a 68-minute silent step looks hung)."""
-    log_path = Path(log_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    parent = os.path.dirname(log_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     started = time.time()
     with open(log_path, 'w', encoding='utf-8') as log:
         proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,

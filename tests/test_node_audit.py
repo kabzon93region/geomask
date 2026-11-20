@@ -9,6 +9,10 @@ import unittest
 from unittest.mock import patch, Mock
 from types import SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermetic  # noqa: E402  (test-support helper in the same directory)
+hermetic.isolate_audit_state()
+
 SOURCE = Path(__file__).resolve().parents[1] / 'assets' / 'geomask-node-audit.py'
 spec = importlib.util.spec_from_file_location('node_audit', SOURCE)
 audit = importlib.util.module_from_spec(spec)

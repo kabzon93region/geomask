@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -189,6 +190,11 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
         self.state.write_text('enabled=0\nip=\n', encoding='utf-8', newline='\n')
         self.calls = self.case / 'tx-calls.jsonl'
         self.calls.write_text('', encoding='utf-8', newline='\n')
+        # A git checkout keeps the asset 0644, and `cmd_console` refuses a non-executable
+        # patcher; the router installs it 0755, so the test gives its copy that mode.
+        self.console_py = self.case / 'geomask-console.py'
+        shutil.copyfile(CONSOLE_PY, self.console_py)
+        self.console_py.chmod(0o755)
         self.tx_stub = self.case / 'tx-stub.py'
         self.tx_stub.write_text(TX_STUB % {'asset': str(TX_ASSET)}, encoding='utf-8',
                                 newline='\n')
@@ -199,7 +205,7 @@ class ConsoleSwitchTransactionTests(unittest.TestCase):
             'CONFIG': win(self.config),
             'STATE': win(self.state),
             'INITD': win(self.case / 'hev-console'),
-            'CONSOLE_PY': win(CONSOLE_PY),
+            'CONSOLE_PY': win(self.console_py),
             'TX_PY': win(self.tx_stub),
             'PYTHON': win(sys.executable),
             'LOCK': win(self.case / 'console.lock'),

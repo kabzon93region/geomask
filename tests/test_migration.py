@@ -1,9 +1,14 @@
 """Unit tests for cron migration to the per-path scheduler."""
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermetic  # noqa: E402  (test-support helper in the same directory)
+hermetic.isolate_audit_state()
 
 SOURCE = Path(__file__).resolve().parents[1] / 'assets' / 'geomask-node-audit.py'
 spec = importlib.util.spec_from_file_location('node_audit', SOURCE)

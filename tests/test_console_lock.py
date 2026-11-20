@@ -17,6 +17,7 @@ from pathlib import Path
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -118,9 +119,15 @@ def lock_prelude(case):
 
 
 def reap(proc):
-    """Kill and wait: a running child with cwd inside the TemporaryDirectory blocks cleanup."""
+    """Kill the whole group and wait: a running child inside the TemporaryDirectory blocks cleanup."""
     try:
-        proc.kill()
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
         proc.wait(timeout=10)
     except Exception:
         pass
@@ -259,14 +266,17 @@ class ConsoleWatchdogLockTests(unittest.TestCase):
         holder = self.write('holder.sh', lock_prelude(self.case) + (
             'gm_lock_acquire console 0 || exit 9\nprintf held > "%s/held"\nsleep 60\n'
             % win(self.case)))
-        proc = subprocess.Popen([BASH, win(holder)], cwd=str(self.case))
+        # `sleep` inherits the lock descriptor: killing only bash would leave the lock held
+        # by its child, so the test kills the whole process group (CI-187 group D).
+        proc = subprocess.Popen([BASH, win(holder)], cwd=str(self.case),
+                                start_new_session=True)
         self.addCleanup(reap, proc)
         for _ in range(200):
             if (self.case / 'held').exists():
                 break
             time.sleep(0.05)
         inode = self.lock_file().stat().st_ino
-        proc.kill()
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         proc.wait(timeout=10)
         time.sleep(0.2)
         self.assertTrue(self.lock_is_free(), 'a killed holder kept the lane locked')

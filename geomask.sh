@@ -750,23 +750,27 @@ _gm_lock_free_fd() {
 # terminating a non-interactive shell on the `exec` line.
 _gm_lock_open() { # <fd> <path>
   { : >>"$2"; } 2>/dev/null || return 1
+  # The redirect must be scoped to the group. `exec N<>file 2>/dev/null` redirects THIS
+  # shell's stderr for the rest of the run, so every later diagnostic disappeared - the
+  # rank-violation message never reached its caller (CI-187 group D). The descriptor itself
+  # stays open, because `exec` inside the group applies to the current shell.
   case "$1" in
-    5) exec 5<>"$2" 2>/dev/null ;;
-    6) exec 6<>"$2" 2>/dev/null ;;
-    7) exec 7<>"$2" 2>/dev/null ;;
-    8) exec 8<>"$2" 2>/dev/null ;;
-    9) exec 9<>"$2" 2>/dev/null ;;
+    5) { exec 5<>"$2"; } 2>/dev/null ;;
+    6) { exec 6<>"$2"; } 2>/dev/null ;;
+    7) { exec 7<>"$2"; } 2>/dev/null ;;
+    8) { exec 8<>"$2"; } 2>/dev/null ;;
+    9) { exec 9<>"$2"; } 2>/dev/null ;;
     *) return 1 ;;
   esac
 }
 
 _gm_lock_close_fd() { # <fd>
   case "$1" in
-    5) exec 5>&- 2>/dev/null ;;
-    6) exec 6>&- 2>/dev/null ;;
-    7) exec 7>&- 2>/dev/null ;;
-    8) exec 8>&- 2>/dev/null ;;
-    9) exec 9>&- 2>/dev/null ;;
+    5) { exec 5>&-; } 2>/dev/null ;;
+    6) { exec 6>&-; } 2>/dev/null ;;
+    7) { exec 7>&-; } 2>/dev/null ;;
+    8) { exec 8>&-; } 2>/dev/null ;;
+    9) { exec 9>&-; } 2>/dev/null ;;
   esac
   return 0
 }
@@ -11753,23 +11757,27 @@ _gm_lock_free_fd() {
 # terminating a non-interactive shell on the `exec` line.
 _gm_lock_open() { # <fd> <path>
   { : >>"$2"; } 2>/dev/null || return 1
+  # The redirect must be scoped to the group. `exec N<>file 2>/dev/null` redirects THIS
+  # shell's stderr for the rest of the run, so every later diagnostic disappeared - the
+  # rank-violation message never reached its caller (CI-187 group D). The descriptor itself
+  # stays open, because `exec` inside the group applies to the current shell.
   case "$1" in
-    5) exec 5<>"$2" 2>/dev/null ;;
-    6) exec 6<>"$2" 2>/dev/null ;;
-    7) exec 7<>"$2" 2>/dev/null ;;
-    8) exec 8<>"$2" 2>/dev/null ;;
-    9) exec 9<>"$2" 2>/dev/null ;;
+    5) { exec 5<>"$2"; } 2>/dev/null ;;
+    6) { exec 6<>"$2"; } 2>/dev/null ;;
+    7) { exec 7<>"$2"; } 2>/dev/null ;;
+    8) { exec 8<>"$2"; } 2>/dev/null ;;
+    9) { exec 9<>"$2"; } 2>/dev/null ;;
     *) return 1 ;;
   esac
 }
 
 _gm_lock_close_fd() { # <fd>
   case "$1" in
-    5) exec 5>&- 2>/dev/null ;;
-    6) exec 6>&- 2>/dev/null ;;
-    7) exec 7>&- 2>/dev/null ;;
-    8) exec 8>&- 2>/dev/null ;;
-    9) exec 9>&- 2>/dev/null ;;
+    5) { exec 5>&-; } 2>/dev/null ;;
+    6) { exec 6>&-; } 2>/dev/null ;;
+    7) { exec 7>&-; } 2>/dev/null ;;
+    8) { exec 8>&-; } 2>/dev/null ;;
+    9) { exec 9>&-; } 2>/dev/null ;;
   esac
   return 0
 }
@@ -21278,6 +21286,43 @@ write_mihomo_config() { # <vpn-url> <ai-url> - public entry: serialised live-con
   return $_wmc_rc
 }
 
+# A fresh controller secret for the LAN-exposed mihomo API. 32 hex characters from the
+# kernel pool; the fallback still yields a non-empty value on an image without md5sum.
+_mihomo_new_secret() {
+  _mns=$(head -c 32 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -c1-32)
+  case "$_mns" in
+    ''|*[!0-9a-f]*) _mns="geomask-$(date +%s)-$$" ;;
+  esac
+  printf '%s' "$_mns"
+}
+
+# Write a candidate with the controller bound to the LAN and a secret guaranteed. The caller
+# validates the candidate and only then replaces the live file. Unchanged input produces
+# identical output, so the caller can use `cmp` to skip a pointless backup.
+_mihomo_controller_candidate() { # <live-config> <candidate>
+  _mcc_sec=0
+  grep -qE '^secret:[[:space:]]*[^[:space:]]' "$1" 2>/dev/null && _mcc_sec=1
+  _mcc_new=$(_mihomo_new_secret)
+  # One pass: drop an empty `secret:` line, set the LAN bind, and add the secret right after
+  # it when the file has none. A config without any controller line gets both at the end, so
+  # the result is still a valid mihomo config.
+  awk -v sec="$_mcc_new" -v have_sec="$_mcc_sec" '
+    /^secret:[[:space:]]*$/ { next }
+    /^external-controller:/ {
+      print "external-controller: 0.0.0.0:9090"
+      if (have_sec != 1) { print "secret: \"" sec "\""; have_sec = 1 }
+      done = 1
+      next
+    }
+    { print }
+    END {
+      if (!done) {
+        print "external-controller: 0.0.0.0:9090"
+        if (have_sec != 1) print "secret: \"" sec "\""
+      }
+    }' "$1" > "$2"
+}
+
 _write_mihomo_config_unlocked() { # the actual writer; called only under config-tx
   _wpid=$$
   _c="$(P $MIHOMO_CONF)"
@@ -21393,22 +21438,21 @@ _write_mihomo_config_unlocked() { # the actual writer; called only under config-
         info "existing 2-subscription config kept as-is (ai-devices + torrent-direct present)"
       fi
     fi
-    # A controller bound to 0.0.0.0 (often without a secret) lets any LAN device switch nodes
-    # and read connections. The template always used loopback; the in-place path did not, so
-    # updated routers kept the old exposure (audit follow-up).
-    _ec=$(grep -E '^external-controller:' "$_c" 2>/dev/null | head -1)
-    case "$_ec" in
-      ''|*127.0.0.1*|*localhost*) ;;
-      *)
-        cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
-        if sed 's|^external-controller:.*|external-controller: 127.0.0.1:9090|' "$_c" > "$_c.ecnew.$_wpid" \
-           && mihomo_validate "$_c.ecnew.$_wpid" && mv -f "$_c.ecnew.$_wpid" "$_c"; then
-          info "external-controller moved to 127.0.0.1:9090 (LAN devices could switch nodes)"
-        else
-          rm -f "$_c.ecnew.$_wpid"; warn "external-controller not changed (validation) - check it manually"
-        fi
-        ;;
-    esac
+    # The panels are used from a browser on the LAN: the router has no desktop of its own
+    # (owner decision 20.11.2026). A controller on 0.0.0.0 is safe only with a secret, so a
+    # missing one is generated; an existing secret is preserved byte-for-byte. The WAN zone
+    # rejects input, so the listener is reachable from LAN/WireGuard only.
+    _mihomo_controller_candidate "$_c" "$_c.ecnew.$_wpid"
+    if cmp -s "$_c" "$_c.ecnew.$_wpid"; then
+      rm -f "$_c.ecnew.$_wpid"
+    else
+      cp -p "$_c" "$_c.bak_geomask_$(date +%s)" || true
+      if mihomo_validate "$_c.ecnew.$_wpid" && mv -f "$_c.ecnew.$_wpid" "$_c"; then
+        info "external-controller: 0.0.0.0:9090 (LAN panel; the secret is required)"
+      else
+        rm -f "$_c.ecnew.$_wpid"; warn "external-controller not changed (validation) - check it manually"
+      fi
+    fi
     chmod 600 "$_c" 2>/dev/null
     return 0
   fi
@@ -21433,9 +21477,11 @@ _write_mihomo_config_unlocked() { # the actual writer; called only under config-
     printf '%s\n' 'mode: rule'
     printf '%s\n' 'log-level: info'
     printf '%s\n' 'ipv6: false'
-    # Loopback only: every geomask client already talks to 127.0.0.1:9090, and a controller
-    # bound to 0.0.0.0 with no secret let any LAN device switch nodes and read connections.
-    printf '%s\n' 'external-controller: 127.0.0.1:9090'
+    # Reachable from the LAN so the mihomo UI and the panels can be opened from a browser;
+    # the secret is generated in the same run, because an open controller lets any LAN device
+    # switch nodes and read connections. WAN input stays rejected by the firewall zone.
+    printf '%s\n' 'external-controller: 0.0.0.0:9090'
+    printf 'secret: "%s"\n' "$(_mihomo_new_secret)"
     printf '%s\n' 'external-ui: ui'
     printf '%s\n' 'unified-delay: true'
     printf '%s\n' 'find-process-mode: off'

@@ -27,6 +27,7 @@ from pathlib import Path
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -604,7 +605,10 @@ class KernelSemanticsTests(unittest.TestCase):
             % (sh_quote(posix(self.locks)), sh_quote(posix(HELPER)),
                sh_quote(posix(self.case / 'held'))),
             encoding='utf-8', newline='\n')
-        holder = subprocess.Popen([BASH, posix(script)], cwd=str(self.case))
+        # `sleep` inherits the lock descriptor. Killing only bash leaves that child alive and
+        # the lock held, so the whole process group has to die (CI-187 group D).
+        holder = subprocess.Popen([BASH, posix(script)], cwd=str(self.case),
+                                  start_new_session=True)
         self.addCleanup(reap, holder)
         marker = self.case / 'held'
         for _ in range(200):
@@ -613,7 +617,7 @@ class KernelSemanticsTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertTrue(marker.exists())
         inode = (self.locks / 'console.lock').stat().st_ino
-        holder.kill()
+        os.killpg(os.getpgid(holder.pid), signal.SIGKILL)
         holder.wait(timeout=10)
         time.sleep(0.2)
         probe = self.case / 'probe.sh'
@@ -661,9 +665,15 @@ def sh_quote(value):
 
 
 def reap(proc):
-    """Kill and wait: a live child with cwd inside the TemporaryDirectory blocks cleanup."""
+    """Kill the whole group and wait: a live child inside the TemporaryDirectory blocks cleanup."""
     try:
-        proc.kill()
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
         proc.wait(timeout=10)
     except Exception:
         pass

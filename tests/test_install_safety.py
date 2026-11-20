@@ -215,6 +215,7 @@ class InstallerSafetyTests(unittest.TestCase):
         self.assertIsNotNone(block, 'template block not found')
         body = ('_lanip=192.168.1.1\n_vpnu="https://example.invalid/sub"\n_hwid=""\n'
                 '_tmpconf="%s/config.yaml.zmnew"\n' % posix(self.case)
+                + extract('_mihomo_new_secret') + '\n'
                 + block.group(1) + '\n} > "$_tmpconf"\n'
                 + 'printf "RC=0\\n"')
         result = self.run_script(body)
@@ -223,8 +224,11 @@ class InstallerSafetyTests(unittest.TestCase):
         listeners = {item['name']: item for item in data['listeners']}
         self.assertEqual(listeners['torrent-direct']['listen'], '192.168.1.1')
         self.assertEqual(str(listeners['torrent-direct']['port']), '7894')
-        # a controller on 0.0.0.0 without a secret let any LAN device switch nodes
-        self.assertEqual(data['external-controller'], '127.0.0.1:9090')
+        # The panels are opened from a browser in the LAN, so the controller listens there -
+        # but only with a generated secret: an open controller lets any LAN device switch nodes.
+        self.assertEqual(data['external-controller'], '0.0.0.0:9090')
+        self.assertRegex(str(data.get('secret') or ''),
+                         r'^(?:[0-9a-f]{32}|geomask-[0-9]+-[0-9]+)$')
         # every rule target must exist as a group (GLOBAL is built into mihomo)
         groups = {group['name'] for group in data['proxy-groups']}
         for rule in data['rules']:
@@ -233,6 +237,38 @@ class InstallerSafetyTests(unittest.TestCase):
             if target in ('DIRECT', 'REJECT', 'PASS', 'GLOBAL'):
                 continue
             self.assertIn(target, groups, 'rule points at a missing group: ' + parts)
+
+    def test_the_controller_is_lan_bound_and_keeps_or_adds_a_secret(self):
+        """The panels are opened from a LAN browser, so the bind must not be loopback."""
+        def convert(text):
+            live = self.case / 'live.yaml'
+            candidate = self.case / 'candidate.yaml'
+            live.write_text(text, encoding='utf-8', newline='\n')
+            body = (extract('_mihomo_new_secret') + '\n'
+                    + extract('_mihomo_controller_candidate') + '\n'
+                    + '_mihomo_controller_candidate "%s" "%s"\n'
+                    % (posix(live), posix(candidate)))
+            result = self.run_script(body)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return candidate.read_text(encoding='utf-8')
+
+        kept = convert('external-controller: 127.0.0.1:9090\nsecret: "old-secret"\n'
+                       'mode: rule\n')
+        self.assertIn('external-controller: 0.0.0.0:9090', kept)
+        self.assertIn('secret: "old-secret"', kept)
+        self.assertNotIn('127.0.0.1:9090', kept)
+
+        added = convert('external-controller: 127.0.0.1:9090\nmode: rule\n')
+        self.assertIn('external-controller: 0.0.0.0:9090', added)
+        self.assertRegex(added, r'(?m)^secret: "(?:[0-9a-f]{32}|geomask-[0-9]+-[0-9]+)"$')
+
+        empty = convert('external-controller: 127.0.0.1:9090\nsecret:\nmode: rule\n')
+        self.assertEqual(empty.count('secret:'), 1, empty)
+        self.assertRegex(empty, r'(?m)^secret: "[^"]+"$')
+
+        missing = convert('mode: rule\n')
+        self.assertIn('external-controller: 0.0.0.0:9090', missing)
+        self.assertRegex(missing, r'(?m)^secret: "[^"]+"$')
 
     # ---------------------------------------------------------------- IPv6 default
     def _fake_backend(self, answer):

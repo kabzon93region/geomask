@@ -36,6 +36,7 @@ six modules, not an enforcement boundary (see below).
 | `B-LINUX-POSIX` | `flock(2)`/`fcntl` serialization, file identity/inode, hardlinks, `openat`/`O_NOFOLLOW`, TOCTOU at the kernel level, FIFO, atomic `rename`/directory `fsync`, fd inheritance across `exec` | disposable Linux VM/stand with the real filesystem |
 | `B-LINUX-ROOT` | POSIX mode/uid/gid/umask, `chown`, root-only files, setuid behaviour | disposable Linux VM as root |
 | `B-WIN-ACL` | Windows ACLs as a model of POSIX permissions (the suite deliberately skips 0600/0700 assertions) | not modelled; do not claim parity |
+| `B-WIN-HOST` | Windows host path forms (MSYS `/c/...`, drive letters) that the router never sees; a test skips the translation it cannot exercise | Windows host only; not a router property |
 | `B-WIN-NOSYMLINK` | router-style symlink layout (absolute/relative/dangling links, `rc.d` links) when the probe cannot create a real symlink | Linux/router stand with native symlinks |
 | `B-WIN-NOBASH` | every fixture test that drives the shipped shell helpers through Git Bash; those classes skip wholly | Linux CI (bash present) |
 | `B-ROUTER` | procd, netifd, fw4/nft, rpcd/ubus, uci, kernel routing/sysctl, real services, BusyBox applets, flash/overlay behaviour | OpenWrt stand, disposable, no route to a production LAN |

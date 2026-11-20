@@ -47,6 +47,7 @@ ALLOWED_SKIPS = {
     'no-pyyaml': 'B-ENV-PYYAML',
     'posix-only': 'B-LINUX-POSIX',
     'windows-acl': 'B-WIN-ACL',
+    'windows-only': 'B-WIN-HOST',
     'docs-absent': 'B-DOCS',
     'needs-root': 'B-LINUX-ROOT',
     'router-only': 'B-ROUTER',

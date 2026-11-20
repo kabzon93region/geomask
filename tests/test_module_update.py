@@ -186,7 +186,9 @@ class ModuleUpdateTests(unittest.TestCase):
         target = Path(install_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(self.disk[install_path][0])
-        target.chmod(mode)
+        # The catalogue stores "755" as octal digits; chmod(755) is 0o1363 (no owner read),
+        # which the POSIX trust checks refuse and a non-root run cannot even read.
+        target.chmod(updater.parse_mode(mode))
         return install_path
 
     def index(self, version='1.1.0'):

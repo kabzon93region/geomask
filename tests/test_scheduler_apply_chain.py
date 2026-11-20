@@ -8,9 +8,14 @@ at 03:30. This test drives the real functions with a real report, snapshot and c
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermetic  # noqa: E402  (test-support helper in the same directory)
+hermetic.isolate_audit_state()
 
 HERE = Path(__file__).resolve().parents[1] / 'assets'
 

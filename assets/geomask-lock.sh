@@ -202,23 +202,27 @@ _gm_lock_free_fd() {
 # terminating a non-interactive shell on the `exec` line.
 _gm_lock_open() { # <fd> <path>
   { : >>"$2"; } 2>/dev/null || return 1
+  # The redirect must be scoped to the group. `exec N<>file 2>/dev/null` redirects THIS
+  # shell's stderr for the rest of the run, so every later diagnostic disappeared - the
+  # rank-violation message never reached its caller (CI-187 group D). The descriptor itself
+  # stays open, because `exec` inside the group applies to the current shell.
   case "$1" in
-    5) exec 5<>"$2" 2>/dev/null ;;
-    6) exec 6<>"$2" 2>/dev/null ;;
-    7) exec 7<>"$2" 2>/dev/null ;;
-    8) exec 8<>"$2" 2>/dev/null ;;
-    9) exec 9<>"$2" 2>/dev/null ;;
+    5) { exec 5<>"$2"; } 2>/dev/null ;;
+    6) { exec 6<>"$2"; } 2>/dev/null ;;
+    7) { exec 7<>"$2"; } 2>/dev/null ;;
+    8) { exec 8<>"$2"; } 2>/dev/null ;;
+    9) { exec 9<>"$2"; } 2>/dev/null ;;
     *) return 1 ;;
   esac
 }
 
 _gm_lock_close_fd() { # <fd>
   case "$1" in
-    5) exec 5>&- 2>/dev/null ;;
-    6) exec 6>&- 2>/dev/null ;;
-    7) exec 7>&- 2>/dev/null ;;
-    8) exec 8>&- 2>/dev/null ;;
-    9) exec 9>&- 2>/dev/null ;;
+    5) { exec 5>&-; } 2>/dev/null ;;
+    6) { exec 6>&-; } 2>/dev/null ;;
+    7) { exec 7>&-; } 2>/dev/null ;;
+    8) { exec 8>&-; } 2>/dev/null ;;
+    9) { exec 9>&-; } 2>/dev/null ;;
   esac
   return 0
 }

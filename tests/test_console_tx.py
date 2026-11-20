@@ -441,6 +441,11 @@ class TransactionCliTests(unittest.TestCase):
         self.case = Path(self.tmp.name)
         self.target = self.case / 'config.yaml'
         self.target.write_bytes(b'old: bytes\n')
+        # `--recover` takes the real transaction lock; its default lives under /etc and a
+        # non-root Linux run cannot create it (CI-187 group C).
+        lock = patch.object(self.tx, 'TX_LOCK', self.case / 'tx.lock')
+        lock.start()
+        self.addCleanup(lock.stop)
 
     def run_main(self, argv, stdin=b'new: bytes\n'):
         import contextlib

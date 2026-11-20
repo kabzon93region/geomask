@@ -1752,6 +1752,21 @@
       "notes": "R04 round 4: safe_mihomo_restart возвращает preimage конфига под config-tx; цель — живой config.yaml (покрыт files-объектом), аргументы не резолвятся статически"
     },
     {
+      "id": "dyn.mihomo-controller-candidate",
+      "functions": [
+        "_mihomo_controller_candidate"
+      ],
+      "effects": [
+        "redirect"
+      ],
+      "site_regex": "> \"\\$2\"",
+      "type": "dynamic",
+      "owner": "ours",
+      "snapshot": "SBA",
+      "restore": "RB",
+      "notes": "20.11.2026: кандидат с LAN-привязкой контроллера и секретом пишется в <config>.ecnew.<pid> (передаётся как $2), проверяется mihomo -t и заменяет живой файл; временный файл входит в REINSTALL_TEMP_SUFFIXES"
+    },
+    {
       "id": "dyn.ruleset-stub-loop",
       "functions": [
         "write_mihomo_config",

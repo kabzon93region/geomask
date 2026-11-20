@@ -99,6 +99,8 @@ def classify_reason(reason):
         return 'posix-only'
     if 'windows' in text and ('permission' in text or 'acl' in text or 'lock' in text):
         return 'windows-acl'
+    if 'windows' in text:
+        return 'windows-only'
     if 'root' in text:
         return 'needs-root'
     if 'router' in text:

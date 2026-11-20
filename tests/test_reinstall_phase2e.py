@@ -182,14 +182,17 @@ class Phase2eTest(unittest.TestCase):
             line for line in (self.snapshot_dir / 'objects').read_text(
                 encoding='utf-8', errors='replace').splitlines()
             if line.startswith(('dirlink', 'dir|'))))
-        probe = self.script(
-            '_rs_pin_enforce=1; _rs_snap="%s"\n'
+        case = t.posix(self.case)
+        probe_body = (
+            '_rs_pin_enforce=1; _rs_snap="' + t.posix(self.snapshot_dir) + '"\n'
             '_rs_pin_mode=0\n'
-            '_rs_link_ok /etc/mihomo "%s/etc/mihomo" dir; printf "LINK_RC=%%s\\n" "$?"\n'
-            '_rs_trusted_link "$(readlink -f "%s/etc/mihomo")"; printf "TRUST_RC=%%s\\n" "$?"\n'
-            '_rs_uid "$(readlink -f "%s/etc/mihomo")"; printf "UID_RC=%%s SELF=%%s\\n" "$?" "$(id -u)"\n'
-            % (t.posix(self.snapshot_dir), t.posix(self.case), t.posix(self.case),
-               t.posix(self.case)))
+            'for p in /etc/mihomo /etc/mihomo/ruleset /etc/mihomo/config.yaml; do\n'
+            '  _rs_safe_path "$p"; printf "PATH %s=%s\\n" "$p" "$?"\n'
+            '  _rs_safe_file "$p"; printf "FILE %s=%s\\n" "$p" "$?"\n'
+            'done\n'
+            'ls -ld "' + case + '/etc/mihomo" "' + case + '/mnt/mihomo" "'
+            + case + '/mnt/mihomo/ruleset" 2>&1\n')
+        probe = self.script(probe_body)
         print('DIAG probe:', probe.stdout, probe.stderr)
         restore = self.script(self.restore())
         self.assertEqual(0, self.rc_of(restore, 'RESTORE_RC'),

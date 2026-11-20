@@ -170,9 +170,12 @@ class Phase2fTest(unittest.TestCase):
         target = self.case / 'mnt/mihomo'
         marker = self.case / 'mnt/EVIL'
         body = (self.snap() + '\n'
-                + 'rm -f "%s"\n' % t.posix(target)
-                + 'printf "#!/bin/sh\\nprintf evil > \\"%s\\"\\n" > "%s"\n'
+                # Create the replacement while the pinned inode still exists, then rename it
+                # over the target: rm+create can reuse the freed inode, and then the pin
+                # legitimately matches the swapped file (CI-187 group E).
+                + 'printf "#!/bin/sh\\nprintf evil > \\"%s\\"\\n" > "%s.new"\n'
                   % (t.posix(marker), t.posix(target))
+                + 'mv -f "%s.new" "%s"\n' % (t.posix(target), t.posix(target))
                 + 'printf "ENFORCE=%s MODE=%s LINK=%s\\n" "${_rs_pin_enforce:-0}" '
                   '"${_rs_pin_mode:-0}" "$(readlink -f /etc/init.d/mihomo 2>/dev/null)"\n'
                 + '_rs_safe_exec /etc/init.d/mihomo; printf "SAFE=%s\\n" "$?"\n'

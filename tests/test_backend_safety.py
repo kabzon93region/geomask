@@ -702,7 +702,8 @@ uci() {
     def test_console_off_is_a_real_kill_switch(self):
         (self.case / 'console.state').write_text('enabled=1\nip=192.0.2.50\n', encoding='utf-8')
         result = self.run_backend(
-            'cmd_console off 192.0.2.50; printf "\\nRC=%s\\n" "$?"',
+            'cmd_console off 192.0.2.50; printf "\\nRC=%s\\n" "$?"; '
+            '_console_lock; printf "LOCK=%s\\n" "$?"; _console_unlock',
             functions=['_console_get', '_console_set', '_console_own_rules', '_console_rule_off',
                        '_console_lock', '_console_unlock', 'cmd_console'],
             extra=self.console_extra())
@@ -716,20 +717,22 @@ uci() {
         initd = (self.case / 'initd-calls').read_text(encoding='utf-8')
         self.assertIn('stop', initd)
         self.assertIn('disable', initd)
-        self.assertFalse((self.case / 'console.lock').exists(), 'the kill switch kept the lock')
+        # The lock file stays (one persistent inode is the contract); the lane must be free.
+        self.assertIn('LOCK=0', result.stdout, 'the kill switch kept the lane locked')
 
     def test_console_on_refuses_a_bad_address_before_touching_anything(self):
         before = 'enabled=1\nip=192.0.2.50\n'
         (self.case / 'console.state').write_text(before, encoding='utf-8')
         result = self.run_backend(
-            'cmd_console on 999.1.1.1; printf "\\nRC=%s\\n" "$?"',
+            'cmd_console on 999.1.1.1; printf "\\nRC=%s\\n" "$?"; '
+            '_console_lock; printf "LOCK=%s\\n" "$?"; _console_unlock',
             functions=['_console_get', '_console_set', '_ipv4_ok',
                        '_console_lock', '_console_unlock', 'cmd_console'],
             extra=self.console_extra())
         self.assertIn('bad or missing console IP', result.stdout)
         self.assertIn('RC=1', result.stdout)
         self.assertEqual((self.case / 'console.state').read_text(encoding='utf-8'), before)
-        self.assertFalse((self.case / 'console.lock').exists(), 'a refused switch kept the lock')
+        self.assertIn('LOCK=0', result.stdout, 'a refused switch kept the lane locked')
 
     def test_console_state_replaces_one_key_and_keeps_the_rest(self):
         state = self.case / 'console.state'

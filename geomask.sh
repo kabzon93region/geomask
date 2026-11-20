@@ -18560,7 +18560,7 @@ ASSET_EOF
           "path": "/usr/lib/geomask/geomask-lock.sh",
           "source": "assets/geomask-lock.sh",
           "mode": "0644",
-          "sha256": "e2c6843e8f2534129367aedc468e17ec0584fdd4dc91b95282e74f58a4117e1b"
+          "sha256": "b9947164d45b16eb1b6631dbcf5aac0995c676196c194102cc78d088e6bc4bc6"
         },
         {
           "path": "/usr/lib/geomask/geomask-mihomo-adopt.py",

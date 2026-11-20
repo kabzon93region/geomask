@@ -110,6 +110,7 @@ class Phase2eTest(unittest.TestCase):
     def test_extroot_opt_symlink_is_accepted(self):
         mnt = self.case / 'mnt'
         mnt.mkdir()
+        mnt.chmod(0o755)   # the policy refuses a world-writable storage target
         (self.case / 'opt').rename(mnt / 'opt')
         (self.case / 'opt').symlink_to('mnt/opt', target_is_directory=True)
         result = self.script(self.snap())
@@ -123,6 +124,7 @@ class Phase2eTest(unittest.TestCase):
     def test_symlink_target_swap_between_snapshot_and_restore_is_incomplete(self):
         mnt = self.case / 'mnt'
         mnt.mkdir()
+        mnt.chmod(0o755)   # the policy refuses a world-writable storage target
         (self.case / 'opt').rename(mnt / 'opt')
         (self.case / 'opt').symlink_to('mnt/opt', target_is_directory=True)
         result = self.script(self.snap())
@@ -169,6 +171,7 @@ class Phase2eTest(unittest.TestCase):
     def test_symlinked_etc_mihomo_directory_is_supported(self):
         mnt = self.case / 'mnt'
         mnt.mkdir()
+        mnt.chmod(0o755)   # the policy refuses a world-writable storage target
         (self.case / 'etc/mihomo').rename(mnt / 'mihomo')
         (self.case / 'etc/mihomo').symlink_to('../mnt/mihomo', target_is_directory=True)
         result = self.script(self.snap())

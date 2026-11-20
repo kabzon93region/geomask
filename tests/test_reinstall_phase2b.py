@@ -572,6 +572,14 @@ class Fixture:
     def build(self):
         for relative in fixture_relative_paths():
             (self.case / relative).mkdir(parents=True, exist_ok=True)
+        # A router's storage dirs are not world-writable, and the symlink policy refuses a
+        # target that is. GitHub runners use umask 000, so an unadjusted fixture produced 0777
+        # directories and the policy correctly rejected them (CI-187 group E).
+        for relative in ['.'] + fixture_relative_paths():
+            try:
+                (self.case / relative).chmod(0o755)
+            except OSError:
+                pass
         for relative, body in FILES.items():
             path = self.case / relative
             path.parent.mkdir(parents=True, exist_ok=True)

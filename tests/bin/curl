@@ -10,7 +10,7 @@ for a in "$@"; do
       printf 'Mihomo Meta v1.19.32\n'
       exit 0 ;;
     *9090/proxies*)
-      printf '{"proxies":{"AI":{"alive":true},"VPN":{"alive":true},"GLOBAL":{}}}\n'
+      printf '{"proxies":{"AI":{"alive":true},"VPN":{"alive":true},"VPN-noP2P":{"alive":true},"GLOBAL":{}}}\n'
       exit 0 ;;
     *generate_204*)
       printf '204'

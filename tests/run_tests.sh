@@ -11,6 +11,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SCRIPT="${GM_SCRIPT:-$HERE/../geomask.sh}"
 STUB="$HERE/bin"
 export PATH="$STUB:$PATH"
+# The sandbox models a router with stubs but has no uci, so the default IPv6-off step cannot
+# run there. The scenario suite is about install/repair logic, not the IPv6 policy; keep mode
+# is the documented way to say "leave IPv6 alone" and keeps the fixtures honest (CI-187).
+export GM_IPV6=keep
 
 # ---------- R06 M4: real environment, checked before anything runs ----------
 # The runner used to inherit whatever the operator had: no python, no PyYAML, no native
@@ -1524,8 +1528,12 @@ S49GEN
     && { echo "PASS: S49 fixture uses the post-apply YAML shape that used to break switches"; pass=$((pass+1)); } \
     || { echo "FAIL: S49 fixture is not the post-apply shape"; failn=$((failn+1)); }
   _S49P="$HERE/../assets/geomask-slot-patch.py"
-  "$_PYC" -B "$_S49P" "$_s49cfg" AI "https://ai-swap.example/v2" >"$HERE/state/s49.out" 2>&1
+  # The patcher prints the candidate to stdout and the action to stderr; the backend is the
+  # writer that commits it (C11). The sandbox must apply the same contract.
+  "$_PYC" -B "$_S49P" "$_s49cfg" AI "https://ai-swap.example/v2" \
+    >"$HERE/state/s49.new" 2>"$HERE/state/s49.out"
   _s49rc=$?
+  [ "$_s49rc" -eq 0 ] && mv -f "$HERE/state/s49.new" "$_s49cfg"
   if [ "$_s49rc" -eq 0 ] && grep -qF 'created:slot' "$HERE/state/s49.out"; then
     echo "PASS: S49 AI switch on a shared provider creates an isolated provider"; pass=$((pass+1))
   else
@@ -1543,8 +1551,10 @@ S49GEN
   [ "$(grep -cF 'x-hwid: HWTEST' "$_s49cfg")" -ge 2 ] \
     && { echo "PASS: S49 provider header block copied to the slot provider"; pass=$((pass+1)); } \
     || { echo "FAIL: S49 header block not copied to the slot provider"; failn=$((failn+1)); }
-  "$_PYC" -B "$_S49P" "$_s49cfg" VPN "https://vpn-swap.example/v3" >"$HERE/state/s49.out" 2>&1
+  "$_PYC" -B "$_S49P" "$_s49cfg" VPN "https://vpn-swap.example/v3" \
+    >"$HERE/state/s49.new" 2>"$HERE/state/s49.out"
   _s49rc=$?
+  [ "$_s49rc" -eq 0 ] && mv -f "$HERE/state/s49.new" "$_s49cfg"
   if [ "$_s49rc" -eq 0 ] && grep -qF 'updated:sub' "$HERE/state/s49.out"; then
     echo "PASS: S49 VPN switch re-points its own (now unshared) provider"; pass=$((pass+1))
   else
@@ -1556,8 +1566,10 @@ S49GEN
   grep -qF 'https://ai-swap.example/v2' "$_s49cfg" && grep -qE '^  - slot$' "$_s49cfg" \
     && { echo "PASS: S49 AI keeps its isolated slot after the VPN switch"; pass=$((pass+1)); } \
     || { echo "FAIL: S49 VPN switch disturbed the AI isolation"; failn=$((failn+1)); }
-  "$_PYC" -B "$_S49P" "$_s49cfg" VPN-noP2P "https://np-swap.example/v4" >"$HERE/state/s49.out" 2>&1
+  "$_PYC" -B "$_S49P" "$_s49cfg" VPN-noP2P "https://np-swap.example/v4" \
+    >"$HERE/state/s49.new" 2>"$HERE/state/s49.out"
   _s49rc=$?
+  [ "$_s49rc" -eq 0 ] && mv -f "$HERE/state/s49.new" "$_s49cfg"
   if [ "$_s49rc" -eq 0 ] && grep -qF 'created:slot2' "$HERE/state/s49.out"; then
     echo "PASS: S49 VPN-noP2P switch creates its own provider and group"; pass=$((pass+1))
   else

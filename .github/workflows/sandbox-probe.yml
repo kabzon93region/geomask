@@ -1,0 +1,36 @@
+name: sandbox-probe
+
+# Temporary fast loop for CI-187: the scenario suite alone, without the 10-minute unit gate.
+# Dispatched by hand; remove once tests/run_tests.sh is green on Linux.
+on:
+  workflow_dispatch:
+
+jobs:
+  sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pyyaml
+
+      - name: Sandbox tests
+        env:
+          GM_TEST_LOG_DIR: sandbox-logs
+        run: |
+          mkdir -p sandbox-logs
+          set -o pipefail
+          timeout --kill-after=10 900 bash tests/run_tests.sh 2>&1 | tee sandbox-logs/console.log
+
+      - name: Upload sandbox logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-logs
+          path: sandbox-logs/
+          if-no-files-found: warn

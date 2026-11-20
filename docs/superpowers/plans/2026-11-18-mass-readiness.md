@@ -31,6 +31,74 @@
 - Не добавлять новые jobs/автоматические политики/периодический DNS-repair как «bugfix».
 - Это **overlay над базовым стеком**, не установка factory OpenWrt с нуля: «чистый root/image» ниже означает отсутствие geomask при заранее подготовленных mihomo/MagiTrickle и необходимом hev stack. Проверить отрицательные случаи отсутствующих prerequisites до mutation.
 
+## Ранний этап 0 — небольшие исходники для разработки через ИИ
+
+**Добавлено по запросу владельца 18.11.2026; разбиение выполнено 19–20.11.2026 (партии 9–13 в [журнале исполнения](2026-11-18-execution-log.md)), статус — [PLAN-STATUS](../source-split/PLAN-STATUS.md).** Цель — читать и изменять одну небольшую область, не загружая каждый раз монолит. Это разрешённый рефакторинг структуры исходников, не новая функция роутера.
+
+### 0.1. Что действительно большое
+
+Срез `c15deb7`, tracked implementation files, без tests/fixtures/docs/pycache. Строки физические, включая комментарии/пустые; порог здесь **≥500**, это индикатор для review, не запрет любой ценой. Найдено **16 исходников** и один конечный generated installer:
+
+| Файл | Строк | Решение |
+|---|---:|---|
+| [Установщик](<../../../geomask.sh>) | 45 180 | Уже generated. Не дробить/редактировать вручную и не подавать целиком в контекст ИИ. Сохранить единый download/install artifact. |
+| [Шаблон установщика](<../../../geomask.sh.in>) | 5 997 | Первая очередь: небольшие installer source-parts, включая отдельные snapshot/restore/verify области. |
+| [Backend](<../../../assets/geo-backend.sh>) | 3 565 | Первая очередь: handlers/helpers по ответственности; единый собранный backend/dispatch. |
+| [LuCI](<../../../assets/geo-sync-page.js>) | 1 930 | Следом: RPC/shared/view lifecycle и ordered render-parts без смены JS scope. |
+| [Doctor](<../../../assets/geomask-doctor.py>) | 1 844 | При задаче5: parsers/rules/checks/domain/live/CLI. |
+| [Spool](<../../../assets/geomask-diag-spool.py>) | 1 014 | При задаче7: identity/storage/quota/archive/retrieval/CLI; не разрывать security boundary. |
+| [Config TX](<../../../assets/geomask-config-tx.py>) | 943 | При задаче3: lock/preimage/trial/commit/rollback/CLI, один owner транзакции. |
+| [Node audit](<../../../assets/geomask-node-audit.py>) | 931 | Отдельный следующий проход: provider parsing/probes/jobs/report/CLI. |
+| [Routes](<../../../assets/geomask-routes.sh>) | 897 | При задаче4: discovery/ownership reconciliation/activation/queue; сохранить lock scope. |
+| [DNS guard](<../../../assets/geomask-dnsguard.sh>) | 851 | При DNS-работах: observation/desired/apply/revert/dispatch. |
+| [Apply](<../../../assets/geomask-apply.py>) | 791 | При задаче3: validation/preview/application/status; сохранить lifecycle owner. |
+| [Redactor](<../../../assets/geomask-diag-redact.py>) | 785 | При задаче7: format parsers/key policy/text masking/verifier/CLI. |
+| [Module updater](<../../../assets/geomask-module-update.py>) | 712 | При задаче1: catalogue/state/dependencies/staging/install/CLI; lock/CAS не расходятся по независимым процессам. |
+| [Module manifest](<../../../tools/module_manifest.py>) | 656 | Позже: schema/ownership/validation/I/O; только при реальной пользе для связности. |
+| [Audit state](<../../../assets/geomask-audit-state.py>) | 637 | Позже: storage/revisions/jobs/events; один контракт атомарности. |
+| [Node scan shell](<../../../assets/geomask-node-scan.sh>) | 608 | Позже: wrappers/settings/jobs/scheduling; не дробить embedded Python heredoc пополам. |
+| [Safe write](<../../../tools/safe_write.py>) | 567 | Небольшой cohesive security helper допустимо оставить с объяснением; не ломать transaction ради счётчика строк. |
+
+Ориентир нового authored-файла: **150–400 строк**, мягкий предел около **500**. Длинную цельную функцию/безопасностный алгоритм не резать механически по N строк: либо отдельный тестируемый design-refactor, либо явно объяснённое исключение. Маленькие entrypoints/generated RPC fragments могут быть короче150. Generated outputs не входят в лимит authored sources. Не обещать автоматическое снижение токенов без проверки реального рабочего сценария.
+
+### 0.2. Выбранная схема: маленькие source-parts → прежние файлы поставки
+
+**Не запускать части через последовательные `sh part1; sh part2`.** Это теряет shell globals/exit status/traps/lock-fds и меняет поведение. На первом проходе части существуют **только при разработке/сборке**: их детерминированная композиция восстанавливает прежний текст в том же порядке, без дополнительных runtime imports/source/процессов/зависимостей. То же для JS: не добавлять Node/Vite/npm на роутер и не заменять LuCI module loader.
+
+Предлагаемые НОВЫЕ build-time пути, пока не существующие: `src/installer/`, `src/backend/`, `src/panel/`, в каждом `order.json`; `tools/compose_sources.py`; `tests/test_source_composition.py`. Manifest — декларативный build-order/список частей, а не вторая CODE_MAP. Расширение `.sh.part`/`.js.part` подчёркивает, что это не отдельно запускаемый скрипт. Проверять синтаксис целого composed-файла, не требовать standalone syntax от части внутри JS render closure.
+
+Первые промежуточные outputs сохраняют существующие имена [installer template](<../../../geomask.sh.in>), [backend](<../../../assets/geo-backend.sh>), [panel](<../../../assets/geo-sync-page.js>). После переноса их разделов единственный authored source — соответствующие parts; outputs становятся generated compatibility views, сохраняются для существующих tests/catalogue/raw updater. Конечный [installer](<../../../geomask.sh>) остаётся одним файлом. В сборке явная цепочка: **RPC render → source composition → catalogue → asset injection/version stamping → итоговый installer**. Если требуется новый catalogue, не создавать цикл self-hash; сохранить существующее исключение catalogue-self-entry.
+
+**Обязательные интеграционные ограничения:**
+
+- [Build](<../../../build.py#L74-L145>) сейчас читает template/assets, инжектирует heredocs и stamp-версии; [catalogue builder](<../../../tools/build_module_index.py#L23-L58>) парсит literal MAP и save_stream-блоки, а [hashing](<../../../tools/build_module_index.py#L93-L106>) зависит от LF/одного final newline. Сохранить их входные формы и installed bytes либо менять всех consumers в одной партии.
+- [RPC generator](<../../../tools/gen-geo-rpc.py#L235-L265>) сейчас пишет dispatch/decl прямо в assets. **Не оставлять двух writers:** после переноса renderer пишет выделенные generated source-parts для dispatch/decl, composer собирает asset; manifest RPC остаётся единственным источником методов. `--check` должен обнаруживать drift и source-region, и assembled output, не чинить их молча.
+- [Extraction tests](<../../../tests/test_install_safety.py#L23-L59>) читают assembled template; [catalogue tests](<../../../tests/test_module_index.py#L69-L93>) читают старые paths/bytes. Их не ослаблять ради переноса. Добавить check соответствия parts→assembled, чтобы старые тесты не проверяли stale copy.
+- Сохранить порядок top-level assignments, вызовов и **повторных определений функций**, даже если они выглядят избыточно; shadowing/cleanup — отдельный bugfix после parity. Не менять quoting, stdin/stdout, heredoc delimiters, `$0`, source-location assumptions, temporary paths, fd inheritance и порядок lock/trap.
+- Для Python-кандидатов сначала можно использовать ту же source-only composition с прежним single-file runtime/importlib-path. Настоящее разбиение на runtime packages — отдельная проверяемая партия с полным install/update/rollback ownership manifest, а не скрытая новая зависимость первой фазы.
+
+### 0.3. Конкретные границы первой очереди
+
+Ниже имена будущих parts — предложение, существующие symbols — опорные границы. Shell/Python делить по целым definitions/логическим блокам; ни один heredoc не пересекает файловую границу. Для JS допустимы текстовые render-parts внутри той же closure: они не standalone-модули и проверяются только после точной конкатенации. Композиция не добавляет разделители, wrappers, source-map comments или новые области видимости: UTF-8 без BOM, исходный порядок, LF и точные EOF bytes. Структурно самостоятельные JS modules с explicit context — отдельная следующая партия.
+
+- **Installer / `src/installer/`:** bootstrap+path discovery/controller; config inspection; selection+save/cron helpers; `step1_*`; `step2_*`; `step3_*` и config writer; backup/SMB/trial-restart отдельными областями; `step4_*`; `step5_*`; services; final verify; runner/UI; uninstall; reinstall path-safety/observers; snapshot-files/shared/state; restore-files/shared/runtime; verify-files/UCI/sysctl; nft normalization; verify-net/runtime; reinstall orchestration/preflight/manifests; terminal args/dispatch в конце. Особенно [reinstall область](<../../../geomask.sh.in#L3170-L5364>) не переносить целиком в новый 2 000-строчный файл.
+- **Backend / `src/backend/`:** bootstrap/write-gate/controller; status/health; basic actions; IPv6; devices/DHCP; AI-DNS/routes; subscription registry/slot; self-update; scheduling/lists; admission/policy wrappers; console status, state/provisioning, rules/rollback, command orchestration — раздельно; diag collection/redaction-budget wrappers/archive/retrieval; generated dispatch в конце. Граница [console](<../../../assets/geo-backend.sh#L2362-L2956>) сама >500, поэтому недостаточно просто назвать её console.sh.
+- **Panel / `src/panel/`:** LuCI directives/generated RPC, shared formatting/styles, view lifecycle и render-open; render sections overview/subscriptions/console/devices/updates/modules/diagnostics/lists/nodes/settings; render-close и `act`/`reload`/`pollJob`. [render](<../../../assets/geo-sync-page.js#L261-L309>) имеет общие `view`, `panels`, `all`, bindings и callbacks: сначала текстовая композиция **внутри прежней closure**, не independent tab-modules с потерянными captures. Вынос в самостоятельные render-функции с explicit context API — только отдельная протестированная следующая партия.
+
+### 0.4. Исполнимые подзадачи и критерии
+
+**Порядок:** 0а → 0б → 0в → задачи1–3; panel/прочие candidates — 0г рядом с задачами4–7. Не откладывать P0/P1 до тотального переписывания всех16 файлов. Если baseline CI красный, сначала получить его причины/границы: структурный перенос не должен маскировать failure. Маленький срочный security-fix может идти до extraction соответствующего компонента отдельным коммитом.
+
+- [x] **0а — baseline и локальная навигация.** Перед переносом зафиксировать текущий SHA/hash всего write-set, source-size inventory, failing/skipped baseline tests и связи generators/tests. Использовать **локальную CODE_MAP, которую создаёт плагин DSH**, обновить её штатным доступным способом после переноса. Отсутствие tracked CODE_MAP.md не означает отсутствия карты; **не создавать/коммитить дубль, cache или DB плагина**. Если индекс недоступен через текущие инструменты — явно указать это, использовать source/manifests и не изобретать API плагина.
+- [x] **0б — test-first composer.** Новые `compose_target(target: str) -> bytes` (pure read/compose) и CLI `python -B tools/compose_sources.py --check`/`--write` для трёх разрешённых targets. `--check` немутирующий; `--write` публикует только declared outputs после полной проверки. Tests: exact-order/bytes; changed part → check fails без переписи output; missing/duplicate/unlisted part/unknown target/out-of-root path/cycle → отказ до publish; deterministic LF/EOF и отсутствие необработанных markers. Не использовать eval/shell source при сборке. Manifest использует фиксированный ordered list, без runtime include graph; цикл вложенных includes запрещён/не поддержан.
+- [x] **0в — механический перенос installer/backend.** Добавить ordered parts, перевести RPC dispatch writer на свой generated part, подключить composition к build/catalogue/check pipeline. Паритет **байт-в-байт** относительно замороженного текущего baseline для assembled template/backend/panel, всех installed assets/catalogue entries и final installer; в таком коммите нет bugfix/formatting/version bump. Не выполнять installer на устройстве. Новые dev-tools tests — после safety-review, системные только в изоляции. Commit отдельно от дальнейших исправлений.
+- [x] **0г — panel и связанные Python/shell.** Panel composition с сохранённой closure/директивами/таймерами; остальные кандидаты извлекать по ответственности непосредственно перед их repair-задачей, с тем же no-behavior-change gate. Не делать из каждого короткого helper новый файл. Если authored part >500, объяснить границу либо пересмотреть её до merge.
+- [x] **0д — guards/tooling/docs.** В [development docs](<../../DEVELOPMENT.md>) указать authoritative parts, порядок build и новый способ check; промптам/агентам рекомендовать брать только нужный component+direct contracts, **не generated45k installer и не все parts сразу**. Обновить локальный DSH-index; для поиска через него distinguishing generated outputs настраивать только реально поддерживаемым плагином способом. Repo-check сообщает новые oversized authored files/исключения без ограничения generated outputs. На этапе0 он advisory, не ломает CI из-за ещё не перенесённых16 файлов.
+- [ ] **Gate этапа0:** fresh scratch rebuild/compose parity; `python -B tools/compose_sources.py --check` (будущая команда), `python -B tools/check_build.py --verify-only`, `python -B tools/gen-geo-rpc.py --check`; exact catalogue hash/ownership consistency; parser checks composed shell/JS/Python; existing extraction tests не заменены пустышками. Linux/BusyBox/real-runtime gates остаются, не закрываются source-parity. Штатные проверки не должны молча пересобирать tracked output перед сравнением.
+- [ ] **Проверка пользы для ИИ:** на трёх типовых задачах (console rollback, installer preflight, domain diagnostics) по локальному индексу открыть только профильные parts+контракты, найти definition/caller/test без чтения всего монолита; записать перечень реально прочитанных файлов/строк. После чистого checkout сборка не требует локальной CODE_MAP и не зависит от профиля DSH. Плагин помогает навигации, но не является build dependency.
+
+**Важно для существующего плана:** ссылки на строки ниже относятся к assembled baseline и после bugfix могут смещаться; при реализации использовать устойчивый symbol/part из локального индекса, не искать старый номер как источник истины. Структурный перенос не исправляет и не закрывает ни один U/I/C/R-дефект сам по себе.
+
 ## Review Focus
 
 1. Чужой commit после snapshot до rollback: сохранить чужие bytes, не стирать «восстановлением» (задачи1/3/6).

@@ -119,9 +119,17 @@ def lock_prelude(case):
 
 
 def reap(proc):
-    """Kill the whole group and wait: a running child inside the TemporaryDirectory blocks cleanup."""
+    """Kill the child (its group only when it owns one) and wait.
+
+    A holder started without `start_new_session` shares the test runner's process group;
+    `killpg` on it would kill the whole module and the gate. Only a child that owns its
+    group is killed that way.
+    """
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        if os.getpgid(proc.pid) != os.getpgid(0):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            proc.kill()
     except Exception:
         try:
             proc.kill()

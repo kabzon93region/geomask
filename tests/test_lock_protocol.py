@@ -665,9 +665,18 @@ def sh_quote(value):
 
 
 def reap(proc):
-    """Kill the whole group and wait: a live child inside the TemporaryDirectory blocks cleanup."""
+    """Kill the child (its group only when it owns one) and wait.
+
+    A holder started without `start_new_session` shares the test runner's process group;
+    `killpg` on it would kill the whole module and the gate (CI-187: the 25-minute job was
+    cancelled after the gate lost its group). Only a child that owns its group is killed
+    that way.
+    """
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        if os.getpgid(proc.pid) != os.getpgid(0):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            proc.kill()
     except Exception:
         try:
             proc.kill()

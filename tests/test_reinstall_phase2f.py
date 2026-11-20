@@ -173,10 +173,15 @@ class Phase2fTest(unittest.TestCase):
                 + 'rm -f "%s"\n' % t.posix(target)
                 + 'printf "#!/bin/sh\\nprintf evil > \\"%s\\"\\n" > "%s"\n'
                   % (t.posix(marker), t.posix(target))
+                + 'printf "ENFORCE=%s MODE=%s LINK=%s\\n" "${_rs_pin_enforce:-0}" '
+                  '"${_rs_pin_mode:-0}" "$(readlink -f /etc/init.d/mihomo 2>/dev/null)"\n'
                 + '_rs_safe_exec /etc/init.d/mihomo; printf "SAFE=%s\\n" "$?"\n'
                 + '_rs_verify_runtime "%s"; printf "VERIFY=%%s\\n" "$?"\n'
                   % t.posix(self.snapshot_dir))
         result = self.script(body)
+        print('DIAG 2f:', result.stdout, result.stderr)
+        print('DIAG 2f symlinks:', (self.snapshot_dir / 'symlinks').read_text(
+            encoding='utf-8', errors='replace'))
         self.assertIn('SAFE=1', result.stdout, result.stdout + result.stderr)
         self.assertIn('VERIFY=1', result.stdout, result.stdout + result.stderr)
         self.assertFalse(marker.exists(), 'swapped init script was executed')

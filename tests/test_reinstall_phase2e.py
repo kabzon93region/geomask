@@ -174,6 +174,23 @@ class Phase2eTest(unittest.TestCase):
         result = self.script(self.snap())
         self.assertEqual(0, self.rc_of(result, 'SNAP_RC'),
                          result.stdout + result.stderr + self.logs())
+        # Diagnostics for the Linux-only run: the restore refuses a symlinked /etc/mihomo,
+        # so print the pin and the individual policy answers instead of guessing.
+        print('DIAG symlinks:', (self.snapshot_dir / 'symlinks').read_text(
+            encoding='utf-8', errors='replace'))
+        print('DIAG objects:', '\n'.join(
+            line for line in (self.snapshot_dir / 'objects').read_text(
+                encoding='utf-8', errors='replace').splitlines()
+            if line.startswith(('dirlink', 'dir|'))))
+        probe = self.script(
+            '_rs_pin_enforce=1; _rs_snap="%s"\n'
+            '_rs_pin_mode=0\n'
+            '_rs_link_ok /etc/mihomo "%s/etc/mihomo" dir; printf "LINK_RC=%%s\\n" "$?"\n'
+            '_rs_trusted_link "$(readlink -f "%s/etc/mihomo")"; printf "TRUST_RC=%%s\\n" "$?"\n'
+            '_rs_uid "$(readlink -f "%s/etc/mihomo")"; printf "UID_RC=%%s SELF=%%s\\n" "$?" "$(id -u)"\n'
+            % (t.posix(self.snapshot_dir), t.posix(self.case), t.posix(self.case),
+               t.posix(self.case)))
+        print('DIAG probe:', probe.stdout, probe.stderr)
         restore = self.script(self.restore())
         self.assertEqual(0, self.rc_of(restore, 'RESTORE_RC'),
                          restore.stdout + restore.stderr + self.logs())

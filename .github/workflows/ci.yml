@@ -57,7 +57,10 @@ jobs:
       - name: Sandbox tests
         env:
           GM_TEST_LOG_DIR: sandbox-logs
-        run: timeout --kill-after=10 900 bash tests/run_tests.sh
+        run: |
+          mkdir -p sandbox-logs
+          set -o pipefail
+          timeout --kill-after=10 900 bash tests/run_tests.sh 2>&1 | tee sandbox-logs/console.log
 
       - name: Upload sandbox logs
         if: always()

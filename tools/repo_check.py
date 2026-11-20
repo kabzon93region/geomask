@@ -36,7 +36,7 @@ EXCEPTIONS = {
     'tools/geo-rpc.json':
         'data manifest: splitting it would break the single source of RPC methods',
 }
-GENERATED = {'geomask.sh'}
+GENERATED = {'geomask.sh', 'modules/index.json'}
 
 # Implementation paths the plan's inventory covers (tests/docs excluded on purpose).
 SCAN_DIRS = ('', 'assets', 'tools', 'modules')

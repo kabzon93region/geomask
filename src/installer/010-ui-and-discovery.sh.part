@@ -53,8 +53,9 @@ GM_VPN_URL=""
 GM_AI_URL=""
 # IPv6 is OFF by default (owner decision 14.11.2026): geomask tunnels IPv4 only, so a global
 # IPv6 address leaves for the WAN directly and shows the real address and country.
-# `--ipv6=keep` is the only way to keep IPv6 on the router.
-GM_IPV6=off
+# `--ipv6=keep` is the only way to keep IPv6 on the router. The environment form exists for
+# the sandbox: its fixture has no uci, so the default off-step cannot run there (CI-187).
+GM_IPV6=${GM_IPV6:-off}
 
 # ---- paths shared by the backup, SMB and module code (used before their sections) ----
 BACKUP_DIR=/root/geomask-backups

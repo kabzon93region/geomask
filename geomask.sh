@@ -53,8 +53,9 @@ GM_VPN_URL=""
 GM_AI_URL=""
 # IPv6 is OFF by default (owner decision 14.11.2026): geomask tunnels IPv4 only, so a global
 # IPv6 address leaves for the WAN directly and shows the real address and country.
-# `--ipv6=keep` is the only way to keep IPv6 on the router.
-GM_IPV6=off
+# `--ipv6=keep` is the only way to keep IPv6 on the router. The environment form exists for
+# the sandbox: its fixture has no uci, so the default off-step cannot run there (CI-187).
+GM_IPV6=${GM_IPV6:-off}
 
 # ---- paths shared by the backup, SMB and module code (used before their sections) ----
 BACKUP_DIR=/root/geomask-backups
@@ -18369,6 +18370,18 @@ ASSET_EOF
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/lib/geomask/admission_service.py",
+          "description": ""
+        },
+        {
+          "type": "cache",
+          "path": "/tmp/geomask-admission-cache.json",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "ai_dns": {
@@ -18378,6 +18391,33 @@ ASSET_EOF
       "dependencies": [
         "core",
         "path_ai"
+      ],
+      "owned_resources": [
+        {
+          "type": "service",
+          "path": "ai-doh",
+          "description": ""
+        },
+        {
+          "type": "service",
+          "path": "dnsmasq-ai",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/etc/init.d/ai-doh",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/etc/init.d/dnsmasq-ai",
+          "description": ""
+        },
+        {
+          "type": "nft",
+          "path": "geomask_ai_dns",
+          "description": ""
+        }
       ],
       "files": [
         {
@@ -18401,6 +18441,18 @@ ASSET_EOF
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "service",
+          "path": "ksmbd",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/etc/ksmbd/ksmbd.conf",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "core": {
@@ -18408,6 +18460,28 @@ ASSET_EOF
       "type": "core",
       "name": "geomask (ядро)",
       "dependencies": [],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/lib/geomask/safe_write.py",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/lib/geomask/safe_write_cli.py",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geo-backend.sh",
+          "description": "бэкенд состояния: IPv6, устройства, маршруты (единственный writer)"
+        },
+        {
+          "type": "service",
+          "path": "geomask-backup",
+          "description": ""
+        }
+      ],
       "files": [
         {
           "path": "/etc/geomask-nodes.conf",
@@ -18470,7 +18544,7 @@ ASSET_EOF
           "path": "/usr/bin/geomask-node-scan.sh",
           "source": "assets/geomask-node-scan.sh",
           "mode": "0755",
-          "sha256": "082b368c808d18082e40b57723c25fd3c02a995cb55cdb467084fe3bc89f9ec2"
+          "sha256": "26838834772d05bba3496f8487a46019585316d6ff5cb2011bf52c9cec739029"
         },
         {
           "path": "/usr/bin/geomask-seed-lists.py",
@@ -18613,6 +18687,28 @@ ASSET_EOF
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/etc/geo-devices.list",
+          "description": ""
+        },
+        {
+          "type": "cron",
+          "path": "device_sync",
+          "description": ""
+        },
+        {
+          "type": "nft",
+          "path": "geomask_excl",
+          "description": ""
+        },
+        {
+          "type": "ip_rule",
+          "path": "table 100/101",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "diagnostic": {
@@ -18621,6 +18717,43 @@ ASSET_EOF
       "name": "Diagnostic Services",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "cron",
+          "path": "morning-check",
+          "description": ""
+        },
+        {
+          "type": "cron",
+          "path": "dnscheck",
+          "description": ""
+        },
+        {
+          "type": "cron",
+          "path": "vpnwatch",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-dnscheck.sh",
+          "description": "DNS safety audit"
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-morning-check.sh",
+          "description": "pre-torrent check"
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-vpnwatch.sh",
+          "description": "P2P attempt watcher"
+        },
+        {
+          "type": "file",
+          "path": "/etc/geomask/vpnwatch.conf",
+          "description": "watcher configuration"
+        }
       ],
       "files": [
         {
@@ -18657,6 +18790,18 @@ ASSET_EOF
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/lib/geomask/geomask-doctor.py",
+          "description": "diagnostics engine: checks, route trace, logs"
+        },
+        {
+          "type": "cron",
+          "path": "geomask-doctor-prune",
+          "description": "daily log retention"
+        }
+      ],
       "files": [
         {
           "path": "/usr/lib/geomask/geomask-doctor.py",
@@ -18672,6 +18817,23 @@ ASSET_EOF
       "name": "geomask-guard",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-guard.sh",
+          "description": "восстановление правил и маршрута"
+        },
+        {
+          "type": "file",
+          "path": "/etc/hotplug.d/iface/99-geomask-guard",
+          "description": "запуск сторожа при подъёме интерфейса"
+        },
+        {
+          "type": "cron",
+          "path": "geomask-guard",
+          "description": "страховка каждые 5 минут"
+        }
       ],
       "files": [
         {
@@ -18694,6 +18856,28 @@ ASSET_EOF
       "name": "Админка LuCI",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/libexec/rpcd/geo-sync",
+          "description": "rpcd-обёртка ubus-объекта geo-sync"
+        },
+        {
+          "type": "file",
+          "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
+          "description": "права ubus для панели"
+        },
+        {
+          "type": "file",
+          "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
+          "description": "пункт меню LuCI"
+        },
+        {
+          "type": "file",
+          "path": "/www/luci-static/resources/view/geo-sync/main.js",
+          "description": "страница панели"
+        }
       ],
       "files": [
         {
@@ -18731,6 +18915,18 @@ ASSET_EOF
         "subscription:sub",
         "admission_service"
       ],
+      "owned_resources": [
+        {
+          "type": "config",
+          "path": "/etc/geomask/policies.yaml#path:ai",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/ai.yaml",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "path_vpn": {
@@ -18740,6 +18936,18 @@ ASSET_EOF
       "dependencies": [
         "core",
         "subscription:sub"
+      ],
+      "owned_resources": [
+        {
+          "type": "config",
+          "path": "/etc/geomask/policies.yaml#path:vpn",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/vpn.yaml",
+          "description": ""
+        }
       ],
       "files": []
     },
@@ -18751,6 +18959,18 @@ ASSET_EOF
         "core",
         "subscription:de5"
       ],
+      "owned_resources": [
+        {
+          "type": "config",
+          "path": "/etc/geomask/policies.yaml#path:vpn_nop2p",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/vpn_nop2p.yaml",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "self_update": {
@@ -18760,6 +18980,18 @@ ASSET_EOF
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/tmp/geomask-upd/",
+          "description": ""
+        },
+        {
+          "type": "cron",
+          "path": "upd_check",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "torrent": {
@@ -18768,6 +19000,28 @@ ASSET_EOF
       "name": "Torrent Admin",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/torrentsites.yaml",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-torrent.sh",
+          "description": "listener and ruleset manager"
+        },
+        {
+          "type": "file",
+          "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
+          "description": "tracker and peer ruleset"
+        }
       ],
       "files": [
         {
@@ -18791,6 +19045,38 @@ ASSET_EOF
       "name": "YouTube Edge Watchdog",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "cron",
+          "path": "ytwatch",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/ytvpn.yaml",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-ytwatch.sh",
+          "description": "stalled-edge watchdog"
+        },
+        {
+          "type": "file",
+          "path": "/etc/geomask-ytwatch.conf",
+          "description": "watchdog configuration"
+        },
+        {
+          "type": "file",
+          "path": "/etc/mihomo/ruleset/ytvpn.yaml",
+          "description": "domains pinned to the VPN lane"
+        },
+        {
+          "type": "file",
+          "path": "/etc/mihomo/ruleset/ytdirect.yaml",
+          "description": "domains served directly"
+        }
       ],
       "files": [
         {
@@ -42493,6 +42779,16 @@ bad_countries={c.strip().upper() for c in cfgd.get('bad_countries','RU,BY').spli
 bad_asns={('AS'+a.replace('AS','').strip().upper()) for a in cfgd.get('bad_asns','').split(',') if a.strip()}
 base_filter=cfgd.get('base_filter','Россия')
 provider=cfgd.get('sub_provider','sub')
+
+def _providers_block(text):
+    """Slice out the proxy-providers block. The key may be the file's first line (a fixture
+    or a hand-written config), so a search for '\\nproxy-providers:\\n' alone finds nothing."""
+    _m=re.search(r'(?m)^proxy-providers:\s*$', text)
+    if not _m: return None
+    head=text[_m.start():]
+    nxt=re.search(r'\n(?=[a-z])', head[1:])
+    if nxt: head=head[:nxt.start()+1]
+    return head
 # v1.20.4: sub_provider=all -> scan every subscription, one child run each. Re-running the
 # wrapper per provider keeps the existing single-provider logic (and its rollback) untouched.
 _argv=sys.argv[1:]
@@ -42500,11 +42796,9 @@ _argv=sys.argv[1:]
 # broken regex cannot silently scan nothing again)
 if '--list-providers' in _argv:
     _t=open(os.environ.get('GM_MIHOMO_CFG', CFG), encoding='utf-8', errors='replace').read()
-    try:
-        _i=_t.index('\nproxy-providers:\n')
-    except ValueError:
+    _h=_providers_block(_t)
+    if _h is None:
         print(''); sys.exit(1)
-    _h=_t[_i:]
     _n=re.search(r'\n(?=[a-z])', _h[1:])
     if _n: _h=_h[:_n.start()+1]
     print(','.join(p for p in re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', _h, re.M)
@@ -42632,11 +42926,9 @@ if '--provider' in _argv:
     provider=_argv[_argv.index('--provider')+1]
 elif provider.strip()=='all':
     _t=open(CFG, encoding='utf-8', errors='replace').read()
-    try:
-        _i=_t.index('\nproxy-providers:\n')
-    except ValueError:
+    _head=_providers_block(_t)
+    if _head is None:
         log('sub_provider=all but no proxy-providers section', 'ERR'); sys.exit(1)
-    _head=_t[_i:]
     # stop at the next top-level key so rule-providers entries cannot be mistaken for proxies
     _nxt=re.search(r'\n(?=[a-z])', _head[1:])
     if _nxt: _head=_head[:_nxt.start()+1]

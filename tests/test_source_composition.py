@@ -214,7 +214,8 @@ class MigratedTreeTests(unittest.TestCase):
 
     # One explained exception: this file's code lives inside a single embedded heredoc, and a
     # split would either cross that heredoc (forbidden) or cut the interpreter script in half.
-    SIZE_EXCEPTIONS = {'src/node-scan/001-node-scan.sh.part': 608}
+    # 614 after the shared providers-block parser (CI-187); the pin moves with the file.
+    SIZE_EXCEPTIONS = {'src/node-scan/001-node-scan.sh.part': 614}
 
     def test_the_plan_s_soft_size_limit_holds_with_explained_exceptions(self):
         oversized = []

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Test-only uci: the sandbox models a router but runs on a host without OpenWrt's uci.
+# The reinstall preflight refuses to start when the state is unobservable, and the IPv6 check
+# asks network.lan/dhcp.lan. Values below are a healthy default router; they are read-only
+# answers, so a test that needs a specific state must still write it into GM_PREFIX.
+# Never used on a real router (PATH there starts with /usr/sbin, not tests/bin).
+q=0
+[ "${1:-}" = "-q" ] && { q=1; shift; }
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  get)
+    key=${1:-}
+    case "$key" in
+      network.lan) echo interface ;;
+      dhcp.lan) echo dhcp ;;
+      ksmbd) echo ksmbd ;;
+      network.lanai) echo alias ;;
+      network.lanai.ipaddr) echo 10.0.0.1 ;;
+      network.lan.ip6assign) echo 0 ;;
+      dhcp.lan.ra|dhcp.lan.dhcpv6|dhcp.lan.ndp) echo disabled ;;
+      network.lan.proto) echo static ;;
+      network.lan.ipaddr) echo 192.168.0.1 ;;
+      *) [ "$q" = 1 ] && exit 1; echo "" ;;
+    esac ;;
+  show)
+    echo "network.lan=interface" ;;
+  set|delete|add|commit|reorder|rename)
+    # Writes are accepted but not persisted: the sandbox fixtures own the files they assert on.
+    exit 0 ;;
+  *)
+    exit 0 ;;
+esac

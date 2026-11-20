@@ -145,6 +145,16 @@ bad_countries={c.strip().upper() for c in cfgd.get('bad_countries','RU,BY').spli
 bad_asns={('AS'+a.replace('AS','').strip().upper()) for a in cfgd.get('bad_asns','').split(',') if a.strip()}
 base_filter=cfgd.get('base_filter','Россия')
 provider=cfgd.get('sub_provider','sub')
+
+def _providers_block(text):
+    """Slice out the proxy-providers block. The key may be the file's first line (a fixture
+    or a hand-written config), so a search for '\\nproxy-providers:\\n' alone finds nothing."""
+    _m=re.search(r'(?m)^proxy-providers:\s*$', text)
+    if not _m: return None
+    head=text[_m.start():]
+    nxt=re.search(r'\n(?=[a-z])', head[1:])
+    if nxt: head=head[:nxt.start()+1]
+    return head
 # v1.20.4: sub_provider=all -> scan every subscription, one child run each. Re-running the
 # wrapper per provider keeps the existing single-provider logic (and its rollback) untouched.
 _argv=sys.argv[1:]
@@ -152,11 +162,9 @@ _argv=sys.argv[1:]
 # broken regex cannot silently scan nothing again)
 if '--list-providers' in _argv:
     _t=open(os.environ.get('GM_MIHOMO_CFG', CFG), encoding='utf-8', errors='replace').read()
-    try:
-        _i=_t.index('\nproxy-providers:\n')
-    except ValueError:
+    _h=_providers_block(_t)
+    if _h is None:
         print(''); sys.exit(1)
-    _h=_t[_i:]
     _n=re.search(r'\n(?=[a-z])', _h[1:])
     if _n: _h=_h[:_n.start()+1]
     print(','.join(p for p in re.findall(r'^  ([A-Za-z0-9_-]+):\s*$', _h, re.M)
@@ -284,11 +292,9 @@ if '--provider' in _argv:
     provider=_argv[_argv.index('--provider')+1]
 elif provider.strip()=='all':
     _t=open(CFG, encoding='utf-8', errors='replace').read()
-    try:
-        _i=_t.index('\nproxy-providers:\n')
-    except ValueError:
+    _head=_providers_block(_t)
+    if _head is None:
         log('sub_provider=all but no proxy-providers section', 'ERR'); sys.exit(1)
-    _head=_t[_i:]
     # stop at the next top-level key so rule-providers entries cannot be mistaken for proxies
     _nxt=re.search(r'\n(?=[a-z])', _head[1:])
     if _nxt: _head=_head[:_nxt.start()+1]

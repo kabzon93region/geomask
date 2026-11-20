@@ -9,6 +9,18 @@
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/lib/geomask/admission_service.py",
+          "description": ""
+        },
+        {
+          "type": "cache",
+          "path": "/tmp/geomask-admission-cache.json",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "ai_dns": {
@@ -18,6 +30,33 @@
       "dependencies": [
         "core",
         "path_ai"
+      ],
+      "owned_resources": [
+        {
+          "type": "service",
+          "path": "ai-doh",
+          "description": ""
+        },
+        {
+          "type": "service",
+          "path": "dnsmasq-ai",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/etc/init.d/ai-doh",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/etc/init.d/dnsmasq-ai",
+          "description": ""
+        },
+        {
+          "type": "nft",
+          "path": "geomask_ai_dns",
+          "description": ""
+        }
       ],
       "files": [
         {
@@ -41,6 +80,18 @@
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "service",
+          "path": "ksmbd",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/etc/ksmbd/ksmbd.conf",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "core": {
@@ -48,6 +99,28 @@
       "type": "core",
       "name": "geomask (ядро)",
       "dependencies": [],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/lib/geomask/safe_write.py",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/lib/geomask/safe_write_cli.py",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geo-backend.sh",
+          "description": "бэкенд состояния: IPv6, устройства, маршруты (единственный writer)"
+        },
+        {
+          "type": "service",
+          "path": "geomask-backup",
+          "description": ""
+        }
+      ],
       "files": [
         {
           "path": "/etc/geomask-nodes.conf",
@@ -110,7 +183,7 @@
           "path": "/usr/bin/geomask-node-scan.sh",
           "source": "assets/geomask-node-scan.sh",
           "mode": "0755",
-          "sha256": "082b368c808d18082e40b57723c25fd3c02a995cb55cdb467084fe3bc89f9ec2"
+          "sha256": "26838834772d05bba3496f8487a46019585316d6ff5cb2011bf52c9cec739029"
         },
         {
           "path": "/usr/bin/geomask-seed-lists.py",
@@ -253,6 +326,28 @@
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/etc/geo-devices.list",
+          "description": ""
+        },
+        {
+          "type": "cron",
+          "path": "device_sync",
+          "description": ""
+        },
+        {
+          "type": "nft",
+          "path": "geomask_excl",
+          "description": ""
+        },
+        {
+          "type": "ip_rule",
+          "path": "table 100/101",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "diagnostic": {
@@ -261,6 +356,43 @@
       "name": "Diagnostic Services",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "cron",
+          "path": "morning-check",
+          "description": ""
+        },
+        {
+          "type": "cron",
+          "path": "dnscheck",
+          "description": ""
+        },
+        {
+          "type": "cron",
+          "path": "vpnwatch",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-dnscheck.sh",
+          "description": "DNS safety audit"
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-morning-check.sh",
+          "description": "pre-torrent check"
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-vpnwatch.sh",
+          "description": "P2P attempt watcher"
+        },
+        {
+          "type": "file",
+          "path": "/etc/geomask/vpnwatch.conf",
+          "description": "watcher configuration"
+        }
       ],
       "files": [
         {
@@ -297,6 +429,18 @@
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/lib/geomask/geomask-doctor.py",
+          "description": "diagnostics engine: checks, route trace, logs"
+        },
+        {
+          "type": "cron",
+          "path": "geomask-doctor-prune",
+          "description": "daily log retention"
+        }
+      ],
       "files": [
         {
           "path": "/usr/lib/geomask/geomask-doctor.py",
@@ -312,6 +456,23 @@
       "name": "geomask-guard",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-guard.sh",
+          "description": "восстановление правил и маршрута"
+        },
+        {
+          "type": "file",
+          "path": "/etc/hotplug.d/iface/99-geomask-guard",
+          "description": "запуск сторожа при подъёме интерфейса"
+        },
+        {
+          "type": "cron",
+          "path": "geomask-guard",
+          "description": "страховка каждые 5 минут"
+        }
       ],
       "files": [
         {
@@ -334,6 +495,28 @@
       "name": "Админка LuCI",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/usr/libexec/rpcd/geo-sync",
+          "description": "rpcd-обёртка ubus-объекта geo-sync"
+        },
+        {
+          "type": "file",
+          "path": "/usr/share/rpcd/acl.d/luci-app-geo-sync.json",
+          "description": "права ubus для панели"
+        },
+        {
+          "type": "file",
+          "path": "/usr/share/luci/menu.d/luci-app-geo-sync.json",
+          "description": "пункт меню LuCI"
+        },
+        {
+          "type": "file",
+          "path": "/www/luci-static/resources/view/geo-sync/main.js",
+          "description": "страница панели"
+        }
       ],
       "files": [
         {
@@ -371,6 +554,18 @@
         "subscription:sub",
         "admission_service"
       ],
+      "owned_resources": [
+        {
+          "type": "config",
+          "path": "/etc/geomask/policies.yaml#path:ai",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/ai.yaml",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "path_vpn": {
@@ -380,6 +575,18 @@
       "dependencies": [
         "core",
         "subscription:sub"
+      ],
+      "owned_resources": [
+        {
+          "type": "config",
+          "path": "/etc/geomask/policies.yaml#path:vpn",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/vpn.yaml",
+          "description": ""
+        }
       ],
       "files": []
     },
@@ -391,6 +598,18 @@
         "core",
         "subscription:de5"
       ],
+      "owned_resources": [
+        {
+          "type": "config",
+          "path": "/etc/geomask/policies.yaml#path:vpn_nop2p",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/vpn_nop2p.yaml",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "self_update": {
@@ -400,6 +619,18 @@
       "dependencies": [
         "core"
       ],
+      "owned_resources": [
+        {
+          "type": "file",
+          "path": "/tmp/geomask-upd/",
+          "description": ""
+        },
+        {
+          "type": "cron",
+          "path": "upd_check",
+          "description": ""
+        }
+      ],
       "files": []
     },
     "torrent": {
@@ -408,6 +639,28 @@
       "name": "Torrent Admin",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/torrentsites.yaml",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-torrent.sh",
+          "description": "listener and ruleset manager"
+        },
+        {
+          "type": "file",
+          "path": "/etc/mihomo/ruleset/torrentdirect.yaml",
+          "description": "tracker and peer ruleset"
+        }
       ],
       "files": [
         {
@@ -431,6 +684,38 @@
       "name": "YouTube Edge Watchdog",
       "dependencies": [
         "core"
+      ],
+      "owned_resources": [
+        {
+          "type": "cron",
+          "path": "ytwatch",
+          "description": ""
+        },
+        {
+          "type": "filter",
+          "path": "/etc/mihomo/ruleset/ytvpn.yaml",
+          "description": ""
+        },
+        {
+          "type": "file",
+          "path": "/usr/bin/geomask-ytwatch.sh",
+          "description": "stalled-edge watchdog"
+        },
+        {
+          "type": "file",
+          "path": "/etc/geomask-ytwatch.conf",
+          "description": "watchdog configuration"
+        },
+        {
+          "type": "file",
+          "path": "/etc/mihomo/ruleset/ytvpn.yaml",
+          "description": "domains pinned to the VPN lane"
+        },
+        {
+          "type": "file",
+          "path": "/etc/mihomo/ruleset/ytdirect.yaml",
+          "description": "domains served directly"
+        }
       ],
       "files": [
         {

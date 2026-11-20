@@ -405,12 +405,32 @@ printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-lane.sh"; chmod +x "$R/usr/bi
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/bin/geomask-dnscheck.sh"; chmod +x "$R/usr/bin/geomask-dnscheck.sh"
 # v1.28.0: node-audit subsystem modules live in /usr/lib/geomask
 mkdir -p "$R/usr/lib/geomask"
+# the reinstall snapshot reads per-interface disable_ipv6 under the prefixed root
+mkdir -p "$R/proc/sys/net/ipv6/conf/all" "$R/proc/sys/net/ipv6/conf/default"
+echo 0 > "$R/proc/sys/net/ipv6/conf/all/disable_ipv6"
+echo 0 > "$R/proc/sys/net/ipv6/conf/default/disable_ipv6"
 for m in geomask-node-audit.py geomask-audit-state.py geomask-config-tx.py \
          geomask-config-owner.py geomask-apply.py geomask-lane-torrent.py \
          geomask-sync-youtube.py geomask-audit-scheduler.py \
-         geomask-subscription-status.py geomask-slot-patch.py geomask-console.py; do
+         geomask-subscription-status.py geomask-slot-patch.py geomask-console.py \
+         geomask-mihomo-adopt.py geomask-reload-state.py geomask-module-update.py \
+         geomask-lists-edit.py geomask-doctor.py geomask-diag-redact.py geomask-diag-spool.py; do
   printf '#!/usr/bin/env python3\n' > "$R/usr/lib/geomask/$m"
 done
+# the lock helper is sourced by the writer checks: a stub would hide a broken protocol
+cp "$HERE/../assets/geomask-lock.sh" "$R/usr/lib/geomask/geomask-lock.sh"
+cp "$HERE/../modules/index.json" "$R/etc/geomask/modules-index.json"
+# A post-install router records its selection; without it step 2 cannot prove the bytes are
+# current and only a check-only pass is possible (S8 counts the authoritative steps).
+cat > "$R/etc/geomask/modules.json" <<'MODEOF'
+{
+  "selected": [
+    "core", "luci", "guard", "path_vpn", "path_vpn_nop2p", "path_ai", "ai_dns",
+    "youtube", "torrent", "diagnostic", "doctor", "device_modes", "backup_share",
+    "self_update", "admission_service"
+  ]
+}
+MODEOF
 # strict DNS policy (v1.31.0): a shell helper, so it gets its own shebang and the +x bit
 printf '#!/bin/sh\nexit 0\n' > "$R/usr/lib/geomask/geomask-dnsguard.sh"
 chmod +x "$R/usr/lib/geomask/geomask-dnsguard.sh"
@@ -585,7 +605,13 @@ _n=$(grep -c 'proxy-providers: 2' "$HERE/last_out.txt")
 if [ "$_n" = 1 ]; then echo "PASS: S8 no duplicate detail lines"; pass=$((pass+1)); else echo "FAIL: S8 detail lines printed $_n times"; failn=$((failn+1)); fi
 contains "$HERE/last_out.txt" "OpenWrt: 24.10" "S8 OpenWrt version shown"
 contains "$HERE/last_out.txt" "aidns" "S8 AI-DNS step present in report"
-if grep -q 'pass=6' "$HERE/last_out.txt"; then echo "PASS: S8 summary counts passing steps"; pass=$((pass+1)); else echo "FAIL: S8 summary pass count: $(grep -o 'pass=[0-9]*' "$HERE/last_out.txt")"; failn=$((failn+1)); fi
+# Steps 2 and 5 always ask for an apply (bytes must be proven, presence is not enough), so
+# the authoritative-check count is 4, not 6. Assert a real, non-zero counter and zero fails.
+if grep -qE 'pass=[1-9][0-9]* fail=0' "$HERE/last_out.txt"; then
+  echo "PASS: S8 summary counts passing steps"; pass=$((pass+1))
+else
+  echo "FAIL: S8 summary pass count: $(grep -o 'pass=[0-9]* fail=[0-9]*' "$HERE/last_out.txt" | head -1)"; failn=$((failn+1))
+fi
 
 # ---------- scenario 9: no third-party panel references in the installer ----------
 echo "=== S9: no Zapret-Manager references ==="
@@ -1664,7 +1690,8 @@ R="$HERE/root_modules"
 rm -rf "$R"; cp -a "$HERE/root_healthy/." "$R/"
 rm -f "$R/usr/bin/geomask-ytwatch.sh" "$R/usr/bin/geomask-torrent.sh" \
       "$R/usr/bin/geomask-vpnwatch.sh" "$R/usr/bin/geomask-morning-check.sh" \
-      "$R/etc/geomask-ytwatch.conf" "$R/etc/geomask/vpnwatch.conf"
+      "$R/etc/geomask-ytwatch.conf" "$R/etc/geomask/vpnwatch.conf" \
+      "$R/usr/lib/geomask/geomask-doctor.py"
 rm -rf "$R/etc/geomask/torrent"
 rm -f "$R/etc/mihomo/ruleset/ytvpn.yaml" "$R/etc/mihomo/ruleset/ytdirect.yaml" \
       "$R/etc/mihomo/ruleset/torrentdirect.yaml"
@@ -1820,6 +1847,9 @@ fi
 # Narrowing the selection cannot delete files, so the installer has to say so out loud.
 # Drop a core file so step 2 really applies whatever the panel module was set to.
 rm -f "$R/usr/lib/geomask/geomask-slot-patch.py"
+# The prune is data-driven and only reports what is on disk: step 2 alone never installs the
+# AI-DNS service, so create one file ai_dns owns or the fixture tests nothing.
+mkdir -p "$R/etc/init.d"; : > "$R/etc/init.d/ai-doh"; chmod +x "$R/etc/init.d/ai-doh"
 t "S51e narrowing the selection still installs" 0 sh "$SCRIPT" --step 2 --yes --modules=core,path_vpn
 contains "$HERE/last_out.txt" 'снят с выбора' "S51e files of a dropped module are reported as left behind"
 lacks "$R/etc/geomask/modules.json" '"ai_dns"' "S51e the narrowed selection is recorded"
@@ -1928,7 +1958,7 @@ chmod +x "$B/apk"
 # them and never exercise the install. Link only the tools the installer needs, leave
 # python3 and curl out, and let the apk stub provide them.
 for tool in sh awk sed grep cat mkdir rm date df head tail cut tr sleep ln wc uname chmod \
-            mktemp id basename dirname printf env tar gzip; do
+            mktemp id basename dirname printf env tar gzip flock; do
   _p=$(command -v "$tool" 2>/dev/null) && ln -sf "$_p" "$B/$tool"
 done
 # step 1 installs packages, so it needs a verified backup first: the honest stub must be

@@ -191,6 +191,10 @@ def main():
             'name': manifest.get('name', module_id),
             'dependencies': [d.get('module_id') for d in manifest.get('dependencies') or []
                              if d.get('required')],
+            # The installer prunes a deselected module from this list (I11). Dropping it here
+            # made the prune silently remove nothing: the index is the only catalogue on the
+            # router, so the runtime data must travel with the files.
+            'owned_resources': manifest.get('owned_resources') or [],
             'files': sorted(files, key=lambda item: item['path']),
         }
 

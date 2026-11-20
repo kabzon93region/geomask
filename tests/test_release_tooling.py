@@ -14,6 +14,13 @@ RELEASE = (ROOT / 'tools' / 'release.py').read_text(encoding='utf-8')
 
 
 class ReleaseToolingTests(unittest.TestCase):
+    def test_the_linux_only_sandbox_is_skipped_on_windows(self):
+        """On Windows the sandbox fixtures fail for harness reasons; CI runs them on Ubuntu."""
+        self.assertIn('sandbox_reason', RELEASE)
+        self.assertIn("os.name == 'nt'", RELEASE)
+        self.assertIn('skipped (', RELEASE)
+        self.assertIn('CI-187', RELEASE)
+
     def test_the_release_gate_uses_the_real_timeout_and_streams(self):
         """Defaults were 600 s per module and 1800 s per step - a 68-minute gate could not pass."""
         self.assertIn('GATE_TIMEOUT = 4200', RELEASE)

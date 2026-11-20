@@ -384,6 +384,23 @@
 - Тест-гейт: прогресс в консоль и `progress.txt` (`6abb0d2`, `245de7b`); `gate33` упал только
   на `test_diag_bundle` из-за MSYS-путей, `gate34` — PASS.
 
+## Партия 32 — CI-лог получен: 52 падения на Linux (CI-187)
+
+- `gh run list` показал, что CI на `master` красный давно (как минимум с 17.11). Лог последнего
+  прогона `44652597472` (Ubuntu 26.04): unit-gate — **52 падения в 16 модулях**, `timeout: 0`
+  (то есть дело не в 600-секундном лимите: на Linux `phase2b` укладывается). Упавшие модули:
+  `test_apply_guards`, `test_backend_safety`, `test_console_lock`, `test_console_tx`,
+  `test_diag_redact`, `test_lock_protocol`, `test_migration`, `test_module_update`,
+  `test_node_audit`, `test_node_audit_lifecycle`, `test_reapply_chain`,
+  `test_reinstall_phase2e`, `test_reinstall_phase2f`, `test_sandbox_guard`, `test_scheduler`,
+  `test_scheduler_apply_chain`. Шаг «Sandbox tests» до выполнения не дошёл.
+- Вывод: это ровно тот пункт плана (CI-187), который нельзя закрыть локальным Windows-гейтом.
+  Он остаётся OPEN; данные для починки теперь есть (лог + список модулей).
+- Следствие для релиза: `release.py` больше не считает Windows-прогон песочницы провалом —
+  на Windows шаг помечается `skipped (windows host: Linux-only sandbox fixtures)`, а в
+  release notes добавлена строка про известный красный Linux CI (`skipped (`, тест
+  `test_release_tooling` 6 → 7).
+
 ## Партия 31 — gate35 после переустановки: PASS
 
 - `gate35`: **97 модулей, 1427 тестов, 1397 выполнено, 30 allowlisted skip, 0 fail,

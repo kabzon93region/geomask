@@ -74,7 +74,7 @@ B-020 — `2422295` (бюджет 15 с, partial, probe path). D14 — искл�
 | 5 DNS/rulesets (C04/C07/G02/G03/G05/B-020/P10/P11) | CLOSED-LOCAL, кроме G05 и P10-dataplane — стенд |
 | 6 IPv6 (C06/P06) | код CLOSED-LOCAL; kernel/reboot — стенд |
 | 7 diagnostics (C10/P07/P12/R07) | C10/P12 CLOSED-LOCAL; P07 — стенд; R07 — стенд |
-| 8 tooling/recovery (R01/P06–P10) | R01/P06/P09 CLOSED-LOCAL; P06/P09-power-loss, P08, CI-187, матрица SHA — стенд/владелец |
+| 8 tooling/recovery (R01/P06–P10) | R01/P06/P09 CLOSED-LOCAL; P06/P09-power-loss, P08, матрица SHA — стенд/владелец. CI-187: лог получен (run `44652597472`, Ubuntu, 52 падения в 16 модулях, timeout=0) — Linux-специфичные ожидания тестов, ещё не исправлены |
 | Этап 0 (0а–0д) | 0а/0б/0в/0г/0д CLOSED-LOCAL; gate этапа 0 — стенд |
 
 ## Доказательный baseline

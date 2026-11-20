@@ -44923,13 +44923,16 @@ _rs_snap_files() { # _rs_snap_files <dir> - byte objects of the manifest
         if [ "$_rs_fe" = dir-or-absent ] && [ -d "$(P "$_rs_fp")" ]; then
           # A trusted storage link (extroot-style /etc/mihomo, /etc/geomask) is a
           # directory object: keep the link, pin its target identity, restore metadata.
+          # stat(1) uses lstat by default, so it must be pointed at the RESOLVED target:
+          # recording the link's own 777 mode made the restore chmod the target world-writable
+          # and then refuse every path under it (CI-187 group E).
           _rs_fa="$(P "$_rs_fp")"
-          _rs_f4=$(_rs_stat4 "$_rs_fa") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
+          _rs_lh=$(readlink -f "$_rs_fa" 2>/dev/null) || _rs_lh=""
+          [ -n "${_rs_lh:-}" ] || { bad "snapshot: cannot resolve $_rs_fp"; return 1; }
+          _rs_f4=$(_rs_stat4 "$_rs_lh") || { bad "snapshot: cannot stat $_rs_fp"; return 1; }
           _rs_fm=${_rs_f4%%|*}; _rs_fr=${_rs_f4#*|}
           _rs_fu=${_rs_fr%%|*}; _rs_fr=${_rs_fr#*|}
           _rs_fi=${_rs_fr%%|*}
-          _rs_lh=$(readlink -f "$_rs_fa" 2>/dev/null) || _rs_lh=""
-          [ -n "${_rs_lh:-}" ] || { bad "snapshot: cannot resolve $_rs_fp"; return 1; }
           _rs_lr=$(_rs_posix_path "$_rs_lh")
           _rs_ld=$(_rs_devino "$_rs_lh") || { bad "snapshot: cannot pin $_rs_fp"; return 1; }
           printf 'dirlink|%s|%s|%s|%s|%s|-\n' \

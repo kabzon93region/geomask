@@ -898,6 +898,20 @@ done
         self.assertRegex(result.stdout, r'SIZE=\d+', result.stdout + result.stderr)
         self.assertRegex(result.stdout, r'FOUR=[0-7]{3}\|\d+\|0:\d+\|\d+')
 
+    def test_snapshot_mode_of_a_symlinked_directory_follows_the_target(self):
+        """`ls -ld` reports lrwxrwxrwx (777) for a link; the snapshot must record the target."""
+        if not win_symlink.NATIVE_SYMLINKS:
+            self.skipTest(win_symlink.SYMLINK_REASON)
+        target = self.case / 'real-dir'
+        target.mkdir()
+        os.chmod(target, 0o755)
+        link = self.case / 'link-dir'
+        os.symlink(target.name, link, target_is_directory=True)
+        body = ('stat() { return 127; }\n'
+                'printf "MODE=%s\\n" "$(_rs_mode ' + posix(link) + ')"\n')
+        result = self.run_script(body, functions=['_rs_mode', '_rs_ls_mode'])
+        self.assertIn('MODE=755', result.stdout, result.stdout + result.stderr)
+
     def test_an_empty_uci_delta_does_not_block_the_reinstall(self):
         """uci leaves an empty /tmp/.uci/<pkg> behind; only non-empty is a mid-edit."""
         for name in ('110-restore-snapshot-shared.sh.part', '130-restore-shared-uci.sh.part'):

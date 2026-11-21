@@ -1958,7 +1958,7 @@ chmod +x "$B/apk"
 # them and never exercise the install. Link only the tools the installer needs, leave
 # python3 and curl out, and let the apk stub provide them.
 for tool in sh awk sed grep cat mkdir rm date df head tail cut tr sleep ln wc uname chmod \
-            mktemp id basename dirname printf env tar gzip flock; do
+            mktemp id basename dirname printf env tar gzip flock mv cp ls stat touch; do
   _p=$(command -v "$tool" 2>/dev/null) && ln -sf "$_p" "$B/$tool"
 done
 # step 1 installs packages, so it needs a verified backup first: the honest stub must be

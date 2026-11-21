@@ -14,5 +14,9 @@ tests/root_*/
 tests/freshbin/
 tests/root_fresh/
 
+# test gate / scenario runner logs (local only)
+test-logs/
+sandbox-logs/
+
 # local review/reproduction scratch (never published, never committed)
 audit-temp/

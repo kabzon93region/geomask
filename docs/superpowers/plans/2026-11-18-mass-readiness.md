@@ -264,7 +264,7 @@ Evidence вне Git: [updater](<Y:/openwrt/audit-temp/mass-readiness-20261118/up
 
 **Файлы:** [release](<../../../tools/release.py>), [CI](<../../../.github/workflows/ci.yml>), [testgate](<../../../tests/testgate.py>), [boundaries](<../../../tests/BOUNDARIES.md>), [README](<../../../README.md>).
 
-- [ ] Сначала получить доступный владельцу unit-gate artifact/log CI187, назвать конкретные failed modules/tests/timeouts и причины skips, воспроизвести на изолированном Linux и исправить подтверждённые причины. Повторить CI на final SHA; текущий failure не закрывать локальными47 tests.
+- [x] CI-187 закрыт: run 44855508759 на `b29e201` — все шаги success, unit gate 97 модулей PASS, sandbox `pass=444 fail=0 skip=0 unknown_skip=0`; разбор и итог — `docs/CI-187-ANALYSIS-2026-11-20.md` §10.
 - [ ] Readiness немутирующая, final clean/build/hash после preparation до tag; штатный counts/skips/timeouts gate в изоляции, syntax/list-modules не install proof.
 - [ ] Last valid backup durable до replacement; kill/reboot stages, actual archive write-set/restore с PC-копии. Volatile snapshot не power-loss guarantee.
 - [ ] Late rollback actual graph/registry/argv/egress либо incomplete; bytes/PID недостаточны.
